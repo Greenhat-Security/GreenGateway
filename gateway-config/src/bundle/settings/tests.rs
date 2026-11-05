@@ -16,8 +16,9 @@ use serde_json::{json, Map, Value as JsonValue};
 
 use super::{
     check, children, document_maximum, document_paths, member_names, render::DECIMAL_PATTERN,
-    render_deployment_reference, render_deployment_schema, Child, SettingValue,
-    DEPLOYMENT_SCHEMA_DOCUMENT, SECTIONS, STANDALONE_STORES, STORES_PATH,
+    render_deployment_reference, render_deployment_schema, structured::Document, Child, OwnValue,
+    SettingValue, DEPLOYMENT_SCHEMA_DOCUMENT, OWN_MEMBERS, SECTIONS, STANDALONE_STORES,
+    STORES_PATH,
 };
 use crate::{
     bundle::{
@@ -33,7 +34,7 @@ use crate::{
     state_dir::StateFile,
 };
 
-const CANARY: &str = "zqcanary";
+pub(super) const CANARY: &str = "zqcanary";
 const SAFE: u64 = MAX_SAFE_INTEGER.unsigned_abs();
 /// Where the settings reference sits in `docs/configuration-bundles.md`.
 const REFERENCE_DOCUMENT: &str = "docs/configuration-bundles.md";
@@ -46,18 +47,31 @@ fn repository_path(relative: &str) -> std::path::PathBuf {
         .join(relative)
 }
 
-fn repository_text(relative: &str) -> String {
+pub(super) fn repository_text(relative: &str) -> String {
     let path = repository_path(relative);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
         .replace("\r\n", "\n")
 }
 
-/// Every field a document can set.
+/// Every field a document can set with a scalar or list value; the
+/// structured settings have their own tests (`structured_tests`).
 fn settable() -> impl Iterator<Item = &'static Field> {
     FIELDS
         .iter()
-        .filter(|field| field.document_path().is_some())
+        .filter(|field| field.document_path().is_some() && Document::of(field).is_none())
+}
+
+/// A value the document accepts for a member of its own.
+fn own_valid(value: OwnValue) -> JsonValue {
+    match value {
+        OwnValue::Word(words) => json!(words[0]),
+        OwnValue::Text => json!("settings-probe"),
+        OwnValue::Secret => json!({ "secret": "settings-probe" }),
+        OwnValue::Stores => json!(["service_tokens", "audit"]),
+        // Only a migration document may acknowledge a behavior.
+        OwnValue::Compatibility => json!([]),
+    }
 }
 
 fn field(environment: &str) -> &'static Field {
@@ -91,7 +105,7 @@ fn valid(field: &Field) -> JsonValue {
 
 /// Sets the member at `path` (a JSON Pointer of plain names) in `document`,
 /// creating the sections above it.
-fn set(document: &mut JsonValue, path: &str, value: JsonValue) {
+pub(super) fn set(document: &mut JsonValue, path: &str, value: JsonValue) {
     let mut segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     let last = segments.pop().expect("a path has a member");
     let mut current = document;
@@ -108,7 +122,7 @@ fn set(document: &mut JsonValue, path: &str, value: JsonValue) {
         .insert(last.to_owned(), value);
 }
 
-fn envelope() -> JsonValue {
+pub(super) fn envelope() -> JsonValue {
     json!({
         "apiVersion": "greengateway.dev/v1alpha1",
         "kind": "GatewayDeployment",
@@ -116,7 +130,7 @@ fn envelope() -> JsonValue {
     })
 }
 
-fn with(path: &str, value: JsonValue) -> JsonValue {
+pub(super) fn with(path: &str, value: JsonValue) -> JsonValue {
     let mut document = envelope();
     set(&mut document, path, value);
     document
@@ -132,14 +146,14 @@ fn file() -> FileName {
     FileName::parse("deployment.json").expect("a valid name")
 }
 
-fn read(document: &JsonValue) -> (Option<document::Deployment>, Vec<BundleDiagnostic>) {
+pub(super) fn read(document: &JsonValue) -> (Option<document::Deployment>, Vec<BundleDiagnostic>) {
     let mut diagnostics = Vec::new();
     let deployment = document::deployment(&node(document), &file(), &mut diagnostics);
     (deployment, diagnostics)
 }
 
 /// The codes and pointers of a refused document.
-fn refusals(document: &JsonValue) -> Vec<(Code, String)> {
+pub(super) fn refusals(document: &JsonValue) -> Vec<(Code, String)> {
     let (deployment, diagnostics) = read(document);
     assert_eq!(
         deployment.is_none(),
@@ -152,12 +166,12 @@ fn refusals(document: &JsonValue) -> Vec<(Code, String)> {
         .collect()
 }
 
-fn schema() -> JsonValue {
+pub(super) fn schema() -> JsonValue {
     serde_json::from_str(&repository_text(DEPLOYMENT_SCHEMA_DOCUMENT))
         .expect("the deployment schema is JSON")
 }
 
-fn validator() -> &'static jsonschema::Validator {
+pub(super) fn validator() -> &'static jsonschema::Validator {
     static VALIDATOR: std::sync::LazyLock<jsonschema::Validator> = std::sync::LazyLock::new(|| {
         jsonschema::validator_for(&schema()).expect("the deployment schema compiles")
     });
@@ -223,15 +237,20 @@ fn every_section_the_paths_imply_is_described_once() {
 }
 
 #[test]
-fn the_document_has_a_path_for_every_scalar_and_list_deployment_field() {
+fn every_deployment_field_has_a_path_and_every_json_one_a_structured_form() {
     for field in FIELDS {
         let BundleMapping::Deployment { path } = field.bundle else {
             continue;
         };
-        assert_eq!(
+        assert!(
             path.is_some(),
-            field.field_type != FieldType::Json,
-            "{}: every deployment field but the JSON documents has a path",
+            "{}: every deployment field has a path",
+            field.environment
+        );
+        assert_eq!(
+            Document::of(field).is_some(),
+            field.field_type == FieldType::Json,
+            "{}: a JSON document takes a structured form",
             field.environment
         );
     }
@@ -287,17 +306,35 @@ fn a_document_may_set_every_setting_and_each_is_typed_by_its_entry() {
             valid(field),
         );
     }
-    set(
-        &mut document,
-        STORES_PATH,
-        json!(["service_tokens", "audit"]),
-    );
+    let structured: Vec<&Field> = FIELDS
+        .iter()
+        .filter(|field| Document::of(field).is_some())
+        .collect();
+    for field in &structured {
+        set(
+            &mut document,
+            field
+                .document_path()
+                .expect("a structured setting has a path"),
+            json!([]),
+        );
+    }
+    for member in OWN_MEMBERS {
+        set(&mut document, member.path, own_valid(member.value));
+    }
     let (deployment, diagnostics) = read(&document);
     let deployment = deployment.unwrap_or_else(|| panic!("{diagnostics:?}"));
-    assert_eq!(deployment.settings.values.len(), settable().count());
+    assert_eq!(
+        deployment.settings.values.len(),
+        settable().count() + structured.len()
+    );
+    assert_eq!(deployment.settings.own.len(), OWN_MEMBERS.len());
     for setting in &deployment.settings.values {
         let field = setting.field;
         let typed = match (&setting.value, field.field_type) {
+            (SettingValue::Structured(structured), FieldType::Json) => {
+                structured.environment == json!([]) && structured.secrets.is_empty()
+            }
             _ if field.sensitivity != Sensitivity::Public => {
                 matches!(setting.value, SettingValue::Secret(_))
             }
@@ -317,8 +354,8 @@ fn a_document_may_set_every_setting_and_each_is_typed_by_its_entry() {
         assert!(typed, "{}: {:?}", field.environment, setting.value);
     }
     assert_eq!(
-        deployment.settings.stores,
-        Some(vec!["audit", "service_tokens"]),
+        deployment.settings.own_value(STORES_PATH),
+        Some(&SettingValue::Words(vec!["audit", "service_tokens"])),
         "stores are kept in canonical order"
     );
 

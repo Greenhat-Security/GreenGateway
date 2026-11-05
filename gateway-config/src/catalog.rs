@@ -34,9 +34,11 @@
 //! document. The bundle reader (`crate::bundle::settings`) derives the
 //! document's closed sections from those paths and holds each setting to its
 //! entry here, and the published deployment schema and the settings
-//! reference in `docs/configuration-bundles.md` are rendered from them. The
-//! fields that hold a JSON document (`AUTH_PROVIDERS`, `UPSTREAM_ROUTES`,
-//! `MCP_UPSTREAM_SERVERS`) have no path yet: a bundle cannot set them.
+//! reference in `docs/configuration-bundles.md` are rendered from them. Every
+//! deployment field has a path; the fields that hold a JSON document
+//! (`AUTH_PROVIDERS`, `UPSTREAM_ROUTES`, `MCP_UPSTREAM_SERVERS`) take the
+//! closed structured forms `crate::bundle::settings` defines from the
+//! compiler's own types.
 //!
 //! Some of ADR-0008's catalog columns are not here yet, because nothing
 //! decides or checks them today: exportability and template placeholders,
@@ -352,8 +354,9 @@ impl StateBackends {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BundleMapping {
     /// A `GatewayDeployment` field. `path` is its JSON Pointer beneath
-    /// `/spec`, in snake_case sections; `None` for a field whose document
-    /// form `v1alpha1` does not define yet, which a bundle cannot set.
+    /// `/spec`, in snake_case sections; `None` would be a field whose
+    /// document form `v1alpha1` does not define yet, which a bundle cannot
+    /// set. Every deployment field has a path today.
     Deployment { path: Option<&'static str> },
     /// One of ADR-0008's bootstrap inputs: it stays in the environment beside
     /// a bundle and may not be set inside one.
@@ -362,8 +365,10 @@ pub enum BundleMapping {
     /// `GATEWAY_STATE_DIR`: `POLICY_FILE`, `TOOLS_FILE` and every
     /// `*_SQLITE_PATH`.
     Resource,
-    /// Part of the legacy single JWT provider, which a bundle cannot express:
-    /// it names its authentication providers explicitly.
+    /// A setting `v1alpha1` cannot express: the legacy single JWT provider,
+    /// because a bundle names its authentication providers explicitly, and
+    /// `OPENAPI_SPEC_PATH`, a host path whose OpenAPI discovery managed
+    /// Connections provide (ADR-0008, "Bootstrap inputs").
     NotRepresentable,
     /// A host path ADR-0008 does not place yet: it is neither a bootstrap
     /// input nor a bundle resource, so bundle mode refuses it until the ADR

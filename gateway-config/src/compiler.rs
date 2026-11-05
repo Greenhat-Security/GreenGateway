@@ -1214,9 +1214,12 @@ pub enum AuthProviderType {
     CookieSession,
 }
 
+/// One `AUTH_PROVIDERS` entry as written, before validation. The deployment
+/// document's `authentication.providers` entries are typed with it too
+/// (`bundle::settings::structured`), so the two forms cannot drift.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawAuthProviderConfig {
+pub(crate) struct RawAuthProviderConfig {
     name: String,
     #[serde(rename = "type")]
     provider_type: String,

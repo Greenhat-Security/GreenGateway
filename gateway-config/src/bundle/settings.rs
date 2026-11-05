@@ -24,6 +24,10 @@
 //!   each maps one to one onto an entry of the environment's comma-separated
 //!   form, which trims entries and drops empty ones;
 //! - a field whose value may carry a secret accepts only a secret reference;
+//! - a field that holds a JSON document (`AUTH_PROVIDERS`, `UPSTREAM_ROUTES`,
+//!   `MCP_UPSTREAM_SERVERS`) takes the closed structured form
+//!   [`structured`] defines from the compiler's own types, in which every
+//!   member that may carry a secret accepts only a secret reference;
 //! - no field accepts an unresolved placeholder.
 //!
 //! Rules relating one setting to another, and each string's own grammar, stay
@@ -32,12 +36,19 @@
 //! bounds only: a document can still set a combination the compiler would
 //! refuse, and nothing starts from it.
 //!
-//! One member is the document's own rather than a field's:
-//! `spec.state.stores`, the standalone stores a deployment keeps beneath its
-//! state directory, which in environment mode is which of their
-//! `*_SQLITE_PATH` variables are set (ADR-0008, "Bootstrap inputs").
+//! Some members are the document's own rather than one field's
+//! ([`OWN_MEMBERS`]): the standalone stores a deployment keeps beneath its
+//! state directory, whether each listener terminates TLS and checks client
+//! certificates against a revocation list, the admin login client, and the
+//! compatibility behaviors a `migration` document acknowledges. In
+//! environment mode the first two are which host locators are set
+//! (ADR-0008, "Bootstrap inputs"): the document states the intent, and the
+//! locators stay in the environment.
 
 mod render;
+pub(crate) mod structured;
+#[cfg(test)]
+mod structured_tests;
 #[cfg(test)]
 mod tests;
 
@@ -51,9 +62,11 @@ pub use render::{render_deployment_reference, render_deployment_schema};
 use super::{
     diagnostic::{Code, Pointer},
     document::Checker,
+    profile::Compatibility,
     syntax::{Member, Node, Value, MAX_SAFE_INTEGER},
     value::{Decimal, SecretReference, Unresolved},
 };
+use structured::{Document, Structured};
 
 /// Where the published deployment schema is committed, relative to the
 /// repository root.
@@ -61,6 +74,125 @@ pub const DEPLOYMENT_SCHEMA_DOCUMENT: &str = "docs/schemas/gateway-deployment.v1
 
 /// The document path of the standalone store list.
 pub const STORES_PATH: &str = "/spec/state/stores";
+
+/// The document path of the acknowledged compatibility behaviors.
+pub(crate) const ACKNOWLEDGED_PATH: &str = "/spec/compatibility/acknowledged";
+
+/// What a member of the document's own holds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnValue {
+    /// Exactly one of these words.
+    Word(&'static [&'static str]),
+    /// A non-empty string with no whitespace at either end.
+    Text,
+    /// A secret reference.
+    Secret,
+    /// Distinct names from [`STANDALONE_STORES`], kept in its order.
+    Stores,
+    /// Distinct codes from [`Compatibility::ALL`], kept in its order.
+    Compatibility,
+}
+
+impl OwnValue {
+    /// The words a set member may name, in canonical order.
+    pub(crate) fn set_words(self) -> Option<Vec<&'static str>> {
+        match self {
+            Self::Stores => Some(STANDALONE_STORES.iter().map(|store| store.name).collect()),
+            Self::Compatibility => Some(
+                Compatibility::ALL
+                    .iter()
+                    .map(|behavior| behavior.as_str())
+                    .collect(),
+            ),
+            Self::Word(_) | Self::Text | Self::Secret => None,
+        }
+    }
+}
+
+/// A member of `spec` that is the document's own rather than one catalog
+/// field's.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OwnMember {
+    pub(crate) path: &'static str,
+    pub(crate) value: OwnValue,
+    /// What it means, for the schema.
+    pub(crate) description: &'static str,
+    /// What it is in environment mode, for the reference.
+    pub(crate) environment: &'static str,
+    /// Its default, spelled for the reference.
+    pub(crate) default: &'static str,
+}
+
+/// The words of a listener's TLS and revocation-list intent.
+const INTENT: &[&str] = &["required", "off"];
+
+/// Every member of the document's own, in the order the reference lists
+/// them within their sections.
+pub(crate) const OWN_MEMBERS: &[OwnMember] = &[
+    OwnMember {
+        path: "/spec/listeners/public/tls",
+        value: OwnValue::Word(INTENT),
+        description: "Whether the data listener terminates TLS. The certificate and key are host locators that stay in the environment; the compiler will hold this intent and them to each other.",
+        environment: "`required` when [`TLS_CERT_FILE`](configuration.md#tls_cert_file) and [`TLS_KEY_FILE`](configuration.md#tls_key_file) are set",
+        default: "`\"off\"`",
+    },
+    OwnMember {
+        path: "/spec/listeners/public/client_certificate_crl",
+        value: OwnValue::Word(INTENT),
+        description: "Whether the data listener checks client certificates against a certificate revocation list. The list is a host locator that stays in the environment; the compiler will hold this intent and it to each other.",
+        environment: "`required` when [`CLIENT_CERT_CRL_FILE`](configuration.md#client_cert_crl_file) is set",
+        default: "`\"off\"`",
+    },
+    OwnMember {
+        path: "/spec/listeners/admin/tls",
+        value: OwnValue::Word(INTENT),
+        description: "Whether the admin listener terminates TLS. The certificate and key are host locators that stay in the environment; the compiler will hold this intent and them to each other.",
+        environment: "`required` when [`ADMIN_TLS_CERT_FILE`](configuration.md#admin_tls_cert_file) and [`ADMIN_TLS_KEY_FILE`](configuration.md#admin_tls_key_file) are set",
+        default: "`\"off\"`",
+    },
+    OwnMember {
+        path: "/spec/listeners/admin/client_certificate_crl",
+        value: OwnValue::Word(INTENT),
+        description: "Whether the admin listener checks client certificates against a certificate revocation list. The list is a host locator that stays in the environment; the compiler will hold this intent and it to each other.",
+        environment: "`required` when [`ADMIN_CLIENT_CERT_CRL_FILE`](configuration.md#admin_client_cert_crl_file) is set",
+        default: "`\"off\"`",
+    },
+    OwnMember {
+        path: "/spec/admin_login/client_id",
+        value: OwnValue::Text,
+        description: "The OAuth client ID admin sign-in uses with the admin login provider.",
+        environment: "`client_id` of the [`AUTH_PROVIDERS`](configuration.md#auth_providers) entry [`ADMIN_LOGIN_PROVIDER`](configuration.md#admin_login_provider) names",
+        default: "unset",
+    },
+    OwnMember {
+        path: "/spec/admin_login/client_secret",
+        value: OwnValue::Secret,
+        description: "The OAuth client secret admin sign-in uses with the admin login provider. It is a secret, so it is a secret reference.",
+        environment: "`client_secret` of the [`AUTH_PROVIDERS`](configuration.md#auth_providers) entry [`ADMIN_LOGIN_PROVIDER`](configuration.md#admin_login_provider) names",
+        default: "unset",
+    },
+    OwnMember {
+        path: "/spec/admin_login/redirect_uri",
+        value: OwnValue::Text,
+        description: "The callback URL the admin login provider redirects to after sign-in.",
+        environment: "`redirect_uri` of the [`AUTH_PROVIDERS`](configuration.md#auth_providers) entry [`ADMIN_LOGIN_PROVIDER`](configuration.md#admin_login_provider) names",
+        default: "unset",
+    },
+    OwnMember {
+        path: STORES_PATH,
+        value: OwnValue::Stores,
+        description: "The standalone stores kept beneath the state directory, each named once; in environment mode, which of their *_SQLITE_PATH variables are set.",
+        environment: "",
+        default: "unset",
+    },
+    OwnMember {
+        path: ACKNOWLEDGED_PATH,
+        value: OwnValue::Compatibility,
+        description: "The compatibility behaviors a migration document keeps, each named once. Only the migration profile may acknowledge one, and each is then a warning instead of an error.",
+        environment: "none: environment mode has no profile",
+        default: "unset",
+    },
+];
 
 /// A standalone store a deployment document can enable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,7 +255,7 @@ pub struct Section {
 pub const SECTIONS: &[Section] = &[
     Section {
         path: "/spec/listeners",
-        description: "The listeners the gateway binds. Certificate, key, CA and CRL files are host locators and stay in the environment.",
+        description: "The listeners the gateway binds. Certificate, key, CA and CRL files are host locators and stay in the environment; the document states whether each listener terminates TLS and checks a revocation list.",
     },
     Section {
         path: "/spec/listeners/public",
@@ -143,7 +275,7 @@ pub const SECTIONS: &[Section] = &[
     },
     Section {
         path: "/spec/admin_login",
-        description: "Admin sign-in through an authentication provider.",
+        description: "Admin sign-in through an authentication provider, and the OAuth client it signs in with.",
     },
     Section {
         path: "/spec/admin_sessions",
@@ -203,7 +335,7 @@ pub const SECTIONS: &[Section] = &[
     },
     Section {
         path: "/spec/authentication",
-        description: "Request authentication.",
+        description: "Request authentication and the authentication providers.",
     },
     Section {
         path: "/spec/tool_runtime",
@@ -219,7 +351,7 @@ pub const SECTIONS: &[Section] = &[
     },
     Section {
         path: "/spec/upstream",
-        description: "The single upstream and the timeouts of proxied requests.",
+        description: "The single upstream or the upstream routes, the MCP upstream servers, and the timeouts of proxied requests.",
     },
     Section {
         path: "/spec/egress",
@@ -237,6 +369,10 @@ pub const SECTIONS: &[Section] = &[
         path: "/spec/authority_evidence",
         description: "Authority evidence and its event delivery.",
     },
+    Section {
+        path: "/spec/compatibility",
+        description: "The compatibility behaviors a migration document acknowledges.",
+    },
 ];
 
 /// A setting's value as the document wrote it, typed by its catalog entry.
@@ -251,6 +387,10 @@ pub(crate) enum SettingValue {
     Text(String),
     List(Vec<String>),
     Secret(SecretReference),
+    /// A JSON-valued field, in its environment form.
+    Structured(Structured),
+    /// A set of words, in canonical order.
+    Words(Vec<&'static str>),
 }
 
 /// One setting a document gave.
@@ -260,20 +400,45 @@ pub(crate) struct Setting {
     pub(crate) value: SettingValue,
 }
 
+/// One member of the document's own that a document gave.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OwnSetting {
+    pub(crate) member: &'static OwnMember,
+    pub(crate) value: SettingValue,
+}
+
 /// The settings of a valid deployment document, in the order it gave them.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Settings {
     pub(crate) values: Vec<Setting>,
-    /// The enabled standalone stores in canonical order, when the document
-    /// names them.
-    pub(crate) stores: Option<Vec<&'static str>>,
+    pub(crate) own: Vec<OwnSetting>,
 }
 
 impl Settings {
+    /// The value the document gave the member of its own at `path`.
+    pub(crate) fn own_value(&self, path: &str) -> Option<&SettingValue> {
+        self.own
+            .iter()
+            .find(|setting| setting.member.path == path)
+            .map(|setting| &setting.value)
+    }
+
+    /// The compatibility behaviors the document acknowledges.
+    pub(crate) fn acknowledged(&self) -> Vec<Compatibility> {
+        match self.own_value(ACKNOWLEDGED_PATH) {
+            Some(SettingValue::Words(words)) => Compatibility::ALL
+                .iter()
+                .copied()
+                .filter(|behavior| words.contains(&behavior.as_str()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Rewrites the document's JSON value into its canonical form: each
-    /// decimal as its shortest exact spelling and the store list in
-    /// [`STANDALONE_STORES`] order, so neither changes the canonical bytes
-    /// or the digests made from them.
+    /// decimal as its shortest exact spelling and each set of words (the
+    /// store list, the acknowledged behaviors) in its canonical order, so
+    /// neither changes the canonical bytes or the digests made from them.
     pub(crate) fn canonicalize(&self, document: &mut serde_json::Value) {
         for setting in &self.values {
             let SettingValue::Decimal(decimal) = &setting.value else {
@@ -287,13 +452,18 @@ impl Settings {
                 *slot = serde_json::Value::String(decimal.canonical().to_owned());
             }
         }
-        if let (Some(stores), Some(slot)) = (&self.stores, document.pointer_mut(STORES_PATH)) {
-            *slot = serde_json::Value::Array(
-                stores
-                    .iter()
-                    .map(|store| serde_json::Value::String((*store).to_owned()))
-                    .collect(),
-            );
+        for setting in &self.own {
+            let SettingValue::Words(words) = &setting.value else {
+                continue;
+            };
+            if let Some(slot) = document.pointer_mut(setting.member.path) {
+                *slot = serde_json::Value::Array(
+                    words
+                        .iter()
+                        .map(|word| serde_json::Value::String((*word).to_owned()))
+                        .collect(),
+                );
+            }
         }
     }
 }
@@ -304,10 +474,11 @@ pub(crate) enum Child {
     Setting(&'static Field),
     /// A section, by its document path.
     Section(&'static str),
-    Stores,
+    Own(&'static OwnMember),
 }
 
-/// Every document path below `spec`, in catalog order, the store list last.
+/// Every document path below `spec`, in catalog order, the document's own
+/// members last.
 pub(crate) fn document_paths() -> impl Iterator<Item = (&'static str, Child)> {
     FIELDS
         .iter()
@@ -316,7 +487,11 @@ pub(crate) fn document_paths() -> impl Iterator<Item = (&'static str, Child)> {
                 .document_path()
                 .map(|path| (path, Child::Setting(field)))
         })
-        .chain(std::iter::once((STORES_PATH, Child::Stores)))
+        .chain(
+            OWN_MEMBERS
+                .iter()
+                .map(|member| (member.path, Child::Own(member))),
+        )
 }
 
 /// The members the object at `path` may have, by name, in the order the
@@ -369,15 +544,26 @@ pub(super) fn read_members(
         };
         let pointer = pointer.member(name);
         match *child {
-            Child::Setting(field) => match check(field, &member.value) {
-                Ok(value) => settings.values.push(Setting { field, value }),
-                Err(refused) => {
-                    let pointer = match refused.index {
-                        Some(index) => pointer.index(index),
-                        None => pointer,
-                    };
-                    checker.report(refused.code, pointer, refused.node);
+            Child::Setting(field) => match Document::of(field) {
+                Some(document) => {
+                    let read = structured::read(checker, document, &member.value, &pointer);
+                    if let Some(value) = read {
+                        settings.values.push(Setting {
+                            field,
+                            value: SettingValue::Structured(value),
+                        });
+                    }
                 }
+                None => match check(field, &member.value) {
+                    Ok(value) => settings.values.push(Setting { field, value }),
+                    Err(refused) => {
+                        let pointer = match refused.index {
+                            Some(index) => pointer.index(index),
+                            None => pointer,
+                        };
+                        checker.report(refused.code, pointer, refused.node);
+                    }
+                },
             },
             Child::Section(section) => {
                 if Unresolved::from_node(&member.value).is_some() {
@@ -390,8 +576,54 @@ pub(super) fn read_members(
                     read_members(checker, members, section, &pointer, settings);
                 }
             }
-            Child::Stores => settings.stores = stores(checker, &member.value, &pointer),
+            Child::Own(own) => {
+                if let Some(value) = read_own(checker, own, &member.value, &pointer) {
+                    settings.own.push(OwnSetting { member: own, value });
+                }
+            }
         }
+    }
+}
+
+/// Reads a member of the document's own.
+fn read_own(
+    checker: &mut Checker<'_>,
+    own: &'static OwnMember,
+    node: &Node,
+    pointer: &Pointer,
+) -> Option<SettingValue> {
+    let mut refuse = |code| {
+        checker.report(code, pointer.clone(), node);
+        None
+    };
+    if own.value == OwnValue::Secret {
+        return match SecretReference::from_node(node) {
+            Ok(reference) => Some(SettingValue::Secret(reference)),
+            Err(code) => refuse(code),
+        };
+    }
+    if Unresolved::from_node(node).is_some() {
+        return refuse(Code::Unresolved);
+    }
+    match own.value {
+        OwnValue::Word(words) => match node.as_str() {
+            Some(text) => match words.iter().copied().find(|word| *word == text) {
+                Some(word) => Some(SettingValue::Word(word)),
+                None => refuse(Code::InvalidValue),
+            },
+            None => refuse(Code::WrongType),
+        },
+        OwnValue::Text => match node.as_str() {
+            Some(text) if is_trimmed(text) => Some(SettingValue::Text(text.to_owned())),
+            Some(_) => refuse(Code::InvalidValue),
+            None => refuse(Code::WrongType),
+        },
+        OwnValue::Stores | OwnValue::Compatibility => {
+            let words = own.value.set_words().unwrap_or_default();
+            word_set(checker, &words, node, pointer).map(SettingValue::Words)
+        }
+        // Read above, before the placeholder check.
+        OwnValue::Secret => None,
     }
 }
 
@@ -481,8 +713,9 @@ pub(crate) fn check<'n>(
             }
             Ok(SettingValue::List(entries))
         }
-        // No host path or JSON document has a document path in `v1alpha1`
-        // (the catalog's tests hold that); refusing keeps it so if one did.
+        // No host path has a document path in `v1alpha1` (the catalog's
+        // tests hold that), and a JSON document is read by `structured`,
+        // never here; refusing keeps both so.
         FieldType::Path | FieldType::PathList | FieldType::Json => Err(refused(Code::WrongType)),
     }
 }
@@ -504,7 +737,7 @@ fn within(range: DecimalRange, value: f64) -> bool {
 }
 
 /// Non-empty, with no whitespace at either end.
-fn is_trimmed(text: &str) -> bool {
+pub(crate) fn is_trimmed(text: &str) -> bool {
     !text.is_empty()
         && !text.starts_with(char::is_whitespace)
         && !text.ends_with(char::is_whitespace)
@@ -520,12 +753,14 @@ pub(crate) fn document_maximum(maximum: u64) -> u64 {
     maximum.min(MAX_SAFE_INTEGER.unsigned_abs())
 }
 
-/// `spec.state.stores`: distinct store names, returned in canonical order.
-fn stores(checker: &mut Checker<'_>, node: &Node, pointer: &Pointer) -> Option<Vec<&'static str>> {
-    if Unresolved::from_node(node).is_some() {
-        checker.report(Code::Unresolved, pointer.clone(), node);
-        return None;
-    }
+/// A set of distinct `words`, returned in the order `words` lists them: the
+/// store list and the acknowledged behaviors.
+fn word_set(
+    checker: &mut Checker<'_>,
+    words: &[&'static str],
+    node: &Node,
+    pointer: &Pointer,
+) -> Option<Vec<&'static str>> {
     let Value::Array(items) = &node.value else {
         checker.report(Code::WrongType, pointer.clone(), node);
         return None;
@@ -534,14 +769,19 @@ fn stores(checker: &mut Checker<'_>, node: &Node, pointer: &Pointer) -> Option<V
     let mut valid = true;
     for (index, item) in items.iter().enumerate() {
         let pointer = pointer.index(index);
+        if Unresolved::from_node(item).is_some() {
+            checker.report(Code::Unresolved, pointer, item);
+            valid = false;
+            continue;
+        }
         let Some(text) = item.as_str() else {
             checker.report(Code::WrongType, pointer, item);
             valid = false;
             continue;
         };
-        match STANDALONE_STORES.iter().find(|store| store.name == text) {
-            Some(store) if !named.contains(&store.name) => named.push(store.name),
-            // An unknown store, or one named twice.
+        match words.iter().copied().find(|word| *word == text) {
+            Some(word) if !named.contains(&word) => named.push(word),
+            // An unknown word, or one named twice.
             _ => {
                 checker.report(Code::InvalidValue, pointer, item);
                 valid = false;
@@ -549,10 +789,10 @@ fn stores(checker: &mut Checker<'_>, node: &Node, pointer: &Pointer) -> Option<V
         }
     }
     valid.then(|| {
-        STANDALONE_STORES
+        words
             .iter()
-            .map(|store| store.name)
-            .filter(|name| named.contains(name))
+            .copied()
+            .filter(|word| named.contains(word))
             .collect()
     })
 }

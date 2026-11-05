@@ -149,10 +149,29 @@ spec:
   listeners:
     public:
       address: "0.0.0.0:8080"
+      tls: required
     admin:
       address: "127.0.0.1:9443"
       prefix: /admin
   public_url: https://gateway.example.test
+  authentication:
+    providers:
+      - name: corporate
+        type: jwt
+        issuer: https://idp.example.test
+        audience: greengateway
+  admin_login:
+    provider: corporate
+    client_id: greengateway-admin
+    client_secret: { secret: idp-client }
+    redirect_uri: https://gateway.example.test/v1/admin/auth/callback
+  upstream:
+    routes:
+      - id: orders
+        path_prefix: /orders
+        upstreams:
+          - id: orders-a
+            url: { secret: orders-a }
   egress:
     deny_private_addresses: true
     allowed_hosts: [api.example.test]
@@ -187,6 +206,31 @@ without repeating the value:
   the default, as an empty environment value does.
 - **`upstream.url`** can carry a credential in its user information or query, so
   it takes a secret reference (`secret.inline_value` for a URL written inline).
+- **`authentication.providers`, `upstream.routes` and `upstream.mcp_servers`**
+  hold what `AUTH_PROVIDERS`, `UPSTREAM_ROUTES` and `MCP_UPSTREAM_SERVERS` hold
+  as JSON in the environment, in [structured forms](#structured-settings).
+- **`listeners.public.tls` and `listeners.admin.tls`** (`required` or `off`)
+  state whether a listener terminates TLS, and
+  **`listeners.public.client_certificate_crl` and
+  `listeners.admin.client_certificate_crl`** whether it checks client
+  certificates against a revocation list. The certificate, key and list are
+  host locators that stay in the environment, so the document states the intent
+  only; holding the intent and the locators to each other, in both directions,
+  arrives with the mapping onto the compiler. Whether a listener asks for client
+  certificates at all (`client_certificates`), and so needs a CA bundle, was
+  already a setting.
+- **`admin_login.client_id`, `admin_login.client_secret` and
+  `admin_login.redirect_uri`** are the OAuth client admin sign-in uses, which in
+  environment mode are members of the `AUTH_PROVIDERS` entry
+  `ADMIN_LOGIN_PROVIDER` names. No other provider reads them, so the document
+  keeps them beside the provider's name rather than in a provider. The client
+  secret takes a secret reference.
+- **`compatibility.acknowledged`** names the compatibility behaviors a
+  `migration` document keeps, each once: `policy_default_allow`,
+  `policy_shadow_mode` and `wildcard_role` (`schema.invalid_value` for another
+  word or a repeat), canonicalized into that order. Any other profile that
+  acknowledges one is refused (`schema.not_applicable`); see
+  [deployment profiles](#deployment-profiles).
 - **`state.stores`** names the standalone stores a deployment keeps beneath its
   state directory, each once: `audit`, `discovery`, `principals`, `connections`
   and `service_tokens` (`schema.invalid_value` for another word or a repeat),
@@ -207,18 +251,16 @@ settings arrive with the mapping onto the compiler (see
 
 Some environment variables have no document form:
 
-- `AUTH_PROVIDERS`, `UPSTREAM_ROUTES` and `MCP_UPSTREAM_SERVERS` hold JSON
-  documents in the environment, which can carry inline credentials. Their
-  document forms are a later #242 slice; until then a bundle cannot configure
-  authentication providers, upstream routes or MCP upstream servers.
 - The host locators (certificate, key, CA, CRL, secret-root, database-URL and
   audit log files) and the secret-provider wiring are bootstrap inputs that stay
   in the environment beside a bundle
   ([ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md#bootstrap-inputs)).
 - `POLICY_FILE`, `TOOLS_FILE` and every `*_SQLITE_PATH` are replaced by bundle
-  resources and by `spec.state.stores`; the legacy single JWT provider
-  (`JWT_*`, `ROLES_CLAIM`) is not representable; and `OPENAPI_SPEC_PATH` and
-  `AUTHORITY_EVENT_FILE` are host paths ADR-0008 has not placed yet.
+  resources and by `spec.state.stores`.
+- The legacy single JWT provider (`JWT_*`, `ROLES_CLAIM`) is not representable:
+  a bundle names its authentication providers explicitly. Nor is
+  `OPENAPI_SPEC_PATH`, a host path whose OpenAPI discovery managed Connections
+  provide, and `AUTHORITY_EVENT_FILE` is a host path ADR-0008 has not placed yet.
 
 The value forms those settings will use are fixed now, with the reader and the
 schema's `$defs`:
@@ -243,9 +285,59 @@ schema's `$defs`:
   to exactly the floating-point value the same text gives in an environment
   variable. The store list is canonicalized the same way, into the order above.
 
+### Structured settings
+
+`authentication.providers`, `upstream.routes` and `upstream.mcp_servers` are
+arrays of the entry objects their environment variables hold as JSON, with the
+same member names: an [authentication provider](#authentication-provider), an
+[upstream route](#upstream-route) and an
+[MCP upstream server](#mcp-upstream-server), with the objects beneath them. Each
+object is closed (`schema.unknown_member`), names its required members
+(`schema.missing_member`), and is typed member by member as the tables after the
+settings say. An integer lies within the range of the integer type the compiler
+reads it as, a string is non-empty with no whitespace at either end (a provider's
+`roles_claim_delimiter`, which can be a space, is kept exactly as written), and
+`null` is never a value. Each problem is reported at the member at fault, and an
+empty array is an empty list, as `[]` is in the environment.
+
+Each form classifies the members of one of the compiler's own types, and the
+reader rebuilds each setting in its environment form and has the compiler's
+types read it; tests hold every form to its type's member list, required
+members and integer ranges, so a member the compiler gains is refused in a
+document until its form is decided, and the two forms cannot drift. They
+differ from the environment's in what a document must never hold:
+
+- **Values that can carry a credential take a secret reference.** An upstream
+  route's `upstream_url`, an endpoint's `url` and an MCP upstream server's `url`
+  can carry one in their user information or query, as `upstream.url` can, so
+  each is `{ secret: <alias-id> }` (`secret.inline_value` for a URL written
+  inline, never echoed). The admin login client secret is
+  `admin_login.client_secret`, a reference too.
+- **Static request headers are not representable.** A literal
+  `add_request_headers` value can be a credential, which belongs in a managed
+  Connection, so every entry is refused (`schema.not_representable`, reported at
+  `add_request_headers` and never by the header's name); only an empty object is
+  accepted. Whether a non-credential literal header may be representable is left
+  for a later document version.
+- **Host paths are not representable.** A route's or endpoint's
+  `tls_ca_bundle_path`, an endpoint's `client_identity_pem_path` and a route's
+  `openapi_spec_path` name files on the gateway's host, which never enter a
+  bundle (`schema.not_representable`).
+- **The admin login client is not a provider member.** `client_id`,
+  `client_secret` and `redirect_uri` are `spec.admin_login` members
+  (`schema.unknown_member` inside a provider).
+
+An environment value converts to a document by these rules alone; the tests
+convert each environment fixture this way and prove that the document,
+resolved back, compiles to exactly the configuration the fixture does. A secret
+converts to a reference to an alias its value must then be stored under, and a
+value a document cannot hold to `{ unresolved: not_representable }`, so a
+converted document that lost something never validates. Defaults, each member's own grammar and bounds, and
+every rule relating members stay the compiler's, as for the environment form.
+
 ### Settings
 
-One table per member of `spec`. The value column gives the type and the field's
+One table per member of `spec`, then one per structured form. The value column gives the type and the field's
 own range; the default is the value the document would spell, or what the
 default follows.
 
@@ -253,15 +345,19 @@ default follows.
 
 #### `spec.listeners`
 
-The listeners the gateway binds. Certificate, key, CA and CRL files are host locators and stay in the environment.
+The listeners the gateway binds. Certificate, key, CA and CRL files are host locators and stay in the environment; the document states whether each listener terminates TLS and checks a revocation list.
 
 | Member | Value | Default | Environment mode |
 | --- | --- | --- | --- |
 | `listeners.public.address` | socket address string | `"0.0.0.0:8080"` | [`LISTEN_ADDR`](configuration.md#listen_addr) |
 | `listeners.public.client_certificates` | `off`, `optional` or `required` | `"off"` | [`CLIENT_CERT_MODE`](configuration.md#client_cert_mode) |
+| `listeners.public.tls` | `required` or `off` | `"off"` | `required` when [`TLS_CERT_FILE`](configuration.md#tls_cert_file) and [`TLS_KEY_FILE`](configuration.md#tls_key_file) are set |
+| `listeners.public.client_certificate_crl` | `required` or `off` | `"off"` | `required` when [`CLIENT_CERT_CRL_FILE`](configuration.md#client_cert_crl_file) is set |
 | `listeners.admin.address` | socket address string | unset | [`ADMIN_LISTEN_ADDR`](configuration.md#admin_listen_addr) |
 | `listeners.admin.client_certificates` | `off`, `optional` or `required` | `"off"` | [`ADMIN_CLIENT_CERT_MODE`](configuration.md#admin_client_cert_mode) |
 | `listeners.admin.prefix` | string | `"/admin"` | [`ADMIN_PREFIX`](configuration.md#admin_prefix) |
+| `listeners.admin.tls` | `required` or `off` | `"off"` | `required` when [`ADMIN_TLS_CERT_FILE`](configuration.md#admin_tls_cert_file) and [`ADMIN_TLS_KEY_FILE`](configuration.md#admin_tls_key_file) are set |
+| `listeners.admin.client_certificate_crl` | `required` or `off` | `"off"` | `required` when [`ADMIN_CLIENT_CERT_CRL_FILE`](configuration.md#admin_client_cert_crl_file) is set |
 | `listeners.grpc.address` | socket address string | unset | [`GRPC_LISTEN_ADDR`](configuration.md#grpc_listen_addr) |
 | `listeners.grpc.max_concurrent_streams` | integer, 1 to 10000 | `100` | [`GRPC_MAX_CONCURRENT_STREAMS`](configuration.md#grpc_max_concurrent_streams) |
 | `listeners.grpc.max_metadata_bytes` | integer bytes, 1024 to 1048576 | `16384` | [`GRPC_MAX_METADATA_BYTES`](configuration.md#grpc_max_metadata_bytes) |
@@ -272,7 +368,7 @@ The listeners the gateway binds. Certificate, key, CA and CRL files are host loc
 
 #### `spec.admin_login`
 
-Admin sign-in through an authentication provider.
+Admin sign-in through an authentication provider, and the OAuth client it signs in with.
 
 | Member | Value | Default | Environment mode |
 | --- | --- | --- | --- |
@@ -280,6 +376,9 @@ Admin sign-in through an authentication provider.
 | `admin_login.pending_ttl_secs` | integer seconds, at least 1 | `300` | [`ADMIN_LOGIN_PENDING_TTL_SECS`](configuration.md#admin_login_pending_ttl_secs) |
 | `admin_login.pending_max_entries` | integer, at least 1 | `1024` | [`ADMIN_LOGIN_PENDING_MAX_ENTRIES`](configuration.md#admin_login_pending_max_entries) |
 | `admin_login.pending_max_per_ip` | integer, at least 1 | `16` | [`ADMIN_LOGIN_PENDING_MAX_PER_IP`](configuration.md#admin_login_pending_max_per_ip) |
+| `admin_login.client_id` | string | unset | `client_id` of the [`AUTH_PROVIDERS`](configuration.md#auth_providers) entry [`ADMIN_LOGIN_PROVIDER`](configuration.md#admin_login_provider) names |
+| `admin_login.client_secret` | secret reference | unset | `client_secret` of the [`AUTH_PROVIDERS`](configuration.md#auth_providers) entry [`ADMIN_LOGIN_PROVIDER`](configuration.md#admin_login_provider) names |
+| `admin_login.redirect_uri` | string | unset | `redirect_uri` of the [`AUTH_PROVIDERS`](configuration.md#auth_providers) entry [`ADMIN_LOGIN_PROVIDER`](configuration.md#admin_login_provider) names |
 
 #### `spec.admin_sessions`
 
@@ -388,7 +487,7 @@ Authorization outside the policy document.
 
 #### `spec.authentication`
 
-Request authentication.
+Request authentication and the authentication providers.
 
 | Member | Value | Default | Environment mode |
 | --- | --- | --- | --- |
@@ -397,6 +496,7 @@ Request authentication.
 | `authentication.cookie_name` | string | `"session"` | [`AUTH_COOKIE_NAME`](configuration.md#auth_cookie_name) |
 | `authentication.exempt_paths` | array of strings | follows `listeners.admin.prefix` | [`AUTH_EXEMPT_PATHS`](configuration.md#auth_exempt_paths) |
 | `authentication.service_token_cache_ttl_ms` | integer milliseconds, at least 1 | `5000` | [`SERVICE_TOKEN_CACHE_TTL_MS`](configuration.md#service_token_cache_ttl_ms) |
+| `authentication.providers` | array of [authentication provider](#authentication-provider) objects | unset | [`AUTH_PROVIDERS`](configuration.md#auth_providers) |
 
 #### `spec.tool_runtime`
 
@@ -438,11 +538,13 @@ Cross-site request forgery protection for cookie-authenticated requests.
 
 #### `spec.upstream`
 
-The single upstream and the timeouts of proxied requests.
+The single upstream or the upstream routes, the MCP upstream servers, and the timeouts of proxied requests.
 
 | Member | Value | Default | Environment mode |
 | --- | --- | --- | --- |
 | `upstream.url` | secret reference | unset | [`UPSTREAM_URL`](configuration.md#upstream_url) |
+| `upstream.routes` | array of [upstream route](#upstream-route) objects | unset | [`UPSTREAM_ROUTES`](configuration.md#upstream_routes) |
+| `upstream.mcp_servers` | array of [MCP upstream server](#mcp-upstream-server) objects | unset | [`MCP_UPSTREAM_SERVERS`](configuration.md#mcp_upstream_servers) |
 | `upstream.timeout_ms` | integer milliseconds, at least 1 | follows `egress.timeout_ms` | [`UPSTREAM_TIMEOUT_MS`](configuration.md#upstream_timeout_ms) |
 | `upstream.response_idle_timeout_ms` | integer milliseconds, at least 1 | follows `egress.response_idle_timeout_ms` | [`UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS`](configuration.md#upstream_response_idle_timeout_ms) |
 | `upstream.connect_timeout_ms` | integer milliseconds, at least 1 | follows `egress.connect_timeout_ms` | [`UPSTREAM_CONNECT_TIMEOUT_MS`](configuration.md#upstream_connect_timeout_ms) |
@@ -494,6 +596,208 @@ Authority evidence and its event delivery.
 | `authority_evidence.event_journal_capacity` | integer, 1 to 1000000000 | `1000000` | [`AUTHORITY_EVENT_JOURNAL_CAPACITY`](configuration.md#authority_event_journal_capacity) |
 | `authority_evidence.event_retention_hours` | integer hours, 0 to 87600 | `168` | [`AUTHORITY_EVENT_RETENTION_HOURS`](configuration.md#authority_event_retention_hours) |
 
+#### `spec.compatibility`
+
+The compatibility behaviors a migration document acknowledges.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `compatibility.acknowledged` | array of distinct `policy_default_allow`, `policy_shadow_mode` and `wildcard_role` | unset | none: environment mode has no profile |
+
+#### Authentication provider
+
+One authentication provider, an AUTH_PROVIDERS entry. client_id, client_secret and redirect_uri, which only the admin login provider reads, are set under spec.admin_login.
+
+| Member | Value |
+| --- | --- |
+| `name` | string, required |
+| `type` | `jwt` or `cookie_session`, required |
+| `jwks_url` | string |
+| `issuer` | string |
+| `audience` | string |
+| `jwks_timeout_ms` | integer, 0 to 9007199254740991 |
+| `jwks_max_key_age_secs` | integer, 0 to 9007199254740991 |
+| `require_jti` | `true` or `false` |
+| `roles_claim` | string |
+| `roles_claim_delimiter` | string, kept exactly as written |
+| `org_claim` | string |
+| `introspection_url` | string |
+| `introspection_timeout_ms` | integer, 0 to 9007199254740991 |
+| `cache_ttl_ms` | integer, 0 to 9007199254740991 |
+| `user_id_claim` | string |
+| `email_claim` | string |
+| `client_id` | not here: set `admin_login.client_id` |
+| `client_secret` | not here: set `admin_login.client_secret` |
+| `redirect_uri` | not here: set `admin_login.redirect_uri` |
+
+#### Upstream route
+
+One upstream route, an UPSTREAM_ROUTES entry.
+
+| Member | Value |
+| --- | --- |
+| `id` | string |
+| `forward_cookie_session` | `true` or `false` |
+| `body_limit_profile` | `greenpm_research_v1` |
+| `upstream_csrf_cookie_name` | string |
+| `connection_id` | string |
+| `path_prefix` | string |
+| `host` | string |
+| `upstream_url` | secret reference |
+| `upstreams` | array of [upstream endpoint](#upstream-endpoint) objects |
+| `load_balancing` | [upstream load balancing](#upstream-load-balancing) object |
+| `request_body` | [upstream request body](#upstream-request-body) object |
+| `sse` | [upstream server-sent events](#upstream-server-sent-events) object |
+| `websocket` | [upstream WebSocket](#upstream-websocket) object |
+| `grpc` | [upstream gRPC](#upstream-grpc) object |
+| `limits` | [upstream limits](#upstream-limits) object |
+| `health_check` | [upstream health check](#upstream-health-check) object |
+| `retry` | [upstream retry](#upstream-retry) object |
+| `circuit_breaker` | [upstream circuit breaker](#upstream-circuit-breaker) object |
+| `timeout_ms` | integer, 0 to 9007199254740991 |
+| `response_idle_timeout_ms` | integer, 0 to 9007199254740991 |
+| `connect_timeout_ms` | integer, 0 to 9007199254740991 |
+| `add_request_headers` | not representable: only `{}`; use a managed Connection |
+| `strip_request_headers` | array of strings |
+| `tls_ca_bundle_path` | not representable: a host path |
+| `openapi_spec_path` | not representable: a host path |
+
+#### Upstream endpoint
+
+One endpoint of an upstream route's pool.
+
+| Member | Value |
+| --- | --- |
+| `id` | string, required |
+| `url` | secret reference, required |
+| `weight` | integer, 0 to 65535 |
+| `tls_ca_bundle_path` | not representable: a host path |
+| `client_identity_pem_path` | not representable: a host path |
+
+#### Upstream load balancing
+
+How a route's pool chooses an endpoint.
+
+| Member | Value |
+| --- | --- |
+| `strategy` | `weighted_round_robin` |
+
+#### Upstream request body
+
+How a route forwards request bodies.
+
+| Member | Value |
+| --- | --- |
+| `mode` | `buffered` or `stream` |
+
+#### Upstream server-sent events
+
+A route's server-sent event streams.
+
+| Member | Value |
+| --- | --- |
+| `max_duration_ms` | integer, 0 to 9007199254740991 |
+| `max_response_bytes` | integer, 0 to 9007199254740991 |
+
+#### Upstream WebSocket
+
+A route's WebSocket proxying.
+
+| Member | Value |
+| --- | --- |
+| `max_connections` | integer, 0 to 9007199254740991 |
+| `max_connections_per_endpoint` | integer, 0 to 9007199254740991 |
+| `queue_depth` | integer, 0 to 9007199254740991 |
+| `queue_timeout_ms` | integer, 0 to 9007199254740991 |
+| `handshake_timeout_ms` | integer, 0 to 9007199254740991 |
+| `idle_timeout_ms` | integer, 0 to 9007199254740991 |
+| `max_duration_ms` | integer, 0 to 9007199254740991 |
+| `max_frame_bytes` | integer, 0 to 9007199254740991 |
+| `max_message_bytes` | integer, 0 to 9007199254740991 |
+| `max_write_buffer_bytes` | integer, 0 to 9007199254740991 |
+| `allowed_origins` | array of strings |
+| `require_origin` | `true` or `false` |
+| `allowed_subprotocols` | array of strings |
+
+#### Upstream gRPC
+
+A route's transparent gRPC proxying.
+
+| Member | Value |
+| --- | --- |
+| `max_concurrent_calls` | integer, 0 to 9007199254740991 |
+| `max_concurrent_calls_per_endpoint` | integer, 0 to 9007199254740991 |
+| `queue_depth` | integer, 0 to 9007199254740991 |
+| `queue_timeout_ms` | integer, 0 to 9007199254740991 |
+| `connect_timeout_ms` | integer, 0 to 9007199254740991 |
+| `idle_timeout_ms` | integer, 0 to 9007199254740991 |
+| `max_duration_ms` | integer, 0 to 9007199254740991 |
+| `max_message_bytes` | integer, 0 to 9007199254740991 |
+| `max_request_bytes` | integer, 0 to 9007199254740991 |
+| `max_response_bytes` | integer, 0 to 9007199254740991 |
+| `max_metadata_entries` | integer, 0 to 9007199254740991 |
+
+#### Upstream limits
+
+A route's in-flight and queue bounds.
+
+| Member | Value |
+| --- | --- |
+| `max_in_flight` | integer, 0 to 9007199254740991 |
+| `queue_depth` | integer, 0 to 9007199254740991 |
+| `queue_timeout_ms` | integer, 0 to 9007199254740991 |
+
+#### Upstream health check
+
+Active and passive health checks of a route's pool.
+
+| Member | Value |
+| --- | --- |
+| `method` | string |
+| `path` | string |
+| `interval_ms` | integer, 0 to 9007199254740991 |
+| `jitter_ms` | integer, 0 to 9007199254740991 |
+| `timeout_ms` | integer, 0 to 9007199254740991 |
+| `healthy_threshold` | integer, 0 to 4294967295 |
+| `unhealthy_threshold` | integer, 0 to 4294967295 |
+| `expected_statuses` | array of integers, 0 to 65535 |
+| `passive_failure_statuses` | array of integers, 0 to 65535 |
+| `required_for_readiness` | `true` or `false` |
+| `minimum_healthy` | integer, 0 to 9007199254740991 |
+
+#### Upstream retry
+
+Which failed requests a route retries.
+
+| Member | Value |
+| --- | --- |
+| `max_attempts` | integer, 0 to 255 |
+| `methods` | array of strings |
+| `statuses` | array of integers, 0 to 65535 |
+
+#### Upstream circuit breaker
+
+When a route stops sending to a failing endpoint.
+
+| Member | Value |
+| --- | --- |
+| `failure_threshold` | integer, 0 to 4294967295 |
+| `open_ms` | integer, 0 to 9007199254740991 |
+| `half_open_max_requests` | integer, 0 to 4294967295 |
+| `recovery_threshold` | integer, 0 to 4294967295 |
+
+#### MCP upstream server
+
+One MCP upstream server, an MCP_UPSTREAM_SERVERS entry.
+
+| Member | Value |
+| --- | --- |
+| `name` | string, required |
+| `url` | secret reference, required |
+| `timeout_ms` | integer, 0 to 9007199254740991 |
+| `response_idle_timeout_ms` | integer, 0 to 9007199254740991 |
+| `connect_timeout_ms` | integer, 0 to 9007199254740991 |
+
 <!-- deployment-settings:end -->
 
 ## Referenced policy and tools documents
@@ -531,7 +835,7 @@ once it has passed its schema:
 | Profile | Policy invariants |
 | --- | --- |
 | `production` | Deny by default (`profile.policy_default_allow` for `default_action: allow`), enforce mode (`profile.policy_shadow_mode` for `enforcement_mode: shadow` at the top level or on any route), and no role granting the `*` wildcard permission (`profile.wildcard_role`). |
-| `migration` | The production invariants. ADR-0008 lets a migration bundle keep each of those compatibility behaviors once its deployment document acknowledges it, but `v1alpha1` has no acknowledgment list yet, so none can be acknowledged and none is allowed. |
+| `migration` | The production invariants, except that each behavior the deployment document lists under `compatibility.acknowledged` (`policy_default_allow`, `policy_shadow_mode`, `wildcard_role`) is reported as a warning with the same code instead of an error, so the bundle is read and every report still shows it. A behavior it does not acknowledge is an error, as in `production`. |
 | `development` | None. |
 
 An absent `default_action` is `deny` and an absent `enforcement_mode` is
@@ -947,7 +1251,8 @@ can appear in one. A published code never changes meaning.
 | `schema.invalid_value` | A value the document version does not allow. |
 | `schema.invalid_name` | `metadata.name` is not a lowercase DNS label. |
 | `schema.invalid_decimal` | A decimal outside the decimal grammar. |
-| `schema.not_applicable` | A member that does not apply given another member's value, such as an init answers `operator` with `topology: cluster`. |
+| `schema.not_applicable` | A member that does not apply given another member's value, such as an init answers `operator` with `topology: cluster`, or an acknowledged compatibility behavior outside the `migration` profile. |
+| `schema.not_representable` | A member this document version has no form for: a host path, a literal static request header. The reference says what to use instead. |
 | `reference.invalid_path` | A referenced name is not a portable file name of the right type. |
 | `reference.reserved_path` | A reference names `bundle.yaml`. |
 | `reference.duplicate_path` | Two references name the same file. |
