@@ -28,7 +28,7 @@ impl ToolRuntime {
         context: &ToolInvocationContext,
     ) -> Result<ToolRuntimeToolConfig, ToolRuntimeError> {
         self.admit_invocation(tool_name, context)
-            .map(|state| state.config)
+            .map(|(state, _)| state.config)
     }
 
     /// The pre-cutover policy half of admission.
@@ -40,11 +40,11 @@ impl ToolRuntime {
         let authorization = match self.legacy_authorize_tool_call(tool_name, context) {
             Ok(authorization) => authorization,
             Err(error) => {
-                self.emit_rejected_error(context, tool_name, &error);
+                self.emit_rejected_error(context, tool_name, &error, None);
                 return Err(error);
             }
         };
-        self.enforce_tool_rule(tool_name, context, authorization)
+        self.enforce_tool_rule(tool_name, context, authorization, None)
             .map(|state| state.config)
     }
 
