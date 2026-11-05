@@ -5,7 +5,7 @@ an exit code. Implementation is grouped by responsibility:
 
 | Module | Responsibility |
 |---|---|
-| `bootstrap` | CLI dispatch, configuration, stores and runtime construction |
+| `bootstrap` | Process startup: the one-shot commands, the serving stages and cluster preflight, and the gateway build with its identity and tool bindings (see below) |
 | `routing` | Listener routers, route registration and shared middleware ordering |
 | `app_state` | Shared application state and route identities |
 | `api_contracts` | Request/response types and application error contracts |
@@ -20,6 +20,25 @@ an exit code. Implementation is grouped by responsibility:
 | `admin_policy_analyses`, `policy_analysis` | Structural policy analysis: the analysis endpoint and its concurrency bound, and the state-free request parser, sound inclusion checks, evaluator-confirmed findings, advisory patches and JSON/SARIF reports |
 | `admin_policy_replays`, `policy_replay` | Historical policy replay: the replay job endpoints, their process-local job registry and quotas, and the state-free `replay-context.v1` record and parser, the legacy adapters that read one out of a stored audit event, their evaluator-backed replay, the `policy-replay.v1` request parser, the bounded job engine and the base-to-candidate and recorded-to-base impact comparison |
 | `admin_policy_evidence`, `policy_evidence` | Policy evidence packages: the evidence endpoint, its history reads, revalidation, replay-job binding and export audit record, and the state-free `policy-evidence-request.v1` parser and deterministic `policy-evidence.v1` package assembler |
+
+`bootstrap.rs` is startup's root. `run` either runs the one-shot command the
+arguments name or compiles the configuration and runs the serving stages, and
+each part has its own module under `bootstrap/`:
+
+| Module | Startup concern |
+|---|---|
+| `bootstrap/commands.rs` | The one-shot operator commands (`healthcheck`, `migrate`, `revoke-jwt`, `jwt-revocations-cleanup`, `rate-limit-buckets-cleanup`, `cluster-members`, `maintenance-run`, `import-standalone`, `connection-secrets`), dispatched before anything serving needs is initialized |
+| `bootstrap/stages.rs` | `start_serving` and the `StartupStages` it runs (the configuration compiler, then preflight, activation and serving), and the gateway process's implementation of them |
+| `bootstrap/cluster_preflight.rs` | Cluster mode's preflight: the boot seeds read and checked from the authority, and this boot's membership row (`postgres` builds only) |
+| `bootstrap/gateway_app.rs` | Activation's gateway build: every store, client, background task and admin state, and the routers, in the order startup has always built them |
+| `bootstrap/identity.rs` | The authentication validator chain, OIDC discovery and the egress hosts it seeds, and the admin login and session state |
+| `bootstrap/tool_bindings.rs` | The Connection-binding check for tool definitions and the MCP upstream rediscovery a tools-file reload runs |
+
+`bootstrap.rs` re-exports each module's items, which keep the visibility they
+had when startup was one file, so callers name them as before
+(`bootstrap::start_serving`). The split moved code without reordering it: the
+stages run the same work in the same order, and the gateway build registers
+routes, middleware and background tasks exactly as before.
 
 Sibling modules share crate-private contracts through the composition root.
 The extraction preserves the previous effective visibility and middleware order;
