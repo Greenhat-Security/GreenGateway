@@ -2531,11 +2531,14 @@ fn remote_echo_input_schema() -> RmcpJsonObject {
 
 fn create_service_token(store: &auth::SqliteTokenStore, roles: &[&str]) -> String {
     store
-        .create(auth::tokens::CreateTokenRequest {
-            scopes: roles.iter().map(|role| (*role).to_owned()).collect(),
-            created_by: "mcp-test-bootstrap".to_owned(),
-            expires_at: None,
-        })
+        .create(
+            auth::tokens::CreateTokenRequest {
+                scopes: roles.iter().map(|role| (*role).to_owned()).collect(),
+                created_by: "mcp-test-bootstrap".to_owned(),
+                expires_at: None,
+            },
+            &auth::change_actor::ChangeActor::for_test("mcp-test-bootstrap"),
+        )
         .expect("service token should create")
         .plaintext_token
 }

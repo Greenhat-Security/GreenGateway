@@ -1274,11 +1274,14 @@ fn service_token_credential(config: &mut config::Config, store: &TempDb) -> Stri
     let token_store =
         auth::tokens::SqliteTokenStore::open(&store.path).expect("token store should open");
     let created = token_store
-        .create(auth::tokens::CreateTokenRequest {
-            scopes: vec!["grpc-client".to_owned()],
-            created_by: "grpc-acceptance".to_owned(),
-            expires_at: None,
-        })
+        .create(
+            auth::tokens::CreateTokenRequest {
+                scopes: vec!["grpc-client".to_owned()],
+                created_by: "grpc-acceptance".to_owned(),
+                expires_at: None,
+            },
+            &auth::change_actor::ChangeActor::for_test("grpc-acceptance"),
+        )
         .expect("service token should create");
     config.service_token_sqlite_path = Some(store.path.to_string_lossy().into_owned());
 

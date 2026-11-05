@@ -42,6 +42,7 @@ import { LogExplorer } from './views/LogExplorer';
 import { OpenApiToolsView } from './views/OpenApiToolsView';
 import { PolicyHistoryView } from './views/PolicyHistoryView';
 import { PolicyStudioView } from './views/PolicyStudioView';
+import { releaseHeldPolicyEdits, useHoldsPolicyEdits } from './views/policy-studio/heldEdits';
 import { PrincipalDetail } from './views/PrincipalDetail';
 import { RuleEditor } from './views/RuleEditor';
 import { RuleTable } from './views/RuleTable';
@@ -70,6 +71,7 @@ function AdminSessionExpired() {
   const alertRef = useRef<HTMLDivElement>(null);
   const [checking, setChecking] = useState(false);
   const [message, setMessage] = useState('Sign in again to continue. Previous session data has been cleared.');
+  const holdsPolicyEdits = useHoldsPolicyEdits();
   useEffect(() => { alertRef.current?.focus(); }, []);
 
   async function checkSession() {
@@ -92,6 +94,14 @@ function AdminSessionExpired() {
     <div className="error-panel alert warning" role="alert" tabIndex={-1} ref={alertRef}>
       <h2>Admin session expired</h2>
       <p>{message}</p>
+      {holdsPolicyEdits ? (
+        <p>
+          Only your unsaved Policy Studio edits are still held, in this page. Sign in again without
+          leaving it (in another tab, then Check session, or with a bearer token) and open the Policy
+          Studio: it restores them once the gateway confirms the session owns their draft. Reloading
+          or leaving the page, or logging out, discards them.
+        </p>
+      ) : null}
     </div>
     <Link to="/">Sign in</Link>
     <button type="button" disabled={checking} onClick={() => { void checkSession(); }}>
@@ -472,6 +482,8 @@ function TokenPanel({
         method: 'POST',
         cache: 'no-store',
       });
+      // Logging out ends the work of the session, held edits included.
+      releaseHeldPolicyEdits();
       setStatus('Logged out. Sign in again to continue.');
     } catch {
       setStatus('Log out did not complete. The session may still be active; try again.');

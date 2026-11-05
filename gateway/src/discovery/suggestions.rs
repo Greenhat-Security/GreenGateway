@@ -38,8 +38,12 @@ use crate::{
 pub const BASELINE_ALLOW_SUGGESTION_TYPE: &str = "baseline_allow";
 pub const BASELINE_AUDIT_UNAVAILABLE_REASON: &str =
     "baseline role suggestions require AUDIT_SQLITE_PATH because role claims are only stored in audit history";
-pub const DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS: u64 = 24;
-pub const MAX_RULE_SUGGESTION_BASELINE_WINDOW_HOURS: u64 = 876_000;
+// The baseline window the configuration compiler reads, shared with `ggctl`
+// (issue #242).
+pub(crate) use gateway_config::discovery::{
+    RuleSuggestionConfig, DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
+    MAX_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
+};
 
 const MCP_TOOL_OBSERVATION_METHOD: &str = "MCP";
 const MCP_TOOL_OBSERVATION_PATH_PREFIX: &str = "/mcp/tools/";
@@ -274,19 +278,6 @@ pub struct RuleSuggestionListFilters {
     pub suggestion_type: Option<String>,
     pub limit: usize,
     pub cursor: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RuleSuggestionConfig {
-    pub baseline_window_hours: u64,
-}
-
-impl Default for RuleSuggestionConfig {
-    fn default() -> Self {
-        Self {
-            baseline_window_hours: DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
