@@ -355,6 +355,14 @@ pub(super) fn add_admin_api_routes(
                     routes.admin.suggestion_draft_route.as_str(),
                     post(rule_suggestion_draft_endpoint),
                 )
+                // A draft publication may accept a suggestion it is bound
+                // to (issue #243), so it shares this router's lifecycle
+                // lock and engine; one that is not bound uses only the
+                // policy state inside.
+                .route(
+                    routes.admin.policy_draft_publish_route.as_str(),
+                    post(policy_draft_publish_endpoint),
+                )
                 .with_state(admin_api_states.suggestions),
         )
         .merge(
@@ -394,6 +402,10 @@ pub(super) fn add_admin_api_routes(
                 .route(
                     routes.admin.policy_convert_route.as_str(),
                     post(policy_convert_endpoint),
+                )
+                .route(
+                    routes.admin.policy_tests_route.as_str(),
+                    get(policy_tests_get_endpoint).put(policy_tests_put_endpoint),
                 )
                 .route(
                     routes.admin.policy_test_runs_route.as_str(),
@@ -461,10 +473,6 @@ pub(super) fn add_admin_api_routes(
                     get(policy_draft_get_endpoint)
                         .patch(policy_draft_patch_endpoint)
                         .delete(policy_draft_delete_endpoint),
-                )
-                .route(
-                    routes.admin.policy_draft_publish_route.as_str(),
-                    post(policy_draft_publish_endpoint),
                 )
                 .with_state(admin_api_states.policy),
         )

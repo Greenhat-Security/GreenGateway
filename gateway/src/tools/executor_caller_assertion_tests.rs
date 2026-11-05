@@ -54,6 +54,7 @@ fn context_for(principal: &Principal, request_id: &str) -> ToolInvocationContext
         source_ip: "203.0.113.10".to_owned(),
         actor: Some(actor_from_principal(principal)),
         organization: None,
+        source_address: None,
         caller: AttestedCaller::from_principal(principal).map(Arc::new),
         source: ToolInvocationSource::Mcp,
         admitted_deadline: None,

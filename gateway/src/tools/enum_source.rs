@@ -2234,7 +2234,7 @@ mod tests {
                 &[],
                 Some(&overlay),
                 1,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
                 &[],
                 &[],
             )

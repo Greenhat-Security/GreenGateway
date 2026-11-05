@@ -90,6 +90,8 @@ mod admin_responses;
 use admin_responses::*;
 mod admin_policy_test_runs;
 use admin_policy_test_runs::*;
+mod admin_policy_tests;
+use admin_policy_tests::*;
 mod admin_policy_simulations;
 use admin_policy_simulations::*;
 mod admin_policy_replays;

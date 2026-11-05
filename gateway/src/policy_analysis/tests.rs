@@ -2,26 +2,39 @@
 //! brute-force checks of every proven claim and patch against the canonical
 //! evaluator over small policy universes.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::{BTreeSet, HashSet},
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use http::Method;
+use ipnet::IpNet;
 use proptest::prelude::*;
 use serde_json::{json, Value};
+use url::Url;
 
 use super::{
     checks::{analyze, AnalysisResources},
-    coverage::{pattern_covers, segments},
+    coverage::{pattern_covers, pattern_intersection, segments},
     report::{to_json, to_sarif, AnalysisBinding},
     request::{parse_request, AnalysisFormat},
     AccessEffect, AnalysisLimitation, AnalysisOutcome, Finding, FindingCode, Lane, ProofBasis,
-    Severity, MAX_FINDINGS,
+    Section, Severity, MAX_FINDINGS,
 };
 use crate::{
     auth::{AuthMethod, Principal},
+    middleware::rate_limit::{GlobalRateLanes, LaneLimit},
     policy_eval::{
+        analysis::DirectRuleOutcome,
+        egress::{
+            CompiledEgressPolicy, EgressControls, EgressDestination, EgressEvaluationContext,
+            EgressOutcome, ResolutionFact, EGRESS_CONTEXT_VERSION,
+        },
         tools::{
             SourceRequestContext, SourceRequestDecision, ToolEvaluationContext, ToolOperation,
-            TOOL_CONTEXT_VERSION,
+            ToolReason, TOOL_CONTEXT_VERSION,
         },
         CompiledPolicy, DispatchFacts, HostFact, HttpTarget, PolicyEffect, PolicyEvaluationContext,
         PrincipalFact, PrincipalIdentity, RuleReference, CONTEXT_VERSION,
@@ -31,7 +44,12 @@ use crate::{
         request::StoredCandidate,
     },
     policy_testing::suite::Diagnostics,
-    rbac::{matcher::path_pattern_matches, policy_document::parse_v1_with_typed_matchers, Policy},
+    rbac::{
+        matcher::path_pattern_matches,
+        policy_document::parse_v1_with_typed_matchers,
+        policy_resources::{AdminSurface, ConnectionInventory, PolicyResourceView, ToolInventory},
+        Policy, RuleAction,
+    },
 };
 
 fn policy(value: Value) -> Policy {
@@ -49,15 +67,96 @@ fn far_deadline() -> Instant {
     Instant::now() + Duration::from_secs(60)
 }
 
-fn run_with(policy: &Policy, aliases: &[String], deadline: Instant) -> AnalysisOutcome {
-    analyze(
-        policy,
-        &AnalysisResources {
-            mcp_alias_paths: aliases,
+/// Global rate lanes no override in these tests exceeds unless it means to.
+fn generous_rate_lanes() -> GlobalRateLanes {
+    GlobalRateLanes::new(
+        LaneLimit {
+            requests_per_second: 100.0,
+            burst: 200,
         },
-        deadline,
+        LaneLimit {
+            requests_per_second: 100.0,
+            burst: 200,
+        },
     )
-    .expect("analysis succeeds")
+}
+
+/// A complete resource view: a tool registry holding every tool `policy`
+/// names, no Connections, and a static egress lane admitting nothing.
+fn resource_view_for(policy: &Policy) -> PolicyResourceView {
+    let mut names: BTreeSet<String> = policy.tools.keys().cloned().collect();
+    names.extend(
+        policy
+            .rules
+            .iter()
+            .filter_map(|rule| rule.tool_name.clone()),
+    );
+    PolicyResourceView {
+        configuration: Some("sha256:configuration".to_owned()),
+        egress: Some(Arc::new(CompiledEgressPolicy::new(EgressControls {
+            allowed_hosts: HashSet::new(),
+            allowed_host_globs: Vec::new(),
+            allowed_ports: HashSet::new(),
+            deny_private_ips: true,
+            nat64_prefixes: Vec::new(),
+            private_ip_allow_cidrs: Vec::new(),
+        }))),
+        tools: Some(ToolInventory {
+            names,
+            digest: "sha256:tools".to_owned(),
+        }),
+        connections: Some(ConnectionInventory {
+            etag: "\"connections\"".to_owned(),
+            endpoints: Vec::new(),
+        }),
+        admin: Some(AdminSurface {
+            policy_route: "/v1/admin/policy".to_owned(),
+            policy_route_exempt: false,
+        }),
+        security_revision: None,
+    }
+}
+
+/// The resources an analysis reads, all present: `policy` is its own
+/// active policy, so nothing is a change from it.
+struct Resources<'a> {
+    aliases: &'a [String],
+    active: Option<&'a Policy>,
+    lanes: Option<GlobalRateLanes>,
+    view: Option<PolicyResourceView>,
+}
+
+impl<'a> Resources<'a> {
+    fn new(aliases: &'a [String]) -> Self {
+        Self {
+            aliases,
+            active: None,
+            lanes: Some(generous_rate_lanes()),
+            view: None,
+        }
+    }
+
+    fn run(&self, policy: &Policy, deadline: Instant) -> AnalysisOutcome {
+        let view = self
+            .view
+            .clone()
+            .unwrap_or_else(|| resource_view_for(policy));
+        analyze(
+            policy,
+            &AnalysisResources {
+                mcp_alias_paths: self.aliases,
+                active: self.active.unwrap_or(policy),
+                global_rate_lanes: self.lanes,
+                resource_view: &view,
+            },
+            deadline,
+        )
+        .expect("analysis succeeds")
+    }
+}
+
+fn run_with(policy: &Policy, aliases: &[String], deadline: Instant) -> AnalysisOutcome {
+    Resources::new(aliases).run(policy, deadline)
 }
 
 fn run(policy: &Policy) -> AnalysisOutcome {
@@ -227,7 +326,7 @@ fn a_shadow_for_every_caller_on_every_path_is_reported() {
 }
 
 #[test]
-fn constrained_scoped_or_narrower_allows_are_not_broad() {
+fn constrained_scoped_or_narrower_allows_are_not_broad_for_every_caller() {
     for rule in [
         json!({ "path": "/**", "action": "allow", "principal": { "roles": ["reader"] } }),
         json!({ "path": "/**", "action": "allow", "dispatch": { "kind": "contextless" } }),
@@ -239,11 +338,65 @@ fn constrained_scoped_or_narrower_allows_are_not_broad() {
         assert!(
             !codes(&outcome)
                 .iter()
-                .any(|code| code.starts_with("broad_")),
+                .any(|code| code.starts_with("broad_unconstrained_")),
             "{rule}: {:?}",
             codes(&outcome)
         );
     }
+}
+
+#[test]
+fn an_allow_on_every_path_for_named_callers_is_a_broad_path_grant() {
+    let outcome = run(&policy(base(
+        json!([{ "methods": ["GET"], "path": "/**", "action": "allow", "principal": { "roles": ["reader"] } }]),
+        json!([]),
+    )));
+    let finding = only(&outcome, FindingCode::BroadPathGrant);
+    assert_eq!(finding.severity, Severity::Medium);
+    assert_eq!(finding.proof_basis, ProofBasis::Proven);
+    assert_eq!(finding.details["action"], json!("allow"));
+    assert_eq!(finding.details["all_methods"], json!(false));
+    assert!(finding.patch.is_none());
+    // Scoped to a dispatch, narrower than every path, or a deny: not broad.
+    for rule in [
+        json!({ "path": "/**", "action": "allow", "principal": { "roles": ["reader"] }, "dispatch": { "kind": "contextless" } }),
+        json!({ "path": "/api/**", "action": "allow", "principal": { "roles": ["reader"] } }),
+        json!({ "path": "/**", "action": "deny", "principal": { "roles": ["reader"] } }),
+    ] {
+        let outcome = run(&policy(base(json!([rule]), json!([]))));
+        assert!(
+            !codes(&outcome).contains(&"broad_path_grant"),
+            "{rule}: {:?}",
+            codes(&outcome)
+        );
+    }
+}
+
+#[test]
+fn an_allow_for_every_caller_and_every_method_is_an_all_methods_grant() {
+    let outcome = run(&policy(base(
+        json!([
+            { "path": "/public/**", "action": "allow" },
+            { "methods": ["GET"], "path": "/docs/**", "action": "allow" },
+            { "path": "/team/**", "action": "allow", "principal": { "roles": ["reader"] } }
+        ]),
+        json!([]),
+    )));
+    let finding = only(&outcome, FindingCode::AllMethodsGrant);
+    assert_eq!(finding.element.position, Some(0));
+    assert_eq!(finding.severity, Severity::Medium);
+    assert_eq!(finding.proof_basis, ProofBasis::Proven);
+    // Every path too is broad_unconstrained_allow's, not this.
+    let outcome = run(&policy(base(
+        json!([{ "path": "/**", "action": "allow" }]),
+        json!([]),
+    )));
+    assert_eq!(
+        codes(&outcome),
+        ["broad_unconstrained_allow"],
+        "{:?}",
+        codes(&outcome)
+    );
 }
 
 #[test]
@@ -375,46 +528,145 @@ fn a_shadow_after_an_allow_that_covers_it_is_shadowed_and_low() {
 }
 
 #[test]
-fn rules_an_earlier_rule_does_not_fully_cover_are_not_reported() {
-    for (earlier, later) in [
+fn rules_an_earlier_rule_does_not_fully_cover_are_not_reported_as_covered() {
+    for (earlier, later, partial) in [
         // Narrower caller.
         (
             json!({ "path": "/api/**", "action": "allow", "principal": { "roles": ["reader"] } }),
             json!({ "path": "/api/admin", "action": "deny" }),
+            true,
         ),
         // Narrower methods.
         (
             json!({ "methods": ["GET"], "path": "/api/**", "action": "allow" }),
             json!({ "path": "/api/admin", "action": "deny" }),
+            true,
         ),
         // Narrower path: a single wildcard never matches an empty segment.
         (
             json!({ "path": "/api/*", "action": "allow" }),
             json!({ "path": "/api/**", "action": "deny" }),
+            true,
         ),
         // A dispatch-bound rule does not cover an unbound one.
         (
             json!({ "path": "/**", "action": "deny", "dispatch": { "kind": "contextless" } }),
             json!({ "path": "/api", "action": "deny" }),
+            false,
         ),
         // A disabled rule covers nothing.
         (
             json!({ "path": "/**", "action": "deny", "enabled": false }),
             json!({ "path": "/api", "action": "deny" }),
+            false,
         ),
         // A tool-name rule never covers an HTTP rule.
         (
             json!({ "tool_name": "echo", "action": "deny" }),
             json!({ "path": "/api", "action": "deny" }),
+            false,
         ),
     ] {
         let outcome = run(&policy(base(json!([earlier, later]), json!([]))));
+        let codes = codes(&outcome);
         assert!(
-            !codes(&outcome).iter().any(|code| code.starts_with("rule_")),
-            "{earlier} / {later}: {:?}",
+            !codes.contains(&"rule_unreachable") && !codes.contains(&"rule_shadowed"),
+            "{earlier} / {later}: {codes:?}",
+        );
+        // A less restrictive earlier rule that decides part of what the
+        // later one matches is a partial overlap, and nothing else is.
+        assert_eq!(
+            codes.contains(&"rule_partially_shadowed"),
+            partial,
+            "{earlier} / {later}: {codes:?}",
+        );
+    }
+}
+
+#[test]
+fn a_deny_an_earlier_allow_pre_empts_in_part_is_partially_shadowed() {
+    let mut document = base(
+        json!([
+            { "id": "readers", "path": "/api/**", "action": "allow", "principal": { "roles": ["reader"] } },
+            { "id": "admin-deny", "path": "/api/admin/**", "action": "deny" }
+        ]),
+        json!([]),
+    );
+    document["schema_version"] = json!("1.0.0");
+    let outcome = run(&policy(document));
+    let finding = only(&outcome, FindingCode::RulePartiallyShadowed);
+    assert_eq!(finding.severity, Severity::Medium);
+    assert_eq!(finding.proof_basis, ProofBasis::Proven);
+    assert_eq!(finding.element.position, Some(1));
+    assert_eq!(
+        finding
+            .related
+            .as_ref()
+            .and_then(|related| related.id.as_deref()),
+        Some("readers")
+    );
+    assert_eq!(finding.details["action"], json!("deny"));
+    assert_eq!(finding.details["preempting_action"], json!("allow"));
+    assert_eq!(
+        finding.details["pre_empted_in"],
+        json!(["http", "rendered_tool_http"])
+    );
+    assert!(finding.never_decides_in.is_empty());
+    assert!(finding.patch.is_none());
+
+    // A deny before the allow, or a later rule no more restrictive than
+    // the earlier one, is the ordinary exception pattern: not reported.
+    for rules in [
+        json!([
+            { "path": "/api/admin/**", "action": "deny" },
+            { "path": "/api/**", "action": "allow", "principal": { "roles": ["reader"] } }
+        ]),
+        json!([
+            { "path": "/api/**", "action": "deny", "principal": { "roles": ["reader"] } },
+            { "path": "/api/admin/**", "action": "allow" }
+        ]),
+        json!([
+            { "path": "/api/**", "action": "allow", "principal": { "roles": ["reader"] } },
+            { "path": "/other/**", "action": "deny" }
+        ]),
+    ] {
+        let outcome = run(&policy(base(rules.clone(), json!([]))));
+        assert!(
+            !codes(&outcome).contains(&"rule_partially_shadowed"),
+            "{rules}: {:?}",
             codes(&outcome)
         );
     }
+}
+
+#[test]
+fn a_partial_overlap_the_evaluator_does_not_confirm_is_inconclusive() {
+    // The only path both patterns match has an empty interior segment,
+    // which the evaluator refuses: the overlap is not confirmed.
+    let outcome = run(&policy(base(
+        json!([
+            { "path": "/a//*", "action": "allow", "principal": { "roles": ["reader"] } },
+            { "path": "/a//b", "action": "deny" }
+        ]),
+        json!([]),
+    )));
+    let finding = only(&outcome, FindingCode::RulePartiallyShadowed);
+    assert_eq!(finding.proof_basis, ProofBasis::Inconclusive);
+    assert_eq!(finding.limitations, ["witness_unconfirmed"]);
+}
+
+#[test]
+fn pattern_intersections_are_built_by_alignment() {
+    let meet = |left: &str, right: &str| {
+        pattern_intersection(&segments(left), &segments(right), "w")
+            .map(|segments| format!("/{}", segments.join("/")))
+    };
+    assert_eq!(meet("/a/**", "/*/b").as_deref(), Some("/a/b"));
+    assert_eq!(meet("/**", "/a/{id}").as_deref(), Some("/a/w"));
+    assert_eq!(meet("/a/**", "/**").as_deref(), Some("/a"));
+    assert_eq!(meet("/a/*", "/b/*"), None);
+    assert_eq!(meet("/a/*", "/a"), None);
+    assert_eq!(meet("relative", "/**"), None);
 }
 
 #[test]
@@ -777,6 +1029,509 @@ fn a_narrower_earlier_rate_override_covers_nothing() {
     assert!(codes(&outcome).is_empty(), "{:?}", codes(&outcome));
 }
 
+#[test]
+fn a_rate_override_looser_than_its_global_lane_is_reported_by_lane() {
+    let lanes = GlobalRateLanes::new(
+        LaneLimit {
+            requests_per_second: 10.0,
+            burst: 20,
+        },
+        LaneLimit {
+            requests_per_second: 5.0,
+            burst: 10,
+        },
+    );
+    let analyzed = rate_policy(json!([
+        { "methods": ["get"], "path": "/reads/**", "requests_per_second": 50.0, "burst": 10 },
+        { "methods": ["POST"], "path": "/writes/**", "requests_per_second": 1.0, "burst": 1 },
+        { "requests_per_second": 6.0, "burst": 5 }
+    ]));
+    let mut resources = Resources::new(&[]);
+    resources.lanes = Some(lanes);
+    let outcome = resources.run(&analyzed, far_deadline());
+    let looser: Vec<&Finding> = outcome
+        .findings
+        .iter()
+        .filter(|finding| finding.code == FindingCode::RateOverrideLooserThanGlobal)
+        .collect();
+    assert_eq!(looser.len(), 2, "{:?}", codes(&outcome));
+    assert_eq!(looser[0].element.position, Some(0));
+    assert_eq!(looser[0].details["lanes"], json!(["read"]));
+    assert_eq!(looser[0].details["requests_per_second_higher"], json!(true));
+    assert_eq!(looser[0].details["burst_higher"], json!(false));
+    assert_eq!(looser[1].element.position, Some(2));
+    assert_eq!(looser[1].details["lanes"], json!(["write"]));
+    for finding in looser {
+        assert_eq!(finding.severity, Severity::Low);
+        assert_eq!(finding.proof_basis, ProofBasis::Proven);
+        assert!(finding.patch.is_none());
+    }
+    assert!(outcome.complete);
+
+    // Without the global lanes the check cannot run, and says so; a policy
+    // without overrides does not need them.
+    resources.lanes = None;
+    let outcome = resources.run(&analyzed, far_deadline());
+    assert!(!outcome.complete);
+    assert_eq!(
+        outcome.limitations,
+        [AnalysisLimitation::ResourcesUnavailable]
+    );
+    assert!(!codes(&outcome).contains(&"rate_override_looser_than_global"));
+    assert!(
+        resources
+            .run(&rate_policy(json!([])), far_deadline())
+            .complete
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MCP alias and host-qualified lane effects
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_allow_a_later_deny_overrides_for_mcp_aliases_is_reported() {
+    let document = json!({
+        "schema_version": "1.0.0",
+        "default_action": "deny",
+        "rules": [
+            { "id": "mcp-allow", "methods": ["POST"], "path": "/mcp", "action": "allow" },
+            { "id": "catch-all-deny", "path": "/**", "action": "deny" }
+        ],
+    });
+    let aliases = ["/v1/mcp".to_owned()];
+    let outcome = run_with(&policy(document.clone()), &aliases, far_deadline());
+    let finding = only(&outcome, FindingCode::McpAliasRuleOverridden);
+    assert_eq!(finding.severity, Severity::Low);
+    assert_eq!(finding.proof_basis, ProofBasis::Proven);
+    assert_eq!(finding.element.id.as_deref(), Some("mcp-allow"));
+    assert_eq!(
+        finding
+            .related
+            .as_ref()
+            .and_then(|related| related.id.as_deref()),
+        Some("catch-all-deny")
+    );
+    assert_eq!(finding.details["deciding_action"], json!("deny"));
+    assert_eq!(finding.details["lane"], json!("mcp_alias"));
+    assert!(finding.patch.is_none());
+
+    // Without a configured alias there is no alias lane to report.
+    let outcome = run(&policy(document));
+    assert!(!codes(&outcome).contains(&"mcp_alias_rule_overridden"));
+}
+
+#[test]
+fn an_alias_route_weaker_than_the_canonical_route_is_reported() {
+    let document = base(
+        json!([]),
+        json!([
+            { "path_prefix": "/mcp", "permission": "api:admin" },
+            { "path_prefix": "/v1/mcp", "permission": "api:read" }
+        ]),
+    );
+    let aliases = ["/v1/mcp".to_owned()];
+    let outcome = run_with(&policy(document), &aliases, far_deadline());
+    let finding = only(&outcome, FindingCode::McpAliasRoutePrecedence);
+    assert_eq!(finding.severity, Severity::Medium);
+    assert_eq!(finding.proof_basis, ProofBasis::Proven);
+    assert_eq!(finding.element.pointer, "/routes/1");
+    assert_eq!(
+        finding
+            .related
+            .as_ref()
+            .map(|related| related.pointer.as_str()),
+        Some("/routes/0")
+    );
+    assert_eq!(finding.details["permission_differs"], json!(true));
+    assert_eq!(finding.details["mode_differs"], json!(false));
+
+    // An alias route at least as strict as the canonical one is not.
+    let stricter = base(
+        json!([]),
+        json!([
+            { "path_prefix": "/mcp", "permission": "api:read" },
+            { "path_prefix": "/v1/mcp", "permission": "api:admin" }
+        ]),
+    );
+    let outcome = run_with(&policy(stricter), &aliases, far_deadline());
+    assert!(!codes(&outcome).contains(&"mcp_alias_route_precedence"));
+}
+
+#[test]
+fn an_allow_a_selected_upstream_ignores_is_reported_with_the_host_route() {
+    let mut document = base(
+        json!([{ "id": "partners", "path": "/partner/**", "action": "allow", "principal": { "roles": ["reader"] } }]),
+        json!([
+            { "id": "partner-host", "path_prefix": "/partner", "hosts": ["partner.example.test"], "permission": "api:admin" }
+        ]),
+    );
+    document["schema_version"] = json!("1.0.0");
+    let outcome = run(&policy(document));
+    let finding = only(&outcome, FindingCode::SelectedUpstreamAllowIgnored);
+    assert_eq!(finding.severity, Severity::Low);
+    assert_eq!(finding.proof_basis, ProofBasis::Proven);
+    assert_eq!(finding.element.id.as_deref(), Some("partners"));
+    assert_eq!(
+        finding
+            .related
+            .as_ref()
+            .and_then(|related| related.id.as_deref()),
+        Some("partner-host")
+    );
+    assert_eq!(finding.details["lane"], json!("selected_upstream"));
+
+    // A route the caller passes anyway, or no host-bound route, changes
+    // nothing a selected upstream decides.
+    for routes in [
+        json!([{ "path_prefix": "/partner", "hosts": ["partner.example.test"], "permission": "api:read" }]),
+        json!([{ "path_prefix": "/partner", "permission": "api:admin" }]),
+    ] {
+        let outcome = run(&policy(base(
+            json!([{ "path": "/partner/**", "action": "allow", "principal": { "roles": ["reader"] } }]),
+            routes.clone(),
+        )));
+        assert!(
+            !codes(&outcome).contains(&"selected_upstream_allow_ignored"),
+            "{routes}: {:?}",
+            codes(&outcome)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool policy and grant lints
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_tool_rule_its_tool_entry_refuses_every_caller_of_never_decides() {
+    let mut document = base(
+        json!([
+            { "id": "echo-other-issuer", "tool_name": "echo", "action": "allow", "principal": { "issuers": ["https://other.example.test"] } },
+            { "id": "off-deny", "tool_name": "off", "action": "deny" },
+            { "id": "missing-deny", "tool_name": "missing", "action": "deny" },
+            { "id": "cookie-only", "tool_name": "web", "action": "deny", "principal": { "auth_methods": ["bearer_token"] } },
+            { "id": "echo-ok", "tool_name": "echo", "action": "deny", "principal": { "issuers": ["https://idp.example.test"] } }
+        ]),
+        json!([]),
+    );
+    document["schema_version"] = json!("1.0.0");
+    document["tools"] = json!({
+        "echo": { "issuers": ["https://idp.example.test"] },
+        "off": { "enabled": false },
+        "web": { "auth_methods": ["session_cookie"] }
+    });
+    let outcome = run(&policy(document));
+    let never: Vec<&Finding> = outcome
+        .findings
+        .iter()
+        .filter(|finding| finding.code == FindingCode::ToolRuleNeverDecides)
+        .collect();
+    let reasons: Vec<(Option<&str>, &Value)> = never
+        .iter()
+        .map(|finding| (finding.element.id.as_deref(), &finding.details["reason"]))
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            (Some("echo-other-issuer"), &json!("issuers_disjoint")),
+            (Some("off-deny"), &json!("tool_disabled")),
+            (Some("missing-deny"), &json!("tool_absent")),
+            (Some("cookie-only"), &json!("auth_methods_disjoint")),
+        ]
+    );
+    for finding in &never {
+        assert_eq!(finding.proof_basis, ProofBasis::Proven);
+        assert_eq!(lanes(&finding.never_decides_in), ["tool"]);
+        assert_eq!(
+            finding.patch.as_ref().map(|patch| patch.access_effect),
+            Some(AccessEffect::Equivalent)
+        );
+    }
+}
+
+#[test]
+fn a_tool_rule_naming_a_caller_its_entry_refuses_grants_less_than_it_names() {
+    let mut document = base(
+        json!([
+            { "tool_name": "ops", "action": "allow", "principal": { "roles": ["reader"] } },
+            { "tool_name": "ops", "action": "allow", "principal": { "roles": ["operator"] } }
+        ]),
+        json!([]),
+    );
+    document["roles"]["operator"] = json!({ "permissions": ["api:read"] });
+    document["tools"] = json!({ "ops": { "allowed_roles": ["operator"] } });
+    let outcome = run(&policy(document));
+    let finding = only(&outcome, FindingCode::ToolRuleGrantNarrowed);
+    assert_eq!(finding.element.position, Some(0));
+    assert_eq!(finding.severity, Severity::Low);
+    assert_eq!(finding.proof_basis, ProofBasis::Proven);
+    assert!(!codes(&outcome).contains(&"tool_rule_never_decides"));
+}
+
+#[test]
+fn a_grant_by_an_issuer_bound_role_without_its_issuers_is_reported() {
+    let mut document = base(
+        json!([
+            { "id": "admin-pages", "path": "/admin/**", "action": "allow", "principal": { "roles": ["reader", "admin"] } },
+            { "id": "bound", "path": "/admin/**", "action": "allow", "principal": { "roles": ["admin"], "issuers": ["https://idp.example.test"] } },
+            { "id": "deny", "path": "/admin/x", "action": "deny", "principal": { "roles": ["admin"] } }
+        ]),
+        json!([]),
+    );
+    document["schema_version"] = json!("1.0.0");
+    document["tools"] = json!({ "ops": { "allowed_roles": ["admin"] } });
+    let outcome = run(&policy(document.clone()));
+    let grants: Vec<&Finding> = outcome
+        .findings
+        .iter()
+        .filter(|finding| finding.code == FindingCode::IssuerlessRoleGrant)
+        .collect();
+    assert_eq!(grants.len(), 2, "{:?}", codes(&outcome));
+    let rule = grants
+        .iter()
+        .find(|finding| finding.element.section == Section::Rules)
+        .expect("the rule grant");
+    assert_eq!(rule.severity, Severity::High);
+    assert_eq!(rule.proof_basis, ProofBasis::Proven);
+    assert_eq!(rule.element.id.as_deref(), Some("admin-pages"));
+    assert_eq!(rule.element.pointer, "/rules/0/principal/roles/1");
+    assert_eq!(rule.details["lane"], json!("http"));
+    let tool = grants
+        .iter()
+        .find(|finding| finding.element.section == Section::Tools)
+        .expect("the tool grant");
+    assert_eq!(tool.severity, Severity::Medium);
+    assert_eq!(tool.element.pointer, "/tools/ops/allowed_roles/0");
+    assert_eq!(tool.element.name.as_deref(), Some("ops"));
+
+    // In mapped-role mode a caller holds only what its issuer's mappings
+    // grant, so nothing is granted by a bare claim.
+    document["identity_mappings"] = json!([
+        { "id": "admins", "issuer": "https://idp.example.test", "claimed_roles": ["admin"], "grant_roles": ["admin"] }
+    ]);
+    let outcome = run(&typed_matcher_policy(document));
+    assert!(!codes(&outcome).contains(&"issuerless_role_grant"));
+}
+
+#[test]
+fn a_wildcard_grant_bound_to_an_issuer_is_still_a_wildcard_permission() {
+    let mut document = base(json!([]), json!([]));
+    document["roles"] = json!({
+        "root": { "permissions": ["*"], "issuers": ["https://idp.example.test"] },
+        "anyone": { "permissions": ["*"] }
+    });
+    let outcome = run(&policy(document));
+    let finding = only(&outcome, FindingCode::WildcardPermission);
+    assert_eq!(finding.element.name.as_deref(), Some("root"));
+    assert_eq!(finding.element.pointer, "/roles/root/permissions/0");
+    assert_eq!(finding.proof_basis, ProofBasis::Heuristic);
+    assert_eq!(finding.severity, Severity::Low);
+    assert_eq!(
+        only(&outcome, FindingCode::WildcardGrantWithoutIssuer)
+            .element
+            .name
+            .as_deref(),
+        Some("anyone")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Egress lints
+// ---------------------------------------------------------------------------
+
+fn egress_findings(outcome: &AnalysisOutcome, code: FindingCode) -> Vec<(&str, &Finding)> {
+    outcome
+        .findings
+        .iter()
+        .filter(|finding| finding.code == code)
+        .map(|finding| (finding.element.pointer.as_str(), finding))
+        .collect()
+}
+
+#[test]
+fn egress_wildcards_non_public_cidrs_and_unusual_ports_are_reported() {
+    let mut document = base(json!([]), json!([]));
+    document["egress"] = json!({
+        "hosts": ["*.com", "*.example.test", "api.example.test"],
+        "cidrs": ["169.254.169.254/32", "10.0.0.0/8", "10.1.2.0/24", "8.8.8.0/24", "127.0.0.0/8", "::/0"],
+        "ports": [443, 22, 8443]
+    });
+    let outcome = run(&policy(document));
+    let wildcards = egress_findings(&outcome, FindingCode::EgressBroadWildcardHost);
+    assert_eq!(wildcards.len(), 1);
+    assert_eq!(wildcards[0].0, "/egress/hosts/0");
+    assert_eq!(wildcards[0].1.proof_basis, ProofBasis::Heuristic);
+
+    let cidrs: Vec<(&str, Severity, Value, Value)> =
+        egress_findings(&outcome, FindingCode::EgressNonPublicCidr)
+            .into_iter()
+            .map(|(pointer, finding)| {
+                assert_eq!(finding.proof_basis, ProofBasis::Proven, "{pointer}");
+                (
+                    pointer,
+                    finding.severity,
+                    finding.details["categories"].clone(),
+                    finding.details["covers_whole_range"].clone(),
+                )
+            })
+            .collect();
+    let expected = [
+        (
+            "/egress/cidrs/0",
+            Severity::High,
+            json!(["link_local"]),
+            json!(false),
+        ),
+        (
+            "/egress/cidrs/4",
+            Severity::High,
+            json!(["loopback"]),
+            json!(false),
+        ),
+        (
+            "/egress/cidrs/5",
+            Severity::High,
+            json!(["loopback", "link_local", "private"]),
+            json!(true),
+        ),
+        (
+            "/egress/cidrs/1",
+            Severity::Medium,
+            json!(["private"]),
+            json!(true),
+        ),
+        (
+            "/egress/cidrs/2",
+            Severity::Low,
+            json!(["private"]),
+            json!(false),
+        ),
+    ];
+    assert_eq!(cidrs.len(), expected.len(), "{cidrs:?}");
+    for entry in expected {
+        assert!(cidrs.contains(&entry), "{entry:?} in {cidrs:?}");
+    }
+
+    let ports = egress_findings(&outcome, FindingCode::EgressUnusualPort);
+    assert_eq!(ports.len(), 1);
+    assert_eq!(ports[0].0, "/egress/ports/1");
+    // The report names list members by pointer, never their values.
+    let text = to_json(&outcome, &binding("sha256:digest", "\"sha256:etag\""))
+        .expect("renders")
+        .to_string();
+    for value in ["169.254", "10.0.0.0", "*.com", "\"22\""] {
+        assert!(!text.contains(value), "{value} leaked into {text}");
+    }
+}
+
+#[test]
+fn an_egress_change_from_the_active_policy_needs_a_restart() {
+    let active = policy(base(json!([]), json!([])));
+    let mut document = base(json!([]), json!([]));
+    document["egress"] = json!({ "hosts": ["api.example.test"] });
+    let analyzed = policy(document);
+    let mut resources = Resources::new(&[]);
+    resources.active = Some(&active);
+    let outcome = resources.run(&analyzed, far_deadline());
+    let finding = only(&outcome, FindingCode::EgressChangeRequiresRestart);
+    assert_eq!(finding.element.pointer, "/egress");
+    assert_eq!(finding.proof_basis, ProofBasis::Proven);
+    assert_eq!(finding.severity, Severity::Medium);
+    // Analyzed as itself, nothing changed.
+    assert!(!codes(&run(&analyzed)).contains(&"egress_change_requires_restart"));
+}
+
+// ---------------------------------------------------------------------------
+// Cross-resource references and lockout
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unknown_references_and_case_collisions_are_reported_as_heuristics() {
+    let mut document = base(
+        json!([{ "id": "ghosts", "path": "/x", "action": "deny", "principal": { "roles": ["reader", "ghost"] } }]),
+        json!([{ "id": "nobody", "path_prefix": "/locked", "permission": "nobody:holds" }]),
+    );
+    document["schema_version"] = json!("1.0.0");
+    document["roles"]["Reader"] = json!({ "permissions": ["api:read"] });
+    document["tools"] = json!({ "unregistered": {} });
+    let analyzed = policy(document);
+    let mut view = resource_view_for(&analyzed);
+    view.tools = Some(ToolInventory {
+        names: BTreeSet::new(),
+        digest: "sha256:tools".to_owned(),
+    });
+    view.connections = Some(ConnectionInventory {
+        etag: "\"connections\"".to_owned(),
+        endpoints: vec!["https://upstream.example.test".to_owned()],
+    });
+    let mut resources = Resources::new(&[]);
+    resources.view = Some(view);
+    let outcome = resources.run(&analyzed, far_deadline());
+    let role = only(&outcome, FindingCode::RoleNotDefined);
+    assert_eq!(role.element.pointer, "/rules/0/principal/roles/1");
+    assert_eq!(role.element.id.as_deref(), Some("ghosts"));
+    assert_eq!(role.element.member.as_deref(), Some("/principal/roles/1"));
+    let route = only(&outcome, FindingCode::RoutePermissionUngranted);
+    assert_eq!(route.element.pointer, "/routes/0/permission");
+    assert_eq!(route.element.id.as_deref(), Some("nobody"));
+    let tool = only(&outcome, FindingCode::ToolNotRegistered);
+    assert_eq!(tool.element.pointer, "/tools/unregistered");
+    assert_eq!(tool.element.name.as_deref(), Some("unregistered"));
+    assert_eq!(
+        only(&outcome, FindingCode::NameCaseCollision)
+            .element
+            .section,
+        Section::Roles
+    );
+    assert_eq!(
+        only(&outcome, FindingCode::ConnectionEndpointEgressDenied)
+            .element
+            .pointer,
+        "/egress"
+    );
+    for code in [
+        FindingCode::RoleNotDefined,
+        FindingCode::RoutePermissionUngranted,
+        FindingCode::ToolNotRegistered,
+        FindingCode::NameCaseCollision,
+        FindingCode::ConnectionEndpointEgressDenied,
+    ] {
+        assert_eq!(only(&outcome, code).proof_basis, ProofBasis::Heuristic);
+    }
+    assert!(outcome.complete);
+}
+
+#[test]
+fn losing_every_policy_writer_is_a_likely_lockout() {
+    let mut active = base(json!([]), json!([]));
+    active["roles"]["policy-admin"] = json!({ "permissions": ["admin:policy:write"] });
+    let active = policy(active);
+    let analyzed = policy(base(json!([]), json!([])));
+    let mut resources = Resources::new(&[]);
+    resources.active = Some(&active);
+    let outcome = resources.run(&analyzed, far_deadline());
+    let finding = only(&outcome, FindingCode::PolicyWriteUnreachable);
+    assert_eq!(finding.severity, Severity::High);
+    assert_eq!(finding.proof_basis, ProofBasis::Heuristic);
+    assert_eq!(finding.element.pointer, "/roles");
+    // The active policy analyzed as itself loses nothing.
+    assert!(!codes(&resources.run(&active, far_deadline())).contains(&"policy_write_unreachable"));
+}
+
+#[test]
+fn a_resource_view_that_was_not_read_makes_the_analysis_incomplete() {
+    let analyzed = policy(base(json!([]), json!([])));
+    let mut resources = Resources::new(&[]);
+    resources.view = Some(PolicyResourceView::default());
+    let outcome = resources.run(&analyzed, far_deadline());
+    assert!(!outcome.complete);
+    assert_eq!(
+        outcome.limitations,
+        [AnalysisLimitation::ResourcesUnavailable]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Bounds, identity and renderings
 // ---------------------------------------------------------------------------
@@ -796,6 +1551,23 @@ fn a_passed_deadline_stops_pairwise_checks_and_marks_the_result_incomplete() {
     assert_eq!(outcome.limitations, [AnalysisLimitation::DeadlineExceeded]);
     // The linear checks ran before the deadline was read.
     assert_eq!(codes(&outcome), ["default_allow"]);
+}
+
+#[test]
+fn a_passed_deadline_also_stops_the_linear_checks_that_ask_the_evaluator() {
+    let mut document = base(
+        json!([
+            { "path": "/**", "action": "allow" },
+            { "tool_name": "missing", "action": "deny" }
+        ]),
+        json!([]),
+    );
+    document["egress"] = json!({ "cidrs": ["127.0.0.0/8"] });
+    let outcome = run_with(&policy(document), &[], Instant::now());
+    assert!(!outcome.complete);
+    assert_eq!(outcome.limitations, [AnalysisLimitation::DeadlineExceeded]);
+    // No witness was asked for, so nothing that needs one is reported.
+    assert!(outcome.findings.is_empty(), "{:?}", codes(&outcome));
 }
 
 #[test]
@@ -928,8 +1700,8 @@ fn both_renderings_name_the_stored_candidate_they_analyzed() {
 fn the_json_report_is_deterministic_and_names_no_policy_value() {
     let document = base(
         json!([
-            { "path": "/secret-area/**", "action": "allow" },
-            { "path": "/secret-area/vault", "action": "deny", "principal": { "roles": ["reader"] } }
+            { "path": "/secret-area/**", "action": "allow", "principal": { "auth_methods": ["bearer_token"] } },
+            { "path": "/secret-area/vault", "action": "deny", "principal": { "roles": ["reader"], "auth_methods": ["bearer_token"] } }
         ]),
         json!([]),
     );
@@ -1111,6 +1883,117 @@ fn request_schema() -> Value {
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
     serde_json::from_str(&text)
         .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()))
+}
+
+fn results_schema() -> Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../docs/schemas/policy-analysis-results.v1.schema.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()))
+}
+
+fn schema_enum(schema: &Value, name: &str) -> Vec<String> {
+    schema["$defs"][name]["enum"]
+        .as_array()
+        .unwrap_or_else(|| panic!("$defs/{name} is an enum"))
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The published result schema closes the vocabularies the analyzer
+/// renders -- codes in SARIF rule order, limitations, lanes and sections --
+/// and admits a rendered report that exercises most of them.
+#[test]
+fn the_published_result_schema_names_every_code_and_admits_a_rendered_report() {
+    let schema = results_schema();
+    let codes_in_order: Vec<String> = FindingCode::ALL
+        .iter()
+        .map(|code| code.as_str().to_owned())
+        .collect();
+    assert_eq!(schema_enum(&schema, "code"), codes_in_order);
+    assert_eq!(
+        schema_enum(&schema, "limitation"),
+        [
+            AnalysisLimitation::ComparisonBudgetExhausted,
+            AnalysisLimitation::DeadlineExceeded,
+            AnalysisLimitation::FindingsTruncated,
+            AnalysisLimitation::ResourcesUnavailable,
+        ]
+        .map(|limitation| limitation.as_str())
+    );
+    assert_eq!(
+        schema_enum(&schema, "lane"),
+        [
+            Lane::Http,
+            Lane::McpAlias,
+            Lane::SelectedUpstream,
+            Lane::RenderedToolHttp,
+            Lane::SourceRequest,
+            Lane::Tool,
+            Lane::Rate,
+        ]
+        .map(|lane| lane.as_str())
+    );
+    assert_eq!(
+        schema_enum(&schema, "section"),
+        [
+            Section::DefaultAction,
+            Section::EnforcementMode,
+            Section::Roles,
+            Section::Rules,
+            Section::Routes,
+            Section::RateLimits,
+            Section::Tools,
+            Section::Egress,
+            Section::IdentityMappings,
+        ]
+        .map(|section| section.as_str())
+    );
+
+    let mut document = base(
+        json!([
+            { "path": "/api/**", "action": "allow", "principal": { "roles": ["reader"] } },
+            { "path": "/api/admin/**", "action": "deny" },
+            { "path": "/public/**", "action": "allow" },
+            { "path": "/a//*", "action": "allow", "principal": { "roles": ["reader"] } },
+            { "path": "/a//b", "action": "deny" },
+            { "path": "/admin/**", "action": "allow", "principal": { "roles": ["admin"] } },
+            { "tool_name": "missing", "action": "deny" }
+        ]),
+        json!([{ "path_prefix": "/locked", "permission": "nobody:holds" }]),
+    );
+    document["default_action"] = json!("allow");
+    document["egress"] = json!({ "hosts": ["*.com"], "cidrs": ["127.0.0.0/8"], "ports": [22] });
+    let outcome = run(&policy(document));
+    let digest = format!("sha256:{}", "0".repeat(64));
+    let report = to_json(&outcome, &binding(&digest, "\"sha256:etag\"")).expect("renders");
+    let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
+    let errors: Vec<String> = validator
+        .iter_errors(&report)
+        .map(|error| format!("{} at {}", error, error.instance_path()))
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let rendered: BTreeSet<&str> = codes(&outcome).into_iter().collect();
+    for code in [
+        "default_allow",
+        "rule_partially_shadowed",
+        "all_methods_grant",
+        "issuerless_role_grant",
+        "tool_rule_never_decides",
+        "egress_broad_wildcard_host",
+        "egress_non_public_cidr",
+        "egress_unusual_port",
+        "route_permission_ungranted",
+    ] {
+        assert!(rendered.contains(code), "{code} in {rendered:?}");
+    }
+    assert!(outcome
+        .findings
+        .iter()
+        .any(|finding| finding.proof_basis == ProofBasis::Inconclusive));
 }
 
 /// The published schema and the parser agree on the requests both can
@@ -1298,24 +2181,32 @@ fn http_paths() -> Vec<String> {
     paths
 }
 
-fn universe_principals() -> Vec<PrincipalFact> {
-    let mut principals = vec![PrincipalFact::Anonymous];
+/// The universe's authenticated callers: every role set over the two
+/// roles, from no issuer, the issuer `r2` is bound to, and another.
+fn universe_identities() -> Vec<Principal> {
+    let mut identities = Vec::new();
     for roles in [&[][..], &["r1"][..], &["r2"][..], &["r1", "r2"][..]] {
-        for issuer in [None, Some("i1")] {
-            principals.push(PrincipalFact::Authenticated(
-                PrincipalIdentity::from_principal(&Principal {
-                    user_id: "u1".to_owned(),
-                    issuer: issuer.map(str::to_owned),
-                    email: None,
-                    org_id: None,
-                    roles: roles.iter().map(|role| (*role).to_owned()).collect(),
-                    session_id: String::new(),
-                    auth_method: AuthMethod::Bearer,
-                }),
-            ));
+        for issuer in [None, Some("i1"), Some("i2")] {
+            identities.push(Principal {
+                user_id: "u1".to_owned(),
+                issuer: issuer.map(str::to_owned),
+                email: None,
+                org_id: None,
+                roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+                session_id: String::new(),
+                auth_method: AuthMethod::Bearer,
+            });
         }
     }
-    principals
+    identities
+}
+
+fn universe_principals() -> Vec<PrincipalFact> {
+    std::iter::once(PrincipalFact::Anonymous)
+        .chain(universe_identities().iter().map(|principal| {
+            PrincipalFact::Authenticated(PrincipalIdentity::from_principal(principal))
+        }))
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1475,7 +2366,9 @@ fn rule_strategy() -> impl Strategy<Value = Value> {
             Just(json!({})),
             Just(json!({ "roles": ["r1"] })),
             Just(json!({ "roles": ["r1", "r2"] })),
-            Just(json!({ "roles": ["r1"], "issuers": ["i1"] }))
+            Just(json!({ "roles": ["r1"], "issuers": ["i1"] })),
+            Just(json!({ "issuers": ["i2"] })),
+            Just(json!({ "roles": ["r2"], "auth_methods": ["bearer_token"] }))
         ],
         prop_oneof![Just("allow"), Just("deny"), Just("shadow")],
         prop_oneof![
@@ -1513,6 +2406,24 @@ fn route_strategy() -> impl Strategy<Value = Value> {
         })
 }
 
+/// The tool entries: each admits every caller, a role, an issuer or an
+/// authentication method no universe caller has, or is disabled.
+fn tools_strategy() -> impl Strategy<Value = Value> {
+    (
+        prop_oneof![
+            2 => Just(json!({})),
+            1 => Just(json!({ "enabled": false })),
+            1 => Just(json!({ "issuers": ["i1"] }))
+        ],
+        prop_oneof![
+            2 => Just(json!({ "allowed_roles": ["r1"] })),
+            1 => Just(json!({ "allowed_roles": ["r2"] })),
+            1 => Just(json!({ "auth_methods": ["session_cookie"] }))
+        ],
+    )
+        .prop_map(|(t1, t2)| json!({ "t1": t1, "t2": t2 }))
+}
+
 fn policy_strategy() -> impl Strategy<Value = Value> {
     (
         prop::collection::vec(rule_strategy(), 0..5),
@@ -1524,8 +2435,9 @@ fn policy_strategy() -> impl Strategy<Value = Value> {
             Just(json!(["p1", "p2"])),
             Just(json!(["*"]))
         ],
+        tools_strategy(),
     )
-        .prop_map(|(rules, routes, default_action, mode, r1)| {
+        .prop_map(|(rules, routes, default_action, mode, r1, tools)| {
             json!({
                 "schema_version": "0.1.0",
                 "default_action": default_action,
@@ -1536,7 +2448,7 @@ fn policy_strategy() -> impl Strategy<Value = Value> {
                 },
                 "rules": rules,
                 "routes": routes,
-                "tools": { "t1": {}, "t2": { "allowed_roles": ["r1"] } },
+                "tools": tools,
             })
         })
 }
@@ -1608,6 +2520,508 @@ proptest! {
                     ),
                     AccessEffect::Expanding | AccessEffect::Unknown => {}
                 }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Brute force: proven overlap, lane-effect and grant claims
+// ---------------------------------------------------------------------------
+
+fn universe_methods() -> [Method; 3] {
+    [Method::GET, Method::POST, Method::PUT]
+}
+
+fn restrictiveness(action: &RuleAction) -> u8 {
+    match action {
+        RuleAction::Allow => 0,
+        RuleAction::Shadow => 1,
+        RuleAction::Deny => 2,
+    }
+}
+
+/// The rule at `position` compiled alone, under the policy's roles.
+fn rule_alone(policy: &Policy, position: usize) -> CompiledPolicy {
+    CompiledPolicy::for_analysis(Policy {
+        rules: vec![policy.rules[position].clone()],
+        routes: Vec::new(),
+        rate_limits: Vec::new(),
+        tools: std::collections::HashMap::new(),
+        default_action: crate::rbac::DefaultAction::Deny,
+        enforcement_mode: crate::rbac::EnforcementMode::Enforce,
+        egress: crate::rbac::EgressPolicy::default(),
+        id: None,
+        ..policy.clone()
+    })
+}
+
+fn question(
+    compiled: &CompiledPolicy,
+    method: &Method,
+    path: &str,
+    principal: &PrincipalFact,
+    target: HttpTarget,
+    request_host: HostFact,
+    dispatch: Option<DispatchFacts>,
+) -> PolicyEvaluationContext {
+    PolicyEvaluationContext {
+        version: CONTEXT_VERSION,
+        snapshot: compiled.snapshot(),
+        method: Some(method.clone()),
+        path: Some(path.to_owned()),
+        principal: principal.clone(),
+        target,
+        request_host,
+        dispatch,
+    }
+}
+
+fn first_direct(
+    compiled: &CompiledPolicy,
+    method: &Method,
+    path: &str,
+    principal: &PrincipalFact,
+) -> Option<usize> {
+    match compiled.match_direct_rules(&question(
+        compiled,
+        method,
+        path,
+        principal,
+        HttpTarget::Contextless,
+        HostFact::Absent,
+        None,
+    )) {
+        Ok(DirectRuleOutcome::Matched { index }) => Some(index),
+        _ => None,
+    }
+}
+
+fn alias_target() -> HttpTarget {
+    HttpTarget::McpAlias {
+        canonical_path: "/mcp".to_owned(),
+    }
+}
+
+fn tool_reason(
+    compiled: &CompiledPolicy,
+    tool_name: &str,
+    principal: &PrincipalFact,
+) -> ToolReason {
+    compiled
+        .evaluate_tool(&ToolEvaluationContext {
+            version: TOOL_CONTEXT_VERSION,
+            snapshot: compiled.snapshot(),
+            operation: ToolOperation::Invocation,
+            tool_name: Some(tool_name.to_owned()),
+            principal: principal.clone(),
+            method: None,
+            path: None,
+        })
+        .expect("the universe is well formed")
+        .reason()
+}
+
+fn refused_at_admission(reason: ToolReason) -> bool {
+    matches!(
+        reason,
+        ToolReason::UnknownTool | ToolReason::Disabled | ToolReason::RoleNotAllowed
+    )
+}
+
+/// An earlier, less restrictive rule decides a request the rule matches.
+fn partially_shadowed_shown(policy: &Policy, compiled: &CompiledPolicy, position: usize) -> bool {
+    let alone = rule_alone(policy, position);
+    let action = &policy.rules[position].action;
+    http_paths().iter().any(|path| {
+        universe_methods().iter().any(|method| {
+            universe_principals().iter().any(|principal| {
+                first_direct(&alone, method, path, principal) == Some(0)
+                    && first_direct(compiled, method, path, principal).is_some_and(|index| {
+                        index < position
+                            && restrictiveness(&policy.rules[index].action)
+                                < restrictiveness(action)
+                    })
+            })
+        })
+    })
+}
+
+/// A later, more restrictive rule decides an alias request the rule alone
+/// decides.
+fn alias_override_shown(policy: &Policy, compiled: &CompiledPolicy, position: usize) -> bool {
+    let alone = rule_alone(policy, position);
+    let action = &policy.rules[position].action;
+    ALIAS_PATHS.iter().any(|alias| {
+        universe_methods().iter().any(|method| {
+            universe_principals().iter().any(|principal| {
+                let ask = |compiled: &CompiledPolicy| {
+                    compiled
+                        .evaluate(&question(
+                            compiled,
+                            method,
+                            alias,
+                            principal,
+                            alias_target(),
+                            HostFact::Absent,
+                            None,
+                        ))
+                        .ok()
+                        .and_then(|evaluation| evaluation.matched())
+                };
+                ask(&alone) == Some(RuleReference::Direct(0))
+                    && matches!(ask(compiled), Some(RuleReference::Direct(index))
+                        if index > position
+                            && restrictiveness(&policy.rules[index].action) > restrictiveness(action))
+            })
+        })
+    })
+}
+
+/// The route lane forwards an alias request by the alias route and blocks
+/// the same caller's request to the canonical path by the canonical route.
+fn alias_route_shown(policy: &Policy, route: usize, canonical: usize) -> bool {
+    let routes_only = CompiledPolicy::for_analysis(Policy {
+        rules: Vec::new(),
+        ..policy.clone()
+    });
+    ALIAS_PATHS.iter().any(|alias| {
+        universe_methods().iter().any(|method| {
+            universe_principals().iter().any(|principal| {
+                let ask = |path: &str, target: HttpTarget| {
+                    routes_only
+                        .evaluate(&question(
+                            &routes_only,
+                            method,
+                            path,
+                            principal,
+                            target,
+                            HostFact::Absent,
+                            None,
+                        ))
+                        .expect("the universe is well formed")
+                };
+                let at_alias = ask(alias, alias_target());
+                let at_canonical = ask("/mcp", HttpTarget::Contextless);
+                at_alias.matched() == Some(RuleReference::Route(route))
+                    && at_alias.effect() != PolicyEffect::Block
+                    && at_canonical.matched() == Some(RuleReference::Route(canonical))
+                    && at_canonical.effect() == PolicyEffect::Block
+            })
+        })
+    })
+}
+
+/// A request the rule decides and forwards when addressed to the selected
+/// host is blocked once that host's upstream is selected.
+fn selected_upstream_shown(compiled: &CompiledPolicy, position: usize) -> bool {
+    http_paths().iter().any(|path| {
+        universe_methods().iter().any(|method| {
+            universe_principals().iter().any(|principal| {
+                let addressed = compiled
+                    .evaluate(&question(
+                        compiled,
+                        method,
+                        path,
+                        principal,
+                        HttpTarget::Contextless,
+                        HostFact::Present(SELECTED_HOST.to_owned()),
+                        None,
+                    ))
+                    .expect("the universe is well formed");
+                let selected = compiled
+                    .evaluate(&question(
+                        compiled,
+                        method,
+                        path,
+                        principal,
+                        HttpTarget::ProxyDispatch,
+                        HostFact::Absent,
+                        Some(DispatchFacts {
+                            route_id: Some("pooled".to_owned()),
+                            route_host: Some(SELECTED_HOST.to_owned()),
+                            route_path_prefix: None,
+                            upstream_origin: "pool:pooled".to_owned(),
+                        }),
+                    ))
+                    .expect("the universe is well formed");
+                addressed.matched() == Some(RuleReference::Direct(position))
+                    && addressed.effect() != PolicyEffect::Block
+                    && selected.effect() == PolicyEffect::Block
+            })
+        })
+    })
+}
+
+/// A caller the tool rule alone matches is refused by its tool's entry.
+fn tool_grant_narrowed_shown(policy: &Policy, compiled: &CompiledPolicy, position: usize) -> bool {
+    let alone = rule_alone(policy, position);
+    let Some(tool_name) = policy.rules[position].tool_name.as_deref() else {
+        return false;
+    };
+    universe_principals().iter().any(|principal| {
+        alone.match_tool_rules(tool_name, principal) == Ok(DirectRuleOutcome::Matched { index: 0 })
+            && refused_at_admission(tool_reason(compiled, tool_name, principal))
+    })
+}
+
+/// A caller claiming one of `roles` from an issuer the role is not bound to
+/// is admitted by `admits`.
+fn issuerless_shown(
+    policy: &Policy,
+    compiled: &CompiledPolicy,
+    roles: &[String],
+    admits: impl Fn(&PrincipalFact) -> bool,
+) -> bool {
+    universe_identities().iter().any(|identity| {
+        let inactive_bound_role = roles.iter().any(|role| {
+            identity.roles.contains(role)
+                && policy
+                    .roles
+                    .get(role)
+                    .is_some_and(|entry| !entry.issuers.is_empty())
+                && !compiled.engine().principal_has_active_role(identity, role)
+        });
+        inactive_bound_role
+            && admits(&PrincipalFact::Authenticated(
+                PrincipalIdentity::from_principal(identity),
+            ))
+    })
+}
+
+/// The rule alone matches every universe path for some caller and method.
+fn broad_path_shown(policy: &Policy, position: usize) -> bool {
+    let alone = rule_alone(policy, position);
+    universe_principals().iter().any(|principal| {
+        universe_methods().iter().any(|method| {
+            http_paths()
+                .iter()
+                .all(|path| first_direct(&alone, method, path, principal) == Some(0))
+        })
+    })
+}
+
+/// The rule alone matches every universe method, and `DELETE`, for an
+/// anonymous caller on some path.
+fn all_methods_shown(policy: &Policy, position: usize) -> bool {
+    let alone = rule_alone(policy, position);
+    http_paths().iter().any(|path| {
+        universe_methods()
+            .iter()
+            .chain([&Method::DELETE])
+            .all(|method| first_direct(&alone, method, path, &PrincipalFact::Anonymous) == Some(0))
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Every proven overlap, MCP alias, selected-upstream, tool-entry and
+    /// grant claim is shown by a request of the universe, asked of the
+    /// evaluator directly: the claims are existential, and the universe
+    /// holds the witness the analyzer built.
+    #[test]
+    fn proven_overlap_lane_and_grant_claims_have_a_witness_in_the_universe(document in policy_strategy()) {
+        let analyzed = policy(document);
+        let outcome = run_with(&analyzed, &alias_paths(), far_deadline());
+        prop_assert!(outcome.complete);
+        let compiled = CompiledPolicy::for_analysis(analyzed.clone());
+        for finding in outcome.findings.iter().filter(|finding| finding.proof_basis == ProofBasis::Proven) {
+            let position = finding.element.position;
+            let related = finding.related.as_ref().and_then(|related| related.position);
+            let shown = match (finding.code, finding.element.section, position) {
+                (FindingCode::RulePartiallyShadowed, _, Some(position)) => {
+                    partially_shadowed_shown(&analyzed, &compiled, position)
+                }
+                (FindingCode::McpAliasRuleOverridden, _, Some(position)) => {
+                    alias_override_shown(&analyzed, &compiled, position)
+                }
+                (FindingCode::McpAliasRoutePrecedence, _, Some(position)) => {
+                    related.is_some_and(|canonical| alias_route_shown(&analyzed, position, canonical))
+                }
+                (FindingCode::SelectedUpstreamAllowIgnored, _, Some(position)) => {
+                    selected_upstream_shown(&compiled, position)
+                }
+                (FindingCode::ToolRuleGrantNarrowed, _, Some(position)) => {
+                    tool_grant_narrowed_shown(&analyzed, &compiled, position)
+                }
+                (FindingCode::IssuerlessRoleGrant, Section::Rules, Some(position)) => {
+                    let rule = &analyzed.rules[position];
+                    let alone = rule_alone(&analyzed, position);
+                    issuerless_shown(&analyzed, &compiled, &rule.principal.roles, |principal| {
+                        match rule.tool_name.as_deref() {
+                            Some(tool_name) => alone.match_tool_rules(tool_name, principal)
+                                == Ok(DirectRuleOutcome::Matched { index: 0 }),
+                            None => http_paths().iter().any(|path| {
+                                universe_methods()
+                                    .iter()
+                                    .any(|method| first_direct(&alone, method, path, principal) == Some(0))
+                            }),
+                        }
+                    })
+                }
+                (FindingCode::IssuerlessRoleGrant, Section::Tools, _) => {
+                    let name = finding.element.name.clone().unwrap_or_default();
+                    let entry = &analyzed.tools[&name];
+                    issuerless_shown(&analyzed, &compiled, &entry.allowed_roles, |principal| {
+                        !refused_at_admission(tool_reason(&compiled, &name, principal))
+                    })
+                }
+                (FindingCode::BroadPathGrant, _, Some(position)) => broad_path_shown(&analyzed, position),
+                (FindingCode::AllMethodsGrant, _, Some(position)) => all_methods_shown(&analyzed, position),
+                _ => true,
+            };
+            prop_assert!(
+                shown,
+                "{} at {} has no witness in the universe",
+                finding.code.as_str(),
+                finding.element.pointer
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Brute force: egress CIDRs against the static egress lane
+// ---------------------------------------------------------------------------
+
+/// The categories a universe address belongs to, by the published ranges.
+fn address_category(address: IpAddr) -> Option<&'static str> {
+    [
+        ("loopback", "127.0.0.0/8"),
+        ("loopback", "::1/128"),
+        ("link_local", "169.254.0.0/16"),
+        ("link_local", "fe80::/10"),
+        ("private", "10.0.0.0/8"),
+        ("private", "172.16.0.0/12"),
+        ("private", "192.168.0.0/16"),
+        ("private", "100.64.0.0/10"),
+        ("private", "fc00::/7"),
+    ]
+    .into_iter()
+    .find(|(_, range)| {
+        range
+            .parse::<IpNet>()
+            .is_ok_and(|range| range.contains(&address))
+    })
+    .map(|(category, _)| category)
+}
+
+fn egress_addresses() -> Vec<IpAddr> {
+    [
+        "127.0.0.1",
+        "127.255.255.254",
+        "169.254.169.254",
+        "169.254.1.1",
+        "10.0.0.1",
+        "10.1.2.3",
+        "172.16.0.1",
+        "172.31.255.254",
+        "192.168.1.1",
+        "100.64.0.1",
+        "8.8.8.8",
+        "::1",
+        "fe80::1",
+        "fd00::1",
+        "fc00::1",
+        "2606:4700::1",
+    ]
+    .iter()
+    .filter_map(|address| address.parse().ok())
+    .collect()
+}
+
+/// Whether the static egress lane, refusing non-global addresses outside
+/// `cidrs`, connects to the witness host resolved to `address`.
+fn egress_lane_admits(cidrs: &[IpNet], address: IpAddr) -> bool {
+    let lane = CompiledEgressPolicy::new(EgressControls {
+        allowed_hosts: HashSet::from(["witness.invalid".to_owned()]),
+        allowed_host_globs: Vec::new(),
+        allowed_ports: HashSet::new(),
+        deny_private_ips: true,
+        nat64_prefixes: Vec::new(),
+        private_ip_allow_cidrs: cidrs.to_vec(),
+    });
+    let url = Url::parse("https://witness.invalid/").expect("url parses");
+    let destination = EgressDestination::from_url(&url);
+    let answers = [SocketAddr::new(address, 443)];
+    matches!(
+        lane.evaluate(&EgressEvaluationContext {
+            version: EGRESS_CONTEXT_VERSION,
+            snapshot: lane.snapshot(),
+            destination: &destination,
+            resolution: ResolutionFact::Resolved(&answers),
+        })
+        .expect("the question is well formed")
+        .outcome(),
+        EgressOutcome::Allow { .. }
+    )
+}
+
+fn cidr_strategy() -> impl Strategy<Value = &'static str> {
+    prop_oneof![
+        Just("127.0.0.0/8"),
+        Just("127.0.0.1/32"),
+        Just("169.254.0.0/16"),
+        Just("169.254.169.254/32"),
+        Just("10.0.0.0/8"),
+        Just("10.1.0.0/16"),
+        Just("172.16.0.0/12"),
+        Just("192.168.1.0/24"),
+        Just("100.64.0.0/10"),
+        Just("8.8.8.0/24"),
+        Just("0.0.0.0/0"),
+        Just("::1/128"),
+        Just("fe80::/10"),
+        Just("fd00::/8"),
+        Just("2606:4700::/32"),
+        Just("::/0"),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Every proven non-public CIDR finding names exactly the categories of
+    /// the universe addresses the CIDR holds, and for each the egress lane
+    /// refuses such an address without the CIDR and connects with it.
+    #[test]
+    fn proven_egress_cidr_claims_hold_against_the_egress_lane(
+        cidrs in prop::collection::vec(cidr_strategy(), 1..4),
+    ) {
+        let mut document = base(json!([]), json!([]));
+        document["egress"] = json!({ "cidrs": cidrs });
+        let outcome = run(&policy(document));
+        for (index, cidr) in cidrs.iter().enumerate() {
+            let cidr: IpNet = cidr.parse().expect("the strategy's CIDRs parse");
+            let pointer = format!("/egress/cidrs/{index}");
+            let finding = outcome.findings.iter().find(|finding| {
+                finding.code == FindingCode::EgressNonPublicCidr && finding.element.pointer == pointer
+            });
+            let held: BTreeSet<&str> = egress_addresses()
+                .into_iter()
+                .filter(|address| cidr.contains(address))
+                .filter_map(address_category)
+                .collect();
+            let Some(finding) = finding else {
+                prop_assert!(held.is_empty(), "{cidr} holds {held:?} and was not reported");
+                continue;
+            };
+            prop_assert_eq!(finding.proof_basis, ProofBasis::Proven);
+            let named: BTreeSet<&str> = finding.details["categories"]
+                .as_array()
+                .expect("categories")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            prop_assert_eq!(&named, &held, "{}", cidr);
+            for category in named {
+                prop_assert!(egress_addresses().into_iter().any(|address| {
+                    cidr.contains(&address)
+                        && address_category(address) == Some(category)
+                        && !egress_lane_admits(&[], address)
+                        && egress_lane_admits(&[cidr], address)
+                }), "{cidr}: {category}");
             }
         }
     }

@@ -35,6 +35,8 @@ pub(super) const POLICY_RULE_SHADOW_REVIEW_ADMIN_ROUTE: &str =
     "/v1/admin/policy/rules/shadow-review";
 pub(super) const POLICY_VALIDATE_ADMIN_ROUTE: &str = "/v1/admin/policy/validate";
 pub(super) const POLICY_CONVERT_ADMIN_ROUTE: &str = "/v1/admin/policy/convert";
+/// The stored `policy-tests.v1` suite (issue #243).
+pub(super) const POLICY_TESTS_ADMIN_ROUTE: &str = "/v1/admin/policy/tests";
 /// Run a `policy-tests.v1` suite (issue #243, slice 11).
 pub(super) const POLICY_TEST_RUNS_ADMIN_ROUTE: &str = "/v1/admin/policy/tests/runs";
 /// Simulate synthetic cases against the active policy and a candidate
@@ -273,6 +275,7 @@ pub(super) struct AdminRoutes {
     pub(super) policy_rule_shadow_review_route: String,
     pub(super) policy_validate_route: String,
     pub(super) policy_convert_route: String,
+    pub(super) policy_tests_route: String,
     pub(super) policy_test_runs_route: String,
     pub(super) policy_simulations_route: String,
     pub(super) policy_replays_route: String,
@@ -389,6 +392,7 @@ impl AdminRoutes {
             policy_rule_shadow_review_route: format!("{api_prefix}/policy/rules/shadow-review"),
             policy_validate_route: format!("{api_prefix}/policy/validate"),
             policy_convert_route: format!("{api_prefix}/policy/convert"),
+            policy_tests_route: format!("{api_prefix}/policy/tests"),
             policy_test_runs_route: format!("{api_prefix}/policy/tests/runs"),
             policy_simulations_route: format!("{api_prefix}/policy/simulations"),
             policy_replays_route: format!("{api_prefix}/policy/replays"),
@@ -514,6 +518,11 @@ pub(super) struct PolicyAdminState {
     /// the policy history database standalone, migration 22's table in
     /// cluster mode. `None` leaves the draft routes answering `503`.
     pub(super) draft_store: Option<Arc<dyn storage::PolicyDraftStore>>,
+    /// The stored policy test suite (issue #243): a table in the policy
+    /// history database standalone, migration 29's tables in cluster mode.
+    /// `None` leaves the suite routes, and every run or evidence package
+    /// that names the stored suite, answering `503`.
+    pub(super) test_suite_store: Option<Arc<dyn storage::PolicyTestSuiteStore>>,
     /// Cluster mode's authoritative control plane. Present exactly when
     /// `policy_file` is absent-but-cluster: mutations commit through its
     /// CAS transaction instead of the file, and history is its documents.
@@ -733,7 +742,30 @@ pub(super) struct SuggestionsAdminState {
     /// something makes it true; this is that something. Cluster mode does
     /// not depend on it -- its authority is the acceptance transaction's
     /// `FOR UPDATE` lock, which also excludes the other replicas.
-    pub(super) lifecycle_guard: Arc<tokio::sync::Mutex<()>>,
+    ///
+    /// Standalone acceptance also records a durable intent before its policy
+    /// write (issue #243), and the lock is held across the reconciliation of
+    /// pending intents that runs at startup and before every suggestion read
+    /// or transition, so no request ever sees a suggestion an unfinished
+    /// acceptance is about to move.
+    pub(super) lifecycle_guard: Arc<tokio::sync::Mutex<SuggestionLifecycle>>,
+}
+
+/// What the suggestion lifecycle lock protects beyond mutual exclusion: the
+/// standalone acceptances this process committed but could not yet mark
+/// accepted, by suggestion id and candidate ETag.
+///
+/// A durable intent records every acceptance, and the reconciler decides an
+/// intent from what the policy authority shows; that is all a restart has.
+/// While the process lives it also knows which commits it made itself, which
+/// settles the one case durable state cannot: a commit whose history row
+/// was not appended, overwritten by a later policy write before the
+/// suggestion could be moved. Losing this on restart is safe: a restart
+/// reloads the policy file, so the active policy is the committed candidate
+/// unless something wrote over it while the gateway was down.
+#[derive(Default)]
+pub(super) struct SuggestionLifecycle {
+    pub(super) committed_acceptances: HashSet<(String, String)>,
 }
 
 #[derive(Clone)]

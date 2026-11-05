@@ -6,13 +6,18 @@
 //! `diff`), the stable exit codes, shell completion, secure bearer-token
 //! input, the version handshake with a running gateway, offline bundle
 //! validation, pinning, diagnosis and semantic diff with the gateway's own
-//! bundle reader and diff engine (`gateway-config`), and the offline
-//! commands over a standalone revision ledger (`ggctl ledger`).
+//! bundle reader and diff engine (`gateway-config`), the offline commands
+//! over a standalone revision ledger (`ggctl ledger`), offline backups of a
+//! standalone state directory and their restore (`ggctl backup`), the
+//! policy commands, which ask a gateway's own validator and evaluator
+//! (`ggctl policy`), and offline evidence package verification
+//! (`ggctl evidence verify`).
 //!
 //! `ggctl` reads no configuration file and no environment variable, never
 //! accepts a secret as an argument, and makes no network request unless a
 //! command is given `--server`. The command reference is `docs/ggctl.md`.
 
+mod backup;
 mod cli;
 mod completion;
 mod convert;
@@ -20,12 +25,15 @@ mod credential;
 mod diagnostic;
 mod diff;
 mod doctor;
+mod evidence;
 mod help;
 mod init;
+mod input;
 mod ledger;
 mod mcp_config;
 mod output;
 mod pin;
+mod policy;
 mod remote;
 mod report;
 mod sarif;
@@ -140,6 +148,7 @@ mod tests {
              greengateway.dev/v1alpha1  GatewayInitAnswers\n\
              greengateway.dev/v1alpha1  GatewayCapabilities\n\
              greengateway.dev/v1alpha1  GgctlReport\n\
+             greengateway.dev/v1alpha1  GatewayBackup\n\
              greengateway.dev/v1alpha1  McpClientConfigs\n"
         );
 

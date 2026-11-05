@@ -69,6 +69,15 @@ fn every_refusal_carries_a_stable_code() {
         ImportError::SectionConflict { section: "policy" }.code(),
         "section_conflict"
     );
+    assert_eq!(
+        ImportError::TargetOperationRefused {
+            operation: "policy.document_v1",
+            reason: "capability_not_advertised",
+            detail: String::new(),
+        }
+        .code(),
+        "target_operation_refused"
+    );
 }
 
 /// The report's "not imported" list and the list the validation pass
@@ -238,15 +247,28 @@ fn a_standalone_configuration_without_a_policy_file_is_refused() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// Standalone mode serves policy v1, but no cluster replica of this build
-/// does: they advertise document format `0..0`. An import that carried a v1
-/// document across -- as the live policy or as any version in its history
-/// -- would leave every replica refusing the policy it was handed, so the
-/// load refuses it before anything is written, and says how to proceed.
+/// Cluster replicas of this build serve policy v1 (document formats `0..=1`),
+/// so a standalone deployment on v1 -- as the live policy or as any version
+/// in its history -- loads for import. Writing it is the gated operation
+/// `policy.document_v1`, so the source says when it needs the target's
+/// roster asked, and a 0.x deployment never does.
 #[test]
-fn a_standalone_policy_v1_document_is_refused_live_or_in_history() {
+fn a_standalone_policy_v1_document_loads_live_or_in_history_and_is_gated() {
     let v1 = r#"{"schema_version":"1.0.0","id":"v1-live","default_action":"deny"}"#;
     let v0 = r#"{"schema_version":"0.1.0","id":"v0-live","default_action":"deny"}"#;
+
+    // A 0.x deployment with no history asks nothing of the roster.
+    let directory = temp_directory("source-v0-live");
+    let policy_file = directory.join("policy.json");
+    std::fs::write(&policy_file, v0).expect("the policy file should write");
+    let path = directory.join("standalone.env");
+    std::fs::write(&path, format!("POLICY_FILE={}\n", policy_file.display()))
+        .expect("the environment file should write");
+    let Ok(source) = StandaloneSource::load(&path) else {
+        panic!("a 0.x standalone policy must load");
+    };
+    assert!(!source.writes_policy_document_v1());
+    let _ = std::fs::remove_dir_all(&directory);
 
     // The live document.
     let directory = temp_directory("source-v1-live");
@@ -255,15 +277,12 @@ fn a_standalone_policy_v1_document_is_refused_live_or_in_history() {
     let path = directory.join("standalone.env");
     std::fs::write(&path, format!("POLICY_FILE={}\n", policy_file.display()))
         .expect("the environment file should write");
-    let Err(error) = StandaloneSource::load(&path) else {
-        panic!("a v1 standalone policy must be refused");
+    let source = match StandaloneSource::load(&path) {
+        Ok(source) => source,
+        Err(error) => panic!("a v1 standalone policy must load: {error}"),
     };
-    assert_eq!(error.code(), "source_document_unparseable", "{error}");
-    let rendered = error.to_string();
-    assert!(
-        rendered.contains("'1.0.0'") && rendered.contains("0.x document"),
-        "the operator must learn which format and what to do: {rendered}"
-    );
+    assert_eq!(source.policy.schema_version, "1.0.0");
+    assert!(source.writes_policy_document_v1());
     let _ = std::fs::remove_dir_all(&directory);
 
     // A 0.x live document whose history holds a v1 version.
@@ -288,13 +307,14 @@ fn a_standalone_policy_v1_document_is_refused_live_or_in_history() {
     let path = directory.join("standalone.env");
     std::fs::write(&path, format!("POLICY_FILE={}\n", policy_file.display()))
         .expect("the environment file should write");
-    let Err(error) = StandaloneSource::load(&path) else {
-        panic!("a v1 version in the standalone history must be refused");
+    let source = match StandaloneSource::load(&path) {
+        Ok(source) => source,
+        Err(error) => panic!("a v1 version in the standalone history must load: {error}"),
     };
-    assert_eq!(error.code(), "source_document_unparseable", "{error}");
+    assert_eq!(source.policy.schema_version, "0.1.0");
     assert!(
-        error.to_string().contains("policy history"),
-        "the refusal names the history, not the live policy: {error}"
+        source.writes_policy_document_v1(),
+        "a v1 version in the history is written to the cluster too"
     );
     let _ = std::fs::remove_dir_all(&directory);
 }
@@ -847,7 +867,7 @@ mod database {
                     expected_overlay_revision: 0,
                 }),
                 1,
-                "fixture-operator",
+                &crate::auth::change_actor::ChangeActor::for_test("fixture-operator"),
                 &[],
             )
             .expect("the OpenAPI catalog and overlay should publish atomically");
@@ -1448,6 +1468,215 @@ mod database {
             None,
             "the refused apply did not even bind the database"
         );
+    }
+
+    /// Issue #243: a standalone deployment on policy v1 imports into
+    /// cluster mode, and only while no live replica of the target is a
+    /// build that cannot read format 1. Such a replica -- one that
+    /// advertises document formats `0..=0` and not `policy_document_v1` --
+    /// refuses a dry run and an apply with `target_operation_refused` and
+    /// the gate's reason, and nothing authoritative is written. Once it has
+    /// left, the apply imports the v1 document and the cluster's own reader
+    /// serves it under v1.
+    #[tokio::test]
+    async fn a_policy_v1_import_waits_for_every_live_member_to_read_it() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let deployment = "deploy-import-v1";
+        let (config, _dsn_file) = target_config(&database.dsn, deployment);
+        let pool = migrate(&config).await;
+        let fixture = build_fixture("policy-v1", 1, 0);
+        let v1 = json!({
+            "schema_version": "1.0.0",
+            "id": "live-v1",
+            "default_action": "deny",
+            "roles": { "admin": { "permissions": ["data:read", "policy:write"] } },
+            "rules": [{ "id": "deny-admin", "path": "/admin/**", "action": "deny" }]
+        });
+        std::fs::write(
+            fixture.directory.join("policy.json"),
+            serde_json::to_vec_pretty(&v1).expect("the v1 policy should serialize"),
+        )
+        .expect("the v1 policy file should write");
+
+        // A live replica of the build before this one: the schema, the
+        // protocol and role descriptions, but document formats 0..=0.
+        let (schema_min, schema_max) = migrations::schema_version_range();
+        let older = uuid::Uuid::new_v4();
+        pool.get()
+            .await
+            .expect("checkout")
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint,
+                      capabilities)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, 'older', $4, $5, 0, 0,
+                         repeat('a', 64), 'operation_requirements,policy_role_descriptions')",
+                &[
+                    &deployment,
+                    &older.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    &schema_min,
+                    &schema_max,
+                ],
+            )
+            .await
+            .expect("an older member row inserts");
+
+        for mode in [ImportMode::DryRun, ImportMode::Apply] {
+            let Err(refused) = run(&request(&fixture, mode), &config).await else {
+                panic!("{mode:?}: a live member that cannot read v1 must refuse the import");
+            };
+            assert_eq!(refused.code(), "target_operation_refused", "{mode:?}");
+            let rendered = refused.to_string();
+            assert!(
+                rendered.contains("policy.document_v1")
+                    && rendered.contains("capability_not_advertised"),
+                "{mode:?}: the refusal names the operation and the reason: {rendered}"
+            );
+            assert!(
+                !rendered.contains(&older.to_string()),
+                "{mode:?}: the refusal names no member: {rendered}"
+            );
+        }
+        assert_eq!(
+            count_of(&pool, "SELECT count(*) FROM greengateway.policy_documents").await,
+            0,
+            "nothing was imported"
+        );
+
+        // The older replica stopped and its row was swept: the import runs.
+        execute(
+            &pool,
+            &format!(
+                "DELETE FROM greengateway.cluster_members WHERE instance_id = '{older}'::uuid"
+            ),
+        )
+        .await;
+        let report = match run(&request(&fixture, ImportMode::Apply), &config).await {
+            Ok(report) => report,
+            Err(error) => {
+                panic!("the v1 import should apply once no lacking member is live: {error}")
+            }
+        };
+        assert_eq!(report.validation.status, "verified");
+        let active = PolicyControlPlane::active(&PostgresPolicyStore::new(pool.clone()))
+            .await
+            .expect("the cluster reads the imported policy")
+            .expect("the import activated a policy");
+        assert_eq!(active.policy.schema_version, "1.0.0");
+        assert_eq!(active.policy.rules[0].id.as_deref(), Some("deny-admin"));
+    }
+
+    /// Issue #243: a standalone policy v1 document whose rules carry
+    /// conditions imports into cluster mode only while every live replica
+    /// of the target enforces them. A replica of the build that serves v1
+    /// but refuses every rule condition -- document formats `0..=1` and
+    /// `policy_document_v1`, but not `policy_rule_conditions` -- refuses a
+    /// dry run and an apply with `target_operation_refused` naming
+    /// `policy.rule_conditions`, and nothing authoritative is written. Once
+    /// it has left, the apply imports the document with its conditions.
+    #[tokio::test]
+    async fn a_policy_v1_import_with_rule_conditions_waits_for_every_live_member_to_enforce_them() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let deployment = "deploy-import-v1-conditions";
+        let (config, _dsn_file) = target_config(&database.dsn, deployment);
+        let pool = migrate(&config).await;
+        let fixture = build_fixture("policy-v1-conditions", 1, 0);
+        let conditioned = json!({
+            "schema_version": "1.0.0",
+            "id": "live-v1-conditions",
+            "default_action": "deny",
+            "roles": { "admin": { "permissions": ["data:read", "policy:write"] } },
+            "rules": [{
+                "id": "internal-only",
+                "path": "/internal/**",
+                "action": "allow",
+                "conditions": { "source_network": { "cidrs": ["10.0.0.0/8"] } }
+            }]
+        });
+        std::fs::write(
+            fixture.directory.join("policy.json"),
+            serde_json::to_vec_pretty(&conditioned).expect("the v1 policy should serialize"),
+        )
+        .expect("the v1 policy file should write");
+
+        let (schema_min, schema_max) = migrations::schema_version_range();
+        let older = uuid::Uuid::new_v4();
+        pool.get()
+            .await
+            .expect("checkout")
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint,
+                      capabilities)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, 'older', $4, $5, 0, 1,
+                         repeat('a', 64),
+                         'operation_requirements,policy_document_v1,policy_role_descriptions')",
+                &[
+                    &deployment,
+                    &older.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    &schema_min,
+                    &schema_max,
+                ],
+            )
+            .await
+            .expect("an older member row inserts");
+
+        for mode in [ImportMode::DryRun, ImportMode::Apply] {
+            let Err(refused) = run(&request(&fixture, mode), &config).await else {
+                panic!("{mode:?}: a live member that refuses conditions must refuse the import");
+            };
+            assert_eq!(refused.code(), "target_operation_refused", "{mode:?}");
+            let rendered = refused.to_string();
+            assert!(
+                rendered.contains("policy.rule_conditions")
+                    && rendered.contains("capability_not_advertised"),
+                "{mode:?}: the refusal names the operation and the reason: {rendered}"
+            );
+            assert!(
+                !rendered.contains(&older.to_string()),
+                "{mode:?}: the refusal names no member: {rendered}"
+            );
+        }
+        assert_eq!(
+            count_of(&pool, "SELECT count(*) FROM greengateway.policy_documents").await,
+            0,
+            "nothing was imported"
+        );
+
+        execute(
+            &pool,
+            &format!(
+                "DELETE FROM greengateway.cluster_members WHERE instance_id = '{older}'::uuid"
+            ),
+        )
+        .await;
+        let report = match run(&request(&fixture, ImportMode::Apply), &config).await {
+            Ok(report) => report,
+            Err(error) => {
+                panic!("the import should apply once no lacking member is live: {error}")
+            }
+        };
+        assert_eq!(report.validation.status, "verified");
+        let active = PolicyControlPlane::active(&PostgresPolicyStore::new(pool.clone()))
+            .await
+            .expect("the cluster reads the imported policy")
+            .expect("the import activated a policy");
+        assert_eq!(active.policy.rules[0].id.as_deref(), Some("internal-only"));
+        assert!(active.policy.rules[0].conditions.is_some());
     }
 
     /// The namespace-empty refusal, falsified: a single row in ONE

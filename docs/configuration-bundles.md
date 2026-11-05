@@ -358,9 +358,9 @@ reopened. Specifically:
   and the gateway must not read the same bytes differently.
 
 Bundles are directories only. There is no archive form of a bundle, so no
-archive reader sits in the configuration path; the backup archive (a later #242
-slice) has its own reader, which must apply the
-[archive entry admission rules](archive-admission.md).
+archive reader sits in the configuration path; the
+[standalone backup](standalone-backup.md) archive has its own reader, which
+applies the [archive entry admission rules](archive-admission.md).
 
 ## The YAML subset
 
@@ -452,8 +452,9 @@ will refuse the variable. No gateway reads `GATEWAY_STATE_DIR` yet, and in
 environment mode every store stays where its variable puts it. The layout, the
 admission rules and the lock are the shared `gateway-config` library's
 `state_dir` module, which the gateway and `ggctl` both use. Today the revision
-ledger, and the `ggctl ledger` commands over it, are the only things that open
-through it.
+ledger, the `ggctl ledger` commands over it, and `ggctl backup create` and
+`ggctl backup restore` ([standalone backups](standalone-backup.md)) are the only
+things that open through it.
 
 | File | Store | Environment-mode variable |
 | --- | --- | --- |
@@ -465,6 +466,7 @@ through it.
 | `policy-history.sqlite3` | Policy publication history | `POLICY_HISTORY_SQLITE_PATH` |
 | `config-ledger.sqlite3` | The [configuration revision ledger](configuration-ledger.md) | none |
 | `state.lock` | The directory's lock file | none |
+| `restore-marker.json` | The [restore marker](standalone-backup.md#the-restore-marker) `ggctl backup restore` leaves for the next gateway start, which records it and removes it | none |
 
 SQLite keeps `-wal`, `-shm` and `-journal` files beside each store; they belong
 to it. A test holds this table to the field catalog: every store the catalog

@@ -26,8 +26,9 @@
 //! strictness, not behaviour -- and two members a 0.x document cannot carry:
 //! `identity_mappings` and rule `conditions` (`super::identity_mappings`,
 //! `super::conditions`). This build validates both and the kernel evaluates
-//! both, but no serving path enforces them yet, so a document that uses
-//! either is refused with every check but that one reported first.
+//! both. The serving lanes enforce identity mappings and every condition
+//! leaf but `tool_argument`, so a document whose conditions use that leaf is
+//! refused, with every check but that one reported first.
 //!
 //! ## Diagnostics
 //!
@@ -117,7 +118,7 @@ impl PolicySchema {
     }
 
     /// The document format major the cluster roster advertises a range of
-    /// (`cluster_membership::DOCUMENT_VERSION_RANGE`).
+    /// (`cluster_membership::DOCUMENT_VERSION_RANGE`, `0..=1` in this build).
     #[cfg(any(test, feature = "postgres"))]
     pub(crate) const fn document_format_major(self) -> i32 {
         match self {
@@ -415,7 +416,8 @@ impl IssueCode {
                  configuration"
             }
             Self::DocumentFormatUnsupportedInCluster => {
-                "cluster mode does not yet commit documents of this schema_version"
+                "not every live replica of this cluster can be shown to read documents of this \
+                 schema_version, so cluster mode does not commit one yet"
             }
             Self::PolicyFileTooLarge => {
                 "the policy as a policy file holds it would be larger than a policy file may be"
@@ -498,8 +500,8 @@ impl IssueCode {
                 "the time window is empty or unordered, or not written as RFC 3339 UTC instants"
             }
             Self::TypedMatchersNotEnforced => {
-                "this gateway validates rule conditions but does not yet enforce them, so it \
-                 accepts no document whose rules carry them"
+                "this gateway validates tool_argument conditions but does not yet enforce them, \
+                 so it accepts no document whose rule conditions read a tool argument"
             }
         }
     }
@@ -601,8 +603,8 @@ impl IssueCode {
                  current UPSTREAM_ROUTES."
             }
             Self::DocumentFormatUnsupportedInCluster => {
-                "Keep a cluster deployment on a 0.x document until a release that gates v1 \
-                 documents on every replica's capability."
+                "Finish the rollout so every replica runs a release that serves this document \
+                 format, or wait for departed replicas to go stale, then publish again."
             }
             Self::PolicyFileTooLarge => {
                 "Keep the pretty-printed document, as the gateway writes a policy file, within \
@@ -655,8 +657,9 @@ impl IssueCode {
                  window includes from and excludes until."
             }
             Self::TypedMatchersNotEnforced => {
-                "Remove every rule's conditions before publishing; this release only validates \
-                 them. Identity mappings are enforced and may stay."
+                "Remove every tool_argument condition before publishing; this release only \
+                 validates them. Identity mappings and the other conditions are enforced and \
+                 may stay."
             }
             Self::PolicyWriteUnreachable => {
                 "Keep at least one role that grants admin:policy:write, or \"*\", to the \
@@ -1205,36 +1208,39 @@ pub(crate) fn parse_v1_source(source: &[u8], document: &Value) -> Result<Policy,
 /// Structural problems are all reported; semantic validation stops at the
 /// first, as it does for v0.
 ///
-/// A document whose rules carry conditions is refused last, after every
-/// other check has passed, with [`IssueCode::TypedMatchersNotEnforced`]: the
-/// kernel evaluates them, but no serving adapter yet captures the request
-/// facts they read. Refusing them here refuses them on every path a policy is
-/// accepted by -- startup, reload, replacement, drafts, simulations, test
-/// runs and bundles -- since each reads a v1 document through this function.
-/// Identity mappings are served, so they are accepted: every serving lane
-/// resolves internal roles through them from the organization authentication
-/// verified (`CompiledPolicy::serving_facts`).
+/// A document whose rule conditions read a tool argument is refused last,
+/// after every other check has passed, with
+/// [`IssueCode::TypedMatchersNotEnforced`]: the kernel evaluates such a leaf,
+/// but tool admission decides before the call's arguments are validated, so
+/// no serving lane captures the fact it reads. Refusing it here refuses it on
+/// every path a policy is accepted by -- startup, reload, replacement,
+/// drafts, simulations, test runs and bundles -- since each reads a v1
+/// document through this function. Identity mappings and every other
+/// condition leaf are served, so they are accepted: each serving lane
+/// captures the facts they read (`middleware::policy_facts`).
 pub(crate) fn parse_v1(document: &Value) -> Result<Policy, Vec<PolicyIssue>> {
     let policy = parse_v1_document(document)?;
     refuse_unenforced_matchers(&policy).map_err(|issue| vec![issue])?;
     Ok(policy)
 }
 
-/// [`parse_v1`] without its refusal of the rule conditions this build does
-/// not enforce, for the tests that evaluate them.
+/// [`parse_v1`] without its refusal of the tool-argument conditions this
+/// build does not enforce, for the tests that evaluate them.
 #[cfg(test)]
 pub(crate) fn parse_v1_with_typed_matchers(document: &Value) -> Result<Policy, Vec<PolicyIssue>> {
     parse_v1_document(document)
 }
 
-/// The refusal [`parse_v1`] applies last: at the first rule's conditions.
-/// Identity mappings are not refused; the serving lanes enforce them.
+/// The refusal [`parse_v1`] applies last: at the conditions of the first
+/// rule whose tree reads a tool argument anywhere, under any combinator.
+/// Identity mappings and the other leaves are not refused; the serving lanes
+/// enforce them.
 fn refuse_unenforced_matchers(policy: &Policy) -> Result<(), PolicyIssue> {
-    match policy
-        .rules
-        .iter()
-        .position(|rule| rule.conditions.is_some())
-    {
+    match policy.rules.iter().position(|rule| {
+        rule.conditions
+            .as_ref()
+            .is_some_and(super::conditions::Condition::reads_tool_arguments)
+    }) {
         Some(index) => Err(PolicyIssue::located(
             IssueCode::TypedMatchersNotEnforced,
             format!("/rules/{index}/conditions"),
