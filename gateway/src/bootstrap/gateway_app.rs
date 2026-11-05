@@ -303,7 +303,7 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
             .transpose()?
             .map(|store| Arc::new(store) as Arc<dyn storage::PolicyDraftStore>);
     // The stored policy test suite (issue #243) lives beside the policy
-    // history the same way: migration 28's tables in cluster mode, and a
+    // history the same way: migration 29's tables in cluster mode, and a
     // `policy_test_suite_versions` table in the history database standalone.
     // A database that cannot be opened fails startup.
     #[cfg(feature = "postgres")]

@@ -1,6 +1,6 @@
 //! PostgreSQL stored policy test suite (issue #243).
 //!
-//! Implements [`PolicyTestSuiteStore`] against migration 28's
+//! Implements [`PolicyTestSuiteStore`] against migration 29's
 //! `policy_test_suite_versions` and `policy_test_suite_active`, so every
 //! replica of a cluster reads and replaces one suite. A write is the shared
 //! versioned-document transaction ([`postgres_documents::commit_in`]), the one

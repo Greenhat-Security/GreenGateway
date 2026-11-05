@@ -31,7 +31,7 @@
 //!   so `AUTHORITY_EVIDENCE_DURABILITY=required` refuses it there; cluster mode
 //!   commits it with its `document_change_evidence` row.
 //! - **Nothing in the browser.** The suite lives in the policy history
-//!   database standalone and in migration 28's tables in cluster mode, never
+//!   database standalone and in migration 29's tables in cluster mode, never
 //!   in client storage.
 use super::*;
 

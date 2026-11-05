@@ -243,7 +243,7 @@ If-Match: "sha256:..."            (replacing the stored one)
   `<POLICY_FILE>.history.sqlite` default): the newest row is the stored suite,
   and a write is one SQLite transaction that re-checks the precondition and
   appends, so a crash leaves the old version or the new one. In cluster mode,
-  in PostgreSQL migration 28's `greengateway.policy_test_suite_versions` and
+  in PostgreSQL migration 29's `greengateway.policy_test_suite_versions` and
   `greengateway.policy_test_suite_active`, committed through the same
   versioned-document transaction as the policy, as a resource of its own (see
   [the policy control plane](deployment/postgres.md#the-policy-control-plane)).

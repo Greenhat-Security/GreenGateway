@@ -22,9 +22,9 @@ use crate::storage::{
 };
 
 const MIGRATION_23: &str = include_str!("migrations/0023_document_and_catalog_change_evidence.sql");
-/// Migration 28 replaces migration 23's `action` and `resource_type` CHECKs,
+/// Migration 29 replaces migration 23's `action` and `resource_type` CHECKs,
 /// so the vocabulary in force is the one it adds.
-const MIGRATION_28: &str = include_str!("migrations/0028_policy_test_suites.sql");
+const MIGRATION_29: &str = include_str!("migrations/0029_policy_test_suites.sql");
 
 const ALL_ACTIONS: [DocumentAction; 10] = [
     DocumentAction::PolicyPublish,
@@ -50,14 +50,14 @@ fn document_check_values(column: &str) -> BTreeSet<String> {
     quoted_values(table, column, "migration 23")
 }
 
-/// The quoted values of the replacement CHECK on `column` that migration 28
+/// The quoted values of the replacement CHECK on `column` that migration 29
 /// adds to `document_change_evidence`.
 fn widened_check_values(column: &str) -> BTreeSet<String> {
-    let alter = MIGRATION_28
+    let alter = MIGRATION_29
         .split("ALTER TABLE greengateway.document_change_evidence")
         .nth(1)
-        .expect("migration 28 alters document_change_evidence");
-    quoted_values(alter, column, "migration 28")
+        .expect("migration 29 alters document_change_evidence");
+    quoted_values(alter, column, "migration 29")
 }
 
 fn quoted_values(sql: &str, column: &str, migration: &str) -> BTreeSet<String> {

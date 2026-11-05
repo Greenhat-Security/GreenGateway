@@ -418,7 +418,7 @@ impl Code {
             Self::CaFileNotRegularFile => ("trust.ca_file_not_regular_file", "the CA file is not a regular file", Usage),
             Self::CaFileUnsafePermissions => (
                 "trust.ca_file_unsafe_permissions",
-                "the CA file, or a directory holding it, is writable by group or other",
+                "the CA file, a directory above it or a link on its path is owned by an account other than root and this one, or is writable by group or other",
                 Usage,
             ),
             Self::CaFileTooLarge => ("trust.ca_file_too_large", "the CA file is larger than 1 MiB", Usage),
@@ -513,7 +513,7 @@ impl Code {
             Self::AnswersNotRegularFile => ("init.answers_not_regular_file", "the answers file is not a regular file", Usage),
             Self::AnswersUnsafePermissions => (
                 "init.answers_unsafe_permissions",
-                "the answers file, or a directory holding it, is writable by group or other",
+                "the answers file, a directory above it or a link on its path is owned by an account other than root and this one, or is writable by group or other",
                 Usage,
             ),
             Self::AnswersTooLarge => ("init.answers_too_large", "the answers file is larger than 64 KiB", Invalid),

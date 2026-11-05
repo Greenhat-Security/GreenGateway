@@ -244,6 +244,17 @@ fn an_answers_file_that_cannot_be_used_is_refused_with_its_own_code() {
         fs::write(&writable, OPERATOR_ANSWERS).expect("answers write");
         fs::set_permissions(&writable, fs::Permissions::from_mode(0o666)).expect("mode");
         cases.push((writable, Code::AnswersUnsafePermissions, Exit::Usage));
+        // Whoever can write a directory above the one holding the answers
+        // can swap that directory for one of their own.
+        let open = parent.root.join("open");
+        let inner = open.join("inner");
+        fs::create_dir_all(&inner).expect("directories");
+        fs::set_permissions(&inner, fs::Permissions::from_mode(0o755)).expect("mode");
+        let below = inner.join("answers.yaml");
+        fs::write(&below, OPERATOR_ANSWERS).expect("answers write");
+        fs::set_permissions(&below, fs::Permissions::from_mode(0o644)).expect("mode");
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).expect("mode");
+        cases.push((below, Code::AnswersUnsafePermissions, Exit::Usage));
     }
     for (path, code, expected) in cases {
         let (exit, captured) = run(&[
