@@ -14,7 +14,7 @@ fn env_example_matches_gateway_env_reads() {
         .expect("gateway crate should live directly under the repo root");
 
     let documented = documented_env_vars(&repo_root.join(".env.example"));
-    let code_reads = code_env_vars(&gateway_root.join("src"));
+    let code_reads = gateway_env_reads(&gateway_root);
 
     let missing_from_example: Vec<_> = code_reads.difference(&documented).cloned().collect();
     let missing_from_code: Vec<_> = documented.difference(&code_reads).cloned().collect();
@@ -22,8 +22,8 @@ fn env_example_matches_gateway_env_reads() {
     assert!(
         missing_from_example.is_empty() && missing_from_code.is_empty(),
         ".env.example drift detected.\n\
-         Read in gateway/src but missing from .env.example: {}\n\
-         Documented in .env.example but not read in gateway/src: {}",
+         Read in gateway/src or the gateway-config compiler but missing from .env.example: {}\n\
+         Documented in .env.example but not read in gateway/src or the gateway-config compiler: {}",
         format_vars(&missing_from_example),
         format_vars(&missing_from_code)
     );
@@ -68,7 +68,7 @@ fn env_example_exempt_paths_are_not_hardcoded() {
 /// `RBAC_EXEMPT_PATHS` value replaces the whole default must also disclose the
 /// admin authentication routes the code appends anyway.
 ///
-/// `append_admin_login_exempt_paths` in gateway/src/config.rs runs
+/// `append_admin_login_exempt_paths` in gateway-config/src/compiler.rs runs
 /// unconditionally after the parse whenever `ADMIN_LOGIN_PROVIDER` is set, so
 /// `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` stay
 /// exempt even for an operator who supplied an explicit list. Enabling either
@@ -120,7 +120,7 @@ fn exempt_path_replacement_claims_disclose_the_forced_admin_auth_routes() {
                 "{} claims {claim:?} without disclosing that \
                  /v1{{ADMIN_PREFIX}}/auth/login and /v1{{ADMIN_PREFIX}}/auth/callback stay exempt \
                  while ADMIN_LOGIN_PROVIDER is set. Say so with the phrase {DISCLOSURE:?} or change \
-                 append_admin_login_exempt_paths in gateway/src/config.rs to match the claim.\n\n{block}",
+                 append_admin_login_exempt_paths in gateway-config/src/compiler.rs to match the claim.\n\n{block}",
                 path.display()
             );
             for route in ["login", "callback", "config", "logout"] {
@@ -158,7 +158,7 @@ fn configuration_doc_matches_gateway_env_reads() {
         .expect("gateway crate should live directly under the repo root");
 
     let documented = configuration_doc_env_vars(&repo_root.join("docs/configuration.md"));
-    let code_reads = code_env_vars(&gateway_root.join("src"));
+    let code_reads = gateway_env_reads(&gateway_root);
 
     let missing_from_doc: Vec<_> = code_reads.difference(&documented).cloned().collect();
     let missing_from_code: Vec<_> = documented.difference(&code_reads).cloned().collect();
@@ -166,8 +166,8 @@ fn configuration_doc_matches_gateway_env_reads() {
     assert!(
         missing_from_doc.is_empty() && missing_from_code.is_empty(),
         "docs/configuration.md drift detected.\n\
-         Read in gateway/src but missing from docs/configuration.md: {}\n\
-         Documented in docs/configuration.md but not read in gateway/src: {}",
+         Read in gateway/src or the gateway-config compiler but missing from docs/configuration.md: {}\n\
+         Documented in docs/configuration.md but not read in gateway/src or the gateway-config compiler: {}",
         format_vars(&missing_from_doc),
         format_vars(&missing_from_code)
     );
@@ -175,8 +175,9 @@ fn configuration_doc_matches_gateway_env_reads() {
 
 /// The field catalog (`gateway_config::catalog`) names every setting the
 /// gateway's configuration compiler reads; the source scan below finds every
-/// variable `gateway/src` reads by name. They are the same set, so nothing the
-/// gateway reads escapes the catalog's checks.
+/// variable `gateway/src` and the compiler in `gateway-config/src` read by
+/// name. They are the same set, so nothing the gateway reads escapes the
+/// catalog's checks.
 #[test]
 fn field_catalog_matches_gateway_env_reads() {
     let gateway_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -185,7 +186,7 @@ fn field_catalog_matches_gateway_env_reads() {
         .iter()
         .map(|field| field.environment.to_owned())
         .collect();
-    let code_reads = code_env_vars(&gateway_root.join("src"));
+    let code_reads = gateway_env_reads(&gateway_root);
 
     let missing_from_catalog: Vec<_> = code_reads.difference(&catalog).cloned().collect();
     let missing_from_code: Vec<_> = catalog.difference(&code_reads).cloned().collect();
@@ -193,8 +194,8 @@ fn field_catalog_matches_gateway_env_reads() {
     assert!(
         missing_from_catalog.is_empty() && missing_from_code.is_empty(),
         "field catalog drift detected.\n\
-         Read in gateway/src but missing from gateway-config's catalog: {}\n\
-         In the catalog but not read in gateway/src: {}",
+         Read in gateway/src or the gateway-config compiler but missing from gateway-config's catalog: {}\n\
+         In the catalog but not read in gateway/src or the gateway-config compiler: {}",
         format_vars(&missing_from_catalog),
         format_vars(&missing_from_code)
     );
@@ -337,9 +338,24 @@ fn cloudflare_forwarded_env_vars(path: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-fn code_env_vars(src_dir: &Path) -> BTreeSet<String> {
-    let mut files = Vec::new();
-    collect_rs_files(src_dir, &mut files);
+/// The variables the gateway reads by name: in its own source, and in the
+/// configuration compiler it links from `gateway-config` (issue #242), which
+/// reads every configuration input through the reader the gateway hands it.
+/// The rest of `gateway-config` reads no environment variable, and its
+/// bundle file names (`POLICY_FILE` is `policy.json` there) would make the
+/// compiler's names of the same spelling ambiguous to the walk.
+fn gateway_env_reads(gateway_root: &Path) -> BTreeSet<String> {
+    let repo_root = gateway_root
+        .parent()
+        .expect("gateway crate should live directly under the repo root");
+    let compiler = repo_root.join("gateway-config/src/compiler");
+    let mut files = vec![compiler.with_extension("rs")];
+    collect_rs_files(&gateway_root.join("src"), &mut files);
+    collect_rs_files(&compiler, &mut files);
+    code_env_vars(files)
+}
+
+fn code_env_vars(mut files: Vec<PathBuf>) -> BTreeSet<String> {
     files.sort();
 
     let sources: Vec<(PathBuf, String)> = files
@@ -354,7 +370,8 @@ fn code_env_vars(src_dir: &Path) -> BTreeSet<String> {
     env_vars_in_sources(&sources)
 }
 
-/// Resolve the variable name behind every environment read in `gateway/src`.
+/// Resolve the variable name behind every environment read in the scanned
+/// sources (`gateway/src` and the compiler in `gateway-config/src`).
 ///
 /// The drift tests above are only worth their assertions if this walk sees
 /// every read, so it does two things a narrower scan would not. A name that the
@@ -368,7 +385,7 @@ fn code_env_vars(src_dir: &Path) -> BTreeSet<String> {
 ///
 /// The walk does not track modules, so `a::KEY` and `b::KEY` are the same name
 /// to it. That only costs precision when the reading file declares the name
-/// itself and means a different one, which no module in `gateway/src` does.
+/// itself and means a different one, which no scanned module does.
 fn env_vars_in_sources(sources: &[(PathBuf, String)]) -> BTreeSet<String> {
     let crate_consts = crate_string_consts(sources);
     let mut vars = BTreeSet::new();
@@ -390,7 +407,7 @@ fn env_vars_in_sources(sources: &[(PathBuf, String)]) -> BTreeSet<String> {
                     let value = resolved.unwrap_or_else(|| {
                         panic!(
                             "{} reads the environment as `{name}`, which does not resolve to a \
-                             single `&str` constant anywhere in gateway/src. Name the variable \
+                             single `&str` constant anywhere in the scanned sources. Name the variable \
                              with a string literal or one unambiguous `&str` constant so it \
                              cannot be omitted from .env.example, docs/configuration.md, or \
                              the Cloudflare forwarding list.",

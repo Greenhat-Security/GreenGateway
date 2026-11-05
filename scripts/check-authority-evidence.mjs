@@ -170,6 +170,11 @@ export function validateEvent(event) {
 // `not_refused` is the activation that starts the gateway.
 const REQUIRED_MODES = new Set(["admitted", "refused", "refused_at_startup", "unavailable", "outside_gateway", "not_refused"]);
 
+// The gateway's source, and the configuration compiler it links from the
+// shared gateway-config library (issue #242), which refuses the settings the
+// evidence rows anchor on.
+const SOURCE_ROOTS = ["gateway/src/", "gateway-config/src/"];
+
 export function validateInventory(inventory, readSource = (path) => readFileSync(resolve(ROOT, path), "utf8")) {
   check(inventory.version === 1 && inventory.issue === 425, "unknown inventory contract");
   check(/^[0-9a-f]{40}$/.test(inventory.reviewed_revision), "missing reviewed revision");
@@ -191,7 +196,7 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
   };
   const reference = (ref) => {
     check(ref && typeof ref.path === "string" && typeof ref.anchor === "string" && ref.anchor.length >= 8, "incomplete source anchor");
-    check(ref.path.startsWith("gateway/src/"), "evidence must reference runtime or regression source");
+    check(SOURCE_ROOTS.some((root) => ref.path.startsWith(root)), "evidence must reference runtime or regression source");
     check(source(ref.path).includes(ref.anchor), `stale source anchor: ${ref.path} :: ${ref.anchor}`);
     references += 1;
   };

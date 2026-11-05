@@ -42,9 +42,9 @@ const INVALID_TOKEN: &str = "invalid or expired token";
 /// a demand refresh is allowed again.
 const MIN_JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(MIN_JWKS_KEY_AGE_SECS_LIMIT);
 
-// The key age bounds the configuration compiler holds `JWT_JWKS_MAX_KEY_AGE_SECS`
-// to, shared with `ggctl` (issue #242).
-pub(crate) use gateway_config::auth::{MAX_JWKS_KEY_AGE_SECS_LIMIT, MIN_JWKS_KEY_AGE_SECS_LIMIT};
+// The lower of the key age bounds the configuration compiler holds
+// `JWT_JWKS_MAX_KEY_AGE_SECS` to, shared with `ggctl` (issue #242).
+pub(crate) use gateway_config::auth::MIN_JWKS_KEY_AGE_SECS_LIMIT;
 
 /// The `exp` leeway the validator grants (jsonwebtoken's default, made
 /// explicit): a token is accepted until `exp + leeway`, so a revocation
@@ -73,8 +73,8 @@ pub struct JwtAuthConfig {
     /// not trusted at all: a request then refreshes first or fails closed.
     /// Operator-configured (`JWT_JWKS_MAX_KEY_AGE_SECS` / a provider's
     /// `jwks_max_key_age_secs`), bounded above by
-    /// [`MAX_JWKS_KEY_AGE_SECS_LIMIT`], and part of the static configuration
-    /// fingerprint replicas must agree on.
+    /// [`gateway_config::auth::MAX_JWKS_KEY_AGE_SECS_LIMIT`], and part of the
+    /// static configuration fingerprint replicas must agree on.
     pub jwks_max_key_age: Duration,
     /// Reject tokens without a non-empty `jti` claim.
     pub require_jti: bool,

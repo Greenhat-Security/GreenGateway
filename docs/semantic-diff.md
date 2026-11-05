@@ -10,10 +10,11 @@ read with its production validators, and the standalone ledger's plans
 ([configuration-ledger.md](configuration-ledger.md#plans-and-conditional-apply))
 diff a candidate against the head this way and require every risk code to be
 acknowledged before an apply. Nothing serves or logs those comparisons yet:
-the admin routes are a later #242 slice, and `ggctl diff --env`,
-`--against-env` and `--server` need the environment compiler and those
-routes. Nothing here
-changes how a gateway is configured, started or reloaded.
+the admin routes are a later #242 slice. `ggctl diff --env` and
+`--against-env` need an environment-file front end over the compiler, which
+`ggctl` can now link (`gateway_config::compiler`), and `--server` needs those
+routes. Nothing here changes how a gateway is configured, started or
+reloaded.
 
 ## What it compares
 
@@ -23,7 +24,7 @@ a default never register:
 
 | Input | Compared as | Field identifiers |
 | --- | --- | --- |
-| Two environment configurations | the configuration compiler's validated plan (`gateway/src/config/plan.rs`), setting by setting | the environment variable name, for example `EGRESS_ALLOWED_HOSTS` |
+| Two environment configurations | the configuration compiler's validated plan (`gateway-config/src/compiler/plan.rs`), setting by setting | the environment variable name, for example `EGRESS_ALLOWED_HOSTS` |
 | Two [configuration bundles](configuration-bundles.md) | what the shared bundle reader accepted: the manifest, the deployment document, and the policy and tools documents, as written and checked against their published schemas (`ggctl diff`) or in the form the gateway's production validators produce (the gateway) | a dotted document path, for example `policy.egress.hosts` or `resources.policy.sha256` |
 
 Every compiler input is compared exactly once: the environment adapter
@@ -128,9 +129,9 @@ route and direct-rule edits are `unknown`; a route switched to
 `enforcement_mode: shadow` is also `risk.shadow_enabled`. An unset upstream
 timeout is compared as the egress timeout it inherits.
 
-The authoritative tables are `SETTINGS` in `gateway/src/config/semantic_diff.rs`
-for the environment and `gateway-config/src/semantic_diff/resources.rs` for
-bundles and documents.
+The authoritative tables are `SETTINGS` in
+`gateway-config/src/compiler/semantic_diff.rs` for the environment and
+`gateway-config/src/semantic_diff/resources.rs` for bundles and documents.
 
 ## Risk codes
 

@@ -75,7 +75,6 @@ const VAULT_PROVIDER_LABEL: &str = "vault_kv_v2";
 // the configuration compiler (issue #242).
 pub(crate) use gateway_config::connections::vault_secret::{
     validate_vault_provider_config, VaultAuthConfig, VaultProviderConfig, VaultProviderConfigError,
-    MAX_VAULT_PROVIDER_CONFIG_BYTES,
 };
 // The parts of the document only tests assemble by hand.
 #[cfg(test)]

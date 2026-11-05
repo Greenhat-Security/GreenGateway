@@ -39,10 +39,10 @@ pub const BASELINE_AUDIT_UNAVAILABLE_REASON: &str =
     "baseline role suggestions require AUDIT_SQLITE_PATH because role claims are only stored in audit history";
 // The baseline window the configuration compiler reads, shared with `ggctl`
 // (issue #242).
-pub(crate) use gateway_config::discovery::{
-    RuleSuggestionConfig, DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
-    MAX_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
-};
+pub(crate) use gateway_config::discovery::RuleSuggestionConfig;
+// Its default, which only tests name now that the compiler applies it.
+#[cfg(test)]
+pub(crate) use gateway_config::discovery::DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS;
 
 const MCP_TOOL_OBSERVATION_METHOD: &str = "MCP";
 const MCP_TOOL_OBSERVATION_PATH_PREFIX: &str = "/mcp/tools/";

@@ -132,7 +132,7 @@ pub struct SecretAliasMetadata {
 // configuration compiler (issue #242).
 pub(crate) use gateway_config::connections::secret::{
     validate_operator_secret_alias_config, OperatorSecretAliasConfig, OperatorSecretAliasSource,
-    SecretProviderConfigError, SecretRootConfig, MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES,
+    SecretProviderConfigError, SecretRootConfig,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

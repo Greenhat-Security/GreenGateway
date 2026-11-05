@@ -345,7 +345,7 @@ class ArithmeticTests(unittest.TestCase):
         self.assertIn("name the server's limits", err)
 
     def test_pool_sizes_match_the_gateway_configuration(self):
-        config = (ROOT / "gateway/src/config.rs").read_text(encoding="utf-8")
+        config = (ROOT / "gateway-config/src/compiler.rs").read_text(encoding="utf-8")
         self.assertIn(f"pub const DEFAULT_DATABASE_POOL_MAX: usize = {sizing.DEFAULT_POOL_MAX};", config)
         self.assertIn(f"pub const MAX_DATABASE_POOL_MAX: usize = {sizing.MAX_POOL_MAX};", config)
 
