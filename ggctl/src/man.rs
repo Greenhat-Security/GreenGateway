@@ -1,15 +1,16 @@
 //! Manual pages, generated from the command table.
 //!
-//! `ggctl help --man` writes ggctl(1) and `ggctl help --man COMMAND` writes
-//! ggctl-COMMAND(1), in man(7) roff. A page says what `ggctl help` says, from
-//! the same table and the same text, so the two cannot drift; the tests hold
-//! every page to its help. A page names no date, path or platform, so every
-//! build of one version writes the same bytes, which keeps the release
-//! archives that install them under `man/man1` reproducible
-//! (`scripts/ggctl_release.py`).
+//! `ggctl help --man` writes ggctl(1), `ggctl help --man COMMAND` writes
+//! ggctl-COMMAND(1) for a command or a command family, and `ggctl help --man
+//! FAMILY COMMAND` writes ggctl-FAMILY-COMMAND(1), in man(7) roff. A page
+//! says what `ggctl help` says for the same topic, from the same table and
+//! the same text, so the two cannot drift; the tests hold every page to its
+//! help. A page names no date, path or platform, so every build of one
+//! version writes the same bytes, which keeps the release archives that carry
+//! them under `man/man1` reproducible (`scripts/ggctl_release.py`).
 
 use crate::{
-    cli::{CommandSpec, COMMANDS},
+    cli::{CommandSpec, FamilySpec, HelpTopic, COMMANDS},
     diagnostic::Exit,
     help,
 };
@@ -18,12 +19,23 @@ use crate::{
 const SOURCE: &str = concat!("ggctl ", env!("CARGO_PKG_VERSION"));
 const MANUAL: &str = "GreenGateway Manual";
 
-/// ggctl(1), or ggctl-COMMAND(1) for one command.
-pub(crate) fn page(command: Option<&CommandSpec>) -> String {
-    match command {
-        Some(command) => command_page(command),
-        None => overview_page(),
+/// The page for a help topic: ggctl(1), or the page of one command or
+/// command family.
+pub(crate) fn page(topic: HelpTopic) -> String {
+    match topic {
+        HelpTopic::Overview => overview_page(),
+        HelpTopic::Family(family) => family_page(family),
+        HelpTopic::Spec(command) => command_page(command),
     }
+}
+
+/// A command's or family's page name: `ledger seed` is ggctl-ledger-seed.
+fn page_name(name: &str) -> String {
+    format!("ggctl-{}", name.replace(' ', "-"))
+}
+
+fn reference(name: &str) -> String {
+    format!("{}(1)", bold(name))
 }
 
 fn overview_page() -> String {
@@ -31,13 +43,7 @@ fn overview_page() -> String {
     page.push_str(".SH NAME\n");
     push_line(&mut page, &escape(&format!("ggctl - {}", help::TAGLINE)));
     page.push_str(".SH SYNOPSIS\n");
-    for (index, usage) in help::OVERVIEW_USAGE.iter().copied().enumerate() {
-        if index > 0 {
-            page.push_str(".br\n");
-        }
-        let (name, rest) = usage.split_once(' ').unwrap_or((usage, ""));
-        push_line(&mut page, &format!("{} {}", bold(name), escape(rest)));
-    }
+    push_synopsis(&mut page, help::OVERVIEW_USAGE);
     page.push_str(".SH DESCRIPTION\n");
     push_paragraphs(&mut page, help::OVERVIEW_NOTES);
     page.push_str(".SH COMMANDS\n");
@@ -49,24 +55,53 @@ fn overview_page() -> String {
         push_entry(&mut page, &bold(&exit.code().to_string()), exit.meaning());
     }
     page.push_str(".SH SEE ALSO\n");
-    let pages: Vec<String> = COMMANDS
-        .iter()
-        .map(|command| format!("{}(1)", bold(&format!("ggctl-{}", command.name))))
+    // Each family's page comes just before the pages of its commands.
+    let mut pages = Vec::new();
+    for command in COMMANDS {
+        if let Some(family) = command.family() {
+            if family.members().next().map(|first| first.name) == Some(command.name) {
+                pages.push(reference(&page_name(family.name)));
+            }
+        }
+        pages.push(reference(&page_name(command.name)));
+    }
+    push_line(&mut page, &pages.join(", "));
+    page
+}
+
+fn family_page(family: &FamilySpec) -> String {
+    let name = page_name(family.name);
+    let mut page = title(&name);
+    page.push_str(".SH NAME\n");
+    push_line(&mut page, &escape(&format!("{name} - {}", family.summary)));
+    page.push_str(".SH SYNOPSIS\n");
+    let usage = help::family_usage(family);
+    push_synopsis(&mut page, &[usage[0].as_str(), usage[1].as_str()]);
+    page.push_str(".SH DESCRIPTION\n");
+    push_paragraphs(&mut page, family.description);
+    page.push_str(".SH COMMANDS\n");
+    for (word, command) in family.commands.iter().zip(family.members()) {
+        push_entry(&mut page, &bold(word), command.summary);
+    }
+    page.push_str(".SH SEE ALSO\n");
+    let pages: Vec<String> = std::iter::once(reference("ggctl"))
+        .chain(
+            family
+                .members()
+                .map(|command| reference(&page_name(command.name))),
+        )
         .collect();
     push_line(&mut page, &pages.join(", "));
     page
 }
 
 fn command_page(command: &CommandSpec) -> String {
-    let name = format!("ggctl-{}", command.name);
+    let name = page_name(command.name);
     let mut page = title(&name);
     page.push_str(".SH NAME\n");
     push_line(&mut page, &escape(&format!("{name} - {}", command.summary)));
     page.push_str(".SH SYNOPSIS\n");
-    let invocation = format!("ggctl {}", command.name);
-    let usage = help::usage(command);
-    let rest = usage.strip_prefix(&invocation).unwrap_or_default();
-    push_line(&mut page, &format!("{}{}", bold(&invocation), escape(rest)));
+    push_synopsis(&mut page, &[help::usage(command).as_str()]);
     page.push_str(".SH DESCRIPTION\n");
     push_paragraphs(&mut page, command.description);
     if !command.arguments.is_empty() {
@@ -88,8 +123,34 @@ fn command_page(command: &CommandSpec) -> String {
     let names: Vec<String> = names.iter().map(|name| bold(name)).collect();
     push_entry(&mut page, &names.join(", "), description);
     page.push_str(".SH SEE ALSO\n");
-    push_line(&mut page, &format!("{}(1)", bold("ggctl")));
+    let mut pages = vec![reference("ggctl")];
+    if let Some(family) = command.family() {
+        pages.push(reference(&page_name(family.name)));
+    }
+    push_line(&mut page, &pages.join(", "));
     page
+}
+
+/// Usage lines, one per line: the literal words that start each, such as
+/// `ggctl ledger seed`, in bold, and the rest as written.
+fn push_synopsis(page: &mut String, usages: &[&str]) {
+    for (index, usage) in usages.iter().enumerate() {
+        if index > 0 {
+            page.push_str(".br\n");
+        }
+        let words: Vec<&str> = usage.split(' ').collect();
+        let literal = words
+            .iter()
+            .take_while(|word| word.starts_with(|first: char| first.is_ascii_lowercase()))
+            .count();
+        let (literal, rest) = words.split_at(literal);
+        let mut line = bold(&literal.join(" "));
+        if !rest.is_empty() {
+            line.push(' ');
+            line.push_str(&escape(&rest.join(" ")));
+        }
+        push_line(page, &line);
+    }
 }
 
 /// The comment naming the generator, then the `.TH` line.
@@ -155,6 +216,7 @@ fn escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::FAMILIES;
 
     /// What a reader of the page sees: its text lines with the escapes this
     /// module writes undone, requests and comments dropped, and whitespace
@@ -216,8 +278,10 @@ mod tests {
         blocks
     }
 
-    fn topics() -> impl Iterator<Item = Option<&'static CommandSpec>> {
-        std::iter::once(None).chain(COMMANDS.iter().map(Some))
+    fn topics() -> impl Iterator<Item = HelpTopic> {
+        std::iter::once(HelpTopic::Overview)
+            .chain(FAMILIES.iter().map(HelpTopic::Family))
+            .chain(COMMANDS.iter().map(HelpTopic::Spec))
     }
 
     #[test]
@@ -235,23 +299,36 @@ mod tests {
 
     #[test]
     fn every_page_is_named_after_its_command_and_its_summary() {
-        let overview = page(None);
+        let overview = page(HelpTopic::Overview);
         assert!(overview.contains("\n.TH GGCTL 1 \"\" \"ggctl "));
         assert!(rendered(&overview).starts_with("ggctl - the GreenGateway operator CLI "));
         for command in COMMANDS {
-            let page = page(Some(command));
-            let name = escape(&format!("GGCTL-{}", command.name.to_ascii_uppercase()));
-            assert!(
-                page.contains(&format!("\n.TH {name} 1 ")),
-                "{}",
-                command.name
-            );
+            let page = page(HelpTopic::Spec(command));
+            let name = page_name(command.name);
+            let title = escape(&name.to_ascii_uppercase());
+            assert!(page.contains(&format!("\n.TH {title} 1 ")), "{name}");
             assert!(rendered(&page).starts_with(&format!(
-                "ggctl-{} - {} ggctl {}",
-                command.name, command.summary, command.name
+                "{name} - {} ggctl {}",
+                command.summary, command.name
             )));
-            assert!(rendered(&overview).contains(&format!("ggctl-{}(1)", command.name)));
+            assert!(rendered(&overview).contains(&format!("{name}(1)")));
         }
+        for family in FAMILIES {
+            let page = page(HelpTopic::Family(family));
+            let name = page_name(family.name);
+            assert!(page.contains(&format!("\n.TH {} 1 ", escape(&name.to_ascii_uppercase()))));
+            assert!(rendered(&page).starts_with(&format!(
+                "{name} - {} ggctl {} <COMMAND>",
+                family.summary, family.name
+            )));
+            assert!(rendered(&overview).contains(&format!("{name}(1)")));
+            for command in family.members() {
+                let see_also = rendered(&super::page(HelpTopic::Spec(command)));
+                assert!(see_also.ends_with(&format!("ggctl(1), {name}(1)")));
+                assert!(rendered(&page).contains(&format!("{}(1)", page_name(command.name))));
+            }
+        }
+        assert_eq!(page_name("ledger seed"), "ggctl-ledger-seed");
     }
 
     #[test]

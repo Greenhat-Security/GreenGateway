@@ -69,7 +69,7 @@ VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
 COMMIT = re.compile(r"[0-9a-f]{40}")
 DIGEST = re.compile(r"[0-9a-f]{64}")
 REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
-COMMAND = re.compile(r"[a-z][a-z-]*")
+COMMAND = re.compile(r"[a-z][a-z-]*(?: [a-z][a-z-]*)?")
 LICENSE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+-]*")
 # The zip format cannot record a time before 1980-01-01.
 ZIP_EPOCH = 315532800
@@ -229,10 +229,13 @@ def require_parity(help_text, page, name):
 
 
 def listed_commands(overview):
-    """The command names the `ggctl help` overview lists."""
+    """The command names the `ggctl help` overview lists. A name and its
+    summary are two spaces apart, and a family's command is listed by its
+    full name, such as `ledger seed`."""
     _, found, rest = overview.partition("\nCommands:\n")
     lines = rest.split("\n\n", 1)[0].splitlines() if found else []
-    commands = [line.split()[0] for line in lines if line.startswith("  ") and not line.startswith("   ")]
+    commands = [re.split(r" {2,}", line.strip(), maxsplit=1)[0] for line in lines
+                if line.startswith("  ") and not line.startswith("   ")]
     if not commands or any(not COMMAND.fullmatch(command) for command in commands) \
             or len(set(commands)) != len(commands):
         raise ValueError("the ggctl help overview does not list its commands")
@@ -272,10 +275,14 @@ def members(binary, target, version, license_text, run=run_binary):
     page = text_output(run(binary, "help", "--man"), "ggctl help --man")
     require_parity(overview, page, "ggctl.1")
     files.append(("man/man1/ggctl.1", page.encode("ascii"), 0o644))
-    for command in listed_commands(overview):
-        name = f"ggctl-{command}.1"
-        help_text = text_output(run(binary, "help", command), "ggctl help " + command)
-        page = text_output(run(binary, "help", "--man", command), "ggctl help --man " + command)
+    commands = listed_commands(overview)
+    # Each family named by a command such as `ledger seed` has a page too.
+    families = list(dict.fromkeys(command.split(" ")[0] for command in commands if " " in command))
+    for topic in families + commands:
+        words = topic.split(" ")
+        name = "ggctl-" + "-".join(words) + ".1"
+        help_text = text_output(run(binary, "help", *words), "ggctl help " + topic)
+        page = text_output(run(binary, "help", "--man", *words), "ggctl help --man " + topic)
         require_parity(help_text, page, name)
         files.append(("man/man1/" + name, page.encode("ascii"), 0o644))
     for shell, path in COMPLETIONS.items():

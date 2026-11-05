@@ -25,10 +25,14 @@
 //!   duplicate or case-colliding names, and bounded sizes and expansion),
 //!   ahead of the backup archive reader that will apply them, so that reader
 //!   cannot approximate them. Bundles themselves are directories only;
+//! - [`state_dir`]: the standalone state directory, with the fixed file
+//!   names of the stores beneath it, the rules the directory must meet, the
+//!   exclusive lock a process holds on it and a best-effort check for a
+//!   network filesystem under it;
 //! - [`ledger`]: the standalone configuration revision ledger, an
 //!   append-only, hash-chained SQLite record of the bundles a standalone
-//!   deployment applied, which refuses to open when anything in it no longer
-//!   verifies;
+//!   deployment applied, which opens only under a held state directory and
+//!   refuses to open when anything in it no longer verifies;
 //! - [`revisions`]: conditional plan, apply, history and rollback over that
 //!   ledger, which recompiles every candidate, binds risk acknowledgements
 //!   to the exact plan, requires the union of permissions and never
@@ -59,7 +63,9 @@
 //! writes. The archive guard reads and writes only the readers and writers
 //! it is handed. The ledger is the one store: it reads and writes only its own
 //! database and journal files beneath the state directory it is given, and
-//! the revision service reads and writes only through it.
+//! the revision service reads and writes only through it. The state
+//! directory's lock file is the one other file written: created empty,
+//! locked and never removed.
 
 pub mod archive;
 pub mod auth;
@@ -78,4 +84,5 @@ pub mod permissions;
 pub mod request_bounds;
 pub mod revisions;
 pub mod semantic_diff;
+pub mod state_dir;
 pub mod upstream_route;

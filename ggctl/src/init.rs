@@ -138,7 +138,7 @@ fn read_answers(
     let bytes = match credential::read_regular_file(
         path,
         init::MAX_ANSWERS_BYTES,
-        FilePermissions::NotWritableByOthers,
+        FilePermissions::TrustAnchor,
     ) {
         Ok(bytes) => bytes,
         Err(problem) => {
