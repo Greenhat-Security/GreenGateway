@@ -9015,7 +9015,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::record_change_evidence#1",
-      "sha256": "11e3ab16855d4f9ac9e52b88108115452d60cddf89e8549019d52df38cfe02bb",
+      "sha256": "56cf4d967d548ad3311dfe6c7cd55cf48b0e2a35ce80ce883e18f72559c52ace",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -15337,7 +15337,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::journaled_evidence_from_row#1",
-      "sha256": "08b5b3590ed6622748f9e8e805dcf0cdac7b2e324f2deee4f3342b949f9b7439",
+      "sha256": "952269e9c6f8027f9c31a4513c809a38eb34fb4d78b087ed97ba3017e8177f1a",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
