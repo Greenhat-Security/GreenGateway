@@ -422,8 +422,9 @@ fn pinned_documents(
 }
 
 impl ClusterPolicyReplays {
-    /// The owner's job started with idempotency key `key`, already answered:
-    /// `Ok(None)` when there is none.
+    /// The answer for a retry of the owner's job started with idempotency
+    /// key `key` -- the job, a conflict, or the store's refusal -- or `None`
+    /// when the key names no job.
     pub(super) async fn answer_retry(
         &self,
         state: &PolicyAdminState,
@@ -431,17 +432,17 @@ impl ClusterPolicyReplays {
         principal: &auth::Principal,
         key: &str,
         request_digest: &str,
-    ) -> Result<Option<Response>, Response> {
+    ) -> Option<Response> {
         match self.store.find_idempotent(&owner(principal), key).await {
-            Ok(None) => Ok(None),
+            Ok(None) => None,
             Ok(Some(record)) if record.spec.request_digest == request_digest => {
                 let current = base_etag_is_current(state, rbac_state, &record.spec.base_etag).await;
-                Ok(Some(respond(StatusCode::OK, &record, current)))
+                Some(respond(StatusCode::OK, &record, current))
             }
-            Ok(Some(_)) => Ok(Some(replay_idempotency_conflict())),
+            Ok(Some(_)) => Some(replay_idempotency_conflict()),
             Err(error) => {
                 tracing::error!(error = %error, "policy replay could not read its job store");
-                Err(store_unavailable())
+                Some(store_unavailable())
             }
         }
     }

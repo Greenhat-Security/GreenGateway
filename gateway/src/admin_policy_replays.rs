@@ -719,9 +719,20 @@ enum ReplayBackend<'a> {
     Cluster(&'a Arc<ClusterPolicyReplays>),
 }
 
+impl<'a> ReplayBackend<'a> {
+    /// The standalone audit log, when this is the standalone backend.
+    fn standalone(self) -> Option<&'a Arc<storage::SqliteAuditEventStore>> {
+        match self {
+            Self::Standalone(store) => Some(store),
+            #[cfg(feature = "postgres")]
+            Self::Cluster(_) => None,
+        }
+    }
+}
+
 /// The backend a replay route serves, or the `503` for none: cluster mode
 /// without its job store, or standalone mode without an audit query store.
-fn replay_backend(state: &PolicyAdminState) -> Result<ReplayBackend<'_>, Response> {
+fn replay_backend(state: &PolicyAdminState) -> ResponseResult<ReplayBackend<'_>> {
     #[cfg(feature = "postgres")]
     if state.control_plane.is_some() {
         return state
@@ -729,14 +740,20 @@ fn replay_backend(state: &PolicyAdminState) -> Result<ReplayBackend<'_>, Respons
             .as_ref()
             .map(ReplayBackend::Cluster)
             .ok_or_else(|| {
-                policy_evidence_unavailable("policy replay requires the cluster replay job store")
+                Box::new(policy_evidence_unavailable(
+                    "policy replay requires the cluster replay job store",
+                ))
             });
     }
     state
         .query_store
         .as_ref()
         .map(ReplayBackend::Standalone)
-        .ok_or_else(|| policy_evidence_unavailable("policy replay requires an audit query store"))
+        .ok_or_else(|| {
+            Box::new(policy_evidence_unavailable(
+                "policy replay requires an audit query store",
+            ))
+        })
 }
 
 /// Whether a job's result describes the live policy. A result is immutable
@@ -1100,7 +1117,7 @@ pub(super) async fn policy_replay_create_endpoint(
     };
     let backend = match replay_backend(&state) {
         Ok(backend) => backend,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let body_limit = state.max_body_size.min(MAX_POLICY_REPLAY_BODY_BYTES);
     let body_deadline = tokio::time::Instant::now() + POLICY_REPLAY_BODY_DEADLINE;
@@ -1157,12 +1174,11 @@ pub(super) async fn policy_replay_create_endpoint(
             }
             #[cfg(feature = "postgres")]
             ReplayBackend::Cluster(cluster) => {
-                match cluster
+                if let Some(response) = cluster
                     .answer_retry(&state, rbac_state, &principal, key, &replay.digest)
                     .await
                 {
-                    Ok(Some(response)) | Err(response) => return response,
-                    Ok(None) => {}
+                    return response;
                 }
             }
         }
@@ -1242,27 +1258,27 @@ pub(super) async fn policy_replay_create_endpoint(
         stored,
         projections: replay.projections.clone(),
     };
-    let query_store = match backend {
-        ReplayBackend::Standalone(query_store) => query_store,
-        #[cfg(feature = "postgres")]
-        ReplayBackend::Cluster(cluster) => {
-            let response = cluster
-                .admit(
-                    &state,
-                    &principal,
-                    &parts,
-                    PreparedReplay {
-                        request: replay,
-                        window,
-                        base,
-                        candidate,
-                        binding,
-                    },
-                )
-                .await;
-            drop(slot);
-            return response;
-        }
+    #[cfg(feature = "postgres")]
+    if let ReplayBackend::Cluster(cluster) = backend {
+        let response = cluster
+            .admit(
+                &state,
+                &principal,
+                &parts,
+                PreparedReplay {
+                    request: replay,
+                    window,
+                    base,
+                    candidate,
+                    binding,
+                },
+            )
+            .await;
+        drop(slot);
+        return response;
+    }
+    let Some(query_store) = backend.standalone() else {
+        return policy_evidence_unavailable("policy replay requires an audit query store");
     };
     if let Some(refusal) = jobs.precheck(&owner).and_then(admission_refusal) {
         return refusal;
@@ -1432,7 +1448,7 @@ pub(super) async fn policy_replay_get_endpoint(
                 cluster.read(&state, rbac_state, &principal, &job_id).await
             }
             Ok(ReplayBackend::Standalone(_)) => replay_job_not_found(),
-            Err(response) => response,
+            Err(response) => *response,
         };
     }
     let Some(job) = jobs.find(&replay_owner(&principal), &job_id) else {
@@ -1469,7 +1485,7 @@ pub(super) async fn policy_replay_delete_endpoint(
                 cluster.cancel(&state, &principal, &job_id).await
             }
             Ok(ReplayBackend::Standalone(_)) => replay_job_not_found(),
-            Err(response) => response,
+            Err(response) => *response,
         };
     }
     let Some(job) = jobs.find(&replay_owner(&principal), &job_id) else {
