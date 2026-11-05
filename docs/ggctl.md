@@ -2,7 +2,7 @@
 
 `ggctl` is GreenGateway's operator command-line tool (issue #242, [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md)). It is a separate binary: the `gateway` server keeps its name, its no-argument startup, its Docker entrypoint and its one-shot commands (`gateway migrate`, `gateway healthcheck`, `gateway import-standalone`, ...) unchanged.
 
-**Status: alpha.** This build implements `version`, `schema`, `init`, `validate`, `convert`, `doctor`, `diff`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `init` writes a new [configuration bundle](configuration-bundles.md) for a deployment profile, `validate` and `doctor` check one offline with the gateway's own bundle reader, `convert` converts one between document versions, and `diff` compares two bundles semantically and classifies each change's risk. `ggctl` cannot yet pin, plan, apply, export or back up anything, it has no browser wizard (`init --web`), and it cannot yet validate, convert or diff an environment file (`--env`, `--against-env`) or diff against a server (`diff --server`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle yet.
+**Status: alpha.** This build implements `version`, `schema`, `init`, `validate`, `pin`, `convert`, `doctor`, `diff`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `init` writes a new [configuration bundle](configuration-bundles.md) for a deployment profile, `validate` and `doctor` check one offline with the gateway's own bundle reader, `pin` rewrites its SHA-256 pins once its files validate, `convert` converts one between document versions, and `diff` compares two bundles semantically and classifies each change's risk. `ggctl` cannot yet plan, apply, export or back up anything, it has no browser wizard (`init --web`), and it cannot yet validate, convert or diff an environment file (`--env`, `--against-env`) or diff against a server (`diff --server`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle yet.
 
 ## Building
 
@@ -24,6 +24,7 @@ ggctl version [--server URL] [--ca-file PATH] [--token-stdin | --token-file PATH
 ggctl schema [KIND] [--api-version VERSION] [--format human|json]
 ggctl init --profile production|migration|development --output DIR [--answers FILE] [--format human|json]
 ggctl validate BUNDLE [--strict] [--warnings-as-errors] [--format human|json|sarif]
+ggctl pin BUNDLE [--strict] [--format human|json]
 ggctl convert BUNDLE --to VERSION (--output DIR | --in-place) [--strict] [--format human|json]
 ggctl doctor BUNDLE [--format human|json]
 ggctl diff BUNDLE --against BUNDLE [--check] [--strict] [--format human|json|sarif]
@@ -81,6 +82,29 @@ In CI, validate the bundle a change touches and keep the SARIF log for review:
 ```
 
 The step fails on exit `3` or `1`; upload `bundle.sarif` with the CI system's SARIF tooling if it annotates reviews.
+
+### `pin`
+
+The only command that rewrites manifest digests ([ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md#digests)), and it pins only files that validate. It reads the bundle in the directory `BUNDLE` with the same reader as `validate` and every check `validate` runs but one: each referenced file's SHA-256 is recorded instead of compared with its pin. Nothing is written unless every other check passed, so `pin` refuses a policy the profile forbids, a document that fails its schema, or a file that is missing, oversized, linked or not LF, exactly as `validate` does (exit `3`), and never pins a file that does not validate.
+
+- Each pin that differs from its file's SHA-256 is replaced digit for digit where the reader found it, so every other byte of `bundle.yaml` (comments, member order, quoting and spacing) is kept, and a review shows only the digits that changed. A pin to replace must be written as its 64 digits between double or single quotes, as `init` writes it; any other spelling, plain or with escapes, is refused with `reference.pin_not_rewritable` at its line and column, and nothing is written. The manifest itself must be valid, each pin's form included (`reference.invalid_digest` for one that is not 64 lowercase hex digits).
+- The new manifest is checked in memory first: with the other files exactly as read, it must read as a valid bundle with every check, its pins included. It is then written to a new hidden file beside `bundle.yaml` (`.bundle.yaml.ggctl-pin-PID-N`, created exclusively, `0600` and checked on Unix), flushed to storage and renamed over `bundle.yaml`, and on Unix the directory is flushed. A failed write leaves `bundle.yaml` exactly as it was and removes the hidden file (`pin.write_failed`); only a process killed before the rename can leave the hidden file behind, which the reader never opens and which is safe to delete. There is never a partial `bundle.yaml`.
+- `bundle.yaml` must be a regular file. A link, such as the per-key link of a Kubernetes atomic-writer volume, is refused before anything is read (`pin.manifest_link`), and neither it nor its target is touched: pin the bundle's source, not the volume it is delivered in. `bundle.yaml` must also still hold the bytes `pin` read, checked before the hidden file is created and again just before the rename (`pin.manifest_changed`). A rename cannot compare and swap, so this narrows a race with another writer but cannot close it: do not edit a bundle while pinning it.
+- When every pin already matches, nothing is written.
+- The bundle is then read back with every check, its pins included, and must be exactly the files that were pinned. Otherwise a file changed while `pin` ran: the reader's errors are reported with `pin.read_back_failed`, and `ggctl validate` says what the bundle is now.
+- On Unix the new `bundle.yaml` is `0600` and owned by the account that ran `pin`, whatever the old one's mode and owner were; on Windows it inherits the ACL of the bundle directory. Git records neither, so a checkout is unaffected, but a bundle a gateway reads in place under another account must be made readable to it again (for example `chmod 0644`; the reader refuses only group or other write).
+- The human result says whether the bundle was pinned, gives its new source digest and lists each file with whether its pin changed. `--format json` writes one `GgctlReport` whose `result` holds `valid`, `bundle` (what the manifest declares, without digests), `files` (each with its `role`, `file`, `previous` and new `sha256` pin, and `changed`), `changed`, `written` and, once read back, `pinned`, whose `sourceDigest` is the bundle's new identity. `--strict` reads `BUNDLE` as `validate --strict` does.
+
+`pin` reads only beneath `BUNDLE`, writes nothing but `bundle.yaml` and its hidden replacement, makes no network request, reads no environment variable and never echoes the path. A pin is integrity metadata, not a signature: pinning records what the files are and does not make them trusted, so review a change before you pin it. As for `validate`, the gateway's production policy and tools validators do not run (`validate.production_validators_not_run`).
+
+Exit codes: `0` pinned or already pinned, `3` for an invalid bundle, a pin that cannot be replaced in place or a linked `bundle.yaml`, `5` when `bundle.yaml` changed while it was being pinned, `1` when the bundle could not be read, the new manifest could not be written, or the bundle did not read back as pinned.
+
+```sh
+$EDITOR deploy/bundle/policy.json
+ggctl pin deploy/bundle
+ggctl validate deploy/bundle --strict
+git diff deploy/bundle   # the policy, and one pin in bundle.yaml
+```
 
 ### `convert`
 
@@ -164,7 +188,7 @@ Writes a completion script to standard output. It completes commands, options, f
 - **Diagnostics go to standard error** in human form. With `--format json` or `--format sarif` they are in the document instead and standard error stays empty.
 - **An argument error found before a command runs** (an unknown option, a refused secret or insecure option, a malformed `--server`) is written to standard error only, exits `2`, and writes no report.
 - **No color, no prompts, no progress output.** `ggctl` reads no configuration file and no environment variable, and makes no network request unless a command is given `--server`.
-- **Files are written only where a command is told to.** `init` and `convert --output` create the one directory `--output` names, and never write anything else, overwrite anything, or echo the path.
+- **Files are written only where a command is told to.** `init` and `convert --output` create the one directory `--output` names, and never write anything else, overwrite anything, or echo the path. `pin` replaces only `BUNDLE`'s `bundle.yaml`.
 
 A report always has `apiVersion: greengateway.dev/v1alpha1`, `kind: GgctlReport`, the `command`, the process `exitCode` and its stable `outcome` name, the `diagnostics`, and a command-specific `result`. Every diagnostic has a stable `code`, a `severity` (`error`, `warning` or `info`), fixed `message` text, an optional fixed `hint`, a `remediation` anchor and at most one location: when it concerns one argument, that argument's 1-based `location.argument` position; when the bundle reader found it, the bundle-relative `location.file`, a `location.pointer` built from member names the reader defines, and the 1-based `location.line` and `location.column` where the reader has them. Diagnostics are value-free by construction: they never contain an argument, token, URL, path, address, document value, server response or library error text. An unknown option is reported by its position, never by its spelling, because the spelling may be a mistyped secret. A published code never changes meaning; renaming or removing one needs a new report version.
 
@@ -181,12 +205,12 @@ SARIF 2.1.0 output belongs to `validate`, which ADR-0008 gives it, and to `diff`
 | `2` | `usage` | Usage error, including a reserved command or a refused insecure option. |
 | `3` | `invalid` | Invalid, incompatible or unsupported configuration, server or document version; a failed required doctor check; any warning under `--warnings-as-errors`. |
 | `4` | `drift` | Drift found by `diff --check`. |
-| `5` | `conflict` | Precondition conflict: missing or stale ETag, plan, acknowledgment or lock, or an output directory that is not empty. |
+| `5` | `conflict` | Precondition conflict: missing or stale ETag, plan, acknowledgment or lock, an output directory that is not empty, or a manifest that changed while it was being pinned. |
 | `6` | `unavailable` | A dependency was unavailable and nothing was sent or committed; safe to retry. |
 | `7` | `integrity` | Backup or archive integrity or restore verification failure. |
 | `8` | `denied` | Authentication or authorization refused. |
 
-When several errors apply, the one that must not be hidden wins: `1` over everything, and `6` only when nothing else went wrong, so a pipeline that retries on `6` never resends work another error left in doubt. Today `4` comes from `diff --check` and `5` only from an `init` or `convert --output` directory that is not empty; the ETag, plan and lock conflicts of `5`, and `7`, belong to commands later slices add.
+When several errors apply, the one that must not be hidden wins: `1` over everything, and `6` only when nothing else went wrong, so a pipeline that retries on `6` never resends work another error left in doubt. Today `4` comes from `diff --check` and `5` only from an `init` or `convert --output` directory that is not empty, or a `bundle.yaml` that changed while `pin` ran; the ETag, plan and lock conflicts of `5`, and `7`, belong to commands later slices add.
 
 ## Credentials
 
@@ -345,6 +369,18 @@ A problem inside the answers document is reported with the [bundle reader's code
 | `convert.downgrade_refused` | 3 | `--to` is older than the bundle's document version; `ggctl` never converts down. |
 | `convert.in_place_unavailable` | 3 | The conversion would change the bundle, which `--in-place` cannot do atomically yet; use `--output`. No conversion that changes a bundle exists while `greengateway.dev/v1alpha1` is the only version. |
 
+### Pin diagnostics
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `pin.manifest_link` | 3 | `bundle.yaml` is a link or not a regular file, as in a Kubernetes atomic-writer volume. Nothing was written, and the link's target was not touched; pin the bundle's source instead. |
+| `pin.manifest_changed` | 5 | `bundle.yaml` changed after `ggctl pin` read it. Nothing was written; pin again once nothing else is editing the bundle. |
+| `pin.write_failed` | 1 | The new `bundle.yaml` could not be created, written, flushed or renamed into place, for example on a read-only filesystem. `bundle.yaml` was left as it was, and the hidden file was removed. |
+| `pin.permissions_unavailable` | 1 | The filesystem did not keep mode `0600` on the new `bundle.yaml` (Unix). `bundle.yaml` was left as it was. |
+| `pin.read_back_failed` | 1 | The bundle did not read back as the files that were pinned: a file changed while `ggctl pin` ran. The reader's errors say which; run `ggctl validate`. |
+
+A pin that must change but is not written as its 64 digits between quotes is the [bundle reader's code](configuration-bundles.md#diagnostics) `reference.pin_not_rewritable` (exit `3`), located at the pin.
+
 ### Output diagnostics
 
 | Code | Exit | Meaning |
@@ -364,4 +400,4 @@ A problem inside the answers document is reported with the [bundle reader's code
 
 ## Platform notes
 
-`ggctl` is tested on Linux, macOS and Windows. Exit codes, stream separation, terminal detection, token-file type and size checks and the remote client behave the same on all three. The owner-only permission check on token files applies on Unix only, as do the owner, mode and path checks on `--ca-file` and `--answers` files, and so does the bundle reader's refusal of a group- or other-writable bundle directory or file ([files and the directory](configuration-bundles.md#files-and-the-directory)); on Windows the reader enforces the link, reparse-point, regular-file and name rules, and ACLs are left to the operator. Likewise `init` and `convert --output` create their directory `0700` and its files `0600` on Unix and check those modes, while on Windows the new entries inherit the ACL of the directory they are created in. Shell completion is generated for bash, zsh, fish and PowerShell.
+`ggctl` is tested on Linux, macOS and Windows. Exit codes, stream separation, terminal detection, token-file type and size checks and the remote client behave the same on all three. The owner-only permission check on token files applies on Unix only, as do the owner, mode and path checks on `--ca-file` and `--answers` files, and so does the bundle reader's refusal of a group- or other-writable bundle directory or file ([files and the directory](configuration-bundles.md#files-and-the-directory)); on Windows the reader enforces the link, reparse-point, regular-file and name rules, and ACLs are left to the operator. Likewise `init` and `convert --output` create their directory `0700` and its files `0600` on Unix and check those modes, and `pin` writes its new `bundle.yaml` `0600` and checks it, while on Windows the new entries inherit the ACL of the directory they are created in. Shell completion is generated for bash, zsh, fish and PowerShell.

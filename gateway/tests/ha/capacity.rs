@@ -195,8 +195,8 @@ fn cell_options(plan: &CellPlan) -> ClusterOptions {
 /// The acquisition family, as the exporter names it.
 const ACQUIRE_FAMILY: &str = "greengateway_database_pool_acquire_seconds";
 
-/// `storage::postgres::CheckoutClass`'s seven labels, in its order.
-const OPERATION_CLASSES: [&str; 7] = [
+/// `storage::postgres::CheckoutClass`'s eight labels, in its order.
+const OPERATION_CLASSES: [&str; 8] = [
     "revision_check",
     "credential_check",
     "rate_limit",
@@ -204,6 +204,7 @@ const OPERATION_CLASSES: [&str; 7] = [
     "security_state_read",
     "control_plane_write",
     "maintenance",
+    "policy_replay",
 ];
 
 /// The acquisition series' outcomes: `none`, the six classified kinds

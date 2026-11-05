@@ -14,8 +14,8 @@
 //! ```
 //!
 //! `base_etag` pins the active policy the request was written against, as a
-//! simulation's does, and `candidate` takes the simulation's three sources
-//! with the same members ([`parse_candidate`]); `projections` names the
+//! simulation's does, and `candidate` takes the simulation's sources with the
+//! same members ([`parse_candidate`]); `projections` names the
 //! simulation's projections the impact comparison is reported under
 //! ([`parse_projections`]), `as_authored` alone when omitted. The window is a
 //! half-open

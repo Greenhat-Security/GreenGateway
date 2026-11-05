@@ -78,7 +78,7 @@ impl Exit {
             }
             Self::Drift => "drift found by diff --check",
             Self::Conflict => {
-                "precondition conflict: missing or stale ETag, plan, acknowledgment or lock, or an output destination that is not empty"
+                "precondition conflict: missing or stale ETag, plan, acknowledgment or lock, an output destination that is not empty, or a manifest that changed while it was being pinned"
             }
             Self::Unavailable => "a dependency was unavailable and nothing was sent or committed; safe to retry",
             Self::Integrity => "backup or archive integrity or restore verification failure",
@@ -194,6 +194,12 @@ pub(crate) enum Code {
     UnsupportedTargetVersion,
     DowngradeRefused,
     InPlaceUnavailable,
+    // Pinning.
+    ManifestLink,
+    ManifestChanged,
+    PinWriteFailed,
+    PinPermissionsUnavailable,
+    ReadBackFailed,
     // This process.
     WriteFailed,
     DestinationExists,
@@ -218,6 +224,7 @@ pub(crate) const FAMILIES: &[&str] = &[
     "diff",
     "init",
     "convert",
+    "pin",
     "output",
     "internal",
 ];
@@ -285,6 +292,11 @@ impl Code {
         Self::UnsupportedTargetVersion,
         Self::DowngradeRefused,
         Self::InPlaceUnavailable,
+        Self::ManifestLink,
+        Self::ManifestChanged,
+        Self::PinWriteFailed,
+        Self::PinPermissionsUnavailable,
+        Self::ReadBackFailed,
         Self::WriteFailed,
         Self::DestinationExists,
         Self::DestinationUnusable,
@@ -329,6 +341,7 @@ impl Code {
             "diff" => "docs/ggctl.md#diff-diagnostics",
             "init" => "docs/ggctl.md#init-diagnostics",
             "convert" => "docs/ggctl.md#convert-diagnostics",
+            "pin" => "docs/ggctl.md#pin-diagnostics",
             "output" => "docs/ggctl.md#output-diagnostics",
             _ => "docs/ggctl.md#internal-diagnostics",
         }
@@ -518,6 +531,31 @@ impl Code {
                 "convert.in_place_unavailable",
                 "this ggctl cannot replace a bundle in place with a conversion that changes it; write it with --output",
                 Invalid,
+            ),
+            Self::ManifestLink => (
+                "pin.manifest_link",
+                "bundle.yaml is a link or not a regular file, which ggctl pin never replaces; nothing was written",
+                Invalid,
+            ),
+            Self::ManifestChanged => (
+                "pin.manifest_changed",
+                "bundle.yaml changed after ggctl pin read it; nothing was written",
+                Conflict,
+            ),
+            Self::PinWriteFailed => (
+                "pin.write_failed",
+                "the new bundle.yaml could not be created, written, flushed or renamed into place; bundle.yaml was left as it was",
+                Failure,
+            ),
+            Self::PinPermissionsUnavailable => (
+                "pin.permissions_unavailable",
+                "the filesystem did not keep owner-only permissions on the new bundle.yaml; bundle.yaml was left as it was",
+                Failure,
+            ),
+            Self::ReadBackFailed => (
+                "pin.read_back_failed",
+                "the bundle did not read back as the files that were pinned, so a file changed while ggctl pin ran; run ggctl validate",
+                Failure,
             ),
             Self::WriteFailed => ("output.write_failed", "the output could not be written", Failure),
             Self::DestinationExists => (

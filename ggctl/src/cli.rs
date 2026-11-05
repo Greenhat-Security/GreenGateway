@@ -84,6 +84,7 @@ const COMMAND_NAMES: &[&str] = &[
     "schema",
     "init",
     "validate",
+    "pin",
     "convert",
     "doctor",
     "diff",
@@ -261,6 +262,29 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         arguments: &[BUNDLE],
         options: &[STRICT, WARNINGS_AS_ERRORS, VALIDATE_FORMAT],
         run: crate::validate::run,
+    },
+    CommandSpec {
+        name: "pin",
+        summary: "Rewrite a bundle's SHA-256 pins for files that validate",
+        description: &[
+            "The only command that rewrites manifest digests. Reads the bundle in the directory \
+             BUNDLE as validate does, with every check except the comparison of each referenced \
+             file with its pin, and pins nothing unless every file passes: then each pin that \
+             differs from its file's SHA-256 is replaced digit for digit, so every other byte of \
+             bundle.yaml, comments and order included, is kept. A pin to replace must be its 64 \
+             digits between quotes, as init writes it.",
+            "The new manifest is written to a new hidden file beside bundle.yaml, owner-only on \
+             Unix, flushed and renamed over it, so an interrupted write never leaves a partial \
+             manifest; bundle.yaml must be a regular file, not a link, and must not change while \
+             ggctl runs. The bundle is then read back with every check and its new source digest \
+             reported. It makes no network request and reads no environment variable. Exits 0 \
+             when pinned (or already pinned), 3 when a file is invalid or bundle.yaml is a link, \
+             5 when bundle.yaml changed meanwhile, and 1 when the bundle could not be read or \
+             written.",
+        ],
+        arguments: &[BUNDLE],
+        options: &[STRICT, FORMAT],
+        run: crate::pin::run,
     },
     CommandSpec {
         name: "convert",
