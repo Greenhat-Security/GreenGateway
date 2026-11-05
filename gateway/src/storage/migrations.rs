@@ -423,12 +423,12 @@ impl SchemaCompatibility {
 // the migration role ran the successor's `migrate up` while the prepared
 // replicas served, and both wrote the one table that migration changes with
 // the same explicit column list (`connections::pg_store::
-// record_catalog_change_evidence` as both releases had it, without the three
-// columns). This build is not that successor: it carries migration 25 byte
-// for byte, so its migrator records the approved checksum, but it serves only
-// the schema its manifest ends at, so from a prepared fleet it is a coordinated
-// drain/migrate/restart like every other step. Its catalog writer records all
-// three columns.
+// record_catalog_change_evidence`). This build is not that successor: it
+// carries migration 25 byte for byte, so its migrator records the approved
+// checksum, but it serves only schema 29, so from a prepared fleet it is a
+// coordinated drain/migrate/restart like every other step.
+// That shared column list left out the three columns; this build's catalog
+// writer records all three.
 // `migration_twenty_five_is_the_extension_its_prepared_release_approved` pins
 // the manifest entry to the checksum that release approved, and the
 // published matrix's rolling step to both.

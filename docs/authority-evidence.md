@@ -708,8 +708,7 @@ that row as any other unprojectable row does.
 Tests: the shared service-token change-evidence contract and the JWT revocation
 evidence tests in `gateway/src/storage/contract_tests.rs` (both token stores), the
 Connection deletion, create and replace evidence tests in
-`gateway/src/connections/pg_store_tests.rs`
-and its catalog evidence tests
+`gateway/src/connections/pg_store_tests.rs` and its catalog evidence tests
 `catalog_evidence_records_the_whole_actor_for_every_catalog_action` (each of the
 four catalog actions by an issuer-less principal, a service token and a principal
 with an issuer, under the same CHECK as migration 24's tables) and
@@ -971,10 +970,11 @@ Enforcement:
   naming the inventory operation code and nothing from the request. Every policy
   mutation asks at `commit_policy_mutation`, the commit path they share (so draft
   publication asks as `policy.publish`, and its own `policy.draft_publish_refused`
-  record carries the same reason), suggestion acceptance asks as
-  `policy.suggestion.accept` before its rule is written, and a stored policy test
-  suite write (`PUT .../policy/tests`) asks as `policy_tests.publish` before its
-  body is read. Connection and local-secret
+  record carries the same reason), suggestion acceptance, including a draft
+  publication bound to a suggestion, asks as `policy.suggestion.accept` before
+  its acceptance intent or its rule is written, and a stored policy test suite
+  write (`PUT .../policy/tests`) asks as `policy_tests.publish` before its body
+  is read. Connection and local-secret
   changes, the `connection-secrets reencrypt` command, catalog refreshes, OpenAPI
   catalog registrations and overlay writes and removals never ask: the Connections
   database records each of them in the change's own transaction

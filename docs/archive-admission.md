@@ -5,7 +5,7 @@ This page is the reference for the entry admission rules in `gateway-config`
 [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md) requires of every
 archive GreenGateway reads. The only archive the ADR defines is the
 [standalone backup](standalone-backup.md) archive, which `ggctl backup verify`
-reads, and `ggctl backup create` reads back before it publishes one, through
+and `ggctl backup restore` read, and `ggctl backup create` reads back before it publishes one, through
 these rules. Its container is GreenGateway's own uncompressed framed format,
 chosen under the [dependency policy](deployment/cargo-dependency-policy.md):
 no archive or compression library is part of the build.
@@ -168,7 +168,7 @@ versions and per-entry checksums are its to verify
 | `archive.read_failed` | The archive could not be read. |
 | `archive.write_failed` | An entry's data could not be written to its destination. |
 
-A published code never changes meaning. `ggctl backup verify` and
-`ggctl backup create` report these codes as they are, located by the entry's
+A published code never changes meaning. `ggctl backup verify`,
+`ggctl backup create` and `ggctl backup restore` report these codes as they are, located by the entry's
 position, with exit code `7` (ADR-0008's archive integrity failure), or `1`
 for `archive.read_failed` and `archive.write_failed`.

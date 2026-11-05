@@ -2,11 +2,13 @@
 //!
 //! - Standard output carries only what was asked for: an artifact (a schema,
 //!   a completion script, help), the human result, with `--format json`
-//!   exactly one `GgctlReport` document, or with `validate --format sarif`
-//!   exactly one SARIF 2.1.0 log.
+//!   exactly one `GgctlReport` document, with `--format sarif` exactly one
+//!   SARIF 2.1.0 log, or with `policy test --format junit` exactly the
+//!   gateway's JUnit XML report.
 //! - Diagnostics go to standard error in human form. With `--format json` or
 //!   `--format sarif` they are in the document instead, and standard error
-//!   stays empty.
+//!   stays empty. A JUnit report has no place for them, so they stay on
+//!   standard error.
 //! - An argument error found before a command runs is reported on standard
 //!   error only, with exit code 2, and no report is written: the requested
 //!   format is not known to be trustworthy yet.
@@ -25,7 +27,7 @@ use gateway_config::{
 use serde::Serialize;
 
 use crate::{
-    cli::{Invocation, FORMAT_JSON, FORMAT_SARIF},
+    cli::{Invocation, FORMAT_JSON, FORMAT_JUNIT, FORMAT_SARIF},
     diagnostic::{Code, Diagnostic, Exit},
     sarif,
 };
@@ -47,8 +49,10 @@ pub(crate) struct Io<'a> {
 pub(crate) enum Format {
     Human,
     Json,
-    /// SARIF 2.1.0: `validate` is the only command whose `--format` offers it.
+    /// SARIF 2.1.0, for `validate`, `diff` and `policy lint`.
     Sarif,
+    /// JUnit XML, for `policy test`: the gateway's own rendering.
+    Junit,
 }
 
 impl Format {
@@ -56,6 +60,7 @@ impl Format {
         match invocation.text("--format") {
             Some((_, FORMAT_JSON)) => Self::Json,
             Some((_, FORMAT_SARIF)) => Self::Sarif,
+            Some((_, FORMAT_JUNIT)) => Self::Junit,
             _ => Self::Human,
         }
     }
@@ -378,6 +383,8 @@ pub(crate) fn finish_report<T: Serialize>(
         Format::Human => human(result, io.stdout)
             .and_then(|()| io.stdout.flush())
             .and_then(|()| write_diagnostics(io.stderr, diagnostics)),
+        // Without the report itself there is nothing to write but why.
+        Format::Junit => write_diagnostics(io.stderr, diagnostics),
     };
     match written {
         Ok(()) => exit,
@@ -397,6 +404,22 @@ pub(crate) fn sarif_log(
         .map_err(io::Error::from)
         .and_then(|()| writeln!(io.stdout))
         .and_then(|()| io.stdout.flush())
+    {
+        Ok(()) => exit,
+        Err(_) => write_failed(io),
+    }
+}
+
+/// Writes an artifact a server answered to standard output, then
+/// `diagnostics` to standard error, and returns the exit code they
+/// determine.
+pub(crate) fn served_artifact(io: &mut Io<'_>, bytes: &[u8], diagnostics: &[Diagnostic]) -> Exit {
+    let exit = Exit::worst(diagnostics.iter().map(|diagnostic| diagnostic.code.exit()));
+    match io
+        .stdout
+        .write_all(bytes)
+        .and_then(|()| io.stdout.flush())
+        .and_then(|()| write_diagnostics(io.stderr, diagnostics))
     {
         Ok(()) => exit,
         Err(_) => write_failed(io),
