@@ -159,12 +159,10 @@ impl ConnectionScheme {
     }
 }
 
-// The minimum protocol version and the client-certificate mode a listener's
-// settings name, shared with `ggctl` through the configuration compiler
-// (issue #242).
-pub(crate) use gateway_config::inbound_tls::{
-    ClientCertMode, ClientCertRequirement, TlsMinVersion,
-};
+// The minimum protocol version and the client-certificate requirement a
+// listener's settings name, shared with `ggctl` through the configuration
+// compiler (issue #242).
+pub(crate) use gateway_config::inbound_tls::{ClientCertRequirement, TlsMinVersion};
 
 static TLS12_AND_ABOVE: &[&SupportedProtocolVersion] = &[&version::TLS12, &version::TLS13];
 static TLS13_ONLY: &[&SupportedProtocolVersion] = &[&version::TLS13];

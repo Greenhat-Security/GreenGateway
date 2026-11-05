@@ -1108,6 +1108,8 @@
           "cap-fs-ext@4.0.3|registry+https://github.com/rust-lang/crates.io-index",
           "cap-std@4.0.3|registry+https://github.com/rust-lang/crates.io-index",
           "hex@0.4.3|registry+https://github.com/rust-lang/crates.io-index",
+          "http@1.5.0|registry+https://github.com/rust-lang/crates.io-index",
+          "ipnet@2.12.2|registry+https://github.com/rust-lang/crates.io-index",
           "jsonschema@0.60.2|registry+https://github.com/rust-lang/crates.io-index",
           "proptest@1.11.0|registry+https://github.com/rust-lang/crates.io-index",
           "rusqlite@0.40.2|registry+https://github.com/rust-lang/crates.io-index",
@@ -1115,6 +1117,7 @@
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
           "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index",
           "sha2@0.11.1|registry+https://github.com/rust-lang/crates.io-index",
+          "tracing@0.1.44|registry+https://github.com/rust-lang/crates.io-index",
           "url@2.5.8|registry+https://github.com/rust-lang/crates.io-index",
           "uuid@1.26.1|registry+https://github.com/rust-lang/crates.io-index"
         ]
@@ -6328,11 +6331,44 @@
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           {
+            "name": "http",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^1.4.2",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "ipnet",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^2.11.0",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
             "name": "sha2",
             "rename": null,
             "kind": null,
             "target": null,
             "req": "^0.11.0",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "tracing",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^0.1.44",
             "optional": false,
             "uses_default_features": true,
             "features": [],
@@ -8103,8 +8139,28 @@
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway::config::use std :: { collections :: { HashMap , HashSet } , env :: { self , VarError } , error :: Error , fmt , net :: SocketAddr , path :: PathBuf , str :: FromStr , sync :: LazyLock , }#1",
-      "sha256": "a82115cd7f23df27472f360ce15ca064c567ff292a12bb255a02f1337f5f4ec2",
+      "scope": "gateway::config::use std :: { env :: { self , VarError } , net :: SocketAddr , path :: PathBuf , }#1",
+      "sha256": "f9068c4ba6cc254e97df1e01cc99e226c7a145f252d6b5f451d18388ad71a019",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/config.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::config::use gateway_config :: compiler :: *#1",
+      "sha256": "f1f9d1777e876e66af73068fce198f503825dc5adc01ec60df2f1c08461c35b4",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Glob re-export of the configuration compiler (gateway_config::compiler, issue #242) at the paths the gateway has always named its settings by; the compiler names no transport, file, process or environment API, which its zero-I/O source scan holds."
+    },
+    {
+      "file": "gateway-config/src/compiler.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::compiler::use std :: { collections :: { HashMap , HashSet } , env :: VarError , error :: Error , fmt , net :: SocketAddr , path :: PathBuf , str :: FromStr , sync :: LazyLock , }#1",
+      "sha256": "3658d7829c4639413132de512131545d84b54304c94a3e51bbaafa1745faeb86",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -8189,41 +8245,41 @@
       "purpose": "Moved unchanged from gateway::inbound_tls for #242: the listener client-certificate mode the configuration compiler parses. Its only unexpanded input is the `#[default]` variant marker of a standard `Default` derive; a plain enum with no transport, file or process capability."
     },
     {
-      "file": "gateway/src/config.rs",
+      "file": "gateway-config/src/compiler.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::StateBackend#1",
+      "scope": "gateway_config::compiler::StateBackend#1",
       "sha256": "5b01127d64e2cd12fe7fe2a565ecdca8c1ee988a78b41ad2ea6a885bbf05665c",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
-      "file": "gateway/src/config.rs",
+      "file": "gateway-config/src/compiler.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::DatabaseTlsMode#1",
+      "scope": "gateway_config::compiler::DatabaseTlsMode#1",
       "sha256": "ad2ac35857d530f78b48d111ec5c77f7824cd76194ad1916d4af7d87a65de8ef",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
-      "file": "gateway/src/config.rs",
+      "file": "gateway-config/src/compiler.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::UpstreamLoadBalancingStrategy#1",
+      "scope": "gateway_config::compiler::UpstreamLoadBalancingStrategy#1",
       "sha256": "0031658aa35b4a616c8259f3ff0140c864aaf8acd49026ab38085314e386c36f",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
-      "file": "gateway/src/config.rs",
+      "file": "gateway-config/src/compiler.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::UpstreamRequestBodyMode#1",
+      "scope": "gateway_config::compiler::UpstreamRequestBodyMode#1",
       "sha256": "6784b1ca2fbb5aecac05d65ef310aab6aba6d2d3ba0ab9018e45d7b9bf497fc1",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
@@ -8319,21 +8375,11 @@
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
-      "file": "gateway/src/config.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::config::impl  ConfigError::problems#1",
-      "sha256": "73ec1cd52e14bd0b84a851b33f115fbba88fc1f38ae27efa9abca263a4f9adef",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
-    },
-    {
-      "file": "gateway/src/config.rs",
+      "file": "gateway-config/src/compiler.rs",
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "gateway::config::url_host_is_loopback#1",
+      "scope": "gateway_config::compiler::url_host_is_loopback#1",
       "sha256": "ef51ec667a217d2d76d791c03eecc2efea01487c8c2ca36450eae01d85634e64",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
@@ -15422,31 +15468,21 @@
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
     {
-      "file": "gateway/src/config/authority_events.rs",
+      "file": "gateway-config/src/compiler/authority_events.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::authority_events::AuthorityEventSinkSetting#1",
+      "scope": "gateway_config::compiler::authority_events::AuthorityEventSinkSetting#1",
       "sha256": "f5ef9e35e4d2ca02be18a568f1c64792fbd79433ae4191195d3ca705e1ef31f4",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
-      "file": "gateway/src/config/authority_events.rs",
+      "file": "gateway-config/src/compiler/authority_events.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::authority_events::impl  AuthorityEventSettings::retention#1",
-      "sha256": "e5f0f85f57447269aa7d76fd7187872f459993214341bfa959539733fc4d0fbc",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
-    },
-    {
-      "file": "gateway/src/config/authority_events.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::config::authority_events::AuthorityEvidenceDurability#1",
+      "scope": "gateway_config::compiler::authority_events::AuthorityEvidenceDurability#1",
       "sha256": "4504d9d256f82b5d0e1bccb9bd5a65f603360b6cd1e057d858a651494a1816c8",
       "owner": "GreenGateway maintainers",
       "purpose": "Clone/Copy/Debug/Default/PartialEq/Eq derives and #[default] on the two-value AUTHORITY_EVIDENCE_DURABILITY setting; no transport, file or process capability (issue #425)."

@@ -144,19 +144,18 @@ impl RoutingInputs {
 
 /// The validated proxy settings.
 #[derive(Clone, PartialEq)]
-pub(crate) struct ProxyPlan {
-    pub(crate) trust_proxy_headers: bool,
-    pub(crate) trusted_proxy_cidrs: Vec<IpNet>,
-    pub(crate) upstream_url: Option<String>,
-    pub(crate) upstream_routes: Vec<UpstreamRouteConfig>,
-    pub(crate) mcp_upstream_servers: Vec<McpUpstreamServerConfig>,
-    pub(crate) upstream_timeout_ms: Option<u64>,
-    pub(crate) upstream_response_idle_timeout_ms: Option<u64>,
-    pub(crate) upstream_connect_timeout_ms: Option<u64>,
+pub struct ProxyPlan {
+    pub trust_proxy_headers: bool,
+    pub trusted_proxy_cidrs: Vec<IpNet>,
+    pub upstream_url: Option<String>,
+    pub upstream_routes: Vec<UpstreamRouteConfig>,
+    pub mcp_upstream_servers: Vec<McpUpstreamServerConfig>,
+    pub upstream_timeout_ms: Option<u64>,
+    pub upstream_response_idle_timeout_ms: Option<u64>,
+    pub upstream_connect_timeout_ms: Option<u64>,
     /// Where each of the two blocks' inputs came from, in the order they are
     /// read.
-    #[allow(dead_code)] // Read by the stage tests; startup builds from the values alone.
-    pub(crate) provenance: Vec<Provenance>,
+    pub provenance: Vec<Provenance>,
 }
 
 /// Prints the plan's shape, not its destinations.
@@ -337,7 +336,7 @@ fn validate_cookie_session_delegation(
                 .or_else(|| auth_cookie_name.strip_prefix("__Host-"))
                 .unwrap_or(auth_cookie_name);
             if !route.forward_cookie_session
-                || !crate::middleware::auth::safe_cookie_token(name)
+                || !crate::auth::safe_cookie_token(name)
                 || name_base == auth_base
             {
                 findings.refuse(

@@ -3,15 +3,10 @@ use std::{
     env::VarError,
 };
 
-use gateway_config::semantic_diff::{
-    ChangeClass, Display, Effect, RiskCode, SemanticDiff, Severity, Shown,
-    DEFAULT_TOOL_MAX_CONCURRENT, DEFAULT_TOOL_TIMEOUT_MS,
-};
-
 use super::{plans, SETTINGS};
 use crate::{
-    config::{inventory::CONFIG_INPUTS, plan, plan::ConfigPlan},
-    rbac::policy::{DEFAULT_TOOL_POLICY_MAX_CONCURRENT, DEFAULT_TOOL_POLICY_TIMEOUT_MS},
+    compiler::{inventory::CONFIG_INPUTS, plan, plan::ConfigPlan},
+    semantic_diff::{ChangeClass, Display, Effect, RiskCode, SemanticDiff, Severity, Shown},
 };
 
 const CANARY: &str = "zqcanary";
@@ -85,17 +80,6 @@ fn every_compiler_input_is_compared_exactly_once() {
         };
         assert_eq!(field.class, expected, "{}", field.id);
     }
-}
-
-/// The policy members the diff models are the shared reader's list, which
-/// `config::bundle`'s tests hold to the loader's.
-#[test]
-fn the_policy_model_takes_the_policy_loaders_defaults() {
-    assert_eq!(DEFAULT_TOOL_TIMEOUT_MS, DEFAULT_TOOL_POLICY_TIMEOUT_MS);
-    assert_eq!(
-        DEFAULT_TOOL_MAX_CONCURRENT,
-        u64::from(DEFAULT_TOOL_POLICY_MAX_CONCURRENT)
-    );
 }
 
 #[test]

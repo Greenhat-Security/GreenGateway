@@ -25,7 +25,7 @@ use std::{collections::BTreeMap, env::VarError};
 
 use super::inventory;
 
-/// How one variable came back when `Config::from_env_vars` looked it up.
+/// How one variable came back when the compiler looked it up.
 /// Never its value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LookupState {
@@ -35,7 +35,7 @@ enum LookupState {
     Set,
 }
 
-/// How every inventoried variable `Config::from_env_vars` requested came
+/// How every inventoried variable the compiler requested came
 /// back.
 #[derive(Default)]
 pub(super) struct Lookups {
@@ -61,7 +61,7 @@ impl Lookups {
         self.states.insert(name, state);
     }
 
-    /// A variable `from_env_vars` never requested had no effect on the
+    /// A variable the compiler never requested had no effect on the
     /// parse, which is also what an unset one has.
     fn state(&self, name: &str) -> LookupState {
         self.states.get(name).copied().unwrap_or(LookupState::Unset)
@@ -70,7 +70,7 @@ impl Lookups {
 
 /// What a diagnostic records about the input its problem names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ConfigDiagnosticCode {
+pub enum ConfigDiagnosticCode {
     /// The variable is not set.
     Unset,
     /// The variable is set to an empty or whitespace-only value.
@@ -93,7 +93,7 @@ pub(crate) enum ConfigDiagnosticCode {
 /// does not parse, is out of bounds, or is not one of the accepted words.
 /// Every other rule relates inputs, and is named for what it requires.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ConfigRule {
+pub enum ConfigRule {
     /// The input's own value was refused.
     Value,
     /// `ADMIN_LISTEN_ADDR` resolves to the data listener's address.
@@ -235,17 +235,16 @@ impl Report {
 }
 
 /// One configuration problem, without the value that caused it.
-#[allow(dead_code)] // Fields are read by the parity tests until the #433 compiler reads them.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ConfigDiagnostic {
+pub struct ConfigDiagnostic {
     /// The inventoried variable the problem begins with, or `None` when it
     /// begins with none.
-    pub(crate) variable: Option<&'static str>,
-    pub(crate) code: ConfigDiagnosticCode,
+    pub variable: Option<&'static str>,
+    pub code: ConfigDiagnosticCode,
     /// The rule that refused the problem.
-    pub(crate) rule: ConfigRule,
+    pub rule: ConfigRule,
     /// Built from `variable`, `code` and fixed text only.
-    pub(crate) message: String,
+    pub message: String,
 }
 
 fn diagnostic(problem: &str, lookups: &Lookups, rule: ConfigRule) -> ConfigDiagnostic {

@@ -1,7 +1,7 @@
 //! The listeners, their inbound TLS and client-certificate authentication,
 //! compiled in pure stages (issue #433, PR 2).
 //!
-//! This is the first block `Config::from_env_vars` reads.
+//! This is the first block the compiler reads.
 //! [`ListenerInputs::read`] requests its nineteen inputs; [`compile`] parses
 //! each one on its own and then checks the rules between them: the listeners
 //! must not share an address, a certificate list needs its key list, admin TLS
@@ -144,14 +144,15 @@ impl ListenerInputs {
 /// position: the first pair is the default, and more than one turns on SNI
 /// selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TlsMaterial {
-    pub(crate) certificate_files: Vec<String>,
-    pub(crate) private_key_files: Vec<SecretLocator>,
+pub struct TlsMaterial {
+    pub certificate_files: Vec<String>,
+    pub private_key_files: Vec<SecretLocator>,
 }
 
 impl TlsMaterial {
-    /// The legacy `Config` fields: the certificate and key file lists.
-    pub(super) fn into_files(self) -> (Vec<String>, Vec<String>) {
+    /// The certificate and key file lists, with each key's locator handed
+    /// over as the path activation opens.
+    pub fn into_files(self) -> (Vec<String>, Vec<String>) {
         let private_key_files = self
             .private_key_files
             .into_iter()
@@ -163,24 +164,23 @@ impl TlsMaterial {
 
 /// The validated listener settings.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ListenerPlan {
-    pub(crate) listen_addr: SocketAddr,
-    pub(crate) admin_listen_addr: Option<SocketAddr>,
-    pub(crate) grpc_listen_addr: Option<SocketAddr>,
-    pub(crate) grpc_max_concurrent_streams: u32,
-    pub(crate) grpc_max_metadata_bytes: u32,
+pub struct ListenerPlan {
+    pub listen_addr: SocketAddr,
+    pub admin_listen_addr: Option<SocketAddr>,
+    pub grpc_listen_addr: Option<SocketAddr>,
+    pub grpc_max_concurrent_streams: u32,
+    pub grpc_max_metadata_bytes: u32,
     /// The data listener's TLS material, or `None` for plaintext.
-    pub(crate) data_tls: Option<TlsMaterial>,
+    pub data_tls: Option<TlsMaterial>,
     /// The admin listener's TLS material, or `None` for plaintext.
-    pub(crate) admin_tls: Option<TlsMaterial>,
-    pub(crate) tls_min_version: TlsMinVersion,
-    pub(crate) tls_handshake_timeout_ms: u64,
-    pub(crate) tls_max_concurrent_handshakes: usize,
-    pub(crate) client_cert_auth: Option<InboundClientAuthConfig>,
-    pub(crate) admin_client_cert_auth: Option<InboundClientAuthConfig>,
+    pub admin_tls: Option<TlsMaterial>,
+    pub tls_min_version: TlsMinVersion,
+    pub tls_handshake_timeout_ms: u64,
+    pub tls_max_concurrent_handshakes: usize,
+    pub client_cert_auth: Option<InboundClientAuthConfig>,
+    pub admin_client_cert_auth: Option<InboundClientAuthConfig>,
     /// Where each of the block's inputs came from, in the order they are read.
-    #[allow(dead_code)] // Read by the stage tests; startup builds from the values alone.
-    pub(crate) provenance: Vec<Provenance>,
+    pub provenance: Vec<Provenance>,
 }
 
 /// Each listener input parsed on its own, before any rule relates them.
