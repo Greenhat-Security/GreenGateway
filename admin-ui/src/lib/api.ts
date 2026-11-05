@@ -219,10 +219,11 @@ export async function adminFetchJsonResponse<T>(
 
 // Whether a successful write to this path can have changed the live policy.
 // Previews, validation, conversion, simulations, analyses and test runs read
-// only their request, and a replay job only reads retained records; saving,
-// editing or deleting a draft changes no enforcement, and only a draft's
-// publication does. (Opening a suggestion in a draft or dismissing one is
-// not under `/policy` and changes no policy either.)
+// only their request, and a replay job only reads retained records; a
+// suppression only labels an analyzer finding; saving, editing or deleting a
+// draft changes no enforcement, and only a draft's publication does.
+// (Opening a suggestion in a draft or dismissing one is not under `/policy`
+// and changes no policy either.)
 function changesLivePolicy(path: string): boolean {
   const policyPath = adminApiUrl('/policy');
   if (path !== policyPath && !path.startsWith(`${policyPath}/`)) {
@@ -236,6 +237,10 @@ function changesLivePolicy(path: string): boolean {
     path === adminApiUrl('/policy/analyses') ||
     path === adminApiUrl('/policy/tests/runs')
   ) {
+    return false;
+  }
+  const analysesPath = adminApiUrl('/policy/analyses');
+  if (path === analysesPath || path.startsWith(`${analysesPath}/`)) {
     return false;
   }
   const replaysPath = adminApiUrl('/policy/replays');

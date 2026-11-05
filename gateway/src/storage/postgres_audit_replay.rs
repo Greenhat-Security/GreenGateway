@@ -71,17 +71,10 @@
 //! text, no window bound, position or record value crosses the error
 //! boundary, and the job sees only an opaque [`ReplaySourceError`].
 //!
-//! Nothing calls the reader outside tests yet: cluster mode answers every
-//! replay route `503 policy_replay_unsupported_in_cluster` until replay jobs
-//! run under #241's durable leases.
-
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "cluster replay routes answer 503 until jobs run under #241's durable leases (#243)"
-    )
-)]
+//! The reader's callers are the cluster replay routes, which fix a job's
+//! cutoff when it is admitted, and the replay worker every cluster replica
+//! runs, which reads the job's pages and its closing check
+//! (`admin_policy_replays`'s cluster module).
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

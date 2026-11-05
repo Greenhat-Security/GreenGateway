@@ -234,6 +234,21 @@ scan, evidence and tool-contract regression suites and a real trusted candidate
 verification. Failed/skipped verification or a digest different from the scan/build
 output prevents promotion. See [operator verification and offline evidence](../RELEASING.md#verifying-image-provenance-and-retrieving-the-sbom).
 
+## Signed ggctl release evidence
+
+`ggctl` release archives follow the same model ([release artifacts](../ggctl.md#release-artifacts)).
+`.github/workflows/release-ggctl.yml` builds each target with `--locked`, the
+production compiler and no cache, twice, and requires byte-identical archives
+and SBOMs. Only its tag-push jobs hold OIDC/attestation write permissions: one
+per target attests the archive's SPDX SBOM, and the release job attests the
+build provenance of every archive, SBOM and `SHA256SUMS`, checks that each
+artifact has all three (`scripts/ggctl_release.py check`), and verifies each
+attestation with the pinned GitHub CLI, constrained like the image verifier,
+before it drafts a release. The SBOM is generated from Cargo's resolved
+metadata for the target, so it lists exactly the locked crates the build
+compiles, with their `Cargo.lock` checksums. The build and dry-run jobs that
+pull requests run are read-only and hold no secret.
+
 
 ## Minimal production runtime
 

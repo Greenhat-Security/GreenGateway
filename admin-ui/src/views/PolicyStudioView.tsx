@@ -2359,6 +2359,8 @@ export function PolicyStudioView() {
                     alert: validation.kind === 'failed' ? validation.alert : null,
                   }}
                   canEditDraft={editable}
+                  canAnalyze={canAnalyze}
+                  canWritePolicy={canWrite}
                   onShowInEditor={showDiagnostic}
                 />
               ) : null}

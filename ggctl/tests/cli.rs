@@ -204,6 +204,69 @@ fn help_completion_and_schema_are_artifacts_on_standard_output() {
     );
 }
 
+/// The release archives ship `ggctl help --man` output as their man pages;
+/// each must cover what the binary's own help lists.
+#[test]
+fn every_command_has_a_manual_page_naming_every_option_its_help_lists() {
+    let manual = ggctl(&["help", "--man"], None);
+    assert_eq!(manual.status.code(), Some(0));
+    assert!(manual.stderr.is_empty());
+    let manual = text(&manual.stdout);
+    assert!(manual.contains("\n.TH GGCTL 1 "));
+    assert!(!manual.contains('\r'));
+
+    let overview = text(&ggctl(&["help"], None).stdout);
+    let listed = overview
+        .split("\nCommands:\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n").next())
+        .expect("the overview lists the commands");
+    // A name and its summary are two spaces apart; a family's command is
+    // listed by its full name, such as `ledger seed`.
+    let commands: Vec<&str> = listed
+        .lines()
+        .filter(|line| line.starts_with("  ") && !line.starts_with("   "))
+        .filter_map(|line| line.trim_start().split("  ").next())
+        .collect();
+    assert!(
+        commands.contains(&"validate")
+            && commands.contains(&"ledger seed")
+            && commands.contains(&"backup create")
+    );
+    let mut topics: Vec<&str> = commands
+        .iter()
+        .filter_map(|command| command.split_once(' ').map(|(family, _)| family))
+        .collect();
+    topics.dedup();
+    assert_eq!(topics, ["ledger", "backup", "policy", "evidence"]);
+    topics.extend(&commands);
+    for command in topics {
+        // A page is named by its words joined with hyphens, and roff escapes
+        // every hyphen, including those inside a name such as `mcp-config`.
+        let name = command.replace([' ', '-'], "\\-");
+        assert!(
+            manual.contains(&format!("\\fBggctl\\-{name}\\fR(1)")),
+            "{command}"
+        );
+        let words: Vec<&str> = command.split(' ').collect();
+        let page = ggctl(&[&["help", "--man"][..], &words].concat(), None);
+        assert_eq!(page.status.code(), Some(0), "{command}");
+        let page = text(&page.stdout);
+        assert!(
+            page.contains(&format!(".TH GGCTL\\-{} 1 ", name.to_ascii_uppercase())),
+            "{command}"
+        );
+        let help = text(&ggctl(&[&["help"][..], &words].concat(), None).stdout);
+        for option in help.lines().filter_map(|line| line.strip_prefix("  --")) {
+            let name = option.split_whitespace().next().expect("an option name");
+            assert!(
+                page.contains(&format!("\\fB\\-\\-{}\\fR", name.replace('-', "\\-"))),
+                "{command} --{name}"
+            );
+        }
+    }
+}
+
 #[test]
 fn argument_errors_exit_2_and_never_echo_the_argument() {
     for arguments in [
