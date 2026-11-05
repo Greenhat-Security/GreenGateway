@@ -63,6 +63,10 @@ pub(super) fn admin_ui_html_response(
                 header::CONTENT_SECURITY_POLICY,
                 HeaderValue::from_static(ADMIN_UI_CONTENT_SECURITY_POLICY),
             ),
+            (
+                HeaderName::from_static("permissions-policy"),
+                HeaderValue::from_static(middleware::headers::PERMISSIONS_POLICY),
+            ),
         ],
         html,
     )
@@ -107,6 +111,10 @@ pub(super) fn embedded_asset_response(path: &str, asset: rust_embed::EmbeddedFil
             (
                 header::CONTENT_SECURITY_POLICY,
                 HeaderValue::from_static(ADMIN_UI_CONTENT_SECURITY_POLICY),
+            ),
+            (
+                HeaderName::from_static("permissions-policy"),
+                HeaderValue::from_static(middleware::headers::PERMISSIONS_POLICY),
             ),
         ],
         asset.data.into_owned(),
