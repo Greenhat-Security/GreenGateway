@@ -567,7 +567,7 @@ mod tests {
             powershell.matches(')').count()
         );
         assert!(powershell.contains(
-            "$previous -in @('--against', '--answers', '--ca-file', '--candidate', '--output', '--state-dir', '--token-file')"
+            "$previous -in @('--against', '--against-env', '--answers', '--ca-file', '--candidate', '--env', '--output', '--state-dir', '--token-file')"
         ));
         // A bundle directory completes directory names.
         assert!(bash

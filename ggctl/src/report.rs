@@ -22,6 +22,7 @@ use std::{
 use gateway_config::{
     archive::{ArchiveCode, ArchiveRefusal},
     bundle::{self, BundleDiagnostic},
+    compiler::diagnostic::ConfigRule,
     documents::{API_VERSION_V1ALPHA1, REPORT_KIND},
 };
 use serde::Serialize;
@@ -82,6 +83,48 @@ pub(crate) enum ReportDiagnostic {
     /// The shared archive admission rules refused a backup archive, located
     /// by the position of the entry they refused.
     Archive(ArchiveRefusal),
+    /// One about an environment file (`--env`, `--against-env`): its
+    /// grammar or what the configuration compiler refused in it.
+    Env(EnvDiagnostic),
+}
+
+/// A finding about an environment file, located by the argument that names
+/// the file and, where there is one, the 1-based line, and naming at most an
+/// inventoried setting and a compiler rule: never a value, a key outside the
+/// inventory or the file's path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EnvDiagnostic {
+    /// An `env` or `config` code.
+    pub(crate) code: Code,
+    /// The 1-based position of the option naming the file.
+    pub(crate) argument: usize,
+    /// The 1-based line concerned.
+    pub(crate) line: Option<usize>,
+    /// The inventoried setting concerned, as the compiler's inventory spells
+    /// it: the field catalog's identifier.
+    pub(crate) field: Option<&'static str>,
+    /// The compiler rule that refused it.
+    pub(crate) rule: Option<ConfigRule>,
+    /// A warning that leaves the exit code alone, rather than an error: a
+    /// repeated key without `--strict`.
+    pub(crate) warning: bool,
+    /// Fixed guidance chosen by `ggctl`.
+    pub(crate) hint: Option<&'static str>,
+}
+
+impl EnvDiagnostic {
+    /// An error about the file as a whole, or about one line of it.
+    pub(crate) fn new(code: Code, argument: usize, line: Option<usize>) -> Self {
+        Self {
+            code,
+            argument,
+            line,
+            field: None,
+            rule: None,
+            warning: false,
+            hint: None,
+        }
+    }
 }
 
 impl ReportDiagnostic {
@@ -91,6 +134,7 @@ impl ReportDiagnostic {
             Self::Bundle(diagnostic) | Self::Document { diagnostic, .. } => {
                 diagnostic.code.as_str()
             }
+            Self::Env(diagnostic) => diagnostic.code.as_str(),
             Self::Archive(refusal) => refusal.code.as_str(),
         }
     }
@@ -101,6 +145,7 @@ impl ReportDiagnostic {
             Self::Bundle(diagnostic) | Self::Document { diagnostic, .. } => {
                 diagnostic.severity.as_str()
             }
+            Self::Env(diagnostic) => diagnostic.severity(),
             Self::Archive(_) => "error",
         }
     }
@@ -111,6 +156,7 @@ impl ReportDiagnostic {
             Self::Bundle(diagnostic) | Self::Document { diagnostic, .. } => {
                 diagnostic.code.message()
             }
+            Self::Env(diagnostic) => diagnostic.code.message(),
             Self::Archive(refusal) => refusal.code.message(),
         }
     }
@@ -119,6 +165,7 @@ impl ReportDiagnostic {
         match self {
             Self::Ggctl(diagnostic) => diagnostic.hint,
             Self::Bundle(_) | Self::Document { .. } | Self::Archive(_) => None,
+            Self::Env(diagnostic) => diagnostic.hint,
         }
     }
 
@@ -126,6 +173,7 @@ impl ReportDiagnostic {
         match self {
             Self::Ggctl(diagnostic) => diagnostic.code.remediation(),
             Self::Bundle(_) | Self::Document { .. } => BUNDLE_REMEDIATION,
+            Self::Env(diagnostic) => diagnostic.code.remediation(),
             Self::Archive(_) => ARCHIVE_REMEDIATION,
         }
     }
@@ -136,6 +184,23 @@ impl ReportDiagnostic {
             Self::Ggctl(diagnostic) => diagnostic.code.exit(),
             Self::Bundle(diagnostic) | Self::Document { diagnostic, .. } => bundle_exit(diagnostic),
             Self::Archive(refusal) => archive_exit(refusal),
+            Self::Env(diagnostic) => diagnostic.exit(),
+        }
+    }
+
+    /// The inventoried setting an environment file diagnostic concerns.
+    pub(crate) fn field(&self) -> Option<&'static str> {
+        match self {
+            Self::Env(diagnostic) => diagnostic.field,
+            Self::Ggctl(_) | Self::Bundle(_) | Self::Document { .. } | Self::Archive(_) => None,
+        }
+    }
+
+    /// The name of the compiler rule an environment file diagnostic reports.
+    pub(crate) fn rule(&self) -> Option<&'static str> {
+        match self {
+            Self::Env(diagnostic) => diagnostic.rule.map(ConfigRule::as_str),
+            Self::Ggctl(_) | Self::Bundle(_) | Self::Document { .. } | Self::Archive(_) => None,
         }
     }
 
@@ -163,6 +228,33 @@ impl ReportDiagnostic {
                 entry,
                 conflicts_with: refusal.conflicts_with,
             }),
+            Self::Env(diagnostic) => Some(match diagnostic.line {
+                Some(line) => LocationRecord::Line {
+                    argument: diagnostic.argument,
+                    line,
+                },
+                None => LocationRecord::Argument {
+                    argument: diagnostic.argument,
+                },
+            }),
+        }
+    }
+}
+
+impl EnvDiagnostic {
+    fn severity(&self) -> &'static str {
+        if self.warning {
+            "warning"
+        } else {
+            "error"
+        }
+    }
+
+    fn exit(&self) -> Exit {
+        if self.warning {
+            Exit::Success
+        } else {
+            self.code.exit()
         }
     }
 }
@@ -203,11 +295,18 @@ impl From<BundleDiagnostic> for ReportDiagnostic {
     }
 }
 
+impl From<EnvDiagnostic> for ReportDiagnostic {
+    fn from(diagnostic: EnvDiagnostic) -> Self {
+        Self::Env(diagnostic)
+    }
+}
+
 /// The human form written to standard error.
 impl fmt::Display for ReportDiagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (diagnostic, argument) = match self {
             Self::Ggctl(diagnostic) => return diagnostic.fmt(formatter),
+            Self::Env(diagnostic) => return diagnostic.fmt(formatter),
             Self::Archive(refusal) => {
                 write!(
                     formatter,
@@ -255,6 +354,34 @@ impl fmt::Display for ReportDiagnostic {
     }
 }
 
+/// The human form of an environment file diagnostic: the file by the
+/// argument naming it, then the line, setting and rule where there are any.
+impl fmt::Display for EnvDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "ggctl: {}: {}: {}\n  at: argument {}",
+            self.severity(),
+            self.code.as_str(),
+            self.code.message(),
+            self.argument
+        )?;
+        if let Some(line) = self.line {
+            write!(formatter, ", line {line}")?;
+        }
+        if let Some(field) = self.field {
+            write!(formatter, "\n  setting: {field}")?;
+        }
+        if let Some(rule) = self.rule {
+            write!(formatter, "\n  rule: {}", rule.as_str())?;
+        }
+        if let Some(hint) = self.hint {
+            write!(formatter, "\n  hint: {hint}")?;
+        }
+        write!(formatter, "\n  see: {}", self.code.remediation())
+    }
+}
+
 /// The `GgctlReport` document.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -279,6 +406,12 @@ struct DiagnosticRecord {
     remediation: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     location: Option<LocationRecord>,
+    /// The inventoried setting an environment file diagnostic concerns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: Option<&'static str>,
+    /// The configuration compiler rule that refused it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule: Option<&'static str>,
 }
 
 /// What a diagnostic is about.
@@ -287,6 +420,9 @@ struct DiagnosticRecord {
 pub(crate) enum LocationRecord {
     /// The 1-based position of the command-line argument.
     Argument { argument: usize },
+    /// A 1-based line of the environment file that the option at that
+    /// position names; the file's path is never echoed.
+    Line { argument: usize, line: usize },
     /// A place in one bundle file: its bundle-relative name, a JSON Pointer
     /// built from member names the reader defines, and the 1-based line and
     /// column where the reader has them.
@@ -327,6 +463,8 @@ impl From<&ReportDiagnostic> for DiagnosticRecord {
             hint: diagnostic.hint(),
             remediation: diagnostic.remediation(),
             location: diagnostic.location(),
+            field: diagnostic.field(),
+            rule: diagnostic.rule(),
         }
     }
 }
