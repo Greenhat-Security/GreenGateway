@@ -23,21 +23,26 @@ use super::{
 /// — a revoked token never becomes valid again, and rotating a revoked token
 /// is a conflict.
 ///
-/// Rotate and revoke are told who is acting. Each committed change records
-/// that actor -- its subject, canonical issuer, actor kind and auth mode
-/// ([`ChangeActor`]) -- and its action as append-only change evidence in the
-/// same transaction as the change itself (issue #425): if the evidence cannot
-/// be written, the change rolls back and the call fails. A call that changes
-/// nothing -- a repeat revoke, a rotate refused as a conflict, an unknown
-/// token -- records nothing. An actor evidence cannot record exactly (an
-/// empty or oversized subject,
-/// [`crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_BYTES`], or an issuer outside
-/// [`ChangeActor::is_recordable`]) is refused before anything changes. The
-/// evidence never holds the plaintext, the hash, the display prefix or the
-/// scopes.
+/// Create, rotate and revoke are told who is acting. Each committed change --
+/// the issue of a new token included -- records that actor -- its subject,
+/// canonical issuer, actor kind and auth mode ([`ChangeActor`]) -- and its
+/// action as append-only change evidence in the same transaction as the
+/// change itself (issue #425): if the evidence cannot be written, the change
+/// rolls back and the call fails. A call that changes nothing -- a repeat
+/// revoke, a rotate refused as a conflict, an unknown token -- records
+/// nothing. An actor evidence cannot record exactly (an empty or oversized
+/// subject, [`crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_BYTES`], or an
+/// issuer outside [`ChangeActor::is_recordable`]) is refused before anything
+/// changes. The evidence never holds the plaintext, the hash, the display
+/// prefix or the scopes. A token's `created_by` still names its creator; for
+/// a token issued before issue evidence existed it is the only record.
 #[async_trait]
 pub trait ServiceTokenStore: Send + Sync {
-    async fn create(&self, request: CreateTokenRequest) -> Result<CreatedToken, RepositoryError>;
+    async fn create(
+        &self,
+        request: CreateTokenRequest,
+        actor: &ChangeActor,
+    ) -> Result<CreatedToken, RepositoryError>;
 
     async fn list(&self, filters: &TokenListFilters) -> Result<TokenPage, RepositoryError>;
 
@@ -71,10 +76,15 @@ pub trait ServiceTokenStore: Send + Sync {
 /// trait shares its method names with this contract.
 #[async_trait]
 impl ServiceTokenStore for SqliteTokenStore {
-    async fn create(&self, request: CreateTokenRequest) -> Result<CreatedToken, RepositoryError> {
+    async fn create(
+        &self,
+        request: CreateTokenRequest,
+        actor: &ChangeActor,
+    ) -> Result<CreatedToken, RepositoryError> {
         let store = self.clone();
+        let actor = actor.clone();
         run_blocking(move || {
-            TokenStore::create(&store, request)
+            TokenStore::create(&store, request, &actor)
                 .map_err(|error| map_token_store_error("service_token_create", error))
         })
         .await

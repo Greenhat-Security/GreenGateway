@@ -32,7 +32,10 @@ database gains the same columns. Migration 25 adds the same three columns to
 `catalog_change_evidence`, and every catalog publication records them. Migration 26 makes migration 19's
 `greengateway.admin_session_evidence` the fourth journal source, with journal
 capacity held for every session's withdrawal so that a full journal never refuses a
-logout. The first PR 4 slice adds migration 12 of the
+logout. Migration 27 lets migration 18's token table record the issue of a
+service token too, written and journaled in the create's transaction, and the
+standalone token database rebuilds its own table once to admit it. The first PR 4
+slice adds migration 12 of the
 standalone Connections database: Connection create/replace/delete and local-secret
 create/rotate/delete/re-encryption write its `connection_change_evidence` and
 `connection_local_secret_change_evidence` rows, with the whole actor, in their own
@@ -87,7 +90,7 @@ or unconfigured individual stores.
 | Connection and credential binding changes | Record, bindings, immutable version, shared revision and outbox | Actor/history must survive Connection deletion; safe per-operation metadata and delivery. Standalone writes non-cascading create, replace and `credential.binding_change` evidence, with the whole actor, in the Connections database's own transaction ([Standalone evidence](#standalone-evidence)); PostgreSQL does not yet |
 | Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) and its journal row in the same transaction; delivered with keyed safe references since PR 3; since migration 24 the actor's kind, auth mode and canonical issuer too. Standalone writes the same deletion evidence, without a shared revision, in the Connections database's own transaction | A caller-bound operation identity and an issuer-scoped subject reference, without which the delivered record cannot be `authority_event.v1`; standalone evidence is not delivered |
 | Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox, plus one non-cascading `catalog_change_evidence` row (action derived from the write, event/operation UUIDs, the actor's subject, kind, auth mode and canonical issuer, catalog revision transition, compiled overlay revision, shared revision, database-clock time) that outlives the replacement and the Connection's deletion | Caller-bound operation identity, an issuer-scoped subject reference, journaling for delivery |
-| Service-token issue | Token row with creator, row/shared revisions and outbox | Creation retains only `created_by`; no issue evidence row, operation identity or delivery |
+| Service-token issue | Token row with creator, row/shared revisions and outbox, plus since migration 27 a `service_token_change_evidence` row with action `service_token.issue` (actor, event/operation UUIDs, no prior revision and row revision 1, the create outbox row's shared revision, database-clock time) in the create's transaction, journaled and delivered. Standalone writes the same row in the token database's own create transaction. Neither store records the returned plaintext or its hash | A caller-bound operation identity and an issuer-scoped subject reference; tokens issued before the evidence existed keep only `created_by`; standalone evidence is not delivered |
 | Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction. In PostgreSQL the change also journals its evidence and is delivered since PR 3. Both stores record the actor's kind, auth mode and canonical issuer (migration 24 and the token database's own columns) | A caller-bound operation identity and an issuer-scoped subject reference; standalone evidence is not delivered |
 | JWT revocation | Scoped JTI digest, actor row, shared revision and outbox, plus one non-cascading `jwt_revocation_evidence` row per effective revoke (actor, JTI digest, resulting expiry, shared revision) that extension, reactivation and expiry cleanup never rewrite, journaled in the same transaction and delivered since PR 3; since migration 24 the CLI's actor is recorded as kind `system`, auth mode `system` and no issuer | The CLI actor stays system provenance, not a named human; a caller-bound operation identity |
 | Admin session grant/withdrawal (#424) | With `ADMIN_SESSION_MODE=cluster_postgres`, the session row, one non-cascading `admin_session_evidence` row (event/operation UUIDs, session ID, action, reason, subject and issuer, absolute deadline, database-clock time) and, since migration 26, its journal row commit together in one statement for each grant and each withdrawal; a replacement's withdrawal and grant share one operation ID. Delivered since migration 26 on the `session` axis with keyed safe references; a grant holds journal capacity for its withdrawal, so no withdrawal is refused at capacity ([Admin session withdrawals and journal capacity](#admin-session-withdrawals-and-journal-capacity)) | Actor kind and auth mode (the evidence records neither, so a withdrawal by the prune or a provider rejection is named by the session's subject, not as a system actor), an issuer-scoped subject reference, the withdrawal reason in the delivered record, and a caller-bound operation identity. Standalone sessions are process-local memory with no durable record and stay `unsupported_future_operation` |
@@ -495,7 +498,9 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
   since migration 24, each `null` where the row recorded none, the resource kind
   and its keyed reference (a
   JWT revocation's under its issuer and `jti` digest, an admin session's under its
-  random session ID), and the v1 revision transition as decimal strings. An admin
+  random session ID), and the v1 revision transition as decimal strings. A
+  service-token issue (since migration 27) is the token's first revision: `null`
+  before and `1` after, beside its create's shared revision. An admin
   session record carries `null` for the shared security revision, which a session
   does not take. No identifier, token material, `jti`, issuer or secret reaches
   it.
@@ -556,8 +561,15 @@ Not covered by PR 3, and still open:
   tools seed. A change refused because its evidence insert failed is logged with
   its classified store error and counted by `_evidence_failures_total`, so the
   rule pack pages on it like any other refused authority change.
-- **Every other operation.** PostgreSQL Connection create/replace, credential
-  bindings and token issue have no evidence rows to journal yet.
+- **Service-token issue (migration 27).** A create writes its
+  `service_token_change_evidence` row with action `service_token.issue` after the
+  token row and the create outbox row, under the outbox row's shared revision, and
+  journals it in the same transaction. A full journal refuses the create with
+  `503` and mints nothing. The dispatcher delivers it on the token axis with no
+  revision before it and revision `1` after it. Tokens created before migration 27
+  have no issue row, and nothing is backfilled for them.
+- **Every other operation.** PostgreSQL Connection create/replace and credential
+  bindings have no evidence rows to journal yet.
 
 ### Admin session withdrawals and journal capacity
 
@@ -628,8 +640,8 @@ completes), `a_withdrawal_whose_journal_row_cannot_be_written_does_not_happen` a
 `every_grant_and_withdrawal_leaves_one_evidence_row` (every evidence row journaled,
 every held unit spent); `storage::migrations`' `migration_twenty_six_journals_session_evidence_and_holds_withdrawals`;
 and the delivery projection tests in `gateway/src/authority_events/delivery_tests.rs`.
-The PostgreSQL ones run in CI against its disposable loopback database, not verified
-TLS.
+The PostgreSQL ones run in CI against its disposable loopback database, and again
+over verified TLS ([Verified-TLS storage tests](#verified-tls-storage-tests)).
 
 ## Actor metadata
 
@@ -684,7 +696,8 @@ commit-order dispatcher test, and the app-level
 `admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_sqlite`
 and `_postgres` in `gateway/src/admin_tokens_app_tests.rs`, which drive the admin endpoints with principals from two identity
 providers and a service token and read the evidence rows back. The PostgreSQL ones
-run in CI against its disposable loopback database, not verified TLS.
+run in CI against its disposable loopback database, and again over verified TLS
+([Verified-TLS storage tests](#verified-tls-storage-tests)).
 
 Migration 24 leaves migration 23's two tables unchanged. `catalog_change_evidence`
 joins this contract with migration 25, which adds this section's three columns
@@ -712,7 +725,7 @@ second SQLite file cannot commit atomically with the first.
 
 | Store | Table | Written by | Each row holds |
 | --- | --- | --- | --- |
-| `SERVICE_TOKEN_SQLITE_PATH` | `service_token_change_evidence`, created on open | service-token rotate and revoke | actor, action, event and operation UUIDs, token ID, commit time |
+| `SERVICE_TOKEN_SQLITE_PATH` | `service_token_change_evidence`, created on open (a table created before the issue action existed is rebuilt once on open to admit it, keeping every row, its sequence and the sequence counter) | service-token issue, rotate and revoke | actor, action, event and operation UUIDs, token ID, commit time (an issue's is the token's own `created_at`) |
 | `CONNECTIONS_SQLITE_PATH` | `connection_change_evidence`, Connections schema migration 12 | Connection create, replace and delete | actor, action, event and operation UUIDs, Connection ID, the revision before and after on the action's axis, commit time. A replace that advances the credential revision adds a `credential.binding_change` row on the credential axis under the same operation ID |
 | `CONNECTIONS_SQLITE_PATH` | `connection_local_secret_change_evidence`, Connections schema migration 12 | local-secret create, rotate and delete, and each re-encryption batch that rewrote at least one envelope | actor, action, event and operation UUIDs, the gateway-minted secret ID and its version before and after; a batch records only how many envelopes it rewrote |
 
@@ -773,8 +786,9 @@ What standalone evidence lacks compared with cluster mode:
   Connections database that has been migrated, so a rollback needs the database
   backup taken before the upgrade.
 - **Not covered:** managed catalog, overlay and enum-source publication in the
-  same database, service-token issue, and the file-backed policy, tools and
-  configuration authorities, which wait for #242's ledger.
+  same database, and the file-backed policy, tools and configuration authorities,
+  which wait for #242's ledger. A token issued before the token table admitted
+  the issue action has no issue row; `created_by` stays its only record.
 
 ## Required-durability mode
 
@@ -848,8 +862,8 @@ What required mode does not do:
 - It refuses no `admitted` row. Several of them are retained but not delivered: the
   policy, tools and catalog evidence rows are not journal sources (admin-session
   evidence is, since migration 26),
-  cluster Connection create and replace and token issue have no evidence row of
-  their own (their immutable version or token row names the actor), and the
+  cluster Connection create and replace have no evidence row of their own (their
+  immutable version names the actor), and the
   standalone token, Connection and local-secret evidence has no dispatcher. A
   cluster Connection's version history still cascades with the Connection, whose
   deletion has its own evidence row.
@@ -876,6 +890,63 @@ reload helpers in `middleware/rbac_tests.rs` and `tools/definitions.rs` refuse a
 reload and keep the active document; `config_tests.rs`, `config/stage_tests.rs` and
 `ha.rs` cover the startup rules, their diagnostics and the fingerprint.
 
+## Verified-TLS storage tests
+
+The PostgreSQL evidence suites run twice in CI, in two shards of the required
+`postgres-foundation` check. `postgres-foundation-pg` runs the whole gateway suite
+against a service container over loopback plaintext, under the documented
+`loopback-dev` exception. `postgres-foundation-tls` runs these suites again against a
+disposable PostgreSQL 16, the same pinned image, that accepts TLS and nothing else:
+
+- in `storage::contract_tests`, the service-token and JWT revocation evidence tests
+  (`postgres_service_token_change_evidence_satisfies_the_contract`,
+  `service_token_change_evidence_matches_the_outbox_and_survives_deletion_and_restart`,
+  `a_failed_token_evidence_insert_rolls_back_the_rotate_and_the_revoke`,
+  `revoke_and_rotate_race_never_leaves_a_live_plaintext`,
+  `jwt_revocation_evidence_survives_extension_reactivation_and_cleanup`,
+  `a_failed_jwt_evidence_insert_rolls_back_the_revoke`), the suggestion acceptance's
+  document evidence (`an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction`)
+  and `a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity`;
+- the whole PostgreSQL Connection store suite (`connections::pg_store`), its deletion
+  and catalog evidence included;
+- `storage::postgres_documents` and `storage::postgres_admin_sessions`;
+- the dispatcher (`authority_events::dispatcher`);
+- `storage::migrations`' evidence and journal migrations: 12 through 16, 18, 21, 24,
+  25 and 26;
+- the app-level `admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_postgres`.
+
+Each run generates a throwaway CA and a server certificate for `127.0.0.1` and
+`localhost` in the runner's temporary directory, and deletes the CA key once it has
+signed; no key is committed or kept. The server runs with `ssl=on` and a `pg_hba`
+that admits `hostssl` and rejects `hostnossl`. The suites reach it through the test
+harness, `storage::postgres::test_support`: with `GATEWAY_TEST_POSTGRES_TLS_CA_FILE`
+naming the CA, every pool and session it builds runs in `DATABASE_TLS_MODE=verify`
+with that file as `DATABASE_TLS_CA_FILE`, through the gateway's own DSN validation,
+`enforce_tls_policy`, session settings and rustls connector, so the certificate's
+chain and the name dialled are verified on every connection.
+
+What this proves:
+
+- The evidence writes, rollbacks, journal appends, capacity refusals and deliveries
+  those tests assert hold on verified-TLS sessions exactly as on plaintext ones.
+- No suite in the shard can have passed over plaintext or by skipping.
+  `a_verified_tls_run_reaches_its_database_only_over_tls` asserts that the harness's
+  sessions are TLS (`pg_stat_ssl`) and that the server refuses a plaintext one. With
+  the CA locator set, a missing DSN locator panics instead of skipping, and the shard
+  fails when one of its filters selects no test.
+- A server certificate from another CA
+  (`a_server_certificate_from_another_authority_is_unavailable_and_names_no_dsn`) and
+  one that does not name the address dialled, reached through a relay on `127.0.0.2`
+  (`a_server_certificate_for_another_name_is_unavailable_and_names_no_dsn`), are both
+  refused. The connectivity check every store shares classifies the refusal as
+  `unavailable`, startup reports it as the cause of exhausting its retry budget, and
+  neither error renders any part of the DSN.
+
+What it does not prove: password or client-certificate authentication (the test
+server trusts every TLS client), certificate rotation, a managed provider's server,
+or anything about the rest of the gateway suite, whose PostgreSQL tests still run
+only against the loopback database.
+
 ## Next reviewable slices and validation gates
 
 1. **PostgreSQL Connection deletion evidence (landed).** The delete transaction
@@ -887,7 +958,8 @@ reload and keep the active document; `config_tests.rs`, `config/stage_tests.rs` 
    stale ETag, dependency rejection, a missing record, two writers, a forced
    evidence-insert failure and its rollback, and reconciling a lost response
    from the evidence row; CI runs them against its disposable loopback database,
-   not verified TLS. Migration 24 adds the deleting actor's kind, auth mode and
+   and again over verified TLS ([Verified-TLS storage tests](#verified-tls-storage-tests)).
+   Migration 24 adds the deleting actor's kind, auth mode and
    canonical issuer ([Actor metadata](#actor-metadata)). Still open for this row: a
    caller-bound operation identity at the store boundary.
 2. **Service-token and JWT metadata (landed).** `ServiceTokenStore` rotate and
@@ -906,12 +978,17 @@ reload and keep the active document; `config_tests.rs`, `config/stage_tests.rs` 
    rotate/revoke races, actor survival after token deletion and restart, a
    forced evidence-insert failure and its rollback, extension, reactivation and
    cleanup, and synthetic token-material exclusion; the PostgreSQL ones run in
-   CI against its disposable loopback database, not verified TLS. Migration 24
+   CI against its disposable loopback database, and again over verified TLS
+   ([Verified-TLS storage tests](#verified-tls-storage-tests)). Migration 24
    (and the standalone token database's own columns) adds the actor's kind, auth
    mode and canonical issuer, and records the CLI's system label as kind `system`
-   ([Actor metadata](#actor-metadata)). Still open: a caller-bound operation
-   identity, and token issue evidence (`created_by` remains its only actor
-   record).
+   ([Actor metadata](#actor-metadata)). Migration 27 adds token issue evidence
+   to the same table in both stores, written in the create's transaction (and
+   journaled in PostgreSQL), with the shared contract extended to the issue's
+   actor, its forced insert failure and rollback, plaintext and hash exclusion,
+   restart and the contiguous issue, rotate and revoke chain; tokens issued
+   before it keep `created_by` as their only record. Still open: a caller-bound
+   operation identity.
 3. **Shared documents/catalog metadata (landed).** The shared document core
    (`postgres_documents::commit_in`) now writes one migration 23
    `document_change_evidence` row beside the outbox row of every policy and tools
@@ -938,14 +1015,15 @@ reload and keep the active document; `config_tests.rs`, `config/stage_tests.rs` 
    refusals that write nothing, forced evidence-insert failure and its rollback
    (including inside a suggestion acceptance), principal bounds, survival after
    catalog replacement, Connection deletion and restart, and the overlay
-   vocabulary; CI runs them against its disposable loopback database, not
-   verified TLS. Since migration 25 every catalog publication records the whole
-   actor, kind, auth mode and canonical issuer as Connection deletion does
-   ([Actor metadata](#actor-metadata)). Still open: the alignment of the document
-   rows' actor vocabulary with migration 24's, a caller-bound operation identity,
-   and journaling: neither table is a migration 21 journal source, so the
-   dispatcher does not deliver their rows yet. No scheduled catalog refresh ships,
-   so no system catalog actor is recorded yet.
+   vocabulary; CI runs them against its disposable loopback database, and all but
+   the import's (`import::tests`) again over verified TLS
+   ([Verified-TLS storage tests](#verified-tls-storage-tests)). Since migration 25
+   every catalog publication records the whole actor, kind, auth mode and
+   canonical issuer as Connection deletion does ([Actor metadata](#actor-metadata)).
+   Still open: the alignment of the document rows' actor vocabulary with migration
+   24's, a caller-bound operation identity, and journaling: neither table is a
+   migration 21 journal source, so the dispatcher does not deliver their rows yet.
+   No scheduled catalog refresh ships, so no system catalog actor is recorded yet.
 4. **Durable dispatch (landed for the journaled evidence).** Migration 21's
    journal, capacity reservation and dispatcher cursor, the leased dispatcher and
    the log and file sinks, as described under [Durable delivery](#durable-delivery).
@@ -959,7 +1037,9 @@ reload and keep the active document; `config_tests.rs`, `config/stage_tests.rs` 
    undelivered row, capacity exhaustion refusing every producer while committing
    nothing, the running dispatcher's lease and shutdown, and migration 21's
    backfill; the request-audit sink regressions are unchanged. CI runs them against
-   its disposable loopback database, not verified TLS. Migration 26 adds the
+   its disposable loopback database, and runs the dispatcher and migration tests
+   again over verified TLS ([Verified-TLS storage tests](#verified-tls-storage-tests)).
+   Migration 26 adds the
    cluster admin session evidence as a journal source, with a unit of capacity held
    for each session's withdrawal ([Admin session withdrawals and journal capacity](#admin-session-withdrawals-and-journal-capacity)),
    moving the serving contract from exactly schema 25 to exactly schema 26, a
@@ -974,8 +1054,8 @@ reload and keep the active document; `config_tests.rs`, `config/stage_tests.rs` 
    refused, the migration onto an existing database fabricating nothing, the actor
    CHECKs pinned to migration 24's, synthetic-marker exclusion, and the admin
    endpoints and maintenance command recording their whole actors. Still open here:
-   catalog and overlay publication in that database, token issue evidence, a
-   caller-bound operation identity, and delivery of any standalone evidence.
+   catalog and overlay publication in that database, a caller-bound operation
+   identity, and delivery of any standalone evidence.
    For policy/tools/configuration, require ledger-owned safe manifest/digest,
    parent revision/CAS, actor/operation intent, atomic activation/evidence or
    recoverable staging, authoritative replay after interruption, and export

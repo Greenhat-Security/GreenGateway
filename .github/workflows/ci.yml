@@ -505,21 +505,22 @@ jobs:
   #
   # The test DSN uses the documented `loopback-dev` TLS exception because the
   # GitHub-hosted service container is reachable only over loopback plaintext
-  # -- exactly the shape the exception exists for. Full verified-TLS coverage
-  # (server certificate + hostname verification against a configured CA) is
-  # exercised in the TLS-focused suites of later #241 PRs, which bring up
-  # their own TLS-capable database rather than sharing this one.
+  # -- exactly the shape the exception exists for. Verified TLS (server
+  # certificate and hostname verification against a configured CA) is the
+  # fourth shard's: `postgres-foundation-tls` brings up its own database that
+  # accepts nothing else and runs the authority-evidence suites against it.
   #
   # `POSTGRES_HOST_AUTH_METHOD: trust` means the CI DSN carries no password:
   # there is no secret to leak and nothing for gitleaks to flag. The
   # disposable database is recreated per run.
   #
-  # The job's three passes -- the suite against PostgreSQL with the feature
-  # on, the suite without the feature, and the lint without the feature --
-  # share no build, so they run as three parallel shards. The required
-  # `postgres-foundation` check is the aggregator below: it passes only when
-  # every shard reports `success`, so a failed, skipped or cancelled shard
-  # fails the check rather than disappearing from it.
+  # The job's four passes -- the suite against PostgreSQL with the feature
+  # on, the suite without the feature, the lint without the feature, and the
+  # authority-evidence suites over verified TLS -- share no build, so they
+  # run as four parallel shards. The required `postgres-foundation` check is
+  # the aggregator below: it passes only when every shard reports `success`,
+  # so a failed, skipped or cancelled shard fails the check rather than
+  # disappearing from it.
   postgres-foundation-pg:
     name: postgres-foundation-pg
     runs-on: ubuntu-latest
@@ -632,6 +633,159 @@ jobs:
       - name: Lint without the postgres feature
         run: cargo clippy -p gateway --locked --no-default-features --all-targets -- -D warnings
 
+  # The fourth pass (issue #425): the authority-evidence suites against a
+  # PostgreSQL that accepts verified TLS and nothing else. A step generates a
+  # throwaway CA and a server certificate for 127.0.0.1 and localhost in the
+  # runner's temporary directory and deletes the CA key once it has signed,
+  # so no key outlives the run and none is ever committed. The server is the
+  # service image's pinned digest, started by hand because it needs that
+  # material mounted: `ssl=on`, and a pg_hba that admits `hostssl` and
+  # rejects `hostnossl`, so a plaintext connection is refused, not served.
+  #
+  # GATEWAY_TEST_POSTGRES_TLS_CA_FILE makes the harness
+  # (`storage::postgres::test_support`) connect in `verify` mode with that CA
+  # through the gateway's own connector. With it set a suite cannot pass by
+  # skipping: the harness panics when the DSN locator is missing, and
+  # `a_verified_tls_run_reaches_its_database_only_over_tls` proves the
+  # sessions are TLS and that the server refuses plaintext. Each filter must
+  # select at least one test, so a renamed suite fails here instead of
+  # silently dropping out.
+  postgres-foundation-tls:
+    name: postgres-foundation-tls
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: ci
+          node: 'true'
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          # The default-feature test graph without RUSTFLAGS; see
+          # postgres-foundation-pg.
+          shared-key: postgres-foundation
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Generate a throwaway CA and server certificate
+        run: |
+          set -eu
+          umask 077
+          tls="${RUNNER_TEMP}/pg-tls"
+          mkdir -p "${tls}/server"
+          printf '%s\n' '[req]' 'prompt = no' 'distinguished_name = dn' 'x509_extensions = ext' \
+            '[dn]' 'CN = GreenGateway CI throwaway PostgreSQL CA' \
+            '[ext]' 'basicConstraints = critical,CA:TRUE' 'keyUsage = critical,keyCertSign,cRLSign' \
+            'subjectKeyIdentifier = hash' > "${tls}/ca.cnf"
+          printf '%s\n' '[req]' 'prompt = no' 'distinguished_name = dn' \
+            '[dn]' 'CN = localhost' \
+            '[ext]' 'basicConstraints = critical,CA:FALSE' 'keyUsage = critical,digitalSignature' \
+            'extendedKeyUsage = serverAuth' 'subjectAltName = IP:127.0.0.1,DNS:localhost' \
+            > "${tls}/server.cnf"
+          openssl req -x509 -new -config "${tls}/ca.cnf" -newkey ec \
+            -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 -sha256 \
+            -keyout "${tls}/ca.key" -out "${tls}/ca.crt"
+          openssl req -new -config "${tls}/server.cnf" -newkey ec \
+            -pkeyopt ec_paramgen_curve:P-256 -nodes \
+            -keyout "${tls}/server/server.key" -out "${tls}/server.csr"
+          openssl x509 -req -in "${tls}/server.csr" -CA "${tls}/ca.crt" -CAkey "${tls}/ca.key" \
+            -CAcreateserial -days 1 -sha256 -extfile "${tls}/server.cnf" -extensions ext \
+            -out "${tls}/server/server.crt"
+          rm -f "${tls}/ca.key" "${tls}/ca.srl" "${tls}/server.csr" "${tls}/ca.cnf" "${tls}/server.cnf"
+          printf '%s\n' 'local all all trust' 'hostssl all all all trust' \
+            'hostnossl all all all reject' > "${tls}/server/pg_hba.conf"
+          chmod 0644 "${tls}/ca.crt" "${tls}/server/server.crt" "${tls}/server/pg_hba.conf"
+          openssl verify -CAfile "${tls}/ca.crt" "${tls}/server/server.crt"
+
+      - name: Start PostgreSQL with TLS required
+        # The container starts as root and the entrypoint drops to the
+        # postgres user, so it can first give the server its own copy of the
+        # key, owned by that user and private to it, as PostgreSQL requires.
+        run: |
+          set -eu
+          docker run -d --name greengateway-postgres-tls \
+            -e POSTGRES_USER=greengateway_ci -e POSTGRES_DB=greengateway_ci \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -v "${RUNNER_TEMP}/pg-tls/server:/tls-source:ro" \
+            -p 127.0.0.1:5432:5432 \
+            --entrypoint bash \
+            postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94 \
+            -c 'set -eu
+                install -d -o postgres -g postgres -m 0700 /var/lib/postgresql/tls
+                install -o postgres -g postgres -m 0600 /tls-source/server.key /var/lib/postgresql/tls/
+                install -o postgres -g postgres -m 0644 /tls-source/server.crt /tls-source/pg_hba.conf /var/lib/postgresql/tls/
+                exec docker-entrypoint.sh postgres -c ssl=on \
+                  -c ssl_cert_file=/var/lib/postgresql/tls/server.crt \
+                  -c ssl_key_file=/var/lib/postgresql/tls/server.key \
+                  -c hba_file=/var/lib/postgresql/tls/pg_hba.conf'
+          for attempt in $(seq 1 60); do
+            if docker exec greengateway-postgres-tls \
+              pg_isready -h 127.0.0.1 -p 5432 -U greengateway_ci -d greengateway_ci >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs --tail 50 greengateway-postgres-tls
+          echo "::error::the verified-TLS PostgreSQL did not become ready in 60 s"
+          exit 1
+
+      - name: Write the test DSN file
+        run: |
+          set -eu
+          mkdir -p "${RUNNER_TEMP}/pg"
+          printf 'postgres://greengateway_ci@127.0.0.1:5432/greengateway_ci\n' \
+            > "${RUNNER_TEMP}/pg/database-url"
+          chmod 0600 "${RUNNER_TEMP}/pg/database-url"
+
+      - name: Test the authority-evidence suites over verified TLS
+        env:
+          GATEWAY_TEST_POSTGRES_URL_FILE: ${{ runner.temp }}/pg/database-url
+          GATEWAY_TEST_POSTGRES_TLS_CA_FILE: ${{ runner.temp }}/pg-tls/ca.crt
+        run: |
+          set -euo pipefail
+          test -s "${GATEWAY_TEST_POSTGRES_URL_FILE}"
+          test -s "${GATEWAY_TEST_POSTGRES_TLS_CA_FILE}"
+          suites=(
+            storage::postgres::test_support::tests::
+            storage::contract_tests::postgres_audit_tests::postgres_service_token_change_evidence_satisfies_the_contract
+            storage::contract_tests::postgres_audit_tests::service_token_change_evidence_matches_the_outbox_and_survives_deletion_and_restart
+            storage::contract_tests::postgres_audit_tests::a_failed_token_evidence_insert_rolls_back_the_rotate_and_the_revoke
+            storage::contract_tests::postgres_audit_tests::jwt_revocation_evidence_survives_extension_reactivation_and_cleanup
+            storage::contract_tests::postgres_audit_tests::a_failed_jwt_evidence_insert_rolls_back_the_revoke
+            storage::contract_tests::postgres_audit_tests::revoke_and_rotate_race_never_leaves_a_live_plaintext
+            storage::contract_tests::postgres_audit_tests::an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction
+            storage::contract_tests::postgres_audit_tests::a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity
+            connections::pg_store::tests::
+            storage::postgres_documents::tests::
+            storage::postgres_admin_sessions::tests::
+            authority_events::dispatcher::tests::
+            storage::migrations::tests::migrations_twelve_through_sixteen_preserve_existing_connection_state
+            storage::migrations::tests::migration_eighteen_fabricates_no_evidence_for_existing_tokens_or_revocations
+            storage::migrations::tests::migration_twenty_one_journals_existing_evidence_in_commit_order
+            storage::migrations::tests::migration_twenty_four_adds_actor_metadata_and_guesses_none_for_existing_evidence
+            storage::migrations::tests::migration_twenty_five_adds_catalog_actor_metadata_and_guesses_none
+            storage::migrations::tests::migration_twenty_six_journals_session_evidence_and_holds_withdrawals
+            tests::admin_tokens_app_tests::admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_postgres
+          )
+          listed="$(cargo test -p gateway --locked --bin gateway -- --list 2>/dev/null)"
+          for suite in "${suites[@]}"; do
+            selected="$(grep -F -- "${suite}" <<< "${listed}" | grep -c ': test$' || true)"
+            if [ "${selected}" -eq 0 ]; then
+              echo "::error::${suite} selects no test; point this shard at the suite's new name"
+              exit 1
+            fi
+            echo "${suite}: ${selected} test(s)"
+          done
+          cargo test -p gateway --locked --bin gateway -- "${suites[@]}"
+
+      - name: Show the verified-TLS PostgreSQL log
+        if: failure()
+        run: docker logs --tail 100 greengateway-postgres-tls || true
+
   # The required check. `always()` makes it run, and fail, when a shard
   # failed, was skipped or was cancelled: a required job skipped because a
   # dependency failed would otherwise report as passing.
@@ -641,6 +795,7 @@ jobs:
       - postgres-foundation-pg
       - postgres-foundation-no-default
       - postgres-foundation-lint
+      - postgres-foundation-tls
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -661,11 +816,13 @@ jobs:
           FEATURE_ON_RESULT: ${{ needs.postgres-foundation-pg.result }}
           NO_DEFAULT_RESULT: ${{ needs.postgres-foundation-no-default.result }}
           LINT_RESULT: ${{ needs.postgres-foundation-lint.result }}
+          TLS_RESULT: ${{ needs.postgres-foundation-tls.result }}
         run: |
           status=0
           for shard in "postgres-foundation-pg=${FEATURE_ON_RESULT:-}" \
                        "postgres-foundation-no-default=${NO_DEFAULT_RESULT:-}" \
-                       "postgres-foundation-lint=${LINT_RESULT:-}"; do
+                       "postgres-foundation-lint=${LINT_RESULT:-}" \
+                       "postgres-foundation-tls=${TLS_RESULT:-}"; do
             name="${shard%%=*}"
             result="${shard#*=}"
             if [ "${result}" != "success" ]; then
@@ -1086,7 +1243,7 @@ jobs:
       # `cargo audit` reads Cargo.lock and the advisory database and compiles
       # nothing, so this job restores no Rust cache.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2
         with:
           tool: cargo-audit@0.22.2
           checksum: true
@@ -1684,7 +1841,7 @@ jobs:
         with:
           rust: none
           node: 'false'
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1732,7 +1889,7 @@ jobs:
         with:
           rust: none
           node: 'false'
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1792,6 +1949,7 @@ jobs:
       - postgres-foundation-pg
       - postgres-foundation-no-default
       - postgres-foundation-lint
+      - postgres-foundation-tls
       - postgres-foundation
       - admin-ui
       - cloudflare
@@ -1834,7 +1992,7 @@ jobs:
       - name: Set up verified Buildx and pinned BuildKit
         uses: ./.github/actions/buildx
       - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

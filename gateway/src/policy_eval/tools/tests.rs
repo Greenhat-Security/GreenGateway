@@ -875,6 +875,7 @@ fn differential_context(
         } else {
             ToolInvocationSource::AdminPlayground
         },
+        organization: None,
         caller: None,
         admitted_deadline: None,
     }

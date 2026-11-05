@@ -146,6 +146,7 @@ impl Stage {
             | Code::ReservedPath
             | Code::DuplicatePath
             | Code::InvalidDigest
+            | Code::PinNotRewritable
             | Code::SourceUnsupported
             | Code::Unresolved => Self::References,
             Code::ResourceUnknownMember | Code::ResourceInvalid => Self::Resources,

@@ -681,13 +681,6 @@ pub(crate) fn parse_utc_instant(value: &str) -> Option<i64> {
 pub(crate) enum Fact<T> {
     /// Not captured: a matcher that reads it is undetermined.
     Uncaptured,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no serving adapter captures typed-matcher facts yet; the kernel reads them and its tests supply them"
-        )
-    )]
     Captured(T),
 }
 
@@ -700,7 +693,9 @@ pub(crate) enum Fact<T> {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PolicyFacts {
     /// The organization authentication verified for the principal, if any.
-    /// It is the principal's own issuer that verified it.
+    /// It is the principal's own issuer that verified it: a serving lane
+    /// reads it from the authenticated principal (`Principal::org_id`), never
+    /// from a request header.
     pub(crate) organization: Fact<Option<String>>,
     /// The canonical client address after trusted-proxy processing.
     pub(crate) source_ip: Fact<IpAddr>,
@@ -744,9 +739,11 @@ impl PolicyFacts {
     }
 }
 
-/// The facts every serving lane evaluates with until its adapter captures
-/// them: none. A rule or mapping that reads one is then undetermined, so the
-/// lane answers indeterminate rather than guess.
+/// Facts of which none was captured, for an evaluation whose input records
+/// none: historical replay, the analyzer and the rule preview, and the
+/// serving lanes under a policy nothing in which reads one. A rule or mapping
+/// that reads one is then undetermined, so the answer is indeterminate rather
+/// than a guess.
 pub(crate) static UNCAPTURED_FACTS: PolicyFacts = PolicyFacts::uncaptured();
 
 /// A three-valued answer: whether a condition holds, does not, or cannot be

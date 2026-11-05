@@ -54,14 +54,16 @@ pub(super) async fn token_create_endpoint(
         return token_scope_authz_error_response(error);
     }
 
-    let created = match store
-        .create(auth::tokens::CreateTokenRequest {
-            scopes: requested.scopes,
-            created_by: principal.user_id.clone(),
-            expires_at: requested.expires_at,
-        })
-        .await
-    {
+    // Issue #425: the authenticated principal is the issue's actor, recorded
+    // as its evidence in the create's own transaction. `created_by` keeps
+    // naming the creator on the token row as before.
+    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
+    let request = auth::tokens::CreateTokenRequest {
+        scopes: requested.scopes,
+        created_by: principal.user_id.clone(),
+        expires_at: requested.expires_at,
+    };
+    let created = match store.create(request, &actor).await {
         Ok(created) => created,
         // The one request-reachable invalid input on create: a malformed
         // `expires_at` (scopes are validated before the store is called, and

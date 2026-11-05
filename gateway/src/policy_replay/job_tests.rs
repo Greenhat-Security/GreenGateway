@@ -17,8 +17,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use super::{
     impact::ReplayPolicies,
     job::{
-        run, ReplayControl, ReplayOutcome, ReplayScope, ReplaySource, ReplaySourceError,
-        ReplayStop, MAX_REPLAY_RECORDS, MAX_REPLAY_RECORD_BYTES, REPLAY_PAGE_RECORDS,
+        run, ReplayControl, ReplayOutcome, ReplayScope, ReplaySource, ReplaySourceCheck,
+        ReplaySourceError, ReplayStop, MAX_REPLAY_RECORDS, MAX_REPLAY_RECORD_BYTES,
+        REPLAY_PAGE_RECORDS,
     },
     request::{parse_request, resolve_window, ReplayRequest, MAX_REPLAY_WINDOW},
 };
@@ -139,11 +140,13 @@ type PageHook = Box<dyn FnMut(usize, &mut Vec<(i64, i64, Stored)>)>;
 
 /// A source over rows held in memory: `(id, epoch_us, row)`. It answers a
 /// page query exactly as the SQLite reader does, and lets a test cap page
-/// sizes, fail, or change its rows between pages.
+/// sizes, fail, change its rows between pages, or report that rows the
+/// window may have held were pruned.
 struct VecSource {
     rows: RefCell<Vec<(i64, i64, Stored)>>,
     page_cap: usize,
     fail: bool,
+    pruned: bool,
     pages: Cell<usize>,
     after_page: RefCell<Option<PageHook>>,
 }
@@ -162,6 +165,7 @@ impl VecSource {
             rows: RefCell::new(rows),
             page_cap: usize::MAX,
             fail: false,
+            pruned: false,
             pages: Cell::new(0),
             after_page: RefCell::new(None),
         }
@@ -208,6 +212,10 @@ impl VecSource {
 }
 
 impl ReplaySource for VecSource {
+    fn kind(&self) -> &'static str {
+        "test_rows"
+    }
+
     fn page(&self, query: &ReplayPageQuery) -> Result<Vec<(i64, ReplayRow)>, ReplaySourceError> {
         if self.fail {
             return Err(ReplaySourceError);
@@ -232,7 +240,7 @@ impl ReplaySource for VecSource {
         Ok(page)
     }
 
-    fn window_count(&self, scope: &ReplayScope) -> Result<u64, ReplaySourceError> {
+    fn check(&self, scope: &ReplayScope) -> Result<ReplaySourceCheck, ReplaySourceError> {
         if self.fail {
             return Err(ReplaySourceError);
         }
@@ -245,7 +253,10 @@ impl ReplaySource for VecSource {
                     && (scope.from_epoch_us..scope.to_epoch_us).contains(epoch)
             })
             .count();
-        Ok(u64::try_from(count).expect("a test count fits"))
+        Ok(ReplaySourceCheck {
+            stored: u64::try_from(count).expect("a test count fits"),
+            pruned: self.pruned,
+        })
     }
 }
 
@@ -536,6 +547,32 @@ fn rows_pruned_while_a_job_runs_make_it_incomplete_never_silently_short() {
 }
 
 #[test]
+fn a_source_that_shows_pruned_rows_makes_a_job_incomplete_however_much_it_read() {
+    // Every row the cutoff selected is read and still stored: only the
+    // source can tell that rows the window may have held were gone before
+    // the cutoff counted it, and the result has to say so.
+    let mut source = VecSource::events(
+        (0..3)
+            .map(|_| observed("GET", "/public/a", "allowed", None))
+            .collect(),
+    );
+    source.pruned = true;
+    let scope = source.scope(MAX_REPLAY_RECORDS);
+    let outcome = run_to_end(&source, &scope);
+    assert!(!outcome.complete);
+    assert_eq!(outcome.limitations, ["source_pruned"]);
+    assert_eq!(outcome.scanned, 3);
+    assert_eq!(outcome.replayed, 3);
+    assert_eq!(outcome.result["complete"], json!(false));
+    assert_eq!(outcome.result["limitations"], json!(["source_pruned"]));
+    assert_eq!(
+        outcome.result["source"]["kind"],
+        json!("test_rows"),
+        "the result names the source it read"
+    );
+}
+
+#[test]
 fn a_cancelled_run_returns_no_result() {
     let source = VecSource::events(vec![observed("GET", "/public/a", "allowed", None)]);
     let control = ReplayControl::default();
@@ -711,6 +748,10 @@ fn the_audit_log_reader_pins_a_cutoff_and_reads_only_below_it() {
     .expect("the run completes");
     assert!(outcome.complete, "{:?}", outcome.limitations);
     assert_eq!(outcome.scanned, 2);
+    assert_eq!(
+        outcome.result["source"]["kind"],
+        json!("standalone_audit_log")
+    );
     assert_eq!(
         store
             .replay_window_count(
