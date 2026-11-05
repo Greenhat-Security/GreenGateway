@@ -11218,9 +11218,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::middleware::rbac::impl  RbacState::evaluate_tool_authorization#1",
-      "sha256": "485f2075b7291f8b97da57a2c05c0a3d097abca795782422c859234d5c4c0a3a",
+      "sha256": "ad8f61d6150c392f0bf228d5478faa91ea21f04182c00e0771cc181e3b453208",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #243 tool lanes: tool admission now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact for source_network conditions; a pure data parameter that adds no network, process or transport capability. Reviewed for #243 (decision facts): the authorization handed to the runtime also carries the verdict's decision facts (codes, versions, digests and policy positions); a pure data value that adds no network, process or transport capability."
+      "purpose": "Issue #243 tool lanes: tool admission now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact for source_network conditions; a pure data parameter that adds no network, process or transport capability. Reviewed for #243 (decision facts): the authorization handed to the runtime also carries the verdict's decision facts (codes, versions, digests and policy positions); a pure data value that adds no network, process or transport capability. Reviewed for #243 (tool-argument conditions): the item also takes the argument stage of admission, a callback the tool runtime supplies that validates the call's arguments against the tool's input schema and returns the eligible argument scalars as a typed policy fact (Fact<serde_json::Value>) or the runtime's own refusal; a pure data callback that adds no network, process or transport capability."
     },
     {
       "file": "gateway/src/middleware/rbac.rs",

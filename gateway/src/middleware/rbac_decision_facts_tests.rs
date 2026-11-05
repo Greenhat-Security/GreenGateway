@@ -278,9 +278,12 @@ fn tool_invocation_verdicts_carry_facts_and_a_refusal_carries_none() {
     let installed = state.current_policy();
     let principal = acme_reader();
     let facts = |tool_name: &str| {
-        state.evaluate_tool_authorization(tool_name, Some(&principal), None, |authorization| {
-            authorization.decision_facts.map(|facts| facts.to_json())
-        })
+        state.evaluate_tool_authorization_without_arguments(
+            tool_name,
+            Some(&principal),
+            None,
+            |authorization| authorization.decision_facts.map(|facts| facts.to_json()),
+        )
     };
     let expected = |reason: &str, element: Value| {
         json!({
@@ -320,6 +323,83 @@ fn tool_invocation_verdicts_carry_facts_and_a_refusal_carries_none() {
     );
     // A name no policy can carry is refused before evaluation: no verdict.
     assert_eq!(facts(&"t".repeat(MAX_TOOL_NAME_BYTES + 1)), None);
+}
+
+/// A tool call's arguments are marked available once a `tool_argument`
+/// condition asked for them and they were captured, whether the rule then
+/// matched or not, and the facts never carry them; a call whose rules read
+/// no argument never has them asked for, and its bit stays clear.
+#[test]
+fn tool_argument_facts_are_marked_available_without_their_values() {
+    const REGION: &str = "facts-region-canary-91e3";
+    let policy = Policy::validate_json_value(json!({
+        "schema_version": "1.0.0",
+        "id": "argument-facts",
+        "default_action": "allow",
+        "rules": [{
+            "id": "deny-exports",
+            "tool_name": "export",
+            "action": "deny",
+            "conditions": { "tool_argument": { "pointer": "/region", "in": [REGION] } }
+        }],
+        "tools": { "export": {}, "open": {} }
+    }))
+    .expect("the fixture validates");
+    let (state, _capture) = test_state(policy, &[]);
+    let principal = acme_reader();
+    let schema = json!({
+        "type": "object",
+        "properties": { "region": { "type": "string" } }
+    });
+    let asked = std::cell::Cell::new(0_u32);
+    let facts = |tool_name: &str, arguments: Value| {
+        state
+            .evaluate_tool_authorization(
+                tool_name,
+                Some(&principal),
+                None,
+                |pointers| {
+                    asked.set(asked.get() + 1);
+                    Ok::<_, std::convert::Infallible>(
+                        crate::middleware::policy_facts::tool_argument_facts(
+                            &schema, &arguments, pointers,
+                        ),
+                    )
+                },
+                |authorization| authorization.decision_facts.map(|facts| facts.to_json()),
+            )
+            .unwrap_or_else(|never| match never {})
+            .expect("a verdict carries its facts")
+    };
+    let with_arguments =
+        facts_available::TOOL_NAME | facts_available::PRINCIPAL | facts_available::TOOL_ARGUMENTS;
+
+    let denied = facts("export", json!({ "region": REGION }));
+    assert_eq!(asked.get(), 1);
+    assert_eq!(denied["reason"], "matched_rule");
+    assert_eq!(denied["facts_available"], json!(with_arguments));
+    assert_eq!(
+        denied["element"],
+        json!({ "kind": "rule", "position": 0, "id": "deny-exports" })
+    );
+
+    let admitted = facts("export", json!({ "region": "elsewhere" }));
+    assert_eq!(asked.get(), 2);
+    assert_eq!(admitted["reason"], "allowed");
+    assert_eq!(admitted["facts_available"], json!(with_arguments));
+
+    let unread = facts("open", json!({ "region": REGION }));
+    assert_eq!(asked.get(), 2, "no rule for the tool reads an argument");
+    assert_eq!(
+        unread["facts_available"],
+        json!(facts_available::TOOL_NAME | facts_available::PRINCIPAL)
+    );
+
+    for rendered in [denied, admitted, unread].map(|facts| facts.to_string()) {
+        for value in [REGION, "elsewhere", "/region"] {
+            assert!(!rendered.contains(value), "the facts repeat {value}");
+        }
+    }
 }
 
 /// A fact a rule condition reads is marked available once the lane captured
