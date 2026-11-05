@@ -37,8 +37,10 @@ const PATCH_FORMAT: &str = "policy-simulation.v1/edits";
 /// What an analysis was run against, as the endpoint resolved it.
 pub(crate) struct AnalysisBinding<'a> {
     pub(crate) request_digest: &'a str,
-    /// The active policy's ETag, which the request pinned.
-    pub(crate) base_etag: &'a str,
+    /// The active policy's ETag, which the request pinned. `None` for the
+    /// analysis an evidence package runs (`policy_evidence`): no active
+    /// policy was pinned, and the package names what the candidate replaces.
+    pub(crate) base_etag: Option<&'a str>,
     /// Cluster mode: the security revision the base was read at.
     pub(crate) security_revision: Option<i64>,
     /// `active`, `edits`, `inline`, `draft` or `revision`.
@@ -145,10 +147,15 @@ pub(crate) fn to_json(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut base = json!({ "source": "active", "etag": binding.base_etag });
-    if let (Some(revision), Some(base)) = (binding.security_revision, base.as_object_mut()) {
-        base.insert("security_revision".to_owned(), json!(revision));
-    }
+    let base = binding.base_etag.map(|etag| {
+        let mut base = Map::new();
+        base.insert("source".to_owned(), json!("active"));
+        base.insert("etag".to_owned(), json!(etag));
+        if let Some(revision) = binding.security_revision {
+            base.insert("security_revision".to_owned(), json!(revision));
+        }
+        Value::Object(base)
+    });
     let mut analyzed = json!({ "source": binding.source, "etag": binding.analyzed_etag });
     if let Some(analyzed) = analyzed.as_object_mut() {
         if binding.source == "edits" {
@@ -165,12 +172,11 @@ pub(crate) fn to_json(
     }
     let resource_snapshot = serde_json::to_value(binding.resource_snapshot)
         .map_err(|_| AnalysisError::Internal("resource_snapshot_unavailable"))?;
-    Ok(json!({
+    let mut report = json!({
         "schema_version": RESULT_SCHEMA_VERSION,
         "mode": "structural",
         "request_digest": binding.request_digest,
         "analyzer": analyzer_versions(),
-        "base": base,
         "analyzed": analyzed,
         "resources": { "mcp_alias_paths": binding.mcp_alias_paths },
         "resource_snapshot": resource_snapshot,
@@ -184,7 +190,11 @@ pub(crate) fn to_json(
         "suppressions": suppressions_json(suppressions),
         "summary": summary(outcome, suppressions),
         "findings": findings,
-    }))
+    });
+    if let (Some(base), Some(report)) = (base, report.as_object_mut()) {
+        report.insert("base".to_owned(), base);
+    }
+    Ok(report)
 }
 
 fn analyzer_versions() -> Value {
@@ -370,7 +380,6 @@ pub(crate) fn to_sarif(
     let mut properties = json!({
         "mode": "structural",
         "request_digest": binding.request_digest,
-        "base_etag": binding.base_etag,
         "analyzed_source": binding.source,
         "analyzed_etag": binding.analyzed_etag,
         "resource_snapshot_complete": binding.resource_snapshot.is_complete(),
@@ -381,6 +390,9 @@ pub(crate) fn to_sarif(
         "analyzer": analyzer_versions(),
     });
     if let Some(properties) = properties.as_object_mut() {
+        if let Some(etag) = binding.base_etag {
+            properties.insert("base_etag".to_owned(), json!(etag));
+        }
         if let Some(revision) = binding.security_revision {
             properties.insert("security_revision".to_owned(), json!(revision));
         }

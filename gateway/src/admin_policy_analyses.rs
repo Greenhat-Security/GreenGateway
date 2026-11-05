@@ -270,7 +270,7 @@ pub(super) async fn policy_analyses_endpoint(
     };
     let binding = AnalysisBinding {
         request_digest: &analysis.digest,
-        base_etag: &base_etag,
+        base_etag: Some(&base_etag),
         security_revision: match authority {
             policy_eval::PolicyAuthority::PostgreSql { security_revision } => {
                 Some(security_revision)

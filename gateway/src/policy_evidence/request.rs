@@ -11,18 +11,23 @@
 //!     "projections": ["as_authored"],
 //!     "cases": [ ... ]
 //!   },
-//!   "replay_job_id": "rpl_..."
+//!   "replay_job_id": "rpl_...",
+//!   "analysis": true
 //! }
 //! ```
 //!
-//! `publication.version` names the policy history version the package is
-//! about; the optional `publication.etag` pins the document the caller
-//! reviewed. `suite` is a complete `policy-tests.v1` suite, parsed by the
-//! test-suite parser; `simulation` holds `policy-simulation.v1` cases and
-//! projections, parsed by the functions a simulation parses them with, at a
-//! `terminal` or `matched` trace level. `replay_job_id` names a finished
-//! replay job of the caller's. Every section but `publication` is optional,
-//! and a report says which it lacks.
+//! A request names exactly one candidate. `publication.version` names the
+//! policy history version the package is about; the optional
+//! `publication.etag` pins the document the caller reviewed. In its place,
+//! `draft` names a server-side draft the caller owns by `draft_id` and the
+//! strong `draft_etag` the caller reviewed it at, exactly as a simulation's
+//! draft candidate does. `suite` is a complete `policy-tests.v1` suite,
+//! parsed by the test-suite parser; `simulation` holds `policy-simulation.v1`
+//! cases and projections, parsed by the functions a simulation parses them
+//! with, at a `terminal` or `matched` trace level. `replay_job_id` names a
+//! finished replay job of the caller's, and `analysis: true` asks for the
+//! conservative structural analyzer's results over the candidate. Every
+//! section but the candidate is optional, and a report says which it lacks.
 
 use serde_json::Value;
 
@@ -30,7 +35,9 @@ use super::{REQUEST_MEDIA_TYPE, REQUEST_SCHEMA_VERSION};
 use crate::{
     canonical_json,
     policy_simulation::{
-        request::{parse_projections, MAX_BASE_ETAG_BYTES, MAX_SIMULATION_CASES},
+        request::{
+            parse_projections, MAX_BASE_ETAG_BYTES, MAX_DRAFT_ID_BYTES, MAX_SIMULATION_CASES,
+        },
         Projection, TraceLevel,
     },
     policy_testing::suite::{
@@ -53,6 +60,19 @@ pub(crate) struct PublicationSelector {
     pub(crate) etag: Option<String>,
 }
 
+/// Which of the caller's drafts a package is about, at the strong draft ETag
+/// the caller reviewed it at.
+pub(crate) struct DraftSelector {
+    pub(crate) draft_id: String,
+    pub(crate) draft_etag: String,
+}
+
+/// The candidate a package is about: exactly one of the two.
+pub(crate) enum CandidateSelector {
+    Publication(PublicationSelector),
+    Draft(DraftSelector),
+}
+
 /// The synthetic cases a package's simulation section decides.
 ///
 /// It does not derive `Debug`: cases hold fixture values.
@@ -70,10 +90,12 @@ pub(crate) struct EvidenceRequest {
     /// The ADR-0004 semantic digest of the request, so two requests that
     /// differ only in whitespace or member order name one set of inputs.
     pub(crate) digest: String,
-    pub(crate) publication: PublicationSelector,
+    pub(crate) candidate: CandidateSelector,
     pub(crate) suite: Option<Suite>,
     pub(crate) simulation: Option<SimulationSelection>,
     pub(crate) replay_job_id: Option<String>,
+    /// Whether the package carries the structural analyzer's results.
+    pub(crate) analysis: bool,
 }
 
 impl EvidenceRequest {
@@ -100,9 +122,11 @@ pub(crate) fn parse_request(value: &Value) -> Result<EvidenceRequest, Diagnostic
         &[
             "schema_version",
             "publication",
+            "draft",
             "suite",
             "simulation",
             "replay_job_id",
+            "analysis",
         ],
         &mut diagnostics,
     );
@@ -124,8 +148,30 @@ pub(crate) fn parse_request(value: &Value) -> Result<EvidenceRequest, Diagnostic
             return Err(diagnostics);
         }
     }
-    let publication = required(root, "publication", "", &mut diagnostics)
-        .and_then(|value| parse_publication(value, &mut diagnostics));
+    let candidate = match (root.get("publication"), root.get("draft")) {
+        (Some(publication), None) => {
+            parse_publication(publication, &mut diagnostics).map(CandidateSelector::Publication)
+        }
+        (None, Some(draft)) => parse_draft(draft, &mut diagnostics).map(CandidateSelector::Draft),
+        (None, None) => {
+            diagnostics.push(
+                "missing_field",
+                "/publication",
+                "a request names its candidate: publication or draft is required",
+            );
+            None
+        }
+        // Never one of the two chosen silently: a package is about exactly
+        // the candidate its reviewer named.
+        (Some(_), Some(_)) => {
+            diagnostics.push(
+                "conflicting_field",
+                "/draft",
+                "a request names one candidate: publication or draft, not both",
+            );
+            None
+        }
+    };
     let suite = root
         .get("suite")
         .and_then(|value| parse_embedded_suite(value, &mut diagnostics));
@@ -140,10 +186,18 @@ pub(crate) fn parse_request(value: &Value) -> Result<EvidenceRequest, Diagnostic
             &mut diagnostics,
         )
     });
+    let analysis = match root.get("analysis") {
+        None => false,
+        Some(Value::Bool(analysis)) => *analysis,
+        Some(_) => {
+            diagnostics.push("invalid_type", "/analysis", "analysis must be a boolean");
+            false
+        }
+    };
     if !diagnostics.is_empty() {
         return Err(diagnostics);
     }
-    let Some(publication) = publication else {
+    let Some(candidate) = candidate else {
         // Every path that yields `None` above records why; refused rather
         // than defaulted if one ever does not.
         diagnostics.push("invalid_request", "", "the evidence request is incomplete");
@@ -165,10 +219,11 @@ pub(crate) fn parse_request(value: &Value) -> Result<EvidenceRequest, Diagnostic
         };
     Ok(EvidenceRequest {
         digest,
-        publication,
+        candidate,
         suite,
         simulation,
         replay_job_id,
+        analysis,
     })
 }
 
@@ -201,6 +256,25 @@ fn parse_publication(value: &Value, diagnostics: &mut Diagnostics) -> Option<Pub
     Some(PublicationSelector {
         version: version?,
         etag,
+    })
+}
+
+/// The `draft` member: both members required and bounded as a simulation's
+/// draft candidate bounds them. Whether the draft exists, is the caller's,
+/// is still at that ETag and is pinned to the live policy is the endpoint's
+/// answer.
+fn parse_draft(value: &Value, diagnostics: &mut Diagnostics) -> Option<DraftSelector> {
+    let map = object(value, "/draft", diagnostics)?;
+    check_members(map, "/draft", &["draft_id", "draft_etag"], diagnostics);
+    let draft_id = required(map, "draft_id", "/draft", diagnostics).and_then(|value| {
+        bounded_string(value, "/draft/draft_id", MAX_DRAFT_ID_BYTES, diagnostics)
+    });
+    let draft_etag = required(map, "draft_etag", "/draft", diagnostics).and_then(|value| {
+        bounded_string(value, "/draft/draft_etag", MAX_BASE_ETAG_BYTES, diagnostics)
+    });
+    Some(DraftSelector {
+        draft_id: draft_id?,
+        draft_etag: draft_etag?,
     })
 }
 

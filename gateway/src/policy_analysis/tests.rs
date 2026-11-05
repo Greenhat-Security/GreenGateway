@@ -873,7 +873,7 @@ fn binding<'a>(
 ) -> AnalysisBinding<'a> {
     AnalysisBinding {
         request_digest: digest,
-        base_etag: etag,
+        base_etag: Some(etag),
         security_revision: None,
         source: "active",
         analyzed_etag: etag,
