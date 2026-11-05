@@ -377,7 +377,11 @@ pub(super) fn add_admin_api_routes(
                 )
                 .route(
                     routes.admin.policy_rule_preview_route.as_str(),
-                    post(policy_rule_preview_endpoint),
+                    // Its own limiter: a preview scans retained traffic,
+                    // and never takes an evaluation endpoint's slots.
+                    post(policy_rule_preview_endpoint).layer(Extension(Arc::new(
+                        PolicyEvaluationLimiter::new(MAX_CONCURRENT_POLICY_RULE_PREVIEWS),
+                    ))),
                 )
                 .route(
                     routes.admin.policy_rule_hits_route.as_str(),

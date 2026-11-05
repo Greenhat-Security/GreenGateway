@@ -445,9 +445,12 @@ pub(super) struct PolicyRulePreviewResponse {
     /// `malformed_observation`. Empty when every scanned observation was
     /// judged.
     pub(super) unevaluated_reasons: BTreeMap<&'static str, u64>,
-    /// The window held more observations than the scan ceiling allowed, so
-    /// `match_count` covers only the newest `scanned_event_count` of them.
+    /// The window held more observations than the scan judged -- the scan
+    /// ceiling or the deadline stopped it -- so `match_count` covers only the
+    /// newest `scanned_event_count` of them.
     pub(super) scan_truncated: bool,
+    /// The scan's deadline, rather than its row ceiling, truncated it.
+    pub(super) deadline_exceeded: bool,
     /// Every observation in the window was scanned and judged. Never true for
     /// a truncated scan or one with an unevaluated observation: a partial
     /// count is not evidence of the whole window.

@@ -2217,7 +2217,11 @@ mod cluster_tools_tests {
         // A connection commit lands BEFORE the connections resource is
         // registered -- the startup window the poller could observe.
         connection_store
-            .create(cluster_connection_candidate(), "op", None)
+            .create(
+                cluster_connection_candidate(),
+                &auth::change_actor::ChangeActor::for_test("op"),
+                None,
+            )
             .await
             .expect("connection create should commit");
         let committed_at = connection_store
@@ -2309,7 +2313,11 @@ mod cluster_tools_tests {
         .await
         .expect("policy should initialize");
         connection_store
-            .create(cluster_connection_candidate(), "op", None)
+            .create(
+                cluster_connection_candidate(),
+                &auth::change_actor::ChangeActor::for_test("op"),
+                None,
+            )
             .await
             .expect("connection create should commit");
 
@@ -2501,7 +2509,11 @@ mod cluster_tools_tests {
             .await
             .expect("connections state revision should read");
         let created = connection_store
-            .create(cluster_connection_candidate(), "op", None)
+            .create(
+                cluster_connection_candidate(),
+                &auth::change_actor::ChangeActor::for_test("op"),
+                None,
+            )
             .await
             .expect("connection create should commit");
         let after_commit = connection_store
