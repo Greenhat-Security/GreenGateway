@@ -319,7 +319,11 @@ type whose `Debug` output does not show it:
 
 The client secret is the one secret value in the plan. The legacy document
 holds it inline; making it a reference is an input-format change for #242's
-bundle format, not a change to this stage.
+bundle format, not a change to this stage. The deployment document already
+takes it only as a secret reference (`admin_login.client_secret`), and the
+URLs and static headers above only as references or not at all
+([structured settings](../configuration-bundles.md#structured-settings)); the
+compiler does not read a deployment document yet.
 
 What the contract covers, and what holds it:
 
@@ -538,6 +542,7 @@ beside it:
 | Sensitivity | The [sensitivity wrappers](#sensitivity-wrappers) table | `catalog_tests::the_secret_fields_are_the_compiler_contracts_sensitive_inputs` |
 | Document paths | The deployment schema's settings, and the schema rendered from the catalog | `catalog_tests::the_deployment_schema_defines_exactly_the_catalogs_document_paths`, `bundle::settings::tests::the_committed_schema_is_the_rendered_schema` |
 | Deployment-document bounds | The values the compiler accepts on their own, at every bound and for generated values | `catalog_tests::the_deployment_document_accepts_exactly_what_the_compiler_accepts`, `generated_integer_settings_agree_with_the_compiler`, `generated_decimal_settings_agree_with_the_compiler_and_canonicalize_exactly` |
+| Structured forms of the JSON documents | The compiler's own types (`RawAuthProviderConfig`, `UpstreamRouteConfig` and the route types, `McpUpstreamServerConfig`), and the environment form | `bundle::settings::structured_tests::every_form_lists_exactly_its_compiler_types_members`, `every_environment_fixture_converts_to_a_document_that_compiles_to_the_same_values` |
 | Cloudflare | `GREEN_GATEWAY_ENV_KEYS` and the Cloudflare guide | `env_example::cloudflare_forwarding_matches_supported_gateway_env_vars` |
 | The rendered catalog | `render_json` and its schema | `catalog::tests::the_committed_catalog_is_the_rendered_catalog`, `the_rendered_catalog_matches_its_published_schema` |
 
@@ -550,13 +555,11 @@ catalog's range is what a value is accepted or refused for on its own.
 What the catalog does not hold yet, because nothing decides or checks it
 today:
 
-- **Document paths for the JSON documents.** `AUTH_PROVIDERS`,
-  `UPSTREAM_ROUTES` and `MCP_UPSTREAM_SERVERS` are deployment fields without a
-  path, so a bundle cannot set them yet.
-- **Two host paths ADR-0008 does not place.** `OPENAPI_SPEC_PATH` and
-  `AUTHORITY_EVENT_FILE` are neither bootstrap inputs nor bundle resources;
-  the catalog marks them `unplaced`, and the bundle front end must refuse
-  them until the ADR decides.
+- **A host path ADR-0008 does not place.** `AUTHORITY_EVENT_FILE` is
+  neither a bootstrap input nor a bundle resource; the catalog marks it
+  `unplaced`, and the bundle front end must refuse it until the ADR decides.
+  (`OPENAPI_SPEC_PATH`, which the ADR makes not representable in `v1alpha1`,
+  is catalogued `not_representable` with the legacy JWT provider.)
 - **Exportability and template placeholders, membership of the
   static-configuration fingerprint, and doctor checks.** `ha.rs` stays the
   authority on the fingerprint.
