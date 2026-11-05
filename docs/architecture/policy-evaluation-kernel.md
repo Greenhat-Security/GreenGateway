@@ -417,12 +417,39 @@ branch, and the traced and untraced decisions to each other.
 `POST /v1{ADMIN_PREFIX}/policy/simulations`. It shares the test runner's case
 parser and context builders, compiles the base and each candidate with
 `from_validated_policy` (the base keeps the authority it was read under, a
-candidate is `Standalone`), and asks `evaluate_with_stages`, `evaluate_tool` and
-`select_rate_lane`. Its `enforce_all_shadow` projection is a `Policy` value with
-every shadow made enforcing, compiled for the run; the kernel has no shadow
-switch of its own. Edits are applied to the JSON of the pinned base and the
-result is validated as a policy write would be before anything compiles it. The
-format and API are in [policy-simulation.md](../policy-simulation.md).
+candidate is `Standalone`), and asks `evaluate_with_stages`,
+`evaluate_tool_with_facts` and `select_rate_lane_with_facts` with a collecting
+sink and the facts a live lane captures for the case's principal. Its
+`enforce_all_shadow` projection is a `Policy` value with every shadow made
+enforcing, compiled for the run; the kernel has no shadow switch of its own.
+Edits are applied to the JSON of the pinned base and the result is validated as
+a policy write would be before anything compiles it. The format and API are in
+[policy-simulation.md](../policy-simulation.md).
+
+The tool and rate lanes report through the same sink (slice 12), each in its
+own vocabulary: `evaluate_tool_with_facts` records `ToolStage::Facts`, `Entry`,
+`Identity` and `Rules` (a rendered request only `Facts` and `Rules`), and
+`select_rate_lane_with_facts` records `RateStage::Facts`, `AnonymousBypass` and
+`Overrides`. `StageSink` is generic over the stage type, `NoStages` implements
+it for every one, and `evaluate_tool` and `select_rate_lane` pass it, so the
+live tool and rate adapters run the same code with nothing kept -- the
+`tool_policy` and `rate_lane` microbench budgets hold allocation growth at zero
+-- and a test pins each lane's recorded stages to the decision its untraced
+call returns.
+
+Two synthetic lanes read configuration besides the policy, through
+`policy_testing::synthetic`. An isolated rate sequence runs on a
+`middleware::rate_limit::IsolatedBucket` built from the selected lane's
+configured rate and burst -- the override's own, or the global lane's when none
+governs -- and every step goes through `spend_token`, the arithmetic the live
+`RateLimiter` takes each step through; a test pins the two to the same answers
+over the same histories. The bucket is a value owned by the sequence: it is
+never stored in a bucket store, reported to a gauge or sent to the shared
+PostgreSQL rate authority. An egress case is asked of the live
+`CompiledEgressPolicy` the egress client decides by, with the case's
+hypothetical addresses as `ResolutionFact::Resolved`, or `Missing` without
+them; the lane decides nothing it would need a resolver for, and the synthetic
+path holds no resolver to ask.
 
 ## Replay contexts (#243, slice 12)
 

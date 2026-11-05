@@ -13,6 +13,7 @@
 
 use super::*;
 use crate::policy_eval::{
+    stages::NoStages,
     tools::{ToolEvaluation, ToolEvaluationContext, ToolReason, TOOL_CONTEXT_VERSION},
     DispatchFacts, Evaluation, Fact, HostFact, HttpTarget, PolicyEvaluationContext, PolicyFacts,
     PrincipalFact, PrincipalIdentity, RuleReference, CONTEXT_VERSION,
@@ -248,7 +249,7 @@ fn kernel_tool(
         path,
     };
     compiled
-        .evaluate_tool_with_facts(&context, &verified_organization(principal))
+        .evaluate_tool_with_facts(&context, &verified_organization(principal), &mut NoStages)
         .expect("the kernel answers")
 }
 
