@@ -13,7 +13,10 @@
 //! [`policy_analysis::checks::analyze`] on a blocking thread, behind its own
 //! [`PolicyEvaluationLimiter`] and a deadline. Running out of the deadline,
 //! the comparison budget or the findings cap is an incomplete result, never
-//! a clean one.
+//! a clean one. The endpoint reads what the analysis is judged against once,
+//! before the analysis starts: the active policy, the configured global rate
+//! lanes and the cross-resource view a publication's checks read. A resource
+//! it could not read makes the result incomplete too.
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -215,11 +218,19 @@ pub(super) async fn policy_analyses_endpoint(
     };
     let alias_paths = rbac_state.mcp_alias_paths();
     let alias_count = alias_paths.len();
+    // The resources the cross-resource checks read, read once, as a
+    // publication reads them: what the analysis is judged against.
+    let resource_view = rbac_state.policy_resource_view();
+    let global_rate_lanes = rbac_state.global_rate_lanes();
 
     // The blocking thread owns the slot, so a request dropped mid-analysis
     // keeps its slot until the analysis it started has ended. The deadline
-    // starts before compilation, so compiling counts against it.
-    let analyzed = candidate.unwrap_or(base);
+    // starts before compilation, so compiling counts against it. The active
+    // policy goes along: a lockout or an egress change is a change from it.
+    let (analyzed, active) = match candidate {
+        Some(candidate) => (candidate, base),
+        None => (base.clone(), base),
+    };
     let outcome = match slot
         .run_blocking(move || {
             let deadline = Instant::now() + POLICY_ANALYSIS_DEADLINE;
@@ -227,6 +238,9 @@ pub(super) async fn policy_analyses_endpoint(
                 &analyzed,
                 &AnalysisResources {
                     mcp_alias_paths: &alias_paths,
+                    active: &active,
+                    global_rate_lanes,
+                    resource_view: &resource_view,
                 },
                 deadline,
             )
