@@ -843,6 +843,7 @@ mod database {
                 &[mcp_entry("alpha"), mcp_entry("beta")],
                 &[],
                 &[],
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .expect("the MCP catalog should publish");
         let openapi = store
