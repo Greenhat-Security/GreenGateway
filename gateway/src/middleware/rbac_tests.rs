@@ -3738,7 +3738,7 @@ fn an_invocation_answer_the_kernel_never_gives_is_refused() {
     for name in ["reports.open", "reports.closed", "reports.absent"] {
         let has_entry = name != "reports.absent";
         let genuine = snapshot
-            .evaluate_tool(ToolOperation::Invocation, name, None, None)
+            .evaluate_tool(ToolOperation::Invocation, name, None, no_call_facts(), None)
             .expect("the kernel answers a bounded question");
         for reason in TOOL_REASONS {
             for effect in EFFECTS {
@@ -3855,6 +3855,7 @@ fn a_rendered_http_answer_the_kernel_never_gives_is_refused() {
             ToolOperation::RenderedHttp,
             "reports.open",
             None,
+            no_call_facts(),
             Some((Method::GET, "/elsewhere".to_owned())),
         )
         .expect("the kernel answers a bounded question");
@@ -4037,5 +4038,18 @@ async fn http_attribution_resolves_references_on_the_instance_that_decided() {
 #[path = "rbac_identity_mapping_tests.rs"]
 mod identity_mappings;
 
+#[path = "rbac_condition_tests.rs"]
+mod conditions;
+
 #[path = "rbac_decision_facts_tests.rs"]
 mod decision_facts;
+
+/// A tool call with no address, judged by the system clock: what a policy
+/// without conditions never reads.
+fn no_call_facts() -> ToolCallFacts<'static> {
+    static CLOCK: PolicyClock = PolicyClock::System;
+    ToolCallFacts {
+        source_address: None,
+        clock: &CLOCK,
+    }
+}

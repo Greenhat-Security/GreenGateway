@@ -87,17 +87,21 @@
 //!    unavailability", made executable.
 //! 3. **The document version.** A cluster replica serves only the policy
 //!    document formats the roster advertises,
-//!    `cluster_membership::DOCUMENT_VERSION_RANGE = (0, 0)`: a `0.x`
-//!    `schema_version`. Policy v1 (`1.0.0`) parses in standalone mode but is
-//!    outside that range, so `storage/postgres_policy.rs` refuses to serve it
-//!    and the commit paths refuse to write it, exactly as a build that
-//!    predates v1 refuses it. A document a
+//!    `cluster_membership::DOCUMENT_VERSION_RANGE = (0, 1)`: a `0.x`
+//!    `schema_version` or policy v1 (`1.0.0`). A document at a major this
+//!    binary does not carry (`2.0.0`) is refused by its parser, so
+//!    `storage/postgres_policy.rs` refuses to serve it and the commit paths
+//!    refuse to write it, exactly as a build that advertised `(0, 0)`
+//!    refused policy v1. A document a
 //!    replica cannot parse is never compiled and never served — the
 //!    replica goes to `security_revision_not_compiled` rather than
 //!    continuing under the allow state it had
 //!    ([`an_unsupported_document_version_is_never_compiled_and_never_served`])
 //!    — and this binary will not write one either
 //!    ([`this_binary_refuses_to_write_a_document_version_it_does_not_support`]).
+//!    Committing a v1 document is the gated operation `policy.document_v1`,
+//!    held while any live member does not read format 1; the in-crate
+//!    `cluster_policy_tests` prove that against a real roster.
 //!
 //! What *does* roll, and is asserted first, is the migration-free
 //! replacement: one replica at a time, traffic and conditional
@@ -243,11 +247,11 @@ fn policy_document(marker: Option<&str>) -> String {
 
 /// The same document at a `schema_version` this binary does not serve.
 ///
-/// `1.0.0` is policy v1, document format 1. A cluster replica of this
-/// binary serves only the formats its roster row advertises,
-/// `document_version_max = 0`, so it refuses the document on read and on
-/// write. This is what a *newer* replica's commit would look like to this
-/// one.
+/// `2.0.0` would be document format 2. A cluster replica of this binary
+/// serves only the formats its roster row advertises,
+/// `document_version_max = 1`, and its parser reads no major above it, so
+/// it refuses the document on read and on write. This is what a *newer*
+/// replica's commit would look like to this one.
 fn unsupported_document() -> String {
     json!({
         "default_action": "allow",
@@ -255,7 +259,7 @@ fn unsupported_document() -> String {
         "roles": { ADMIN_ROLE: { "permissions": ["*"] } },
         "routes": [],
         "rules": [],
-        "schema_version": "1.0.0",
+        "schema_version": "2.0.0",
     })
     .to_string()
 }
@@ -1504,8 +1508,8 @@ async fn an_unapproved_migration_has_no_overlap_window_so_it_cannot_roll() {
 /// allow state the replica had before it, readiness is refused with
 /// `security_revision_not_compiled` once the reconcile deadline passes,
 /// and the refusal is predictable from what the replica advertises —
-/// `cluster_membership::DOCUMENT_VERSION_RANGE` is `(0, 0)` and the
-/// injected document's major is `1`.
+/// `cluster_membership::DOCUMENT_VERSION_RANGE` is `(0, 1)` and the
+/// injected document's major is `2`.
 ///
 /// One replica, because the claim is about one binary meeting one
 /// document, and because the row already costs the 30 s of
@@ -1519,7 +1523,7 @@ async fn an_unsupported_document_version_is_never_compiled_and_never_served() {
     let authority = Authority::connect(&cluster.database.migrator_dsn).await;
 
     // 0. The advertised window, read from the product. Everything below
-    //    is a consequence of this pair being (0, 0) — the replica tells
+    //    is a consequence of this pair being (0, 1) — the replica tells
     //    the deployment, on its own roster row, which document majors it
     //    can carry.
     let roster = cluster_replicas(&cluster, "a", &admin).await;
@@ -1531,8 +1535,8 @@ async fn an_unsupported_document_version_is_never_compiled_and_never_served() {
         "the advertised document range should start at 0: {member}"
     );
     assert_eq!(
-        member["document_version_max"], 0,
-        "the advertised document range should end at 0, which is why a 1.x document is \
+        member["document_version_max"], 1,
+        "the advertised document range should end at 1, which is why a 2.x document is \
          refused: {member}"
     );
 

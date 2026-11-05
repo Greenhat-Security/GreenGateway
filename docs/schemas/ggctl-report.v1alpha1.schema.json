@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://greengateway.dev/schemas/ggctl-report.v1alpha1.schema.json",
   "title": "ggctl Report",
-  "description": "The one document ggctl writes to standard output with --format json, for every command that does not write an artifact. exitCode and outcome are the process exit status and its stable name. Diagnostics are value-free: a stable family.reason code, fixed message text, an optional fixed hint, a documentation anchor, and at most one location: the 1-based position of the command-line argument concerned, or a bundle-relative file name with a JSON Pointer built from member names the bundle reader defines and a 1-based line and column, or the position of the argument naming a document that is not a bundle file (the init answers) with a JSON Pointer and a line and column; never an argument, token, URL, path, document value, server response, or library error. A published diagnostic code never changes meaning; renaming or removing one requires a new report version. An argument error found before a command runs writes no report (exit 2, standard error only).",
+  "description": "The one document ggctl writes to standard output with --format json, for every command that does not write an artifact. exitCode and outcome are the process exit status and its stable name. Diagnostics are value-free: a stable family.reason code, fixed message text, an optional fixed hint, a documentation anchor, and at most one location: the 1-based position of the command-line argument concerned, or a bundle-relative file name with a JSON Pointer built from member names the bundle reader defines and a 1-based line and column, or the position of the argument naming a document that is not a bundle file (the init answers) with a JSON Pointer and a line and column, or the 1-based position of a backup archive's entry and of the earlier entry it clashes with; never an argument, token, URL, path, document value, server response, or library error. A published diagnostic code never changes meaning; renaming or removing one requires a new report version. An argument error found before a command runs writes no report (exit 2, standard error only).",
   "type": "object",
   "additionalProperties": false,
   "required": ["apiVersion", "kind", "command", "exitCode", "outcome", "diagnostics", "result"],
@@ -15,7 +15,7 @@
       "const": "GgctlReport"
     },
     "command": {
-      "enum": ["version", "schema", "init", "validate", "pin", "convert", "doctor", "diff"]
+      "enum": ["version", "schema", "init", "validate", "pin", "convert", "doctor", "diff", "ledger seed", "ledger verify", "ledger rollback", "backup create", "backup verify"]
     },
     "exitCode": {
       "type": "integer",
@@ -99,6 +99,46 @@
       "then": {
         "properties": {"result": {"$ref": "#/$defs/diffCommandResult"}}
       }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "ledger seed"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/ledgerSeedResult"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "ledger verify"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/ledgerVerifyResult"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "ledger rollback"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/ledgerRollbackResult"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "backup create"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/backupCreateResult"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "backup verify"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/backupVerifyResult"}}
+      }
     }
   ],
   "$defs": {
@@ -108,9 +148,9 @@
       "required": ["code", "severity", "message", "remediation"],
       "properties": {
         "code": {
-          "description": "The stable family.reason code. docs/ggctl.md lists every ggctl code by family, and docs/configuration-bundles.md every bundle reader code.",
+          "description": "The stable family.reason code. docs/ggctl.md lists every ggctl code by family, docs/configuration-bundles.md every bundle reader code, and docs/archive-admission.md every archive admission code.",
           "type": "string",
-          "pattern": "^(usage|credential|trust|remote|compat|schema|validate|doctor|diff|init|convert|pin|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile)\\.[a-z][a-z0-9_]*$"
+          "pattern": "^(usage|credential|trust|remote|compat|schema|validate|doctor|diff|init|convert|pin|state_dir|ledger|backup|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile|archive)\\.[a-z][a-z0-9_]*$"
         },
         "severity": {
           "enum": ["error", "warning", "info"]
@@ -126,7 +166,7 @@
         "remediation": {
           "description": "A repository documentation anchor.",
           "type": "string",
-          "pattern": "^docs/(ggctl\\.md#[a-z]+-diagnostics|configuration-bundles\\.md#diagnostics)$"
+          "pattern": "^docs/(ggctl\\.md#[a-z_]+-diagnostics|configuration-bundles\\.md#diagnostics|archive-admission\\.md#codes)$"
         },
         "location": {
           "oneOf": [
@@ -189,8 +229,126 @@
                   "minimum": 1
                 }
               }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["entry"],
+              "properties": {
+                "entry": {
+                  "description": "The 1-based position of the backup archive entry the archive admission rules refused. Its name is never echoed.",
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "conflictsWith": {
+                  "description": "For a duplicate, case-colliding or conflicting entry, the 1-based position of the earlier entry it clashes with.",
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
             }
           ]
+        }
+      }
+    },
+    "backupCreateResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["created"],
+      "properties": {
+        "created": {
+          "description": "The archive is at --output and passed every check of ggctl backup verify. Nothing is at --output otherwise.",
+          "type": "boolean"
+        },
+        "store": {"$ref": "#/$defs/backupStoreId"},
+        "backup": {
+          "description": "The backup written, once it verified.",
+          "$ref": "#/$defs/backup"
+        }
+      }
+    },
+    "backupVerifyResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verified"],
+      "properties": {
+        "verified": {
+          "description": "Every check passed: the archive admission rules, the manifest, every entry's SHA-256, the archive's digest, SQLite's integrity check and description of each database, and the ledger's verification.",
+          "type": "boolean"
+        },
+        "store": {"$ref": "#/$defs/backupStoreId"},
+        "backup": {
+          "description": "The backup, once it verified.",
+          "$ref": "#/$defs/backup"
+        }
+      }
+    },
+    "backupStoreId": {
+      "description": "The store a refusal concerns, when it concerns one.",
+      "enum": ["audit", "discovery", "principals", "connections", "service_tokens", "policy_history", "config_ledger"]
+    },
+    "backup": {
+      "description": "A backup as its GatewayBackup manifest describes it (gateway-backup.v1alpha1.schema.json): fixed names, versions, counts and opaque revision IDs, never a path or a store's content.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiVersion", "archiveVersion", "createdAtMs", "createdBy", "sqliteVersion", "stores", "entries", "bytes", "tables", "rows"],
+      "properties": {
+        "apiVersion": {"const": "greengateway.dev/v1alpha1"},
+        "archiveVersion": {"const": 1},
+        "createdAtMs": {
+          "description": "Milliseconds since the Unix epoch, as the writer stamped it.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "createdBy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["program", "version"],
+          "properties": {
+            "program": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$"},
+            "version": {"type": "string", "maxLength": 64}
+          }
+        },
+        "sqliteVersion": {"type": "string", "maxLength": 32},
+        "stores": {
+          "description": "Every store of the state-directory layout, in the layout's order.",
+          "type": "array",
+          "minItems": 7,
+          "maxItems": 7,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["store", "included", "tables", "rows"],
+            "properties": {
+              "store": {"$ref": "#/$defs/backupStoreId"},
+              "included": {"type": "boolean"},
+              "entry": {
+                "description": "The entry holding the store: its own file, or the file of an earlier store it was another name for.",
+                "enum": ["audit.sqlite3", "discovery.sqlite3", "principals.sqlite3", "connections.sqlite3", "service-tokens.sqlite3", "policy-history.sqlite3", "config-ledger.sqlite3"]
+              },
+              "tables": {"type": "integer", "minimum": 0},
+              "rows": {"type": "integer", "minimum": 0}
+            }
+          }
+        },
+        "entries": {"type": "integer", "minimum": 1, "maximum": 7},
+        "bytes": {"type": "integer", "minimum": 0},
+        "tables": {"type": "integer", "minimum": 0},
+        "rows": {"type": "integer", "minimum": 0},
+        "ledger": {
+          "description": "Present when the configuration revision ledger is included.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["revisions", "desired", "active", "restartPending", "bundleApiVersion"],
+          "properties": {
+            "revisions": {"type": "integer", "minimum": 1},
+            "desired": {"type": "string", "pattern": "^rev-[0-9a-f]{32}$"},
+            "active": {
+              "oneOf": [{"type": "string", "pattern": "^rev-[0-9a-f]{32}$"}, {"type": "null"}]
+            },
+            "restartPending": {"type": "boolean"},
+            "bundleApiVersion": {"const": "greengateway.dev/v1alpha1"}
+          }
         }
       }
     },
@@ -490,6 +648,202 @@
           "description": "The changes from the --against bundle to BUNDLE, present when valid.",
           "$ref": "#/$defs/diffResult"
         }
+      }
+    },
+    "ledgerSeedResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valid", "seeded"],
+      "properties": {
+        "valid": {
+          "description": "The bundle reader accepted BUNDLE strictly: an entry the manifest does not reference is an error. The gateway's production policy and tools validators are not part of ggctl and did not run.",
+          "type": "boolean"
+        },
+        "seeded": {
+          "description": "The state directory's new ledger holds the bundle as its first revision, desired and not active.",
+          "type": "boolean"
+        },
+        "bundle": {
+          "description": "BUNDLE, once its manifest was read.",
+          "$ref": "#/$defs/bundle"
+        },
+        "corruption": {"$ref": "#/$defs/ledgerCorruption"},
+        "ledger": {
+          "description": "The new ledger's pointer, once seeded.",
+          "$ref": "#/$defs/ledgerPointer"
+        }
+      }
+    },
+    "ledgerVerifyResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verified"],
+      "properties": {
+        "verified": {
+          "description": "Every check of the ledger passed, read-only: location and permissions, page structure, schema, every record and its hash, the chain, every document and the pointer.",
+          "type": "boolean"
+        },
+        "corruption": {"$ref": "#/$defs/ledgerCorruption"},
+        "ledger": {
+          "description": "The ledger's pointer, when verified.",
+          "$ref": "#/$defs/ledgerPointer"
+        }
+      }
+    },
+    "ledgerRollbackResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rolledBack"],
+      "properties": {
+        "rolledBack": {
+          "description": "A new forward revision restores the target's content. The gateway's production policy and tools validators are not part of ggctl and did not run.",
+          "type": "boolean"
+        },
+        "corruption": {"$ref": "#/$defs/ledgerCorruption"},
+        "plan": {
+          "description": "The rollback as the revision service planned it, once planned.",
+          "$ref": "#/$defs/ledgerRollbackPlan"
+        },
+        "revision": {
+          "description": "The revision appended, once rolled back.",
+          "$ref": "#/$defs/ledgerRevision"
+        },
+        "ledger": {
+          "description": "The ledger's pointer, once rolled back.",
+          "$ref": "#/$defs/ledgerPointer"
+        }
+      }
+    },
+    "ledgerCorruption": {
+      "description": "Present when the ledger failed verification: the class of what was found (docs/configuration-ledger.md#verification).",
+      "enum": ["integrity", "format", "schema", "record", "record_hash", "chain", "document", "pointer", "request"]
+    },
+    "revisionId": {
+      "type": "string",
+      "pattern": "^rev-[0-9a-f]{32}$"
+    },
+    "ledgerPointer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revisions", "desired", "active", "restartPending"],
+      "properties": {
+        "revisions": {
+          "description": "How many revisions the ledger holds.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "desired": {
+          "description": "The newest revision, which is always the desired one.",
+          "$ref": "#/$defs/ledgerRevision"
+        },
+        "active": {
+          "description": "The revision a gateway last compiled and activated; null until one has.",
+          "oneOf": [{"$ref": "#/$defs/revisionId"}, {"type": "null"}]
+        },
+        "restartPending": {
+          "description": "The desired revision is not the active one: a gateway starting from the ledger activates it.",
+          "type": "boolean"
+        }
+      }
+    },
+    "ledgerRevision": {
+      "description": "One revision as the ledger records it, without its actor's identity or any document content.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "sequence", "recordHash", "operation", "actorKind", "activation", "recordedAtMs", "appliedOnline", "changedSections", "riskCodes", "bundle"],
+      "properties": {
+        "revision": {"$ref": "#/$defs/revisionId"},
+        "sequence": {"type": "integer", "minimum": 1},
+        "recordHash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "operation": {"enum": ["seed", "apply", "rollback"]},
+        "rollbackOf": {
+          "description": "For a rollback, the revision whose content it restores.",
+          "$ref": "#/$defs/revisionId"
+        },
+        "actorKind": {"enum": ["principal", "service_token", "system"]},
+        "activation": {
+          "description": "When the revision takes effect. A seed and an offline rollback are restart: no gateway is running to activate them.",
+          "enum": ["live", "restart"]
+        },
+        "recordedAtMs": {
+          "description": "Milliseconds since the Unix epoch, as the writer stamped it.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "appliedOnline": {
+          "description": "The revision records the online request it was applied under; false for a seed and for an offline command's revision.",
+          "type": "boolean"
+        },
+        "changedSections": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/configSection"}
+        },
+        "riskCodes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/riskCode"}
+        },
+        "bundle": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["apiVersion", "name", "profile", "sourceDigest"],
+          "properties": {
+            "apiVersion": {"const": "greengateway.dev/v1alpha1"},
+            "name": {"type": "string"},
+            "profile": {"enum": ["production", "migration", "development"]},
+            "sourceDigest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            }
+          }
+        }
+      }
+    },
+    "ledgerRollbackPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base", "target", "riskCodes", "unacknowledged", "changedSections", "requiredPermissions", "activation", "diff"],
+      "properties": {
+        "base": {
+          "description": "The desired revision the rollback was planned against.",
+          "$ref": "#/$defs/revisionId"
+        },
+        "target": {
+          "description": "REVISION, as the ledger holds it.",
+          "$ref": "#/$defs/revisionId"
+        },
+        "riskCodes": {
+          "description": "The change's risk codes, sorted: each must be named with --acknowledge. Every code is acknowledgeable offline, risk.admin_access_path_removed included.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/riskCode"}
+        },
+        "unacknowledged": {
+          "description": "The risk codes --acknowledge did not name.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/riskCode"}
+        },
+        "changedSections": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/configSection"}
+        },
+        "requiredPermissions": {
+          "description": "The union of permissions the change would need online. An offline command checks none: filesystem access to the state directory is already full control of the deployment.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^admin:[a-z:]+$"}
+        },
+        "activation": {
+          "description": "How the change would take effect online; null when it changes nothing. The revision an offline rollback appends is restart-class whatever this is.",
+          "oneOf": [{"enum": ["live", "restart"]}, {"type": "null"}]
+        },
+        "diff": {"$ref": "#/$defs/diffResult"}
       }
     },
     "diffResult": {

@@ -4,6 +4,7 @@ pub mod csrf;
 pub mod decision;
 pub mod headers;
 pub mod observation;
+pub(crate) mod policy_facts;
 pub mod rate_limit;
 pub mod rbac;
 pub mod validate;

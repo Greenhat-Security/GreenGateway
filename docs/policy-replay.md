@@ -229,12 +229,19 @@ and never reused:
 | 10 | 1024 | tool arguments |
 | 11 | 2048 | clock |
 
-Today an HTTP verdict sets method, path, principal, request host and, for a
+An HTTP verdict sets method, path, principal, request host and, for a
 classified request, routing (`31`); a tool invocation sets tool name and
-principal (`36`). Either adds the organization (`64`) under a policy whose
-roles come from identity mappings, which read the organization the
-principal's issuer verified. No serving lane captures the client address,
-headers, query, tool arguments or clock yet, so those bits stay clear.
+principal (`36`). A lane captures a typed-matcher fact only when the policy
+reads it, and the bits say which it captured: the organization (`64`) under
+a policy whose roles come from identity mappings, which read the
+organization the principal's issuer verified; and the client address, the
+referenced headers, the referenced query parameters and the clock (`128`,
+`256`, `512`, `2048`) when a v1 rule condition reads them. The client
+address bit is clear when the request or call had no address to capture,
+and a tool call never has headers or a query. No serving lane captures tool
+arguments, so that bit stays clear. The bits never carry the values: an
+address, header, query value or instant the evaluator read is not in the
+facts.
 
 A request the policy stage refused to answer -- an unsafe path, an
 incomplete or failed evaluation, a failed revision check, an audit outage --
@@ -366,6 +373,7 @@ an allow.
 | routing `proxy_dispatch` | the classified dispatch with the recorded facts |
 | egress `destination` | the destination with no resolution facts |
 | organization (never recorded) | not recorded: an identity mapping that tests `organizations` is `missing_matcher_fact` |
+| source address, headers, query values, clock (never recorded as condition facts) | not recorded: a rule condition that reads one is `missing_matcher_fact` |
 
 **MCP identity.** A record that does not say whether its path was an MCP
 alias is decided under both readings, contextless and alias, and answers
@@ -382,6 +390,14 @@ internal roles turn on a mapping that tests `organizations` is
 decided by the organization its provider verified. Mappings that test only
 the issuer, authentication method, subject and claimed roles replay as they
 are served.
+
+**Rule conditions.** Replay captures no condition fact: not the
+organization, the source address a record carries for audit, the headers,
+the query values or the instant of the original decision. A condition that
+reads one is unknown, so a decision that turns on it is `indeterminate` with
+`missing_matcher_fact`, never a guessed match or no-match; a condition
+decided without one (an `organization` leaf bound to another issuer, say)
+and a rule the order decides before reaching one replay as they were served.
 
 **Rate lane.** Rate-lane selection reads the recorded method, path and
 principal, exactly as the live rate stage does, and an anonymous caller

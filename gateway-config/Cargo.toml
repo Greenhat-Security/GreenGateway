@@ -8,9 +8,10 @@ license-file.workspace = true
 # ADR-0008). No build script and no network: both binaries link it, and
 # `ggctl` must build without Node or the admin UI. The one I/O it performs is
 # the bundle reader's contained, read-only file access beneath the bundle root
-# it is given, and the revision ledger's one SQLite database beneath the
-# state directory it is given. Every dependency below is already in the
-# workspace graph through the gateway, at the same version and features.
+# it is given, and, beneath the state directory it is given, the revision
+# ledger's one SQLite database and the directory's lock file. Every
+# dependency below is already in the workspace graph through the gateway, at
+# the same version and features.
 [dependencies]
 # The bundle reader opens files beneath one directory capability, without
 # following links, and reads link counts from open handles.
@@ -29,6 +30,12 @@ sha2.workspace = true
 # The secret provider documents' endpoint and address validators parse the
 # URLs an operator configures (they never dial them).
 url.workspace = true
+
+# `statfs` for the state directory's best-effort network-filesystem check
+# (`src/state_dir/filesystem.rs`), the one call made through it. Already in
+# the graph through cap-std, at the same version and features.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix.workspace = true
 
 [dev-dependencies]
 # The bundle reader's seeded, bounded property tests.

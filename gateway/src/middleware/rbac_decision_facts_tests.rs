@@ -278,7 +278,7 @@ fn tool_invocation_verdicts_carry_facts_and_a_refusal_carries_none() {
     let installed = state.current_policy();
     let principal = acme_reader();
     let facts = |tool_name: &str| {
-        state.evaluate_tool_authorization(tool_name, Some(&principal), |authorization| {
+        state.evaluate_tool_authorization(tool_name, Some(&principal), None, |authorization| {
             authorization.decision_facts.map(|facts| facts.to_json())
         })
     };
@@ -320,4 +320,89 @@ fn tool_invocation_verdicts_carry_facts_and_a_refusal_carries_none() {
     );
     // A name no policy can carry is refused before evaluation: no verdict.
     assert_eq!(facts(&"t".repeat(MAX_TOOL_NAME_BYTES + 1)), None);
+}
+
+/// A fact a rule condition reads is marked available once the lane captured
+/// it, and the facts never carry the value it had.
+#[tokio::test]
+async fn the_facts_a_rule_condition_reads_are_marked_available_without_their_values() {
+    const ADDRESS: &str = "10.42.7.9";
+    const HEADER_VALUE: &str = "facts-header-canary-7d2a";
+    const QUERY_VALUE: &str = "facts-query-canary-4c81";
+    let policy = Policy::validate_json_value(json!({
+        "schema_version": "1.0.0",
+        "id": "conditioned-facts",
+        "default_action": "allow",
+        "rules": [{
+            "id": "office-exports",
+            "path": "/exports/**",
+            "action": "deny",
+            "conditions": { "all": [
+                { "source_network": { "cidrs": ["10.0.0.0/8"] } },
+                { "query": { "name": "format", "in": [QUERY_VALUE] } },
+                { "header": { "name": "x-environment", "in": [HEADER_VALUE] } },
+                { "time_window": {
+                    "from": "2026-06-01T00:00:00Z",
+                    "until": "2026-06-01T02:00:00Z"
+                } }
+            ] }
+        }]
+    }))
+    .expect("the fixture validates");
+    let (state, _capture) = test_state(policy, &[]);
+    // 2026-06-01T01:00:00Z, inside the window.
+    let state = state.with_policy_clock(crate::middleware::policy_facts::PolicyClock::fixed(
+        1_780_275_600,
+    ));
+    let mut request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/exports/a?format={QUERY_VALUE}"))
+        .header("x-environment", HEADER_VALUE)
+        .body(Body::empty())
+        .expect("request should build");
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+            ADDRESS.parse().expect("an address"),
+            443,
+        )));
+    let decision = test_router(state, None)
+        .oneshot(request)
+        .await
+        .expect("the request completes")
+        .extensions()
+        .get::<PolicyDecision>()
+        .cloned()
+        .expect("the stage records its decision");
+    assert_eq!(decision.outcome, PolicyDecisionOutcome::Denied);
+    let facts = facts_json(&decision);
+    assert_eq!(
+        facts["facts_available"],
+        json!(
+            facts_available::METHOD
+                | facts_available::PATH
+                | facts_available::PRINCIPAL
+                | facts_available::ROUTING
+                | facts_available::REQUEST_HOST
+                | facts_available::CLIENT_ADDRESS
+                | facts_available::HEADERS
+                | facts_available::QUERY
+                | facts_available::CLOCK
+        )
+    );
+    assert_eq!(
+        facts["element"],
+        json!({ "kind": "rule", "position": 0, "id": "office-exports" })
+    );
+    let rendered = facts.to_string();
+    for value in [
+        ADDRESS,
+        HEADER_VALUE,
+        QUERY_VALUE,
+        "x-environment",
+        "format",
+        "1780275600",
+    ] {
+        assert!(!rendered.contains(value), "the facts repeat {value}");
+    }
 }
