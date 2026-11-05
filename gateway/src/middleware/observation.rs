@@ -38,7 +38,10 @@ use crate::{
     },
 };
 
-use super::decision::{AuthOutcome, PolicyDecision, PolicyDecisionOutcome, UpstreamOutcome};
+use super::decision::{
+    AuthOutcome, PolicyDecision, PolicyDecisionOutcome, UpstreamOutcome,
+    POLICY_DECISION_FACTS_MEMBER,
+};
 
 const HTTP_REQUEST_OBSERVED: &str = "http.request_observed";
 pub(crate) const MIN_INFERRED_CONFORMANCE_SAMPLE_COUNT: u64 = 5;
@@ -539,6 +542,13 @@ fn observation_payload(input: ObservationPayloadInput<'_>) -> Value {
 
         if let Some(matched_rule_id) = decision.matched_rule_id.as_deref() {
             payload.insert("matched_rule_id".to_owned(), json!(matched_rule_id));
+        }
+
+        // The versioned facts the verdict was decided with, for replay to
+        // tell a policy or evaluator change from a candidate's. Codes,
+        // versions, digests and policy positions only: no request value.
+        if let Some(facts) = decision.facts.as_ref() {
+            payload.insert(POLICY_DECISION_FACTS_MEMBER.to_owned(), facts.to_json());
         }
     }
 
@@ -1797,6 +1807,7 @@ mod tests {
                             permission: None,
                             path_prefix: None,
                             matched_rule_id: None,
+                            facts: None,
                         });
                         response
                     }),
@@ -3168,6 +3179,7 @@ paths:
                     permission: Some("data:read".to_owned()),
                     path_prefix: Some("/data".to_owned()),
                     matched_rule_id: None,
+                    facts: None,
                 });
                 response
             }
@@ -3179,6 +3191,7 @@ paths:
                     permission: Some("data:read".to_owned()),
                     path_prefix: Some("/data".to_owned()),
                     matched_rule_id: None,
+                    facts: None,
                 });
                 response
             }
@@ -3190,6 +3203,7 @@ paths:
                     permission: Some("data:read".to_owned()),
                     path_prefix: Some("/data".to_owned()),
                     matched_rule_id: None,
+                    facts: None,
                 });
                 response
             }

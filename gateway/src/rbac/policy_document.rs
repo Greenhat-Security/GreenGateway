@@ -82,6 +82,35 @@ pub(crate) const POLICY_V1_SCHEMA_VERSION: &str = "1.0.0";
 /// digest wherever it is computed.
 pub(crate) const POLICY_MEDIA_TYPE: &str = "application/json";
 
+/// The ADR-0004 semantic digest of a policy this gateway accepted: for a v1
+/// document, the digest `POST .../policy/validate` reports for it, over its
+/// normalized form; for a 0.x document `None`, because that format has no
+/// normative normalization and so no semantic digest. A policy with no
+/// canonical form is refused; callers then name no digest rather than
+/// invent one.
+pub(crate) fn accepted_policy_semantic_digest(
+    policy: &Policy,
+) -> Result<Option<String>, NoCanonicalForm> {
+    match PolicySchema::of_version(&policy.schema_version) {
+        Some(PolicySchema::V1) => {
+            let normalized = serde_json::to_value(policy).map_err(|_| NoCanonicalForm)?;
+            canonical_json::semantic_digest(
+                POLICY_MEDIA_TYPE,
+                POLICY_V1_SCHEMA_VERSION,
+                &normalized,
+            )
+            .map(Some)
+            .map_err(|_| NoCanonicalForm)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// A v1 policy that does not serialize to a canonical form. Unreachable for
+/// a validated document, whose numbers are all in the I-JSON range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NoCanonicalForm;
+
 /// The most structural problems one inspection reports. A document past it
 /// is already refused; listing every element of a 1 MiB document would only
 /// make the refusal larger than the document.

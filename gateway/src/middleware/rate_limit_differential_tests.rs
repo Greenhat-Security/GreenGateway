@@ -420,6 +420,7 @@ async fn assert_refused_paths_are_refused_and_charge_nothing(policy: &Policy) {
                             permission: None,
                             path_prefix: None,
                             matched_rule_id: None,
+                            facts: None,
                         })
                     ),
                     "{method} {path}"
@@ -769,6 +770,7 @@ async fn a_request_pinned_to_another_snapshot_is_refused_rather_than_charged_aga
                 permission: None,
                 path_prefix: None,
                 matched_rule_id: None,
+                facts: None,
             })
         )
     );

@@ -1,6 +1,7 @@
 //! Replay contexts: the legacy adapters' classification and redaction, the
-//! `replay-context.v1` format and its published schema, and what a context
-//! answers when the kernel is asked. `live_tests` proves the adapters
+//! `replay-context.v2` format, its published schema and the v1 it still
+//! reads, the recorded decision facts, and what a context answers when the
+//! kernel is asked. `live_tests` proves the adapters
 //! lossless against the live middleware and tool runtime.
 
 use http::Method;
@@ -12,19 +13,24 @@ use super::{
         HttpReplayOutcome,
     },
     legacy::{adapt_audit_event, could_be_mcp_route_alias, LegacyRecord},
-    EgressFacts, EgressRecord, HostRecord, HttpFacts, McpIdentity, PrincipalRecord, RecordedPolicy,
-    RecordedPrincipal, RecordedResult, ReplayContext, ReplayContextError, ReplayFacts,
-    ReplaySource, RoutingRecord, ToolFacts, MAX_RECORDED_ELEMENT_BYTES, MAX_REPLAY_CONTEXT_BYTES,
-    REPLAY_CONTEXT_SCHEMA_VERSION,
+    EgressFacts, EgressRecord, HostRecord, HttpFacts, McpIdentity, PrincipalRecord,
+    RecordedDecision, RecordedElement, RecordedPolicy, RecordedPrincipal, RecordedResult,
+    ReplayContext, ReplayContextError, ReplayFacts, ReplaySource, RoutingRecord, ToolFacts,
+    MAX_RECORDED_ELEMENT_BYTES, MAX_REPLAY_CONTEXT_BYTES, REPLAY_CONTEXT_SCHEMA_VERSION,
+    REPLAY_CONTEXT_V1_SCHEMA_VERSION,
 };
 use crate::{
     audit::{event, Actor, AuditEvent},
-    auth::AuthMethod,
+    auth::{protected_resource::MCP_RESOURCE_PATH, AuthMethod},
+    middleware::decision::{
+        facts_available, DecisionElement, DecisionLane, DecisionRouting,
+        MAX_DECISION_ELEMENT_ID_BYTES, POLICY_DECISION_FACTS_MEMBER,
+    },
     policy_eval::{
         egress::{CompiledEgressPolicy, EgressControls, EgressDenial, EgressOutcome},
-        tools::ToolReason,
+        tools::{ToolReason, TOOL_CONTEXT_VERSION, TOOL_SEMANTICS_VERSION},
         CompiledPolicy, DispatchFacts, Limitation, LogicalDecision, PolicyAuthority, PolicyEffect,
-        RateLaneOutcome, Reason,
+        RateLaneOutcome, Reason, CONTEXT_VERSION, HTTP_SEMANTICS_VERSION,
     },
     rbac::Policy,
 };
@@ -154,7 +160,67 @@ fn recorded(policy: RecordedPolicy) -> RecordedResult {
         permission: None,
         path_prefix: None,
         attribution_omitted: false,
+        decision: None,
     }
+}
+
+/// An ETag of the shape the admin API sends, obviously not one of a policy.
+fn placeholder_etag() -> String {
+    format!("\"sha256:{}\"", "a".repeat(64))
+}
+
+/// Recorded decision facts for `lane`, with this build's evaluator versions.
+fn decision(
+    lane: DecisionLane,
+    routing: Option<DecisionRouting>,
+    reason: &str,
+    element: DecisionElement,
+) -> RecordedDecision {
+    let (semantics_version, context_version, facts_available) = match lane {
+        DecisionLane::Http => (
+            HTTP_SEMANTICS_VERSION,
+            CONTEXT_VERSION,
+            facts_available::METHOD
+                | facts_available::PATH
+                | facts_available::PRINCIPAL
+                | facts_available::ROUTING
+                | facts_available::REQUEST_HOST,
+        ),
+        DecisionLane::Tool => (
+            TOOL_SEMANTICS_VERSION,
+            TOOL_CONTEXT_VERSION,
+            facts_available::TOOL_NAME | facts_available::PRINCIPAL,
+        ),
+    };
+    RecordedDecision {
+        lane,
+        policy_etag: placeholder_etag(),
+        policy_semantic_digest: None,
+        semantics_version: semantics_version.to_owned(),
+        context_version,
+        facts_available,
+        routing,
+        reason: reason.to_owned(),
+        element: RecordedElement {
+            element,
+            id: None,
+            id_omitted: false,
+        },
+    }
+}
+
+/// HTTP decision facts as the request path writes them.
+fn http_decision_json(routing: &str, reason: &str, element: Value) -> Value {
+    let mut facts = decision(
+        DecisionLane::Http,
+        Some(DecisionRouting::Contextless),
+        reason,
+        DecisionElement::Default,
+    )
+    .to_json();
+    facts["routing"] = json!(routing);
+    facts["element"] = element;
+    facts
 }
 
 #[test]
@@ -197,6 +263,7 @@ fn an_observation_keeps_every_fact_the_kernel_reads_exactly() {
                 permission: Some("items:write".to_owned()),
                 path_prefix: Some("/api".to_owned()),
                 attribution_omitted: false,
+                decision: None,
             }
     );
 }
@@ -686,6 +753,37 @@ fn every_state() -> Vec<ReplayContext> {
     let mut overlong = observation.clone();
     overlong.recorded.matched_rule_id = None;
     overlong.recorded.attribution_omitted = true;
+    // The same records with the decision facts the request path writes.
+    let mut decided = observation.clone();
+    let mut dispatch_decision = decision(
+        DecisionLane::Http,
+        Some(DecisionRouting::ProxyDispatch),
+        "matched_rule",
+        DecisionElement::Route(0),
+    );
+    dispatch_decision.policy_semantic_digest = Some(format!("sha256:{}", "b".repeat(64)));
+    dispatch_decision.element.id = Some("items".to_owned());
+    decided.recorded.decision = Some(dispatch_decision);
+    let mut decided_alias = with_facts(&|facts| {
+        facts.routing = RoutingRecord::Local(McpIdentity::Alias {
+            canonical_path: MCP_RESOURCE_PATH.to_owned(),
+        });
+    });
+    let mut alias_decision = decision(
+        DecisionLane::Http,
+        Some(DecisionRouting::McpAlias),
+        "matched_rule",
+        DecisionElement::Rule(3),
+    );
+    alias_decision.element.id_omitted = true;
+    decided_alias.recorded.decision = Some(alias_decision);
+    let mut decided_tool = tool.clone();
+    decided_tool.recorded.decision = Some(decision(
+        DecisionLane::Tool,
+        None,
+        "allowed",
+        DecisionElement::ToolEntry,
+    ));
     vec![
         observation.clone(),
         with_facts(&|facts| {
@@ -738,13 +836,25 @@ fn every_state() -> Vec<ReplayContext> {
             });
         }),
         overlong,
+        decided,
+        decided_alias,
         tool,
+        decided_tool,
     ]
 }
 
 fn published_schema() -> Value {
+    schema_file("replay-context.v2.schema.json")
+}
+
+fn published_v1_schema() -> Value {
+    schema_file("replay-context.v1.schema.json")
+}
+
+fn schema_file(name: &str) -> Value {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../docs/schemas/replay-context.v1.schema.json");
+        .join("../docs/schemas")
+        .join(name);
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
     serde_json::from_str(&text)
@@ -785,7 +895,7 @@ fn the_parser_and_the_published_schema_refuse_the_same_contexts() {
     };
     let refused = [
         (
-            edit(&base, &|v| v["schema_version"] = json!("replay-context.v2")),
+            edit(&base, &|v| v["schema_version"] = json!("replay-context.v3")),
             ReplayContextError::UnsupportedSchemaVersion,
         ),
         (
@@ -1344,4 +1454,483 @@ fn a_recorded_egress_destination_is_never_allowed_without_resolution() {
         EgressOutcome::Deny(EgressDenial::Userinfo)
     ));
     assert!(evaluate_egress(&policy, &EgressRecord::NotRecorded).is_none());
+}
+
+/// v1 is read exactly as it was published: a context without decision facts
+/// is the same record under either version, and v1 has no member for them.
+#[test]
+fn a_v1_context_is_read_exactly_as_it_was_published() {
+    let v1 = jsonschema::validator_for(&published_v1_schema()).expect("the v1 schema compiles");
+    let mut read = 0;
+    for context in every_state() {
+        let mut serialized = context.to_json();
+        serialized["schema_version"] = json!(REPLAY_CONTEXT_V1_SCHEMA_VERSION);
+        let bytes = serde_json::to_vec(&serialized).expect("serializes");
+        if context.recorded.decision.is_some() {
+            assert_eq!(
+                ReplayContext::parse(&bytes).map(|_| ()),
+                Err(ReplayContextError::UnknownMember),
+                "{serialized}"
+            );
+            assert!(!v1.is_valid(&serialized), "{serialized}");
+            continue;
+        }
+        if let Err(error) = v1.validate(&serialized) {
+            panic!("the v1 schema refused {serialized}: {error}");
+        }
+        let parsed = ReplayContext::parse(&bytes).expect("a v1 context parses");
+        assert!(parsed == context, "{serialized}");
+        // What is read as v1 is written as the current version.
+        assert_eq!(
+            parsed.to_json()["schema_version"],
+            json!(REPLAY_CONTEXT_SCHEMA_VERSION)
+        );
+        read += 1;
+    }
+    assert!(read > 0);
+}
+
+/// The recorded decision facts are refused by the parser and the published
+/// schema alike, and what only the parser can state -- that the facts
+/// describe their own record, and the bits a lane may set -- by the parser.
+#[test]
+fn recorded_decision_facts_are_refused_out_of_bounds_or_describing_another_record() {
+    let validator = jsonschema::validator_for(&published_schema()).expect("the schema compiles");
+    let states = every_state();
+    let decided =
+        states
+            .iter()
+            .find(|context| {
+                context.recorded.decision.as_ref().is_some_and(|decision| {
+                    decision.routing == Some(DecisionRouting::ProxyDispatch)
+                })
+            })
+            .expect("a decided HTTP context")
+            .to_json();
+    let decided_tool = states
+        .iter()
+        .find(|context| {
+            context
+                .recorded
+                .decision
+                .as_ref()
+                .is_some_and(|decision| decision.lane == DecisionLane::Tool)
+        })
+        .expect("a decided tool context")
+        .to_json();
+    let edit = |value: &Value, edit: &dyn Fn(&mut Value)| {
+        let mut value = value.clone();
+        edit(&mut value["recorded"]["decision"]);
+        value
+    };
+    let remove = |value: &mut Value, key: &str| {
+        value.as_object_mut().expect("an object").remove(key);
+    };
+    let both = [
+        (
+            edit(&decided, &|d| {
+                d["schema_version"] = json!("policy-decision.v2")
+            }),
+            ReplayContextError::UnsupportedSchemaVersion,
+        ),
+        (
+            edit(&decided, &|d| d["status"] = json!(200)),
+            ReplayContextError::UnknownMember,
+        ),
+        (
+            edit(&decided, &|d| d["email"] = json!(EMAIL_CANARY)),
+            ReplayContextError::ForbiddenMember,
+        ),
+        (
+            edit(&decided, &|d| remove(d, "reason")),
+            ReplayContextError::MissingMember,
+        ),
+        (
+            edit(&decided, &|d| {
+                d["policy_etag"] = json!(format!("sha256:{}", "a".repeat(64)))
+            }),
+            ReplayContextError::InvalidValue,
+        ),
+        (
+            edit(&decided, &|d| d["policy_semantic_digest"] = json!("md5:x")),
+            ReplayContextError::InvalidValue,
+        ),
+        (
+            edit(&decided, &|d| d["lane"] = json!("rate")),
+            ReplayContextError::InvalidValue,
+        ),
+        (
+            edit(&decided, &|d| d["routing"] = json!("guessed")),
+            ReplayContextError::InvalidValue,
+        ),
+        (
+            edit(&decided, &|d| d["context_version"] = json!(0)),
+            ReplayContextError::InvalidValue,
+        ),
+        (
+            edit(&decided, &|d| d["context_version"] = json!(70_000)),
+            ReplayContextError::InvalidValue,
+        ),
+        (
+            // The first bit no version-1 input names.
+            edit(&decided, &|d| d["facts_available"] = json!(1 << 14)),
+            ReplayContextError::InvalidValue,
+        ),
+        (
+            edit(&decided, &|d| d["facts_available"] = json!("31")),
+            ReplayContextError::InvalidType,
+        ),
+        (
+            edit(&decided, &|d| d["semantics_version"] = json!("Not A Code")),
+            ReplayContextError::InvalidValue,
+        ),
+        (
+            edit(&decided, &|d| d["element"] = json!({ "kind": "guessed" })),
+            ReplayContextError::InvalidValue,
+        ),
+        (
+            edit(&decided, &|d| d["element"] = json!({ "kind": "route" })),
+            ReplayContextError::MissingMember,
+        ),
+        (
+            edit(
+                &decided,
+                &|d| {
+                    d["element"] =
+                        json!({ "kind": "route", "position": 0, "id": "a", "id_omitted": true })
+                },
+            ),
+            ReplayContextError::InvalidValue,
+        ),
+        (
+            edit(&decided, &|d| {
+                d["element"] = json!({ "kind": "default", "position": 0 })
+            }),
+            ReplayContextError::UnknownMember,
+        ),
+        (
+            edit(&decided, &|d| {
+                d["element"] = json!({ "kind": "route", "position": 0, "id": "" })
+            }),
+            ReplayContextError::InvalidValue,
+        ),
+        (
+            edit(&decided, &|d| {
+                d["element"] = json!({ "kind": "route", "position": "first" })
+            }),
+            ReplayContextError::InvalidType,
+        ),
+        (
+            edit(&decided, &|d| {
+                d["element"] = json!({ "kind": "tool_entry" })
+            }),
+            ReplayContextError::InvalidValue,
+        ),
+        (
+            edit(&decided_tool, &|d| d["routing"] = json!("contextless")),
+            ReplayContextError::InvalidValue,
+        ),
+        (
+            edit(&decided_tool, &|d| {
+                d["element"] = json!({ "kind": "default" })
+            }),
+            ReplayContextError::InvalidValue,
+        ),
+    ];
+    for (value, expected) in both {
+        let bytes = serde_json::to_vec(&value).expect("serializes");
+        assert_eq!(
+            ReplayContext::parse(&bytes).map(|_| ()),
+            Err(expected),
+            "the parser accepted or misjudged {value}"
+        );
+        assert!(
+            !validator.is_valid(&value),
+            "the published schema accepted {value}"
+        );
+    }
+
+    let parser_only = [
+        // The verdict the facts name is not the one the record states.
+        (
+            edit(&decided, &|d| d["reason"] = json!("default_deny")),
+            ReplayContextError::InvalidValue,
+        ),
+        // A routing the record's own facts contradict.
+        (
+            edit(&decided, &|d| d["routing"] = json!("contextless")),
+            ReplayContextError::InvalidValue,
+        ),
+        // A tool verdict's facts on an HTTP record.
+        (
+            edit(&decided, &|d| {
+                d["lane"] = json!("tool");
+                remove(d, "routing");
+                d["facts_available"] = json!(facts_available::TOOL_NAME);
+                d["element"] = json!({ "kind": "rule", "position": 0 });
+            }),
+            ReplayContextError::InvalidValue,
+        ),
+        // A bit the HTTP lane never sets.
+        (
+            edit(&decided, &|d| {
+                d["facts_available"] = json!(facts_available::TOOL_NAME)
+            }),
+            ReplayContextError::InvalidValue,
+        ),
+        // Bytes, not characters.
+        (
+            edit(&decided, &|d| {
+                d["element"]["id"] = json!("\u{e9}".repeat(MAX_DECISION_ELEMENT_ID_BYTES / 2 + 1))
+            }),
+            ReplayContextError::TooLong,
+        ),
+        // An invocation that policy admitted names an admitting verdict.
+        (
+            edit(&decided_tool, &|d| d["reason"] = json!("unknown_tool")),
+            ReplayContextError::InvalidValue,
+        ),
+    ];
+    for (value, expected) in parser_only {
+        let bytes = serde_json::to_vec(&value).expect("serializes");
+        assert_eq!(
+            ReplayContext::parse(&bytes).map(|_| ()),
+            Err(expected),
+            "the parser accepted or misjudged {value}"
+        );
+    }
+    // The verified scopes and claims are inputs either lane may have had.
+    for record in [&decided, &decided_tool] {
+        let value = edit(record, &|d| {
+            let bits = d["facts_available"].as_u64().expect("a bit set");
+            d["facts_available"] =
+                json!(bits | u64::from(facts_available::SCOPES | facts_available::CLAIMS));
+        });
+        let bytes = serde_json::to_vec(&value).expect("serializes");
+        assert_eq!(
+            ReplayContext::parse(&bytes).map(|_| ()),
+            Ok(()),
+            "the parser refused {value}"
+        );
+        assert!(
+            validator.is_valid(&value),
+            "the published schema refused {value}"
+        );
+    }
+}
+
+fn observation_with_decision(path: &str, reason: &str, facts: Option<Value>) -> AuditEvent {
+    let mut payload = json!({
+        "method": "GET",
+        "path": path,
+        "policy_decision": "allowed",
+        "policy_reason": reason,
+        "routing_context_known": true,
+    });
+    if let Some(facts) = facts {
+        payload[POLICY_DECISION_FACTS_MEMBER] = facts;
+    }
+    event("http.request_observed", None, payload)
+}
+
+#[test]
+fn decision_facts_are_read_exactly_and_must_describe_their_record() {
+    let alias = "/base/mcp";
+    let rule = json!({ "kind": "rule", "position": 0, "id": "allow-mcp" });
+    let alias_facts = http_decision_json("mcp_alias", "matched_rule", rule.clone());
+    let context = replayable(&observation_with_decision(
+        alias,
+        "matched_rule",
+        Some(alias_facts.clone()),
+    ));
+    // Read exactly, and the classification settles the MCP identity.
+    let read = context
+        .recorded
+        .decision
+        .as_ref()
+        .expect("the facts are read");
+    assert_eq!(read.to_json(), alias_facts);
+    assert!(
+        http_facts(&context).routing
+            == RoutingRecord::Local(McpIdentity::Alias {
+                canonical_path: MCP_RESOURCE_PATH.to_owned(),
+            })
+    );
+    let contextless = replayable(&observation_with_decision(
+        alias,
+        "matched_rule",
+        Some(http_decision_json(
+            "contextless",
+            "matched_rule",
+            rule.clone(),
+        )),
+    ));
+    assert!(http_facts(&contextless).routing == RoutingRecord::Local(McpIdentity::Canonical));
+    // Without them the identity is not recorded, as before.
+    let legacy = replayable(&observation_with_decision(alias, "matched_rule", None));
+    assert!(legacy.recorded.decision.is_none());
+    assert!(http_facts(&legacy).routing == RoutingRecord::Local(McpIdentity::NotRecorded));
+
+    let tool = |event_type: &str, reason: Option<&str>, facts: Value| {
+        let mut payload = json!({ "tool_name": "lookup", "outcome": "rejected" });
+        if let Some(reason) = reason {
+            payload["reason"] = json!(reason);
+        }
+        payload[POLICY_DECISION_FACTS_MEMBER] = facts;
+        event(event_type, None, payload)
+    };
+    let tool_facts_json = |reason: &str, element: Value| {
+        let mut facts =
+            decision(DecisionLane::Tool, None, reason, DecisionElement::ToolEntry).to_json();
+        facts["element"] = element;
+        facts
+    };
+    let rejected = replayable(&tool(
+        event::TOOL_INVOKE_REJECTED,
+        Some("disabled"),
+        tool_facts_json("disabled", json!({ "kind": "tool_entry" })),
+    ));
+    assert_eq!(
+        rejected
+            .recorded
+            .decision
+            .as_ref()
+            .map(|decision| decision.reason.as_str()),
+        Some("disabled")
+    );
+
+    let cases = [
+        // A path no configuration serves as an alias, called one.
+        (
+            observation_with_decision(
+                "/x",
+                "matched_rule",
+                Some(http_decision_json(
+                    "mcp_alias",
+                    "matched_rule",
+                    rule.clone(),
+                )),
+            ),
+            "malformed_decision_facts",
+        ),
+        // A dispatch the observation does not record.
+        (
+            observation_with_decision(
+                "/x",
+                "matched_rule",
+                Some(http_decision_json(
+                    "proxy_dispatch",
+                    "matched_rule",
+                    rule.clone(),
+                )),
+            ),
+            "malformed_decision_facts",
+        ),
+        // Another verdict than the one the record states.
+        (
+            observation_with_decision(
+                "/x",
+                "matched_rule",
+                Some(http_decision_json(
+                    "contextless",
+                    "default_allow",
+                    json!({ "kind": "default" }),
+                )),
+            ),
+            "malformed_decision_facts",
+        ),
+        // A member the format has no place for: refused, never copied.
+        (
+            observation_with_decision(
+                "/x",
+                "matched_rule",
+                Some({
+                    let mut facts = http_decision_json("contextless", "matched_rule", rule.clone());
+                    facts["headers"] = json!({ "authorization": SECRET_CANARY });
+                    facts
+                }),
+            ),
+            "malformed_decision_facts",
+        ),
+        (
+            observation_with_decision("/x", "matched_rule", Some(json!("policy-decision.v1"))),
+            "malformed_decision_facts",
+        ),
+        // A version this adapter was not written for.
+        (
+            observation_with_decision(
+                "/x",
+                "matched_rule",
+                Some({
+                    let mut facts = http_decision_json("contextless", "matched_rule", rule.clone());
+                    facts["schema_version"] = json!("policy-decision.v2");
+                    facts
+                }),
+            ),
+            "unsupported_decision_facts_version",
+        ),
+        // An admitted invocation whose facts name a refusal.
+        (
+            tool(
+                event::TOOL_INVOKE_START,
+                None,
+                tool_facts_json("unknown_tool", json!({ "kind": "no_tool_entry" })),
+            ),
+            "malformed_decision_facts",
+        ),
+        // An HTTP verdict's facts on an invocation.
+        (
+            tool(
+                event::TOOL_INVOKE_REJECTED,
+                Some("disabled"),
+                http_decision_json("contextless", "disabled", json!({ "kind": "default" })),
+            ),
+            "malformed_decision_facts",
+        ),
+    ];
+    for (event, expected) in cases {
+        assert_eq!(
+            adapt_audit_event(&event).code(),
+            expected,
+            "{} {}",
+            event.event_type,
+            event.payload
+        );
+    }
+}
+
+/// Decision facts hold codes, versions, digests and policy positions, so a
+/// context that carries them repeats no request value either.
+#[test]
+fn a_context_with_decision_facts_redacts_everything_the_kernel_does_not_read() {
+    let mut payload = observed_dispatch();
+    payload[POLICY_DECISION_FACTS_MEMBER] = http_decision_json(
+        "proxy_dispatch",
+        "matched_rule",
+        json!({ "kind": "route", "position": 0, "id": "items" }),
+    );
+    let context = replayable(&event(
+        "http.request_observed",
+        Some(actor("session_cookie", &["reader"])),
+        payload,
+    ));
+    assert!(context.recorded.decision.is_some());
+    let serialized = serde_json::to_string(&context.to_json()).expect("serializes");
+    for canary in [
+        REQUEST_ID_CANARY,
+        SOURCE_IP_CANARY,
+        USER_AGENT_CANARY,
+        EMAIL_CANARY,
+        QUERY_CANARY,
+        SECRET_CANARY,
+        UPSTREAM_CANARY,
+        AUTH_REASON_CANARY,
+    ] {
+        assert!(
+            !serialized.contains(canary),
+            "a replay context repeated {canary}: {serialized}"
+        );
+    }
+    let formatted = format!("{context:?}");
+    assert!(!formatted.contains("sha256"), "{formatted}");
 }

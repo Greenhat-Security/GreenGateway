@@ -22,6 +22,13 @@ use crate::{
         Actor, AuditEvent,
     },
     canonical_json,
+    middleware::decision::{
+        facts_available, POLICY_DECISION_FACTS_MEMBER, POLICY_DECISION_FACTS_VERSION,
+    },
+    policy_eval::{
+        tools::{TOOL_CONTEXT_VERSION, TOOL_SEMANTICS_VERSION},
+        CONTEXT_VERSION, HTTP_SEMANTICS_VERSION,
+    },
     policy_simulation::Projection,
     rbac::Policy,
 };
@@ -423,10 +430,18 @@ fn a_candidate_is_compared_with_its_base_record_by_record() {
             "agrees": 7,
             "outcome_differs": 1,
             "attribution_differs": 1,
+            "evaluator_changed": 0,
+            "recorded_under_other_policy": 0,
             "recorded_not_policy_verdict": 1,
             "base_indeterminate": 0,
             "base_refused": 0,
         })
+    );
+    // None of these records carries decision facts, so no difference is
+    // explained by one.
+    assert_eq!(
+        recorded["provenance"],
+        json!({ "base_policy": 0, "other_policy": 0, "other_evaluator": 0, "not_recorded": 10 })
     );
     let differs = recorded["matrix"]
         .as_array()
@@ -668,4 +683,239 @@ fn a_comparison_never_repeats_a_record_value() {
     }
     // Policy elements are named by what the policies themselves say.
     assert!(rendered.contains("\"lockdown\""));
+}
+
+/// Decision facts as the request path writes them, for an HTTP verdict of
+/// a classified contextless request.
+fn http_decision(
+    policy_etag: &str,
+    semantics_version: &str,
+    context_version: u16,
+    reason: &str,
+    element: Value,
+) -> Value {
+    json!({
+        "schema_version": POLICY_DECISION_FACTS_VERSION,
+        "lane": "http",
+        "policy_etag": policy_etag,
+        "semantics_version": semantics_version,
+        "context_version": context_version,
+        "facts_available": facts_available::METHOD
+            | facts_available::PATH
+            | facts_available::PRINCIPAL
+            | facts_available::ROUTING
+            | facts_available::REQUEST_HOST,
+        "routing": "contextless",
+        "reason": reason,
+        "element": element,
+    })
+}
+
+fn with_decision(mut event: AuditEvent, decision: Value) -> AuditEvent {
+    event
+        .payload
+        .as_object_mut()
+        .expect("an object payload")
+        .insert(POLICY_DECISION_FACTS_MEMBER.to_owned(), decision);
+    event
+}
+
+#[test]
+fn a_difference_the_decision_facts_explain_is_labelled_and_never_a_candidate_change() {
+    let base = validated(base_document());
+    let base_etag = crate::policy_etag(&base).expect("the base has an ETag");
+    // Another policy's ETag, computed rather than invented.
+    let other_etag =
+        crate::policy_etag(&validated(candidate_document())).expect("the other has an ETag");
+    let older_semantics = "gg-http-alias-v0";
+    // Recorded denied by the default; the base allows `/public/**` by a rule.
+    let denied_by_default = || {
+        observed(
+            "/public/b",
+            Some(reader()),
+            "denied",
+            "default_deny",
+            json!({}),
+        )
+    };
+    let default_decision = |policy_etag: &str, semantics_version: &str, context_version: u16| {
+        http_decision(
+            policy_etag,
+            semantics_version,
+            context_version,
+            "default_deny",
+            json!({ "kind": "default" }),
+        )
+    };
+    let tool_decision = |policy_etag: &str, reason: &str| {
+        json!({
+            "schema_version": POLICY_DECISION_FACTS_VERSION,
+            "lane": "tool",
+            "policy_etag": policy_etag,
+            "semantics_version": TOOL_SEMANTICS_VERSION,
+            "context_version": TOOL_CONTEXT_VERSION,
+            "facts_available": facts_available::TOOL_NAME | facts_available::PRINCIPAL,
+            "reason": reason,
+            "element": { "kind": "tool_entry" },
+        })
+    };
+    let records = vec![
+        // Decided by the base under this evaluator, and still different:
+        // nothing the record states explains it.
+        with_decision(
+            denied_by_default(),
+            default_decision(&base_etag, HTTP_SEMANTICS_VERSION, CONTEXT_VERSION),
+        ),
+        // Decided under another policy.
+        with_decision(
+            denied_by_default(),
+            default_decision(&other_etag, HTTP_SEMANTICS_VERSION, CONTEXT_VERSION),
+        ),
+        // Decided by the base under another evaluator semantics, and under
+        // another context version.
+        with_decision(
+            denied_by_default(),
+            default_decision(&base_etag, older_semantics, CONTEXT_VERSION),
+        ),
+        with_decision(
+            denied_by_default(),
+            default_decision(&base_etag, HTTP_SEMANTICS_VERSION, CONTEXT_VERSION - 1),
+        ),
+        // Decided by a rule of another policy: an attribution difference.
+        with_decision(
+            observed(
+                "/public/c",
+                Some(reader()),
+                "allowed",
+                "matched_rule",
+                json!({ "matched_rule_id": RECORDED_RULE_CANARY }),
+            ),
+            http_decision(
+                &other_etag,
+                HTTP_SEMANTICS_VERSION,
+                CONTEXT_VERSION,
+                "matched_rule",
+                json!({ "kind": "rule", "position": 7, "id": RECORDED_RULE_CANARY }),
+            ),
+        ),
+        // Recorded under another policy, and the base agrees anyway.
+        with_decision(
+            observed(
+                "/public/a",
+                Some(reader()),
+                "allowed",
+                "matched_rule",
+                json!({ "matched_rule_id": "public-allow" }),
+            ),
+            http_decision(
+                &other_etag,
+                HTTP_SEMANTICS_VERSION,
+                CONTEXT_VERSION,
+                "matched_rule",
+                json!({ "kind": "rule", "position": 1, "id": "public-allow" }),
+            ),
+        ),
+        // A record from before decision facts: unexplained, as before.
+        denied_by_default(),
+        // An invocation another policy admitted, which the base refuses.
+        with_decision(
+            audit_event(
+                event::TOOL_INVOKE_START,
+                Some(reader()),
+                json!({ "tool_name": "archive", "outcome": "started" }),
+            ),
+            tool_decision(&other_etag, "allowed"),
+        ),
+        // One the base refused, and refuses still.
+        with_decision(
+            audit_event(
+                event::TOOL_INVOKE_REJECTED,
+                Some(reader()),
+                json!({ "tool_name": "archive", "reason": "disabled" }),
+            ),
+            tool_decision(&base_etag, "disabled"),
+        ),
+    ];
+    let policies =
+        ReplayPolicies::compile(&base, None, &[Projection::AsAuthored]).expect("the base compiles");
+    let outcome = run_over(&Window::new(records), &policies, 1_000);
+    assert!(outcome.complete);
+    assert_eq!(outcome.result["records"]["replayable"], json!(9));
+    let recorded = &outcome.result["impact"]["recorded"];
+    assert_eq!(
+        recorded["http"]["comparisons"],
+        json!({
+            "outcome_differs": 2,
+            "attribution_differs": 0,
+            "evaluator_changed": 2,
+            "recorded_under_other_policy": 2,
+            "agrees": 1,
+            "recorded_not_policy_verdict": 0,
+            "base_indeterminate": 0,
+            "base_refused": 0,
+        })
+    );
+    assert_eq!(
+        recorded["http"]["provenance"],
+        json!({ "base_policy": 1, "other_policy": 3, "other_evaluator": 2, "not_recorded": 1 })
+    );
+    assert_eq!(
+        recorded["tool"]["comparisons"]["recorded_under_other_policy"],
+        json!(1)
+    );
+    assert_eq!(recorded["tool"]["comparisons"]["agrees"], json!(1));
+    assert_eq!(
+        recorded["tool"]["provenance"],
+        json!({ "base_policy": 1, "other_policy": 1, "other_evaluator": 0, "not_recorded": 0 })
+    );
+    // An explained difference keeps its row, under its own label.
+    assert!(recorded["http"]["matrix"]
+        .as_array()
+        .expect("recorded rows")
+        .iter()
+        .any(
+            |row| row["comparison"] == json!("recorded_under_other_policy")
+                && row["recorded"] == json!({ "policy": "allowed", "reason": "matched_rule" })
+        ));
+
+    // None of it is a candidate change: the candidate is its base, every
+    // record is unchanged, and the statement counts every compared record.
+    let projection = &outcome.result["impact"]["projections"]["as_authored"];
+    for lane in ["http", "tool"] {
+        let transitions = transitions(&projection[lane]);
+        for code in [
+            "newly_allowed",
+            "enforcement_only_change",
+            "newly_denied",
+            "attribution_only_change",
+        ] {
+            assert_eq!(transitions[code], json!(0), "{lane} {code}");
+        }
+        assert_eq!(projection[lane]["changed_elements"], json!([]), "{lane}");
+    }
+    assert_eq!(
+        projection["statement"]["code"],
+        json!("no_newly_allowed_observed")
+    );
+    assert_eq!(projection["statement"]["replayable_events"], json!(9));
+    for count in [
+        "newly_allowed",
+        "newly_denied",
+        "newly_forwarded",
+        "newly_blocked",
+    ] {
+        assert_eq!(outcome.impact["as_authored"][count], json!(0), "{count}");
+    }
+
+    // The result counts provenance by code and never repeats what a record
+    // named: no ETag, no evaluator version, no element id.
+    let rendered = format!("{}{}", outcome.result, outcome.impact);
+    for value in [
+        other_etag.trim_matches('"'),
+        base_etag.trim_matches('"'),
+        older_semantics,
+        RECORDED_RULE_CANARY,
+    ] {
+        assert!(!rendered.contains(value), "the result repeats {value}");
+    }
 }

@@ -344,6 +344,7 @@ const PAYLOAD_CAPTURE_ENABLED: &str = "PAYLOAD_CAPTURE_ENABLED";
 const PAYLOAD_CAPTURE_SAMPLE_RATE: &str = "PAYLOAD_CAPTURE_SAMPLE_RATE";
 const POLICY_FILE: &str = "POLICY_FILE";
 const POLICY_HISTORY_SQLITE_PATH: &str = "POLICY_HISTORY_SQLITE_PATH";
+const POLICY_TESTS_REQUIRED: &str = "POLICY_TESTS_REQUIRED";
 const PRINCIPAL_SQLITE_PATH: &str = "PRINCIPAL_SQLITE_PATH";
 const PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD: &str =
     "PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD";
@@ -501,6 +502,10 @@ pub struct Config {
     pub policy_file: Option<String>,
     pub tools_file: Option<String>,
     pub policy_history_sqlite_path: Option<String>,
+    /// Whether every policy publication must first pass the stored policy
+    /// test suite (issue #243). Off by default; on, a publication with no
+    /// stored suite, or one the suite does not pass, is refused.
+    pub policy_tests_required: bool,
     pub cors_allow_origins: Vec<String>,
     pub max_body_size: usize,
     /// Longest request path admitted, in bytes; `414` beyond it. Bounded above

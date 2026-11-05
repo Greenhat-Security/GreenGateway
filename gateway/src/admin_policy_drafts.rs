@@ -496,6 +496,8 @@ pub(super) fn commit_refusal_reason(refusal: PolicyCommitRefusal) -> &'static st
         PolicyCommitRefusal::AuthorityEvidenceUnsupported => {
             authority_events::required::REFUSAL_REASON
         }
+        PolicyCommitRefusal::RequiredTestsFailed => POLICY_TESTS_REQUIRED_FAILED_REASON,
+        PolicyCommitRefusal::RequiredTestsUnavailable => POLICY_TESTS_UNAVAILABLE_REASON,
         PolicyCommitRefusal::Failed => "policy_commit_failed",
     }
 }

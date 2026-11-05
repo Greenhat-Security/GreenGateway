@@ -3755,7 +3755,21 @@ fn an_invocation_answer_the_kernel_never_gives_is_refused() {
                         let attributable_rule = reason == ToolReason::MatchedRule
                             && matched == Some(RuleReference::Direct(0))
                             && rule_action_for(effect, logical).is_some();
-                        let verdict = snapshot.invocation_verdict(name, &answer);
+                        let (verdict, facts) = snapshot.answered_invocation(
+                            name,
+                            &answer,
+                            &crate::policy_eval::PolicyFacts::uncaptured(),
+                        );
+                        // Facts name a verdict, in a shape the kernel gives;
+                        // a refusal has none.
+                        let kernel_shaped = matched.is_none()
+                            || (reason == ToolReason::MatchedRule
+                                && matches!(matched, Some(RuleReference::Direct(_))));
+                        if matches!(verdict, ToolInvocationVerdict::Refused(_)) {
+                            assert!(facts.is_none(), "{shape}");
+                        } else {
+                            assert_eq!(facts.is_some(), kernel_shaped, "{shape}");
+                        }
                         match &verdict {
                             ToolInvocationVerdict::Entry {
                                 rule_decision: None,
@@ -4031,6 +4045,9 @@ mod conditions;
 
 #[path = "rbac_scope_claim_tests.rs"]
 mod scopes_and_claims;
+
+#[path = "rbac_decision_facts_tests.rs"]
+mod decision_facts;
 
 /// A tool call with no address, judged by the system clock: what a policy
 /// without conditions never reads.

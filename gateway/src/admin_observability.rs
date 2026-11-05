@@ -1289,14 +1289,17 @@ pub(super) async fn commit_suggestion_acceptance_in_cluster(
         },
     )?;
     // The acceptance publishes the whole document, so it is checked against
-    // the other resources exactly as every other policy write is.
-    let review = admit_policy_resources(
-        PublicationRequest {
-            state: &state.policy,
-            rbac_state,
-            parts,
-            principal,
-        },
+    // the other resources exactly as every other policy write is, and, when
+    // policy tests are required, must pass the stored suite (issue #243),
+    // in the order commit_policy_mutation asks them.
+    let publication = PublicationRequest {
+        state: &state.policy,
+        rbac_state,
+        parts,
+        principal,
+    };
+    let mut review = admit_policy_resources(
+        publication,
         before_policy,
         current_etag,
         candidate,
@@ -1305,6 +1308,23 @@ pub(super) async fn commit_suggestion_acceptance_in_cluster(
     .map_err(|response| SuggestionAcceptanceFailure::Refused {
         reason: commit_refusal_reason(PolicyCommitRefusal::ResourcesRefused),
         response,
+    })?;
+    review.required_tests = admit_required_policy_tests(
+        publication,
+        current_etag,
+        candidate,
+        &diff_summary,
+        review.resource_snapshot_digest.as_deref(),
+    )
+    .await
+    .map_err(|failure| match failure {
+        PolicyMutationFailure::Refused(refusal, response) => SuggestionAcceptanceFailure::Refused {
+            reason: commit_refusal_reason(refusal),
+            response,
+        },
+        PolicyMutationFailure::Incomplete(response) => {
+            SuggestionAcceptanceFailure::Incomplete(response)
+        }
     })?;
     // [`admit_policy_document`] in its two halves, so a refusal says which
     // one refused: the format, then the operation gate (a role description
