@@ -332,7 +332,7 @@ fingerprint agreement to complete a rollout.
 
 The platform on-call frees journal room; the security on-call owns every refused
 change. The journal keeps one row per committed Connection delete, service-token
-rotate or revoke, JWT revoke and cluster admin session grant or withdrawal until a
+issue, rotate or revoke, JWT revoke and cluster admin session grant or withdrawal until a
 sink has accepted it and `AUTHORITY_EVENT_RETENTION_HOURS` has passed, and holds one
 more unit for the withdrawal of every admin session still signed in. At
 `AUTHORITY_EVENT_JOURNAL_CAPACITY` units in use (`_retained`, which counts both) each
@@ -536,10 +536,10 @@ no counter, for the reason given.
 
 | Producer | Refusal counter | Alert |
 | --- | --- | --- |
-| Cluster Connection delete, service-token rotate and revoke, JWT revoke (journaled) | `greengateway_authority_event_capacity_refusals_total` for a full journal, `greengateway_authority_event_evidence_failures_total` for any other failed evidence or journal write | `GreenGatewayAuthorityEventCapacityRefusals`, `GreenGatewayAuthorityEvidenceWriteFailures` |
+| Cluster Connection delete, service-token issue (since migration 27), rotate and revoke, JWT revoke (journaled) | `greengateway_authority_event_capacity_refusals_total` for a full journal, `greengateway_authority_event_evidence_failures_total` for any other failed evidence or journal write | `GreenGatewayAuthorityEventCapacityRefusals`, `GreenGatewayAuthorityEvidenceWriteFailures` |
 | Cluster admin session grant, replacement, sign-out, provider rejection and expiry prune (journaled since migration 26) | The same two: a full journal refuses a grant (never a withdrawal), any other failed statement refuses whichever change it was, and a withdrawal its journal could not index is refused too | The same two. There is no admin-session-only rule: the producer is not a label, by design, and a second rule over the same series would page twice for one refusal. The [runbook](#authority-evidence-failures) names the admin session operations the log reports. |
 | Cluster policy and tools commits, managed MCP and OpenAPI catalog and overlay publications (migration 23, not journaled) | `greengateway_authority_event_evidence_failures_total` | `GreenGatewayAuthorityEvidenceWriteFailures` |
-| Standalone service-token rotate and revoke | `greengateway_standalone_evidence_failures_total{store="service_tokens"}` | `GreenGatewayStandaloneEvidenceWriteFailures` |
+| Standalone service-token issue, rotate and revoke | `greengateway_standalone_evidence_failures_total{store="service_tokens"}` | `GreenGatewayStandaloneEvidenceWriteFailures` |
 | Standalone Connection create, replace and delete; local-secret create, rotate, delete and re-encryption batch in the gateway process | `greengateway_standalone_evidence_failures_total{store="connections"}` | `GreenGatewayStandaloneEvidenceWriteFailures` |
 | Local-secret re-encryption by the `connection-secrets reencrypt` command | None: a one-shot command has no metrics endpoint | Gated: the command fails and changes nothing, which its operator sees. |
 | Standalone admin sessions, policy, tools and catalog changes | None: they write no evidence. Sessions are process-local memory, and under `AUTHORITY_EVIDENCE_DURABILITY=required` policy, tools and catalog changes are refused before anything is written ([required-durability mode](../authority-evidence.md#required-durability-mode)) | Gated: there is no evidence write to fail. |

@@ -752,33 +752,37 @@ async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
     let b = replica(&authority, &pool, cluster_config(8), login_keyring());
     let journal = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
     journal
-        .configure_capacity(7)
+        .configure_capacity(8)
         .await
         .expect("capacity applies");
     let tokens = PostgresServiceTokenStore::new(pool.clone());
     let token = tokens
-        .create(crate::auth::tokens::CreateTokenRequest {
-            scopes: vec!["admin:tokens:read".to_owned()],
-            created_by: "creating-admin".to_owned(),
-            expires_at: None,
-        })
+        .create(
+            crate::auth::tokens::CreateTokenRequest {
+                scopes: vec!["admin:tokens:read".to_owned()],
+                created_by: "creating-admin".to_owned(),
+                expires_at: None,
+            },
+            &crate::auth::change_actor::ChangeActor::for_test("creating-admin"),
+        )
         .await
-        .expect("a create journals nothing")
+        .expect("the issue journals one unit")
         .record
         .id;
     let actor = crate::auth::change_actor::ChangeActor::for_test("rotating-admin");
 
-    // Three sessions take two units each, and a token rotate the last one.
+    // After the token's issue, three sessions take two units each, and a
+    // token rotate the last one.
     let logged_out = cookie_headers(&issue_across(&a, &b, &HeaderMap::new()).await.unwrap());
     let rejected = cookie_headers(&issue_across(&a, &a, &HeaderMap::new()).await.unwrap());
     let expiring = cookie_headers(&issue_across(&b, &b, &HeaderMap::new()).await.unwrap());
     assert_eq!(
         journal_state(&pool).await,
         JournalState {
-            head: 3,
-            in_use: 6,
+            head: 4,
+            in_use: 7,
             held: 3,
-            rows: 3
+            rows: 4
         }
     );
     tokens
@@ -787,10 +791,10 @@ async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
         .expect("the last unit is not held")
         .expect("the token exists");
     let full = JournalState {
-        head: 4,
-        in_use: 7,
+        head: 5,
+        in_use: 8,
         held: 3,
-        rows: 4,
+        rows: 5,
     };
     assert_eq!(journal_state(&pool).await, full);
 
@@ -869,10 +873,10 @@ async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
     reasons.sort();
     assert_eq!(reasons, ["expired", "logout", "rejected"]);
     let spent = JournalState {
-        head: 7,
-        in_use: 7,
+        head: 8,
+        in_use: 8,
         held: 0,
-        rows: 7,
+        rows: 8,
     };
     assert_eq!(journal_state(&pool).await, spent);
     // Still full, so the refused grant is still refused. The withdrawals
@@ -912,7 +916,7 @@ async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
         term.deliver_until_caught_up(&tokio_util::sync::CancellationToken::new())
             .await
             .expect("delivery succeeds"),
-        Some(7)
+        Some(8)
     );
     let delivered = sink.records.lock().expect("sink lock").clone();
     let operations: Vec<&str> = delivered
@@ -922,6 +926,7 @@ async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
     assert_eq!(
         operations,
         [
+            "service_token.issue",
             "admin_session.grant",
             "admin_session.grant",
             "admin_session.grant",
@@ -977,7 +982,7 @@ async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
         PostgresAuthorityEventStore::prune_with(&client, Duration::ZERO, 1_000)
             .await
             .expect("retention runs"),
-        7
+        8
     );
     b.issue(
         uuid::Uuid::new_v4().to_string(),
@@ -990,7 +995,7 @@ async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
     assert_eq!(
         journal_state(&pool).await,
         JournalState {
-            head: 8,
+            head: 9,
             in_use: 2,
             held: 1,
             rows: 1

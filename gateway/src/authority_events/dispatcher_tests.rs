@@ -175,11 +175,14 @@ impl Producers {
 
     async fn token(&self) -> String {
         self.tokens
-            .create(CreateTokenRequest {
-                scopes: vec!["admin:tokens:read".to_owned()],
-                created_by: "creating-admin".to_owned(),
-                expires_at: None,
-            })
+            .create(
+                CreateTokenRequest {
+                    scopes: vec!["admin:tokens:read".to_owned()],
+                    created_by: "creating-admin".to_owned(),
+                    expires_at: None,
+                },
+                &ChangeActor::for_test("creating-admin"),
+            )
             .await
             .expect("a token creates")
             .record
@@ -354,7 +357,7 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
         term.deliver_until_caught_up(&stop)
             .await
             .expect("delivery succeeds"),
-        Some(4)
+        Some(6)
     );
 
     let delivered = sink.delivered();
@@ -364,11 +367,22 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
             .map(|record| (record.sequence.as_str(), record.operation.as_str()))
             .collect::<Vec<_>>(),
         [
-            ("1", "service_token.rotate"),
-            ("2", "service_token.revoke"),
-            ("3", "jwt.revoke"),
-            ("4", "connection.delete"),
+            ("1", "service_token.issue"),
+            ("2", "service_token.issue"),
+            ("3", "service_token.rotate"),
+            ("4", "service_token.revoke"),
+            ("5", "jwt.revoke"),
+            ("6", "connection.delete"),
         ]
+    );
+    // An issue is the token's first revision on the token axis.
+    assert_eq!(
+        (
+            delivered[0].revision.axis.as_str(),
+            delivered[0].revision.before.as_deref(),
+            delivered[0].revision.after.as_deref()
+        ),
+        ("token", None, Some("1"))
     );
     // Each event ID is the one its evidence row was committed with.
     let mut evidence_ids = Vec::new();
@@ -407,6 +421,8 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
             ))
             .collect::<Vec<_>>(),
         [
+            (Some("principal"), Some("bearer_token"), None),
+            (Some("principal"), Some("bearer_token"), None),
             (
                 Some("principal"),
                 Some("bearer_token"),
@@ -424,6 +440,7 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
         for identifier in [
             rotated.as_str(),
             revoked.as_str(),
+            "creating-admin",
             "rotating-admin",
             "service-token:revoking-token",
             "deleting-admin",
@@ -436,15 +453,15 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
     }
 
     let stats = store.stats().await.expect("stats read");
-    assert_eq!(stats.cursor, Some(4));
-    assert_eq!(stats.head, 4);
+    assert_eq!(stats.cursor, Some(6));
+    assert_eq!(stats.head, 6);
     assert_eq!(stats.undelivered(), 0);
     assert_eq!(stats.oldest_undelivered_age_secs, None);
 
     // A restart resumes from the committed cursor and delivers nothing again.
     drop(term);
     let mut restarted = begin(&store, &sink, &keyring, 100, 2).await;
-    assert_eq!(restarted.committed_position(), 4);
+    assert_eq!(restarted.committed_position(), 6);
     assert_eq!(
         restarted
             .deliver_until_caught_up(&stop)
@@ -487,7 +504,7 @@ async fn a_crash_between_acceptance_and_the_cursor_commit_redelivers_identical_r
             .deliver_until_caught_up(&CancellationToken::new())
             .await
             .expect("delivery succeeds"),
-        Some(2)
+        Some(3)
     );
     let batches = sink.batches();
     assert_eq!(batches.len(), 2);
@@ -495,14 +512,14 @@ async fn a_crash_between_acceptance_and_the_cursor_commit_redelivers_identical_r
         batches[0], batches[1],
         "the redelivered batch carries the same event IDs and the same records"
     );
-    assert_eq!(store.stats().await.expect("stats").cursor, Some(2));
+    assert_eq!(store.stats().await.expect("stats").cursor, Some(3));
     assert_eq!(
         scalar(
             &pool,
             "SELECT delivered_events FROM greengateway.authority_event_cursors"
         )
         .await,
-        2,
+        3,
         "only the committed delivery is counted"
     );
 }
@@ -532,14 +549,15 @@ async fn a_sink_outage_retries_the_same_batch_and_never_advances_past_it() {
             Some(0),
             "a refused batch never moves the cursor"
         );
-        assert_eq!(stats.undelivered(), 3);
+        // Each token's issue and rotate.
+        assert_eq!(stats.undelivered(), 6);
         assert!(stats.oldest_undelivered_age_secs.is_some());
     }
     assert_eq!(
         term.step(&stop).await.expect("the sink recovers"),
         StepOutcome::Delivered {
-            events: 3,
-            through: 3
+            events: 6,
+            through: 6
         }
     );
     assert_eq!(sink.batches().len(), 1);
@@ -548,7 +566,7 @@ async fn a_sink_outage_retries_the_same_batch_and_never_advances_past_it() {
             .iter()
             .map(|record| record.sequence.as_str())
             .collect::<Vec<_>>(),
-        ["1", "2", "3"]
+        ["1", "2", "3", "4", "5", "6"]
     );
 }
 
@@ -624,9 +642,9 @@ async fn a_fenced_out_leader_cannot_move_the_cursor() {
             .deliver_until_caught_up(&stop)
             .await
             .expect("delivery succeeds"),
-        Some(1)
+        Some(2)
     );
-    assert_eq!(store.stats().await.expect("stats").cursor, Some(1));
+    assert_eq!(store.stats().await.expect("stats").cursor, Some(2));
 }
 
 /// Retention frees exactly what was delivered and is old enough, and an
@@ -663,36 +681,37 @@ async fn retention_never_prunes_an_undelivered_event() {
     let keyring = keyring_for(&store).await;
     let sink = Arc::new(RecordingSink::default());
     let stop = CancellationToken::new();
-    let mut term = begin(&store, &sink, &keyring, 2, 1).await;
+    let mut term = begin(&store, &sink, &keyring, 4, 1).await;
 
     // Claimed at 0: nothing is delivered, so nothing is pruned at any age.
+    // Each token journaled its issue and its rotate.
     assert_eq!(prune(Duration::ZERO).await, 0);
-    assert_eq!(store.stats().await.expect("stats").retained, 4);
+    assert_eq!(store.stats().await.expect("stats").retained, 8);
 
     // Half delivered: exactly that half goes, and its capacity comes back.
     assert!(matches!(
         term.step(&stop).await,
-        Ok(StepOutcome::Delivered { through: 2, .. })
+        Ok(StepOutcome::Delivered { through: 4, .. })
     ));
     assert_eq!(
         prune(Duration::from_secs(3_600)).await,
         0,
         "the retention window holds delivered events too"
     );
-    assert_eq!(prune(Duration::ZERO).await, 2);
+    assert_eq!(prune(Duration::ZERO).await, 4);
     assert_eq!(prune(Duration::ZERO).await, 0);
     let stats = store.stats().await.expect("stats");
-    assert_eq!((stats.retained, stats.first_retained), (2, Some(3)));
-    assert_eq!(stats.undelivered(), 2);
+    assert_eq!((stats.retained, stats.first_retained), (4, Some(5)));
+    assert_eq!(stats.undelivered(), 4);
 
     // The rest is still there to deliver, and goes once delivered.
     assert_eq!(
         term.deliver_until_caught_up(&stop)
             .await
             .expect("delivery succeeds"),
-        Some(2)
+        Some(4)
     );
-    assert_eq!(prune(Duration::ZERO).await, 2);
+    assert_eq!(prune(Duration::ZERO).await, 4);
     assert_eq!(store.stats().await.expect("stats").retained, 0);
     assert_eq!(
         scalar(
@@ -700,11 +719,11 @@ async fn retention_never_prunes_an_undelivered_event() {
             "SELECT count(*) FROM greengateway.service_token_change_evidence"
         )
         .await,
-        4,
+        8,
         "retention never touches the evidence"
     );
     // Positions keep their meaning: the head is unchanged by retention.
-    assert_eq!(store.stats().await.expect("stats").head, 4);
+    assert_eq!(store.stats().await.expect("stats").head, 8);
 }
 
 /// Before any dispatcher has claimed the cursor there is no required
@@ -750,23 +769,22 @@ async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing() {
     let pool = migrated_pool(&database).await;
     let producers = Producers::new(&pool);
     let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
-    store.configure_capacity(2).await.expect("capacity applies");
+    store.configure_capacity(3).await.expect("capacity applies");
+    let request = || CreateTokenRequest {
+        scopes: vec!["admin:tokens:read".to_owned()],
+        created_by: "creating-admin".to_owned(),
+        expires_at: None,
+    };
+    let issuing = ChangeActor::for_test("creating-admin");
+    // Two issues and a rotate fill the journal.
     let first = producers.token().await;
-    let second = producers.token().await;
     let refused = producers
         .tokens
-        .create(CreateTokenRequest {
-            scopes: vec!["admin:tokens:read".to_owned()],
-            created_by: "creating-admin".to_owned(),
-            expires_at: None,
-        })
+        .create(request(), &issuing)
         .await
-        .expect("a create journals nothing and is not refused");
+        .expect("the issue fits");
     producers
         .rotate(&first, &ChangeActor::for_test("rotating-admin"))
-        .await;
-    producers
-        .rotate(&second, &ChangeActor::for_test("rotating-admin"))
         .await;
     let connection = producers
         .connections
@@ -788,9 +806,18 @@ async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing() {
         )
     };
     let outbox = || scalar(&pool, "SELECT count(*) FROM greengateway.security_outbox");
+    let tokens = || scalar(&pool, "SELECT count(*) FROM greengateway.service_tokens");
     let revision_before = revision().await;
     let outbox_before = outbox().await;
+    let tokens_before = tokens().await;
 
+    // An issue's and a rotate's success carry a plaintext, which is
+    // deliberately not Debug, so the refusals are matched rather than
+    // unwrapped.
+    let Err(error) = producers.tokens.create(request(), &issuing).await else {
+        panic!("a full journal refuses the issue");
+    };
+    assert_eq!(error.kind(), RepositoryErrorKind::Unavailable);
     // A rotate's success carries a plaintext, which is deliberately not
     // Debug, so the refusal is matched rather than unwrapped.
     let Err(error) = producers
@@ -835,6 +862,11 @@ async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing() {
     assert_eq!(journal().await, journal_before);
     assert_eq!(revision().await, revision_before);
     assert_eq!(outbox().await, outbox_before);
+    assert_eq!(
+        tokens().await,
+        tokens_before,
+        "the refused issue minted nothing"
+    );
     assert!(
         matches!(
             producers
@@ -855,7 +887,8 @@ async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing() {
             )
         )
         .await,
-        0
+        1,
+        "the token's issue, and nothing of the refused changes"
     );
     assert_eq!(
         scalar(&pool, "SELECT count(*) FROM greengateway.jwt_revocations").await,
@@ -880,20 +913,20 @@ async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing() {
         term.deliver_until_caught_up(&CancellationToken::new())
             .await
             .expect("delivery succeeds"),
-        Some(2)
+        Some(3)
     );
     let client = pool.get().await.expect("maintenance session");
     assert_eq!(
         PostgresAuthorityEventStore::prune_with(&client, Duration::ZERO, 1_000)
             .await
             .expect("retention runs"),
-        2
+        3
     );
     producers
         .rotate(&refused.record.id, &ChangeActor::for_test("rotating-admin"))
         .await;
     let stats = store.stats().await.expect("stats");
-    assert_eq!((stats.retained, stats.head), (1, 3));
+    assert_eq!((stats.retained, stats.head), (1, 4));
 }
 
 /// Make one table refuse every new row from now on. `NOT VALID` keeps the
@@ -950,10 +983,16 @@ async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() 
     };
     let journal_before = journal().await;
     let revision_before = revision().await;
+    let issuing = ChangeActor::for_test("creating-admin");
     let rotating = ChangeActor::for_test("rotating-admin");
     let revoking = ChangeActor::for_test("revoking-admin");
     let deleting = ChangeActor::for_test("deleting-admin");
     let command = ChangeActor::system("operator:revoke-jwt");
+    let request = || CreateTokenRequest {
+        scopes: vec!["admin:tokens:read".to_owned()],
+        created_by: "creating-admin".to_owned(),
+        expires_at: None,
+    };
 
     // The recorder is this thread's, and the test's current-thread runtime
     // runs every producer on this thread.
@@ -964,6 +1003,9 @@ async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() 
 
     // A journal that refuses the append refuses every producer.
     refuse_new_rows(&pool, "authority_event_journal").await;
+    let Err(_) = producers.tokens.create(request(), &issuing).await else {
+        panic!("a refused journal append refuses the issue");
+    };
     let Err(_) = producers.tokens.rotate(&token, &rotating).await else {
         panic!("a refused journal append refuses the rotate");
     };
@@ -982,13 +1024,16 @@ async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() 
         .delete(&connection.id, &connection.etag(), &deleting)
         .await
         .is_err());
-    assert_eq!(evidence_failures(), 4);
+    assert_eq!(evidence_failures(), 5);
     accept_new_rows(&pool, "authority_event_journal").await;
 
     // An evidence table that refuses the insert refuses its own producer:
-    // both service-token changes write the same evidence table, and each
-    // counts its own refusal.
+    // the three service-token changes write the same evidence table, and
+    // each counts its own refusal.
     refuse_new_rows(&pool, "service_token_change_evidence").await;
+    let Err(_) = producers.tokens.create(request(), &issuing).await else {
+        panic!("a refused evidence insert refuses the issue");
+    };
     let Err(_) = producers.tokens.rotate(&token, &rotating).await else {
         panic!("a refused evidence insert refuses the rotate");
     };
@@ -1012,11 +1057,16 @@ async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() 
         .await
         .is_err());
     accept_new_rows(&pool, "connection_change_evidence").await;
-    assert_eq!(evidence_failures(), 8);
+    assert_eq!(evidence_failures(), 10);
 
     // Nothing any refused change would have written exists.
     assert_eq!(journal().await, journal_before);
     assert_eq!(revision().await, revision_before);
+    assert_eq!(
+        scalar(&pool, "SELECT count(*) FROM greengateway.service_tokens").await,
+        1,
+        "neither refused issue minted a token"
+    );
     assert_eq!(
         scalar(
             &pool,
@@ -1050,7 +1100,7 @@ async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() 
         .await
         .expect("the delete commits");
     assert_eq!(journal().await, journal_before + 3);
-    assert_eq!(evidence_failures(), 8);
+    assert_eq!(evidence_failures(), 10);
     assert_eq!(
         recorder.count(crate::metrics::AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL, &[]),
         0,
@@ -1104,7 +1154,8 @@ async fn concurrent_producers_journal_gapless_commit_ordered_positions() {
         .expect("the journal reads");
     let positions: Vec<i64> = rows.iter().map(|row| row.get(0)).collect();
     let revisions: Vec<i64> = rows.iter().map(|row| row.get(1)).collect();
-    assert_eq!(positions, (1..=8).collect::<Vec<i64>>());
+    // The eight issues, then the eight racing rotates.
+    assert_eq!(positions, (1..=16).collect::<Vec<i64>>());
     assert!(
         revisions.windows(2).all(|pair| pair[0] < pair[1]),
         "position order is commit order: {revisions:?}"
@@ -1139,9 +1190,10 @@ async fn an_aborted_append_leaves_no_gap() {
         .stats()
         .await
         .expect("stats");
+    // The issue took the aborted position, and the revoke the next.
     assert_eq!(
         (stats.head, stats.retained, stats.first_retained),
-        (1, 1, Some(1))
+        (2, 2, Some(1))
     );
 }
 
@@ -1244,13 +1296,14 @@ async fn the_running_dispatcher_leads_delivers_and_stops_on_shutdown() {
             .expect("the dispatcher delivers within the budget");
         }
     };
-    delivered(1).await;
+    // The token's issue and its rotate.
+    delivered(2).await;
     assert_eq!(leases.held(DISPATCHER_LEASE_SCOPE), 1);
 
     producers
         .revoke(&token, &ChangeActor::for_test("revoking-admin"))
         .await;
-    delivered(2).await;
+    delivered(3).await;
 
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(10), running)
@@ -1262,7 +1315,7 @@ async fn the_running_dispatcher_leads_delivers_and_stops_on_shutdown() {
         0,
         "the lease is released on the way out"
     );
-    assert_eq!(store.stats().await.expect("stats").cursor, Some(2));
+    assert_eq!(store.stats().await.expect("stats").cursor, Some(3));
 }
 
 /// A replica the membership has not admitted -- held at the fingerprint door,
@@ -1359,16 +1412,16 @@ async fn a_dispatcher_leads_only_while_the_membership_admits_its_replica() {
     assert!(sink.batches().is_empty());
     let held = store.stats().await.expect("stats");
     assert_eq!(held.cursor, None, "a held replica never claims the cursor");
-    assert_eq!(held.undelivered(), 1);
+    assert_eq!(held.undelivered(), 2, "the token's issue and its rotate");
 
     gate.record_fingerprint_agreement();
     eventually("the admitted replica delivers", || {
-        sink.delivered().len() == 1
+        sink.delivered().len() == 2
     })
     .await;
     assert_eq!(leases.held(DISPATCHER_LEASE_SCOPE), 1);
     tokio::time::timeout(Duration::from_secs(10), async {
-        while store.stats().await.expect("stats").cursor != Some(1) {
+        while store.stats().await.expect("stats").cursor != Some(2) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -1386,7 +1439,7 @@ async fn a_dispatcher_leads_only_while_the_membership_admits_its_replica() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(
         sink.delivered().len(),
-        1,
+        2,
         "nothing committed after the fence is delivered by the excluded build"
     );
     assert_eq!(leases.held(DISPATCHER_LEASE_SCOPE), 0);
@@ -1397,7 +1450,7 @@ async fn a_dispatcher_leads_only_while_the_membership_admits_its_replica() {
         .expect("the dispatcher stops on shutdown")
         .expect("the dispatcher task completes");
     let after = store.stats().await.expect("stats");
-    assert_eq!(after.cursor, Some(1));
+    assert_eq!(after.cursor, Some(2));
     assert_eq!(
         after.undelivered(),
         1,
