@@ -236,6 +236,10 @@ pub(crate) struct JournaledEvidence {
     pub(crate) actor_issuer: Option<String>,
     pub(crate) actor_kind: Option<String>,
     pub(crate) actor_auth_mode: Option<String>,
+    /// The revision axis a Connection change row names (migration 28:
+    /// `connection` or `credential`); `None` for every other source, whose
+    /// tables have no such column.
+    pub(crate) revision_axis: Option<String>,
 }
 
 /// The journal and the cursor, as one read sees them.
@@ -469,7 +473,8 @@ impl PostgresAuthorityEventStore {
 /// evidence row; the evidence tables' primary keys are their event IDs.
 /// Admin session evidence names the session's own identity as its actor
 /// and records no actor kind, auth mode, version or shared revision, so
-/// those columns stay empty for it.
+/// those columns stay empty for it. Only Connection change evidence names a
+/// revision axis (migration 28).
 const READ_AFTER_SQL: &str = r#"
 SELECT j.position,
        j.event_id::text,
@@ -480,14 +485,15 @@ SELECT j.position,
        r.issuer,
        coalesce(c.connection_id::text, t.token_id, r.jti_hash, a.session_id::text),
        coalesce(c.prior_version, t.prior_version),
-       t.new_version,
+       coalesce(c.new_version, t.new_version),
        coalesce(c.security_revision, t.security_revision, r.security_revision),
        to_char(coalesce(c.committed_at, t.committed_at, r.committed_at, a.committed_at)
                    AT TIME ZONE 'UTC',
                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
        coalesce(c.actor_issuer, t.actor_issuer, r.actor_issuer),
        coalesce(c.actor_kind, t.actor_kind, r.actor_kind),
-       coalesce(c.actor_auth_mode, t.actor_auth_mode, r.actor_auth_mode)
+       coalesce(c.actor_auth_mode, t.actor_auth_mode, r.actor_auth_mode),
+       c.revision_axis
 FROM greengateway.authority_event_journal j
 LEFT JOIN greengateway.connection_change_evidence c
     ON j.source = 'connection_change_evidence' AND c.event_id = j.event_id
@@ -588,6 +594,7 @@ fn journaled_evidence_from_row(
         actor_issuer: column(row, 12, OPERATION_READ)?,
         actor_kind: column(row, 13, OPERATION_READ)?,
         actor_auth_mode: column(row, 14, OPERATION_READ)?,
+        revision_axis: column(row, 15, OPERATION_READ)?,
     })
 }
 
