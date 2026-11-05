@@ -120,7 +120,7 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
 // the configuration compiler (issue #242).
 pub(crate) use gateway_config::connections::kubernetes_secret::{
     validate_kubernetes_provider_config, KubernetesAuthConfig, KubernetesProviderConfig,
-    KubernetesProviderConfigError, MAX_KUBERNETES_PROVIDER_CONFIG_BYTES,
+    KubernetesProviderConfigError,
 };
 // The parts of the document only tests assemble by hand.
 #[cfg(test)]

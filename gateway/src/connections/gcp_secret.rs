@@ -99,7 +99,7 @@ const GCP_PROVIDER_LABEL: &str = "gcp_secret_manager";
 // the configuration compiler (issue #242).
 pub(crate) use gateway_config::connections::gcp_secret::{
     is_gcp_project_number, is_valid_gcp_service_account, validate_gcp_provider_config,
-    GcpProviderConfig, GcpProviderConfigError, MAX_GCP_PROVIDER_CONFIG_BYTES,
+    GcpProviderConfig, GcpProviderConfigError,
 };
 // The parts of the document only tests assemble by hand.
 #[cfg(test)]

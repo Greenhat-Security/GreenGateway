@@ -11,10 +11,12 @@ pub const ENDPOINT_TARGET_KIND: &str = "endpoint";
 pub const PRINCIPAL_ENDPOINT_TARGET_KIND: &str = "principal_endpoint";
 // The thresholds the configuration compiler reads, shared with `ggctl`
 // (issue #242).
+pub(crate) use gateway_config::discovery::SignalDetectorConfig;
+// Their defaults, which only tests name now that the compiler applies them.
+#[cfg(test)]
 pub(crate) use gateway_config::discovery::{
-    SignalDetectorConfig, DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
-    DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD, DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD,
-    DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
+    DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD, DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
+    DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD, DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
 };
 pub const ERROR_RATE_SPIKE_MIN_SAMPLE_COUNT: u64 = 20;
 pub const VOLUME_OUTLIER_WINDOW_SAMPLE_COUNT: u64 = 20;

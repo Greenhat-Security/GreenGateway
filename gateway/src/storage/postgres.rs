@@ -658,15 +658,6 @@ fn validated_dsn_config(dsn: &str) -> Result<PgConfig, PostgresFoundationError> 
     Ok(config)
 }
 
-impl DatabaseTlsMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Verify => "verify",
-            Self::LoopbackDev => "loopback-dev",
-        }
-    }
-}
-
 /// The `loopback-dev` exception may only point at loopback: a development
 /// convenience that could quietly become a production plaintext connection is
 /// not a development convenience. The failure names the setting, never the

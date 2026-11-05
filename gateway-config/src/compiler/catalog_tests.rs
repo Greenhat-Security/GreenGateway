@@ -1,7 +1,7 @@
 //! The configuration field catalog, held to the compiler and to the documents
 //! that describe it (issue #242, PR 3).
 //!
-//! `gateway_config::catalog` describes every input the compiler reads. These
+//! `crate::catalog` describes every input the compiler reads. These
 //! tests prove each description against the compiler itself rather than
 //! against a second copy of its rules: they compile with each literal default
 //! set explicitly, at each integer bound and just past it, at each end of a
@@ -19,13 +19,13 @@
 
 use std::{collections::BTreeSet, env::VarError, fs, path::Path};
 
-use gateway_config::catalog::{
+use crate::catalog::{
     self, Blank, BootstrapCategory, BundleMapping, DecimalBound, DefaultValue, Field, FieldType,
     Sensitivity, StateBackends, FIELDS,
 };
 use serde_json::Value;
 
-use super::{diagnostic::ConfigRule, inventory, Config, ConfigError};
+use super::{diagnostic::ConfigRule, inventory, ConfigError, ConfigPlan};
 
 fn fixture_value(fixture: &[(&str, &str)], name: &str) -> Result<String, VarError> {
     fixture
@@ -38,8 +38,8 @@ fn fixture_value(fixture: &[(&str, &str)], name: &str) -> Result<String, VarErro
 
 /// Compiles a fixture environment. A variable listed twice takes its last
 /// value, so a context can be extended with the field under test.
-fn compile(fixture: &[(&str, &str)]) -> Result<Config, ConfigError> {
-    Config::from_env_vars(|name| fixture_value(fixture, name))
+fn compile(fixture: &[(&str, &str)]) -> Result<ConfigPlan, ConfigError> {
+    super::compile(|name| fixture_value(fixture, name))
 }
 
 /// A complete cluster-mode configuration.
@@ -84,7 +84,7 @@ fn context(field: &Field) -> Vec<(&'static str, &'static str)> {
     }
 }
 
-fn with(field: &Field, value: &str) -> Result<Config, ConfigError> {
+fn with(field: &Field, value: &str) -> Result<ConfigPlan, ConfigError> {
     let mut fixture: Vec<(&str, &str)> = context(field);
     fixture.push((field.environment, value));
     compile(&fixture)
@@ -110,8 +110,13 @@ fn accepts_on_its_own(field: &Field, value: &str) -> bool {
     !rules_refusing(&fixture, field).contains(&ConfigRule::Value)
 }
 
-fn accepted(fixture: &[(&str, &str)]) -> Config {
-    compile(fixture).unwrap_or_else(|error| panic!("{fixture:?} should be accepted:\n{error}"))
+/// The values `fixture` compiles to, without the provenance that says which
+/// of them the fixture set, so two fixtures that configure the same values
+/// compare equal.
+fn accepted(fixture: &[(&str, &str)]) -> ConfigPlan {
+    compile(fixture)
+        .unwrap_or_else(|error| panic!("{fixture:?} should be accepted:\n{error}"))
+        .without_provenance()
 }
 
 #[test]
@@ -134,12 +139,14 @@ fn every_literal_default_compiles_to_what_leaving_the_field_unset_does() {
             continue;
         };
         let unset = accepted(&context(field));
-        let set = with(field, default).unwrap_or_else(|error| {
-            panic!(
-                "{}={default:?} should be accepted:\n{error}",
-                field.environment
-            )
-        });
+        let set = with(field, default)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{}={default:?} should be accepted:\n{error}",
+                    field.environment
+                )
+            })
+            .without_provenance();
         assert!(
             set == unset,
             "{}={default:?} is not the default the compiler applies",

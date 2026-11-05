@@ -1,9 +1,9 @@
 //! The configuration compiler's stages, run on their own (issue #433, PR 2).
 //!
-//! The parity tests hold `Config::from_env_vars` to its legacy behaviour.
-//! These hold the stages it is now built from: that each block asks for its
+//! The parity tests hold the compiler to the legacy parser's behaviour.
+//! These hold the stages it is built from: that each block asks for its
 //! inputs once and together the blocks read the inventory in order; that
-//! `from_env_vars` is exactly the compiled plan; that provenance names a
+//! `compile` returns exactly what the stages build; that provenance names a
 //! source and never a value; that no plan prints a secret or a secret
 //! locator; and that nothing a stage does opens a file or reaches the
 //! network.
@@ -31,11 +31,9 @@ use super::{
     storage::{
         AuditStoreInputs, ClusterInputs, DiscoveryStoreInputs, DocumentInputs, StateBackendInputs,
     },
-    Config, ConfigError, StateBackend,
+    ConfigError, StateBackend,
 };
-use crate::{
-    auth::admin_session::AdminSessionStorage, connections::secret::OperatorSecretAliasSource,
-};
+use crate::{auth::AdminSessionStorage, connections::secret::OperatorSecretAliasSource};
 
 fn fixture_value(fixture: &[(&str, &str)], name: &str) -> Result<String, VarError> {
     fixture
@@ -272,7 +270,7 @@ fn the_field_catalog_places_every_input_in_the_domain_that_reads_it() {
     for (domain, names) in blocks() {
         let expected = format!("{domain:?}").to_ascii_lowercase();
         for name in names {
-            let field = gateway_config::catalog::field(&name)
+            let field = crate::catalog::field(&name)
                 .unwrap_or_else(|| panic!("{name} has no catalog entry"));
             assert_eq!(field.domain.code(), expected, "{name}");
         }
@@ -317,11 +315,11 @@ fn each_plan_records_the_provenance_of_its_blocks_inputs_in_read_order() {
     }
 }
 
-/// `from_env_vars` is the compiled plan: an accepted configuration is exactly
-/// the plan's `Config`, and a refused one reports exactly the stages'
-/// problems, each with its rule.
+/// `compile` returns what the stages build: an accepted configuration is
+/// exactly the plan they built, and a refused one reports exactly the
+/// stages' problems, each with its rule.
 #[test]
-fn from_env_vars_builds_the_compiled_plan_and_reports_its_problems() {
+fn compile_returns_the_stages_plan_or_their_problems() {
     let postgres_session: Vec<(&str, &str)> = POSTGRES
         .into_iter()
         .chain([
@@ -462,10 +460,10 @@ fn from_env_vars_builds_the_compiled_plan_and_reports_its_problems() {
 
     for fixture in fixtures {
         let (plan, report) = compiled(fixture);
-        match Config::from_env_vars(|name| fixture_value(fixture, name)) {
-            Ok(config) => {
+        match plan::compile(|name| fixture_value(fixture, name)) {
+            Ok(compiled) => {
                 assert!(report.is_empty(), "{fixture:?}: {:?}", report.problems());
-                assert_eq!(config, plan.into_config(), "{fixture:?}");
+                assert_eq!(compiled, plan, "{fixture:?}");
             }
             Err(error) => {
                 assert!(!report.is_empty(), "{fixture:?}");
@@ -589,17 +587,17 @@ fn provenance_says_where_a_value_came_from_and_never_what_it_is() {
 /// it changes the configuration it came from the environment.
 #[test]
 fn a_blank_input_is_attributed_by_what_the_parser_does_with_it() {
-    let defaults = Config::from_env_vars(|_| Err(VarError::NotPresent))
-        .expect("an empty environment is accepted");
+    let defaults = plan::compile(|_| Err(VarError::NotPresent))
+        .expect("an empty environment is accepted")
+        .without_provenance();
     for name in inventory::CONFIG_INPUTS {
         let fixture = [(*name, " ")];
-        let Ok(config) = Config::from_env_vars(|requested| fixture_value(&fixture, requested))
-        else {
+        let Ok(config) = plan::compile(|requested| fixture_value(&fixture, requested)) else {
             // A refused blank builds no plan, so it has no provenance to
             // report.
             continue;
         };
-        let expected = if config == defaults {
+        let expected = if config.without_provenance() == defaults {
             Source::Default
         } else {
             Source::Environment
@@ -762,7 +760,7 @@ fn a_refusal_reports_no_secret_or_locator() {
     };
     for canaries in [CANARY_STANDALONE, CANARY_CLUSTER] {
         let fixture = [canaries, &[("LISTEN_ADDR", "not an address")][..]].concat();
-        let error = Config::from_env_vars(|name| fixture_value(&fixture, name))
+        let error = plan::compile(|name| fixture_value(&fixture, name))
             .expect_err("the listen address is refused");
         assert_eq!(error.problems().len(), 1, "{error}");
         for rendered in render(&error) {
@@ -797,85 +795,12 @@ fn a_refusal_reports_no_secret_or_locator() {
             ),
         ][..],
     ] {
-        let error = Config::from_env_vars(|name| fixture_value(refused, name))
+        let error = plan::compile(|name| fixture_value(refused, name))
             .expect_err("the secret input is refused");
         assert!(!error.diagnostics().is_empty());
         let diagnostics = format!("{:?}", error.diagnostics()).to_ascii_lowercase();
         assert!(!diagnostics.contains("zqcanary"), "{diagnostics}");
     }
-}
-
-/// The static-configuration fingerprint -- the one digest of the
-/// configuration, written to the membership roster and served by the
-/// cluster status API -- is the same whatever the secrets are and wherever
-/// they are kept, while the plans it is computed from do differ in them.
-///
-/// A route's upstream TLS material locators are deliberately part of it
-/// (`ha::insert_route`: they decide which trust the route carries), so they
-/// are held fixed here.
-#[test]
-fn the_fingerprint_is_the_same_whatever_the_secrets_and_their_locators_are() {
-    let configuration = |tag: &str| -> Vec<(&'static str, String)> {
-        vec![
-            ("STATE_BACKEND", "postgres".to_owned()),
-            ("DEPLOYMENT_ID", "deploy-prod-eu".to_owned()),
-            ("DATABASE_URL_FILE", format!("/run/{tag}/database-url")),
-            ("CONNECTION_SECRETS_ROOT", format!("/run/{tag}")),
-            (
-                "RATE_LIMIT_KEYRING",
-                format!(r#"[{{"id":"rate","file":"{tag}-rate-key","role":"primary"}}]"#),
-            ),
-            (
-                "ADMIN_LOGIN_KEYRING",
-                format!(r#"[{{"id":"login","file":"{tag}-login-key","role":"primary"}}]"#),
-            ),
-            ("TLS_CERT_FILE", "/run/tls/data.crt".to_owned()),
-            ("TLS_KEY_FILE", format!("/run/{tag}/data.key")),
-            (
-                "AUTH_PROVIDERS",
-                format!(
-                    r#"[{{"name":"primary","type":"jwt","issuer":"https://issuer.example.test","client_id":"admin-ui","client_secret":"{tag}-client-secret"}}]"#
-                ),
-            ),
-            (
-                "UPSTREAM_ROUTES",
-                format!(
-                    r#"[{{"id":"billing","path_prefix":"/billing","upstream_url":"https://billing.example.test","add_request_headers":{{"x-route-key":"{tag}-header-value"}}}}]"#
-                ),
-            ),
-            (
-                "CONNECTION_SECRET_ALIASES",
-                format!(
-                    r#"[{{"id":"billing","label":"Billing","source":{{"type":"environment","key":"{}_TOKEN"}}}}]"#,
-                    tag.to_ascii_uppercase()
-                ),
-            ),
-            (
-                "CONNECTION_GCP_PROVIDER",
-                format!(
-                    r#"{{"profiles":[{{"id":"primary","audience":"//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/gateway-pool/providers/gateway-provider","token_root":"/run/{tag}-tokens","token_file":"{tag}-token"}}],"aliases":[{{"id":"gcp-ledger","label":"Ledger","profile":"primary","project":"{tag}-project","secret":"{tag}-secret"}}]}}"#
-                ),
-            ),
-        ]
-    };
-    let compile = |tag: &str| {
-        let fixture = configuration(tag);
-        let fixture: Vec<(&str, &str)> = fixture
-            .iter()
-            .map(|(name, value)| (*name, value.as_str()))
-            .collect();
-        let (plan, report) = compiled(&fixture);
-        assert!(report.is_empty(), "{tag}: {:?}", report.problems());
-        plan
-    };
-    let (first, second) = (compile("zqcanary"), compile("relocated"));
-    assert_ne!(first, second, "the plans differ in their secrets");
-
-    let (first, second) = (first.into_config(), second.into_config());
-    let fingerprint = crate::ha::static_config_fingerprint(&first);
-    assert_eq!(fingerprint, crate::ha::static_config_fingerprint(&second));
-    let rendered = format!("{fingerprint} {fingerprint:?}").to_ascii_lowercase();
-    assert!(!rendered.contains("zqcanary"), "{rendered}");
 }
 
 /// The stages carry locators and destinations without touching them: files
@@ -980,23 +905,26 @@ fn the_stages_carry_locators_and_destinations_without_touching_them() {
     assert_eq!(plan.storage.database.tls_ca_file, Some(database_ca));
 }
 
-/// The configuration modules' code names no file, network, process or store
-/// API, and logs only the one warning the inventory documents.
+/// The compiler's code names no file, network, process, store or
+/// environment API, and logs only the one warning the inventory documents.
 ///
 /// A scan of the source text outside comments and string literals, so it
 /// holds what these files call directly; it does not follow a call into
-/// another module. It also reads the `gateway-config` modules the stages call
-/// into (issue #242): path matching, cookie-token and issuer canonicalization,
-/// the route and Connection ID shapes, the request bounds, the TLS, admin
-/// session and discovery settings, and the Connections validators that check
-/// alias, keyring and provider documents. Header-name parsing, the one other
-/// call, is the `http` crate's.
+/// another module. It reads every file of the compiler module except its
+/// tests, found by walking `src/compiler`, so a stage added later is held to
+/// it without being listed. It also reads the other `gateway-config`
+/// modules the stages call into (issue #242): path matching, cookie-token
+/// and issuer canonicalization, the route and Connection ID shapes, the
+/// request bounds, the TLS, admin session and discovery settings, the
+/// Connections validators that check alias, keyring and provider documents,
+/// and the semantic diff engine the plan diff feeds. Header-name parsing,
+/// the one other call, is the `http` crate's.
 ///
 /// The outbound HTTP client is not listed: `scripts/check-egress-only.sh`
 /// already refuses it by name anywhere but `gateway/src/egress.rs`, these
 /// files included.
 #[test]
-fn the_configuration_modules_name_no_input_or_output_api() {
+fn the_compiler_modules_name_no_input_or_output_api() {
     const FORBIDDEN: &[&str] = &[
         "std::fs",
         "fs::",
@@ -1016,39 +944,42 @@ fn the_configuration_modules_name_no_input_or_output_api() {
         "deadpool",
         "sqlx",
         "canonicalize",
+        // The reader is the compiler's only source; it never reads the
+        // process environment itself.
+        "env::var",
+    ];
+    /// The other `gateway-config` modules the compiler calls into.
+    const LEAVES: &[&str] = &[
+        "src/auth.rs",
+        "src/connections.rs",
+        "src/connections/aws_secret.rs",
+        "src/connections/azure_secret.rs",
+        "src/connections/gcp_secret.rs",
+        "src/connections/kubernetes_secret.rs",
+        "src/connections/local_secret.rs",
+        "src/connections/secret.rs",
+        "src/connections/vault_secret.rs",
+        "src/discovery.rs",
+        "src/inbound_tls.rs",
+        "src/opaque_id.rs",
+        "src/path_match.rs",
+        "src/request_bounds.rs",
+        "src/semantic_diff.rs",
+        "src/upstream_route.rs",
     ];
     let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for (file, logging) in [
+    let mut files = vec!["src/compiler.rs".to_owned()];
+    compiler_sources(crate_root, &crate_root.join("src/compiler"), &mut files);
+    for expected in ["src/compiler/plan.rs", "src/compiler/storage.rs"] {
+        assert!(
+            files.iter().any(|file| file == expected),
+            "the walk found {expected}"
+        );
+    }
+    files.extend(LEAVES.iter().map(|file| (*file).to_owned()));
+    for file in &files {
         // The audit-retention warning for a `0`-day window.
-        ("src/config.rs", 1),
-        ("src/config/authority_events.rs", 0),
-        ("src/config/connections.rs", 0),
-        ("src/config/diagnostic.rs", 0),
-        ("src/config/egress.rs", 0),
-        ("src/config/identity.rs", 0),
-        ("src/config/listeners.rs", 0),
-        ("src/config/plan.rs", 0),
-        ("src/config/proxy.rs", 0),
-        ("src/config/runtime.rs", 0),
-        ("src/config/semantic_diff.rs", 0),
-        ("src/config/stage.rs", 0),
-        ("src/config/storage.rs", 0),
-        ("../gateway-config/src/auth.rs", 0),
-        ("../gateway-config/src/connections.rs", 0),
-        ("../gateway-config/src/connections/aws_secret.rs", 0),
-        ("../gateway-config/src/connections/azure_secret.rs", 0),
-        ("../gateway-config/src/connections/gcp_secret.rs", 0),
-        ("../gateway-config/src/connections/kubernetes_secret.rs", 0),
-        ("../gateway-config/src/connections/local_secret.rs", 0),
-        ("../gateway-config/src/connections/secret.rs", 0),
-        ("../gateway-config/src/connections/vault_secret.rs", 0),
-        ("../gateway-config/src/discovery.rs", 0),
-        ("../gateway-config/src/inbound_tls.rs", 0),
-        ("../gateway-config/src/opaque_id.rs", 0),
-        ("../gateway-config/src/path_match.rs", 0),
-        ("../gateway-config/src/request_bounds.rs", 0),
-        ("../gateway-config/src/upstream_route.rs", 0),
-    ] {
+        let logging = usize::from(file == "src/compiler.rs");
         let source = fs::read_to_string(crate_root.join(file))
             .unwrap_or_else(|error| panic!("failed to read {file}: {error}"));
         let code: Vec<String> = source
@@ -1069,6 +1000,35 @@ fn the_configuration_modules_name_no_input_or_output_api() {
             logging,
             "{file} logs a different number of times than the inventory documents"
         );
+    }
+}
+
+/// Every `.rs` file under `directory` but the tests (`tests.rs` and
+/// `*_tests.rs`), relative to the crate root, with forward slashes.
+fn compiler_sources(crate_root: &Path, directory: &Path, files: &mut Vec<String>) {
+    let entries = fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", directory.display()));
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", directory.display()))
+            .path();
+        if path.is_dir() {
+            compiler_sources(crate_root, &path, files);
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let is_test = name == "tests.rs" || name.ends_with("_tests.rs");
+        if name.ends_with(".rs") && !is_test {
+            let relative = path
+                .strip_prefix(crate_root)
+                .expect("the compiler's sources live under the crate root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            files.push(relative);
+        }
     }
 }
 
@@ -1371,7 +1331,7 @@ const EVERY_RULE: [ConfigRule; 30] = [
 fn every_rule_is_reported_by_name_in_the_diagnostics() {
     for rule in EVERY_RULE {
         let (fixture, variable) = rule_fixture(rule);
-        let error = Config::from_env_vars(|name| fixture_value(fixture, name))
+        let error = plan::compile(|name| fixture_value(fixture, name))
             .expect_err("each rule fixture is refused");
         assert_eq!(error.diagnostics().len(), 1, "{rule:?}: {error}");
         let diagnostic = &error.diagnostics()[0];
