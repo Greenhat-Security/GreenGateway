@@ -1133,6 +1133,18 @@ pub(crate) enum CheckoutClass {
     /// Singleton maintenance sessions, cleanup sweeps and operator
     /// commands.
     Maintenance,
+    /// Historical policy replay's reads of the cluster audit stream
+    /// (issue #243): a job's cutoff, its pages and its closing check, each
+    /// one short read-only transaction under the replay's own statement
+    /// and lock bounds (`storage::postgres_audit_replay`).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "cluster replay routes answer 503 until jobs run under #241's durable leases (#243)"
+        )
+    )]
+    PolicyReplay,
 }
 
 impl CheckoutClass {
@@ -1141,7 +1153,7 @@ impl CheckoutClass {
     /// Test-only: the call sites name their own class, and nothing in the
     /// running process needs to enumerate them.
     #[cfg(test)]
-    pub(crate) const KNOWN: [Self; 7] = [
+    pub(crate) const KNOWN: [Self; 8] = [
         Self::RevisionCheck,
         Self::CredentialCheck,
         Self::RateLimit,
@@ -1149,6 +1161,7 @@ impl CheckoutClass {
         Self::SecurityStateRead,
         Self::ControlPlaneWrite,
         Self::Maintenance,
+        Self::PolicyReplay,
     ];
 
     pub(crate) fn metric_label(self) -> &'static str {
@@ -1160,6 +1173,7 @@ impl CheckoutClass {
             Self::SecurityStateRead => "security_state_read",
             Self::ControlPlaneWrite => "control_plane_write",
             Self::Maintenance => "maintenance",
+            Self::PolicyReplay => "policy_replay",
         }
     }
 }
@@ -1723,7 +1737,7 @@ mod tests {
             .collect();
         assert_eq!(
             labels.len(),
-            7,
+            8,
             "a new class is a reviewed vocabulary change"
         );
         assert_eq!(
