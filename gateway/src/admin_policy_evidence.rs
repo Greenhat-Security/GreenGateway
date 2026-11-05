@@ -449,8 +449,24 @@ struct EvaluationWork {
     predecessor: Option<rbac::Policy>,
     suite: Option<SuiteToDecide>,
     simulation: Option<SimulationSelection>,
-    /// The MCP alias paths an analysis reads, when the request asked for one.
-    analysis: Option<Vec<String>>,
+    /// What an analysis reads, when the request asked for one.
+    analysis: Option<AnalysisWork>,
+}
+
+/// What a package's analysis is judged against besides the candidate, read
+/// once by the endpoint as `POST .../policy/analyses` reads it.
+struct AnalysisWork {
+    /// The MCP alias paths.
+    mcp_alias_paths: Vec<String>,
+    /// The policy the candidate would replace, for the lockout and egress
+    /// change checks: the live policy a draft is pinned to. `None` for a
+    /// publication, which is judged on its own, as its revalidation is: its
+    /// commit already ran those checks against the policy that was live.
+    active: Option<rbac::Policy>,
+    /// The configured limits of the global rate lanes.
+    global_rate_lanes: Option<middleware::rate_limit::GlobalRateLanes>,
+    /// The cross-resource view the revalidation read.
+    resource_view: rbac::policy_resources::PolicyResourceView,
 }
 
 /// Decide the suite against the candidate, and the simulation cases against
@@ -559,11 +575,14 @@ fn evaluate_sections(work: EvaluationWork) -> Result<EvaluatedSections, Evidence
     // suite's and cases' time. Running out of it is an incomplete analysis.
     let analysis = match analysis {
         None => None,
-        Some(mcp_alias_paths) => Some(
+        Some(work) => Some(
             analyze(
                 &candidate,
                 &AnalysisResources {
-                    mcp_alias_paths: &mcp_alias_paths,
+                    mcp_alias_paths: &work.mcp_alias_paths,
+                    active: work.active.as_ref().unwrap_or(&candidate),
+                    global_rate_lanes: work.global_rate_lanes,
+                    resource_view: &work.resource_view,
                 },
                 Instant::now() + POLICY_EVIDENCE_ANALYSIS_DEADLINE,
             )
@@ -814,17 +833,13 @@ pub(super) async fn policy_evidence_endpoint(
     // for evidence is not necessarily the one who publishes, and a package
     // must not depend on who asks for it.
     let mut resource_snapshot = None;
+    let resource_view = rbac_state.policy_resource_view();
     let review = inspection.policy().map(|candidate| {
         let base = match &record {
             CandidateRecord::Publication { .. } => candidate,
             CandidateRecord::Draft(_) => predecessor_policy.as_ref().unwrap_or(candidate),
         };
-        rbac::policy_resources::validate_resources(
-            candidate,
-            base,
-            &rbac_state.policy_resource_view(),
-            None,
-        )
+        rbac::policy_resources::validate_resources(candidate, base, &resource_view, None)
     });
     if let Some(review) = review {
         let (findings, snapshot) = review.into_parts();
@@ -865,10 +880,20 @@ pub(super) async fn policy_evidence_endpoint(
     } else {
         None
     };
-    let alias_paths = evidence_request
-        .analysis
-        .then(|| rbac_state.mcp_alias_paths());
-    let alias_count = alias_paths.as_ref().map_or(0, Vec::len);
+    // The analysis reads what the revalidation read: the same resource view,
+    // and for a draft the live policy it is pinned to.
+    let analysis_work = evidence_request.analysis.then(|| AnalysisWork {
+        mcp_alias_paths: rbac_state.mcp_alias_paths(),
+        active: match &record {
+            CandidateRecord::Publication { .. } => None,
+            CandidateRecord::Draft(_) => predecessor_policy.clone(),
+        },
+        global_rate_lanes: rbac_state.global_rate_lanes(),
+        resource_view,
+    });
+    let alias_count = analysis_work
+        .as_ref()
+        .map_or(0, |work| work.mcp_alias_paths.len());
 
     let simulation = evidence_request.simulation.take();
     let (tests_included, simulation_included) = (suite.is_some(), simulation.is_some());
@@ -884,7 +909,7 @@ pub(super) async fn policy_evidence_endpoint(
         predecessor: predecessor_policy,
         suite,
         simulation,
-        analysis: alias_paths,
+        analysis: analysis_work,
     };
     // The blocking thread owns the slot, so a request dropped mid-run keeps
     // its slot until the work it started has ended.

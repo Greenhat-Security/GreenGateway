@@ -555,8 +555,15 @@ policy without its direct rules for a route, `evaluate` over the whole policy
 for a route a rule pre-empts, `select_rate_lane` for an override -- and keeps
 the claim only when an earlier element does. A witness whose facts the kernel
 refuses makes the finding `inconclusive`; any other evaluator error fails the
-analysis. The property tests in `policy_analysis::tests` decide every request
+analysis. Existential claims are asked the same way, of a witness built from
+two elements' predicates: a partial overlap through `match_direct_rules`, an
+alias override and an alias route through `evaluate` with an `McpAlias`
+target, a selected upstream through `evaluate` with and without a dispatch
+that names the host, a tool entry's refusal through `evaluate_tool`, and an
+egress CIDR through the static egress lane with witness resolution facts.
+The property tests in `policy_analysis::tests` decide every request
 of small universes through `evaluate`, `evaluate_tool`,
 `evaluate_source_request` and `select_rate_lane` in every lane, before and
-after each suggested patch. The API is in
+after each suggested patch, and find a universe request showing every proven
+existential claim. The API is in
 [policy-analysis.md](../policy-analysis.md).

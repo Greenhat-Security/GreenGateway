@@ -13,7 +13,10 @@
 //! [`policy_analysis::checks::analyze`] on a blocking thread, behind its own
 //! [`PolicyEvaluationLimiter`] and a deadline. Running out of the deadline,
 //! the comparison budget or the findings cap is an incomplete result, never
-//! a clean one.
+//! a clean one. The endpoint reads what the analysis is judged against once,
+//! before the analysis starts: the active policy, the configured global rate
+//! lanes and the cross-resource view a publication's checks read. A resource
+//! it could not read makes the result incomplete too.
 //!
 //! Each finding is reported with its suppression state (issue #243, slice
 //! 15): the endpoint reads the deployment's suppression records and the
@@ -227,21 +230,28 @@ pub(super) async fn policy_analyses_endpoint(
     };
     let alias_paths = rbac_state.mcp_alias_paths();
     let alias_count = alias_paths.len();
-    let analyzed = candidate.unwrap_or(base);
-    let analyzed_semantic_digest = match policy_semantic_digest(&analyzed) {
-        Ok(digest) => digest,
-        Err(response) => return *response,
-    };
-    // What a suppression binds besides the policy: the resources as they
-    // are now, and the records as the store reads them now. Neither changes
-    // what the analyzer finds; together they decide how a finding reads.
-    let resource_snapshot =
-        rbac::policy_resources::PolicyResourceSnapshot::of(&rbac_state.policy_resource_view());
+    // The resources the cross-resource checks read, read once, as a
+    // publication reads them: what the analysis is judged against. What a
+    // suppression binds besides the policy is the snapshot of that same view
+    // and the records as the store reads them now; neither changes what the
+    // analyzer finds, and together they decide how a finding reads.
+    let resource_view = rbac_state.policy_resource_view();
+    let global_rate_lanes = rbac_state.global_rate_lanes();
+    let resource_snapshot = rbac::policy_resources::PolicyResourceSnapshot::of(&resource_view);
     let suppression_read = read_analysis_suppressions(&state).await;
 
     // The blocking thread owns the slot, so a request dropped mid-analysis
     // keeps its slot until the analysis it started has ended. The deadline
-    // starts before compilation, so compiling counts against it.
+    // starts before compilation, so compiling counts against it. The active
+    // policy goes along: a lockout or an egress change is a change from it.
+    let (analyzed, active) = match candidate {
+        Some(candidate) => (candidate, base),
+        None => (base.clone(), base),
+    };
+    let analyzed_semantic_digest = match policy_semantic_digest(&analyzed) {
+        Ok(digest) => digest,
+        Err(response) => return *response,
+    };
     let outcome = match slot
         .run_blocking(move || {
             let deadline = Instant::now() + POLICY_ANALYSIS_DEADLINE;
@@ -249,6 +259,9 @@ pub(super) async fn policy_analyses_endpoint(
                 &analyzed,
                 &AnalysisResources {
                     mcp_alias_paths: &alias_paths,
+                    active: &active,
+                    global_rate_lanes,
+                    resource_view: &resource_view,
                 },
                 deadline,
             )

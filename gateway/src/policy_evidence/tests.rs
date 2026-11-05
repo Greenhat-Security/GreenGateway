@@ -591,10 +591,15 @@ fn replay_evidence(complete: bool) -> ReplayEvidence {
 /// The suppression record naming the publication's `public-copy` finding,
 /// bound exactly to what [`analysis_evidence`] analyzes.
 fn suppression_of_duplicate(ended: bool) -> Suppression {
+    let publication = policy(publication_document());
     let outcome = analyze(
-        &policy(publication_document()),
+        &publication,
         &AnalysisResources {
             mcp_alias_paths: &[],
+            // A publication is judged on its own, as the endpoint judges it.
+            active: &publication,
+            global_rate_lanes: None,
+            resource_view: &PolicyResourceView::default(),
         },
         Instant::now() + Duration::from_secs(5),
     )
@@ -619,10 +624,15 @@ fn suppression_of_duplicate(ended: bool) -> Suppression {
 /// The analyzer's results over the publication document, as the endpoint
 /// renders them: `stored` names it, `read` holds the suppression records.
 fn analysis_evidence(stored: &StoredCandidate, read: &SuppressionRead) -> AnalysisEvidence {
+    let publication = policy(publication_document());
     let outcome = analyze(
-        &policy(publication_document()),
+        &publication,
         &AnalysisResources {
             mcp_alias_paths: &[],
+            // A publication is judged on its own, as the endpoint judges it.
+            active: &publication,
+            global_rate_lanes: None,
+            resource_view: &PolicyResourceView::default(),
         },
         Instant::now() + Duration::from_secs(5),
     )

@@ -2,11 +2,16 @@
 //!
 //! The analyzer reads one policy and reports what is provably wrong with its
 //! structure, or risky about its defaults: elements that can never decide a
-//! request because an earlier one always does, rules and routes whose written
-//! intent never applies, allows and shadows that match every caller on every
-//! path, and permissive defaults. Each finding names the element by section,
-//! JSON Pointer, position and stable id, says how it was established, and
-//! may carry a candidate patch.
+//! request because an earlier one always does, or decide only part of what
+//! they match; rules and routes whose written intent never applies, or
+//! applies differently to MCP alias requests and selected virtual upstreams;
+//! tool-name rules their tool's entry contradicts; grants broader than they
+//! look; rate overrides looser than their global lane; egress entries that
+//! admit more than the web; and, through the publication's own cross-resource
+//! checks, references other resources contradict and a change that leaves
+//! nobody able to write the policy. Each finding names the element by
+//! section, JSON Pointer, position and stable id, says how it was
+//! established, and may carry a candidate patch.
 //!
 //! ## Proof bases
 //!
@@ -14,10 +19,13 @@
 //!   lane, and -- for every reachability claim -- confirmed by asking the
 //!   canonical evaluator ([`crate::policy_eval`]) which element decides a
 //!   witness request the claimed element itself matches, in the element's
-//!   ordinary lane. The brute-force tests check every proven claim, in every
-//!   lane it names, over small policy universes.
-//! - `heuristic`: a statement whose risk depends on the deployment rather than
-//!   on the policy alone (how many issuers it trusts, for example).
+//!   ordinary lane. An existential claim -- an overlap, a lane effect, a grant
+//!   a tool entry refuses -- is proven only when the evaluator answers the
+//!   witness the analyzer built that way. The brute-force tests check every
+//!   proven claim, in every lane it names, over small policy universes.
+//! - `heuristic`: a statement whose risk depends on the deployment or on
+//!   intent rather than on the policy alone (how many issuers it trusts, or
+//!   whether a port is unusual, for example).
 //! - `inconclusive`: a structural relation the evaluator did not confirm on
 //!   its witness. It is reported, never dropped, and carries no patch.
 //!
@@ -33,9 +41,11 @@
 //! findings rather than inventing them. An element covered only by the union
 //! of several earlier ones, a pattern inclusion that needs more than one
 //! alignment, two spellings of one origin, a route a configured MCP alias
-//! selects by exact prefix, and every partial overlap are not reported. A
-//! clean report is therefore not a statement that the policy is free of
-//! these problems; `docs/policy-analysis.md` lists every blind spot.
+//! selects by exact prefix, and partial overlaps between routes or between
+//! rate overrides are not reported, and a partial rule overlap the evaluator
+//! does not confirm is `inconclusive`. A clean report is therefore not a
+//! statement that the policy is free of these problems;
+//! `docs/policy-analysis.md` lists every blind spot.
 //!
 //! ## Advisory patches
 //!
@@ -60,7 +70,9 @@
 //! [`checks::analyze`] is pure: it compiles the policy for analysis, asks the
 //! evaluator synthetic questions, and returns values. It performs no I/O,
 //! emits no event or metric, and touches no rate bucket, tool permit,
-//! resolver or upstream. Its work is bounded by a comparison budget, a
+//! resolver or upstream; the resources it judges against are read by the
+//! endpoint and handed over, and an egress question carries its own witness
+//! resolution facts. Its work is bounded by a comparison budget, a
 //! deadline and a findings cap; exhausting any of them makes the result
 //! incomplete, never clean. [`suppression::apply`] is pure too: the endpoint
 //! reads the records and hands them over.
@@ -110,11 +122,33 @@ pub(crate) enum FindingCode {
     RouteBypassed,
     RateOverrideUnreachable,
     RateOverrideShadowed,
+    RulePartiallyShadowed,
+    McpAliasRuleOverridden,
+    McpAliasRoutePrecedence,
+    SelectedUpstreamAllowIgnored,
+    ToolRuleNeverDecides,
+    ToolRuleGrantNarrowed,
+    IssuerlessRoleGrant,
+    WildcardPermission,
+    BroadPathGrant,
+    AllMethodsGrant,
+    RateOverrideLooserThanGlobal,
+    EgressBroadWildcardHost,
+    EgressNonPublicCidr,
+    EgressUnusualPort,
+    EgressChangeRequiresRestart,
+    RoleNotDefined,
+    RoutePermissionUngranted,
+    ToolNotRegistered,
+    ConnectionEndpointEgressDenied,
+    NameCaseCollision,
+    PolicyWriteUnreachable,
 }
 
 impl FindingCode {
-    /// Every code, in the fixed order SARIF rule indexes follow.
-    pub(crate) const ALL: [Self; 12] = [
+    /// Every code, in the fixed order SARIF rule indexes follow. A new code
+    /// is appended, so an existing code's rule index never changes.
+    pub(crate) const ALL: [Self; 33] = [
         Self::DefaultAllow,
         Self::GlobalShadowEnforcement,
         Self::BroadUnconstrainedAllow,
@@ -127,6 +161,27 @@ impl FindingCode {
         Self::RouteBypassed,
         Self::RateOverrideUnreachable,
         Self::RateOverrideShadowed,
+        Self::RulePartiallyShadowed,
+        Self::McpAliasRuleOverridden,
+        Self::McpAliasRoutePrecedence,
+        Self::SelectedUpstreamAllowIgnored,
+        Self::ToolRuleNeverDecides,
+        Self::ToolRuleGrantNarrowed,
+        Self::IssuerlessRoleGrant,
+        Self::WildcardPermission,
+        Self::BroadPathGrant,
+        Self::AllMethodsGrant,
+        Self::RateOverrideLooserThanGlobal,
+        Self::EgressBroadWildcardHost,
+        Self::EgressNonPublicCidr,
+        Self::EgressUnusualPort,
+        Self::EgressChangeRequiresRestart,
+        Self::RoleNotDefined,
+        Self::RoutePermissionUngranted,
+        Self::ToolNotRegistered,
+        Self::ConnectionEndpointEgressDenied,
+        Self::NameCaseCollision,
+        Self::PolicyWriteUnreachable,
     ];
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -143,6 +198,27 @@ impl FindingCode {
             Self::RouteBypassed => "route_bypassed",
             Self::RateOverrideUnreachable => "rate_override_unreachable",
             Self::RateOverrideShadowed => "rate_override_shadowed",
+            Self::RulePartiallyShadowed => "rule_partially_shadowed",
+            Self::McpAliasRuleOverridden => "mcp_alias_rule_overridden",
+            Self::McpAliasRoutePrecedence => "mcp_alias_route_precedence",
+            Self::SelectedUpstreamAllowIgnored => "selected_upstream_allow_ignored",
+            Self::ToolRuleNeverDecides => "tool_rule_never_decides",
+            Self::ToolRuleGrantNarrowed => "tool_rule_grant_narrowed",
+            Self::IssuerlessRoleGrant => "issuerless_role_grant",
+            Self::WildcardPermission => "wildcard_permission",
+            Self::BroadPathGrant => "broad_path_grant",
+            Self::AllMethodsGrant => "all_methods_grant",
+            Self::RateOverrideLooserThanGlobal => "rate_override_looser_than_global",
+            Self::EgressBroadWildcardHost => "egress_broad_wildcard_host",
+            Self::EgressNonPublicCidr => "egress_non_public_cidr",
+            Self::EgressUnusualPort => "egress_unusual_port",
+            Self::EgressChangeRequiresRestart => "egress_change_requires_restart",
+            Self::RoleNotDefined => "role_not_defined",
+            Self::RoutePermissionUngranted => "route_permission_ungranted",
+            Self::ToolNotRegistered => "tool_not_registered",
+            Self::ConnectionEndpointEgressDenied => "connection_endpoint_egress_denied",
+            Self::NameCaseCollision => "name_case_collision",
+            Self::PolicyWriteUnreachable => "policy_write_unreachable",
         }
     }
 
@@ -186,6 +262,67 @@ impl FindingCode {
             Self::RateOverrideShadowed => {
                 "an earlier rate-limit override with different limits selects every request this override matches, so this override's limits never apply"
             }
+            Self::RulePartiallyShadowed => {
+                "an earlier, less restrictive enabled rule decides some of the requests this rule matches, so this rule does not decide them where rules decide by first match"
+            }
+            Self::McpAliasRuleOverridden => {
+                "for a request that reaches the MCP endpoint by a configured alias path, a rule later in source order with a more restrictive action decides instead of this rule, although this rule is the first rule that matches the request"
+            }
+            Self::McpAliasRoutePrecedence => {
+                "a request that reaches the MCP endpoint by a configured alias path selects this route by its exact prefix before the route that decides the canonical MCP path, and this route admits a caller that route refuses"
+            }
+            Self::SelectedUpstreamAllowIgnored => {
+                "a direct allow or shadow rule never authorizes a selected host-qualified virtual upstream: a request this rule forwards when it is addressed to a host-bound route's host is blocked when that host's virtual upstream is selected"
+            }
+            Self::ToolRuleNeverDecides => {
+                "the tool's own policy entry refuses every caller this tool-name rule matches before any tool-name rule is read, so this rule never decides an invocation"
+            }
+            Self::ToolRuleGrantNarrowed => {
+                "the tool's own policy entry refuses a caller this allow or shadow tool-name rule names before any tool-name rule is read, so the rule grants less than it names"
+            }
+            Self::IssuerlessRoleGrant => {
+                "a grant names a role without the issuers that role is bound to: a direct rule or a tool entry matches the role a caller claims from any issuer, while a route permission the role grants applies only for the role's issuers"
+            }
+            Self::WildcardPermission => {
+                "a role grants every permission, administrative permissions included"
+            }
+            Self::BroadPathGrant => {
+                "an enabled allow or shadow rule matches every path for the callers it names, so no later rule, route or default decides an ordinary request of theirs"
+            }
+            Self::AllMethodsGrant => {
+                "an enabled allow or shadow rule matches every method, unsafe ones included, for every caller, unauthenticated ones included"
+            }
+            Self::RateOverrideLooserThanGlobal => {
+                "a rate-limit override allows more requests per second or a larger burst than the global lane its methods are charged in; the global lane limits each client address first, so the higher limit applies only across several addresses"
+            }
+            Self::EgressBroadWildcardHost => {
+                "an egress host pattern admits every name under a single label, such as a top-level domain"
+            }
+            Self::EgressNonPublicCidr => {
+                "an egress CIDR admits loopback, link-local or private addresses the gateway otherwise refuses to connect to"
+            }
+            Self::EgressUnusualPort => {
+                "the egress port list admits a port other than the usual web ports"
+            }
+            Self::EgressChangeRequiresRestart => {
+                "the egress section differs from the active policy's, and the policy API cannot apply an egress change: it needs an edit of the policy file and a restart"
+            }
+            Self::RoleNotDefined => "an element names a role no roles entry defines",
+            Self::RoutePermissionUngranted => {
+                "no role grants the permission a route requires, so the route admits no caller unless its mode is shadow"
+            }
+            Self::ToolNotRegistered => {
+                "the policy names a tool this gateway's tool registry does not hold"
+            }
+            Self::ConnectionEndpointEgressDenied => {
+                "the static egress controls refuse the endpoint of an enabled Connection"
+            }
+            Self::NameCaseCollision => {
+                "two role or two tool names differ only in case; names compare exactly, so they are two names"
+            }
+            Self::PolicyWriteUnreachable => {
+                "the active policy lets some principal hold admin:policy:write and this policy lets none, so after publication nobody could change the policy through the policy API"
+            }
         }
     }
 
@@ -219,6 +356,59 @@ impl FindingCode {
             }
             Self::RateOverrideShadowed => {
                 "move the override before the override that covers it, or remove it if the earlier limits are intended"
+            }
+            Self::RulePartiallyShadowed => {
+                "move the rule before the less restrictive rule, or narrow that rule so it no longer matches what this rule is meant to decide"
+            }
+            Self::McpAliasRuleOverridden => {
+                "review the later rule: it decides every request reaching the MCP endpoint by an alias that it matches, whatever its position; narrow it if it was not meant to"
+            }
+            Self::McpAliasRoutePrecedence => {
+                "require the same permission at the alias path as at the canonical MCP path, or remove the alias route"
+            }
+            Self::SelectedUpstreamAllowIgnored => {
+                "grant the access through the host-bound route's permission, which decides a selected virtual upstream"
+            }
+            Self::ToolRuleNeverDecides => {
+                "remove the rule, or enable the tool's entry and align the rule's principal with the issuers and authentication methods the entry admits"
+            }
+            Self::ToolRuleGrantNarrowed => {
+                "admit the caller in the tool's entry too, or narrow the rule to callers the entry admits"
+            }
+            Self::IssuerlessRoleGrant => {
+                "constrain the grant to the role's issuers, or grant the access through a route permission"
+            }
+            Self::WildcardPermission => {
+                "replace the wildcard with the permissions the role needs"
+            }
+            Self::BroadPathGrant => "narrow the rule's path to what the callers it names need",
+            Self::AllMethodsGrant => {
+                "list the methods the rule is meant to allow, or constrain its principal"
+            }
+            Self::RateOverrideLooserThanGlobal => {
+                "lower the override's limits to at most the global lane's, or raise the global lane if more is intended"
+            }
+            Self::EgressBroadWildcardHost => {
+                "replace the pattern with the names, or a wildcard under a domain, the gateway needs to reach"
+            }
+            Self::EgressNonPublicCidr => {
+                "narrow the CIDR to the internal addresses upstreams use; admit loopback or link-local addresses only for an upstream that lives there"
+            }
+            Self::EgressUnusualPort => "list only the ports upstreams listen on",
+            Self::EgressChangeRequiresRestart => {
+                "edit the policy file and restart the gateway to change egress, or keep the active egress section in this document"
+            }
+            Self::RoleNotDefined => "define the role, or correct the name",
+            Self::RoutePermissionUngranted => {
+                "grant the permission through a role, or correct the permission"
+            }
+            Self::ToolNotRegistered => "register the tool, or correct the name",
+            Self::ConnectionEndpointEgressDenied => {
+                "admit the endpoint in the egress controls, or correct the Connection"
+            }
+            Self::NameCaseCollision => "use one spelling",
+            Self::PolicyWriteUnreachable => {
+                "keep a role that grants admin:policy:write to a principal that can hold it"
             }
         }
     }
@@ -332,6 +522,9 @@ pub(crate) enum Section {
     Rules,
     Routes,
     RateLimits,
+    Tools,
+    Egress,
+    IdentityMappings,
 }
 
 impl Section {
@@ -343,6 +536,9 @@ impl Section {
             Self::Rules => "rules",
             Self::Routes => "routes",
             Self::RateLimits => "rate_limits",
+            Self::Tools => "tools",
+            Self::Egress => "egress",
+            Self::IdentityMappings => "identity_mappings",
         }
     }
 }
@@ -357,13 +553,19 @@ pub(crate) struct ElementRef {
     pub(crate) position: Option<usize>,
     /// The element's stable id, when it has one.
     pub(crate) id: Option<String>,
-    /// A role's name.
+    /// A role's or a tool's name.
     pub(crate) name: Option<String>,
+    /// For a finding about one member of the element -- one role a rule's
+    /// principal names, say -- that member's pointer relative to the
+    /// element. Part of the identity, and not rendered: `pointer` already
+    /// names it.
+    pub(crate) member: Option<String>,
 }
 
 impl ElementRef {
     /// The element's identity for a fingerprint: its stable id or name when
-    /// it has one, so a fingerprint survives a reorder, else its position.
+    /// it has one, so a fingerprint survives a reorder, else its position;
+    /// and the member, when the finding is about one.
     fn identity(&self) -> Value {
         let key = match (&self.id, &self.name, self.position) {
             (Some(id), _, _) => json!({ "id": id }),
@@ -371,7 +573,11 @@ impl ElementRef {
             (None, None, Some(position)) => json!({ "position": position }),
             (None, None, None) => json!({}),
         };
-        json!({ "section": self.section.as_str(), "key": key })
+        let mut identity = json!({ "section": self.section.as_str(), "key": key });
+        if let (Some(member), Some(identity)) = (&self.member, identity.as_object_mut()) {
+            identity.insert("member".to_owned(), json!(member));
+        }
+        identity
     }
 
     pub(crate) fn to_json(&self) -> Value {
@@ -452,6 +658,10 @@ pub(crate) enum AnalysisLimitation {
     ComparisonBudgetExhausted,
     DeadlineExceeded,
     FindingsTruncated,
+    /// A resource a check needs could not be read -- part of the
+    /// cross-resource view, or the global rate lanes for a policy with rate
+    /// overrides -- so the checks that need it did not run.
+    ResourcesUnavailable,
 }
 
 impl AnalysisLimitation {
@@ -460,6 +670,7 @@ impl AnalysisLimitation {
             Self::ComparisonBudgetExhausted => "comparison_budget_exhausted",
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::FindingsTruncated => "findings_truncated",
+            Self::ResourcesUnavailable => "resources_unavailable",
         }
     }
 }

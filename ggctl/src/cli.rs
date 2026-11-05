@@ -3,8 +3,9 @@
 //! One static table defines every command, argument and option. Help text
 //! (`help.rs`) and shell completion (`completion.rs`) are generated from it,
 //! and the parser accepts exactly what it lists, so the three cannot drift.
-//! A command family (`ggctl ledger`) is a name whose commands are listed in
-//! the table under their full names (`ledger seed`).
+//! A command family (`ggctl ledger`, `ggctl backup`) is a name whose commands
+//! are listed in the table under their full names (`ledger seed`,
+//! `backup create`).
 //!
 //! Before anything else the parser refuses any argument that looks like a
 //! secret-carrying or verification-disabling option, wherever it appears, so
@@ -117,6 +118,7 @@ pub(crate) const SCHEMA_KINDS: &[&str] = &[
     gateway_config::documents::INIT_ANSWERS_KIND,
     gateway_config::documents::CAPABILITIES_KIND,
     gateway_config::documents::REPORT_KIND,
+    gateway_config::documents::BACKUP_KIND,
 ];
 /// The deployment profiles, as `gateway_config::bundle::Profile` names them.
 pub(crate) const PROFILES: &[&str] = &["production", "migration", "development"];
@@ -163,6 +165,8 @@ const COMMAND_NAMES: &[&str] = &[
     "ledger seed",
     "ledger verify",
     "ledger rollback",
+    "backup create",
+    "backup verify",
     "completion",
     "help",
 ];
@@ -178,10 +182,14 @@ pub(crate) const HELP_TOPICS: &[&str] = &[
     "doctor",
     "diff",
     "ledger",
+    "backup",
     "completion",
     "help",
 ];
 const LEDGER_COMMANDS: &[&str] = &["seed", "verify", "rollback"];
+const BACKUP_COMMANDS: &[&str] = &["create", "verify"];
+/// The second word of every family's commands, once each, for `ggctl help`.
+const SUBCOMMANDS: &[&str] = &["seed", "verify", "rollback", "create"];
 
 const FORMAT: OptionSpec = OptionSpec {
     name: "--format",
@@ -315,21 +323,52 @@ const ACKNOWLEDGE: OptionSpec = OptionSpec {
     repeatable: true,
     help: "acknowledge one risk code of the rollback; give it once for each code, since every code must be named",
 };
+const BACKUP_OUTPUT: OptionSpec = OptionSpec {
+    name: "--output",
+    value: Some(("FILE", ValueKind::Path)),
+    repeatable: false,
+    help:
+        "the backup archive to create (required): it must not exist, and is never standard output",
+};
+const ARCHIVE: ArgumentSpec = ArgumentSpec {
+    name: "FILE",
+    kind: ValueKind::Path,
+    required: true,
+    help: "the backup archive, as ggctl backup create wrote it",
+};
 
-pub(crate) const FAMILIES: &[FamilySpec] = &[FamilySpec {
-    name: "ledger",
-    summary: "Seed, verify or roll back a standalone configuration revision ledger, offline",
-    description: &[
-        "The offline commands over the configuration revision ledger beneath a standalone \
-         state directory (docs/configuration-ledger.md). Each takes the state directory's \
-         exclusive lock first, so it runs only while no gateway or other ggctl holds it, and \
-         exits 5 when one does. None makes a network request or reads an environment \
-         variable, and none writes gateway audit events: a revision's record is its \
-         evidence.",
-    ],
-    commands: LEDGER_COMMANDS,
-    hint: "run `ggctl help ledger` for the ledger commands",
-}];
+pub(crate) const FAMILIES: &[FamilySpec] = &[
+    FamilySpec {
+        name: "ledger",
+        summary: "Seed, verify or roll back a standalone configuration revision ledger, offline",
+        description: &[
+            "The offline commands over the configuration revision ledger beneath a standalone \
+             state directory (docs/configuration-ledger.md). Each takes the state directory's \
+             exclusive lock first, so it runs only while no gateway or other ggctl holds it, and \
+             exits 5 when one does. None makes a network request or reads an environment \
+             variable, and none writes gateway audit events: a revision's record is its \
+             evidence.",
+        ],
+        commands: LEDGER_COMMANDS,
+        hint: "run `ggctl help ledger` for the ledger commands",
+    },
+    FamilySpec {
+        name: "backup",
+        summary: "Back up a standalone state directory, or verify a backup, offline",
+        description: &[
+            "The offline commands over standalone backups (docs/standalone-backup.md): one \
+             archive of the stores beneath a state directory, with a GatewayBackup manifest of \
+             versions, inventory, counts and checksums. A backup is sensitive recovery material, \
+             not configuration. It never holds a plaintext token, a secret value or a key: the \
+             Connections store keeps its secrets as ciphertext, and the key files under \
+             CONNECTION_SECRETS_ROOT are a separate artifact to back up separately. None of \
+             these commands makes a network request or reads an environment variable, and none \
+             writes gateway audit events.",
+        ],
+        commands: BACKUP_COMMANDS,
+        hint: "run `ggctl help backup` for the backup commands",
+    },
+];
 
 pub(crate) const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
@@ -551,6 +590,55 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         run: crate::ledger::rollback,
     },
     CommandSpec {
+        name: "backup create",
+        summary: "Back up a stopped standalone state directory into a new archive",
+        description: &[
+            "Takes the exclusive lock of the state directory --state-dir names, so it runs only \
+             while no gateway or other ggctl holds it, and writes one archive of every store of \
+             the state-directory layout it holds to the new file --output names. Each store is \
+             snapshotted with SQLite's VACUUM INTO from a read-only connection, never copied \
+             file by file, so whatever its write-ahead log holds is included consistently and \
+             neither the store nor its log is written; two names for one file are snapshotted \
+             once. The \
+             configuration revision ledger must pass its full verification and every snapshot \
+             SQLite's integrity check. Nothing else in the directory is read: not its lock \
+             file, not a store's -wal, -shm or -journal file, not any other file.",
+            "The archive is written to a new hidden file beside --output, owner-only on Unix, \
+             flushed and read back with every check of ggctl backup verify, then linked to \
+             --output, which must not exist and is never replaced; a failure leaves nothing at \
+             --output. A backup is never written to standard output. Exits 0 when the backup \
+             was written, 3 for a store that is a link, not a regular file, writable by others \
+             or corrupt, a ledger that does not verify, or a state directory with no store, 5 \
+             when the state directory is locked or --output exists, 7 when what was written \
+             did not verify, and 1 when a store or the archive could not be read or written.",
+        ],
+        arguments: &[],
+        options: &[STATE_DIR, BACKUP_OUTPUT, FORMAT],
+        run: crate::backup::create,
+    },
+    CommandSpec {
+        name: "backup verify",
+        summary: "Verify a backup archive completely, offline",
+        description: &[
+            "Reads the archive FILE completely through the shared archive admission rules, into \
+             a new hidden staging directory beside it, owner-only on Unix and removed \
+             afterwards: every entry name, kind and size before its data is read, the \
+             GatewayBackup manifest as a closed document of a version this ggctl reads, \
+             exactly the entries the manifest lists in its order with each one's SHA-256, the \
+             archive's own digest, and then each database: rollback-journal mode, SQLite's \
+             integrity check, its header versions, schema and table rows as the manifest \
+             records them, and the ledger's full verification and revisions.",
+            "Exits 0 when the backup verifies, 7 when anything about it does not (truncation, \
+             tampering, traversal, links, duplicate or case-colliding entries, a bomb, an \
+             unsupported version or a database that fails its checks), 3 when FILE is a link or \
+             not a regular file, and 1 when it or the staging directory could not be read or \
+             written. A digest is integrity evidence, not authenticity.",
+        ],
+        arguments: &[ARCHIVE],
+        options: &[FORMAT],
+        run: crate::backup::verify,
+    },
+    CommandSpec {
         name: "completion",
         summary: "Write a shell completion script",
         description: &[
@@ -572,7 +660,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         summary: "Print help for ggctl or one command",
         description: &[
             "Prints the help for COMMAND, or the overview without one. For a command family \
-             such as ledger, prints the family's commands, or with SUBCOMMAND that command's help.",
+             such as ledger or backup, prints the family's commands, or with SUBCOMMAND that command's help.",
         ],
         arguments: &[
             ArgumentSpec {
@@ -583,7 +671,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             },
             ArgumentSpec {
                 name: "SUBCOMMAND",
-                kind: ValueKind::Choice(LEDGER_COMMANDS),
+                kind: ValueKind::Choice(SUBCOMMANDS),
                 required: false,
                 help: "a command of the COMMAND family",
             },

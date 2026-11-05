@@ -34,9 +34,14 @@
 //! `InvalidData` rather than serving an unverifiable document) and parses
 //! the document through [`Policy::validate_json_value`], so callers only
 //! ever see a document this binary can serve. A document whose format is
-//! outside `cluster_membership::DOCUMENT_VERSION_RANGE` -- policy v1, today
-//! -- is refused the same way: every replica reads only the formats it
-//! advertises, and the commit path refuses to write any other.
+//! outside `cluster_membership::DOCUMENT_VERSION_RANGE` is refused the same
+//! way: every replica reads only the formats it advertises, and the commit
+//! path refuses to write any other. This build advertises `0..=1`, so a
+//! 0.x document and a policy v1 document are both served, each under the
+//! schema it names; a replica of an earlier build, which advertised
+//! `0..=0`, refuses a v1 document here, which is why committing one is a
+//! gated operation (`compatibility::POLICY_DOCUMENT_V1`) the caller asks
+//! for before it calls `commit`.
 //!
 //! Redaction follows the foundation's rules: no SQL text, no query values,
 //! and no DSN-derived material cross the error boundary.
@@ -630,9 +635,10 @@ fn policy_from_json(
     })?;
     // A document this build parses is not necessarily one it may serve here:
     // a replica reads only the document formats it advertises on the roster,
-    // so every member that serves this deployment reads it the same way. A
-    // policy v1 document fails closed exactly as it does on a build that
-    // predates v1.
+    // so every member that serves this deployment reads it the same way.
+    // This build advertises formats 0 and 1, the two it parses; a build that
+    // advertised only 0 refused a v1 document here, failing closed exactly
+    // as a build that predates v1 refuses it.
     if !policy.cluster_serves_document_format() {
         let (minimum, maximum) = crate::cluster_membership::DOCUMENT_VERSION_RANGE;
         let error = crate::rbac::policy::PolicyError::Invalid(format!(
@@ -671,18 +677,34 @@ mod tests {
     use super::*;
 
     /// A replica parses a stored document through the same validator the
-    /// file loader uses, and then serves it only if its format is one the
-    /// roster says this build reads. Policy v1 is not, yet: it is refused
-    /// as invalid data, exactly as a build that predates v1 refuses it.
+    /// file loader uses, and serves it only if its format is one the roster
+    /// says this build reads: 0.x and policy v1, each under its own schema.
+    /// A format no build of this release reads, and a v1 document that
+    /// breaks v1's rules, are refused as invalid data rather than read as
+    /// something else.
     #[test]
-    fn a_stored_document_outside_the_advertised_formats_is_refused() {
+    fn a_stored_document_is_served_only_in_an_advertised_format() {
+        assert_eq!(crate::cluster_membership::DOCUMENT_VERSION_RANGE, (0, 1));
         let v0 = r#"{"schema_version":"0.1.0","default_action":"deny"}"#;
-        let v1 = r#"{"schema_version":"1.0.0","default_action":"deny"}"#;
+        let v1 = r#"{"schema_version":"1.0.0","default_action":"deny",
+            "rules":[{"id":"r1","path":"/a","methods":["GET"],"action":"allow"}]}"#;
 
-        assert!(policy_from_json(v0, OPERATION_ACTIVE).is_ok());
-        let refused = policy_from_json(v1, OPERATION_ACTIVE).expect_err("v1 must not be served");
+        let served_v0 = policy_from_json(v0, OPERATION_ACTIVE).expect("0.x is served");
+        assert_eq!(served_v0.schema_version, "0.1.0");
+        let served_v1 = policy_from_json(v1, OPERATION_ACTIVE).expect("v1 is served");
+        assert_eq!(served_v1.schema_version, "1.0.0");
+        assert_eq!(served_v1.rules[0].id.as_deref(), Some("r1"));
+
+        // A v1 document is held to v1's rules when it is read back: a rule
+        // without its id is refused, never served as the 0.x document the
+        // same members would make.
+        let unnamed = r#"{"schema_version":"1.0.0","default_action":"deny",
+            "rules":[{"path":"/a","methods":["GET"],"action":"allow"}]}"#;
+        let refused = policy_from_json(unnamed, OPERATION_ACTIVE).expect_err("v1 rules need ids");
         assert_eq!(refused.kind(), RepositoryErrorKind::InvalidData);
-        // The document itself is a valid policy; only the cluster refuses it.
-        assert!(Policy::validate_json_value(serde_json::from_str(v1).expect("JSON")).is_ok());
+
+        let future = r#"{"schema_version":"2.0.0","default_action":"deny"}"#;
+        let refused = policy_from_json(future, OPERATION_ACTIVE).expect_err("format 2 is unknown");
+        assert_eq!(refused.kind(), RepositoryErrorKind::InvalidData);
     }
 }
