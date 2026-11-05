@@ -498,19 +498,33 @@ fn commit_refusal_reason(refusal: PolicyCommitRefusal) -> &'static str {
 }
 
 /// The per-draft size bound, judged on the candidate as the store will
-/// serialize it, before the store is asked.
+/// serialize it, and the bound its publication is held to: the policy file
+/// it would be written as ([`policy_file_size_refusal`]), which is larger.
+/// Both are judged before the store is asked, and before the other write
+/// checks, so a draft saved is one its publication could write, and a
+/// candidate over either bound is `413` like any other too-large draft.
 fn within_candidate_bound(candidate: &rbac::Policy) -> ResponseResult<()> {
+    let too_large = || {
+        Box::new(
+            PolicyDraftRefusal::TooLarge
+                .response_with(json!({ "max_candidate_bytes": MAX_POLICY_DRAFT_CANDIDATE_BYTES })),
+        )
+    };
+    let unserializable = |error: &dyn std::fmt::Display| {
+        tracing::error!(error = %error, "failed to serialize a policy draft candidate");
+        Box::new(internal_server_error(
+            "policy draft candidate could not be serialized",
+        ))
+    };
     match serde_json::to_vec(candidate) {
-        Ok(bytes) if bytes.len() <= MAX_POLICY_DRAFT_CANDIDATE_BYTES => Ok(()),
-        Ok(_) => Err(Box::new(PolicyDraftRefusal::TooLarge.response_with(
-            json!({ "max_candidate_bytes": MAX_POLICY_DRAFT_CANDIDATE_BYTES }),
-        ))),
-        Err(error) => {
-            tracing::error!(error = %error, "failed to serialize a policy draft candidate");
-            Err(Box::new(internal_server_error(
-                "policy draft candidate could not be serialized",
-            )))
-        }
+        Ok(bytes) if bytes.len() <= MAX_POLICY_DRAFT_CANDIDATE_BYTES => {}
+        Ok(_) => return Err(too_large()),
+        Err(error) => return Err(unserializable(&error)),
+    }
+    match candidate.persisted_bytes() {
+        Ok(_) => Ok(()),
+        Err(rbac::policy::PersistedPolicyError::TooLarge { .. }) => Err(too_large()),
+        Err(error) => Err(unserializable(&error)),
     }
 }
 
@@ -682,12 +696,12 @@ pub(super) async fn policy_draft_create_endpoint(
         },
         None => live_policy.clone(),
     };
+    if let Err(response) = within_candidate_bound(&candidate) {
+        return *response;
+    }
     if let Err(response) =
         validate_policy_write_candidate(&state, rbac_state, &live_policy, &candidate)
     {
-        return *response;
-    }
-    if let Err(response) = within_candidate_bound(&candidate) {
         return *response;
     }
     let Some(draft_id) = new_policy_draft_id() else {
@@ -813,12 +827,12 @@ pub(super) async fn policy_draft_patch_endpoint(
         },
         None => draft.candidate,
     };
+    if let Err(response) = within_candidate_bound(&candidate) {
+        return *response;
+    }
     if let Err(response) =
         validate_policy_write_candidate(&state, rbac_state, &live_policy, &candidate)
     {
-        return *response;
-    }
-    if let Err(response) = within_candidate_bound(&candidate) {
         return *response;
     }
 
@@ -1360,12 +1374,12 @@ pub(super) async fn rule_suggestion_draft_endpoint(
         Ok(candidate) => candidate,
         Err(response) => return *response,
     };
+    if let Err(response) = within_candidate_bound(&candidate) {
+        return *response;
+    }
     if let Err(response) =
         validate_policy_write_candidate(&state.policy, rbac_state, &live_policy, &candidate)
     {
-        return *response;
-    }
-    if let Err(response) = within_candidate_bound(&candidate) {
         return *response;
     }
 

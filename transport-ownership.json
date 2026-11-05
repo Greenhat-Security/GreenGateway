@@ -4114,6 +4114,7 @@
           "signal-hook-registry",
           "socket2",
           "sync",
+          "test-util",
           "time",
           "tokio-macros",
           "windows-sys"
@@ -5468,6 +5469,26 @@
             "features": [
               "full",
               "visit"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "tokio",
+            "rename": null,
+            "kind": "dev",
+            "target": null,
+            "req": "^1.52.3",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "io-util",
+              "macros",
+              "net",
+              "rt-multi-thread",
+              "signal",
+              "sync",
+              "time",
+              "test-util"
             ],
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
@@ -6872,7 +6893,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "0df0079ba808b38d1d322ff5bb94b51b23dc1b9be50ba4d9a4322ce467a3af03",
+      "sha256": "e392257c9faecb9cc81d29b8cfc242f1523a312f77ed02a6d34a1e4d6eb715a9",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
