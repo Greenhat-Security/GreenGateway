@@ -1114,6 +1114,7 @@
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
           "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index",
           "sha2@0.11.1|registry+https://github.com/rust-lang/crates.io-index",
+          "url@2.5.8|registry+https://github.com/rust-lang/crates.io-index",
           "uuid@1.26.1|registry+https://github.com/rust-lang/crates.io-index"
         ]
       },
@@ -6300,6 +6301,17 @@
             "uses_default_features": true,
             "features": [],
             "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "url",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^2.5.7",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
           }
         ],
         "features": {},
@@ -7666,16 +7678,6 @@
       "purpose": "Authentication state or protocol handling; network requests consume the checked EgressClient API."
     },
     {
-      "file": "gateway/src/auth/principal.rs",
-      "reasons": [
-        "capability-import-or-glob"
-      ],
-      "scope": "gateway::auth::principal::provider_issuer#1",
-      "sha256": "b22b620cd109ea40f4aa11b8926ca69e8bc43e7fc90e7705761532ac90bae17d",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
-    },
-    {
       "file": "gateway/src/auth/principal_directory.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -8095,6 +8097,16 @@
       "sha256": "f35344af05310ce62d71cb4418df23165a4f4b7fe61773cdaa9b146fec815541",
       "owner": "GreenGateway maintainers",
       "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the bundle reader's secret-reference, placeholder and decimal value forms, which the field catalog (#242 PR 3) will call; pure parsing of an in-memory tree with no I/O and no transport or process capability."
+    },
+    {
+      "file": "gateway-config/src/inbound_tls.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway_config::inbound_tls::ClientCertMode#1",
+      "sha256": "cb25f41734e29125f71a5af1e3178ad926c9ef75e7f653b0675a7bac52506b4f",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Moved unchanged from gateway::inbound_tls for #242: the listener client-certificate mode the configuration compiler parses. Its only unexpanded input is the `#[default]` variant marker of a standard `Default` derive; a plain enum with no transport, file or process capability."
     },
     {
       "file": "gateway/src/config.rs",
@@ -10406,10 +10418,10 @@
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway::inbound_tls::use std :: { collections :: { HashMap , HashSet } , ffi :: OsString , fmt , fs , io , net :: SocketAddr , path :: { Path , PathBuf } , pin :: Pin , str :: FromStr , sync :: Arc , task :: { Context , Poll } , time :: Duration , }#1",
-      "sha256": "d1c08db6a823a0ee8835cfe318812a5ef2f9a0c16b6f035064bee3181c0c427c",
+      "scope": "gateway::inbound_tls::use std :: { collections :: { HashMap , HashSet } , ffi :: OsString , fmt , fs , io , net :: SocketAddr , path :: { Path , PathBuf } , pin :: Pin , sync :: Arc , task :: { Context , Poll } , time :: Duration , }#1",
+      "sha256": "bc79e991633c257ebb616e62b0ebc1b04d0c6dfe93c32bb0dea1d63fc95157ab",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review. Refreshed for #242: the same import without `str::FromStr`, whose last user moved to gateway-config with TlsMinVersion and ClientCertMode; no capability added."
     },
     {
       "file": "gateway/src/inbound_tls.rs",
@@ -10420,16 +10432,6 @@
       "sha256": "d33c7cad49f59b3c5f82a7349827e7e229fccdc3e3c19fe136d2ef9e3a8d5e99",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
-    },
-    {
-      "file": "gateway/src/inbound_tls.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::inbound_tls::ClientCertMode#1",
-      "sha256": "cb25f41734e29125f71a5af1e3178ad926c9ef75e7f653b0675a7bac52506b4f",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Inbound listener binding, TLS wrapping, admission or lifecycle management under operator configuration."
     },
     {
       "file": "gateway/src/inbound_tls.rs",
@@ -12202,6 +12204,16 @@
     {
       "file": "gateway/src/storage/postgres.rs",
       "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::storage::postgres::CheckoutClass#1",
+      "sha256": "532b97bf248ee8a1a4904beaee15d0689000aa766a5bdc1b2d23c7693568a469",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) on the PolicyReplay checkout-class variant, which only the cluster replay reader constructs until cluster replay routes run jobs (#243). A metric label vocabulary entry; dead-code gating only, no transport or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres.rs",
+      "reasons": [
         "unexpanded-macro"
       ],
       "scope": "gateway::storage::postgres::record_pool_acquire#1",
@@ -12510,6 +12522,117 @@
       "sha256": "a3ae50a4c225309e969e2992b81a42ffc30aa9b18ade0e67684a1f44b7243573",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_audit_replay.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::storage::postgres_audit_replay::file_attributes#1",
+      "sha256": "d1ee2ab112c8deac63271147fa247f89152e1c59017006284f9afdaec760ff93",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the cluster audit stream replay reader: cluster replay routes answer 503 until jobs run under #241's durable leases, so only tests call it. Dead-code gating only; the module reads the audit tables through the shared pool and adds no transport or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_audit_replay.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::storage::postgres_audit_replay::use tokio_postgres :: IsolationLevel#1",
+      "sha256": "a9b79b4190c4b0e82cfab8b819e6732a3fb22ddf3e46c43079f304da26eea7b7",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Imports the PostgreSQL driver's isolation-level enum to start read-only replay transactions on pooled connections; no connection constructor, socket or caller-selected authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_audit_replay.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_audit_replay::PostgresReplayReader#1",
+      "sha256": "aed0b8b01c395b184f783cb501f3fa6eaa742231d4cc7038db863e90a229e679",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository reads for historical policy replay through the shared infrastructure pool, under the policy_replay checkout class in short read-only transactions with SET LOCAL statement and lock timeouts; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_audit_replay.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_audit_replay::impl  PostgresReplayReader::new#1",
+      "sha256": "8ae7a49408fdb17b646a7912774af259e227f6f9c1f86c9d5789e7d3d1ebe7bd",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository reads for historical policy replay through the shared infrastructure pool, under the policy_replay checkout class in short read-only transactions with SET LOCAL statement and lock timeouts; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_audit_replay.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_audit_replay::impl  PostgresReplayReader::cutoff#1",
+      "sha256": "0c3698656e46125fdc80f67ca2a7944a034e8873d69164ce0a4f0a5214106fb7",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository reads for historical policy replay through the shared infrastructure pool, under the policy_replay checkout class in short read-only transactions with SET LOCAL statement and lock timeouts; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_audit_replay.rs",
+      "reasons": [
+        "network-or-process-reference",
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::storage::postgres_audit_replay::impl  PostgresReplayReader::read_page#1",
+      "sha256": "7f9b6a81044da23e37cd6eebf174bc2a64cd5de377bfa78e5baa4a6a0b979038",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository reads for historical policy replay through the shared infrastructure pool, under the policy_replay checkout class in short read-only transactions with SET LOCAL statement and lock timeouts; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_audit_replay.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_audit_replay::impl  PostgresReplayReader::check_window#1",
+      "sha256": "98c43285b1f0d6595f978b96be111ce2d74e1179c11f6e196b7bafd3b4a9f2a1",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository reads for historical policy replay through the shared infrastructure pool, under the policy_replay checkout class in short read-only transactions with SET LOCAL statement and lock timeouts; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_audit_replay.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_audit_replay::impl  PostgresReplayReader::read_only#1",
+      "sha256": "9eb9507c78ad7dc7387c2bf343f4fa9f06c622cc9bd92a46e115451791db2d4d",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository reads for historical policy replay through the shared infrastructure pool, under the policy_replay checkout class in short read-only transactions with SET LOCAL statement and lock timeouts; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_audit_replay.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_audit_replay::replay_row#1",
+      "sha256": "dca571955d1f32078229c58ecaac95e542eb82da2b35177c61fc22a85c2d60a4",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository reads for historical policy replay through the shared infrastructure pool, under the policy_replay checkout class in short read-only transactions with SET LOCAL statement and lock timeouts; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_audit_replay.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_audit_replay::column#1",
+      "sha256": "f8feb308cc09f288fa15030ea69a1c6a314205572e1be09d2a2695df039fbc39",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository reads for historical policy replay through the shared infrastructure pool, under the policy_replay checkout class in short read-only transactions with SET LOCAL statement and lock timeouts; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_audit_replay.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_audit_replay::classify#1",
+      "sha256": "985a175815c718185a80f6fde72b3d29487db0305ad63cd93a7ebe263cc860f4",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository reads for historical policy replay through the shared infrastructure pool, under the policy_replay checkout class in short read-only transactions with SET LOCAL statement and lock timeouts; no caller-selected HTTP authority and no new network or process capability."
     },
     {
       "file": "gateway/src/storage/postgres_audit.rs",

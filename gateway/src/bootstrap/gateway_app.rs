@@ -303,7 +303,7 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
             .transpose()?
             .map(|store| Arc::new(store) as Arc<dyn storage::PolicyDraftStore>);
     // Analyzer finding suppressions (issue #243, slice 15) live where drafts
-    // do: migration 27's table in cluster mode, and a
+    // do: migration 28's table in cluster mode, and a
     // `policy_analysis_suppressions` table in the policy history database in
     // standalone mode. A database that cannot be opened fails startup.
     #[cfg(feature = "postgres")]

@@ -983,12 +983,14 @@ fn the_stages_carry_locators_and_destinations_without_touching_them() {
 /// The configuration modules' code names no file, network, process or store
 /// API, and logs only the one warning the inventory documents.
 ///
-/// A scan of the source text outside comments, so it holds what these files
-/// call directly; it does not follow a call into another module. The ones the
-/// stages reach -- path matching, cookie-token and issuer canonicalization,
-/// route and Connection ID shapes, header-name parsing, and the Connections
-/// validators that check alias, keyring and provider documents -- are
-/// functions of their arguments alone.
+/// A scan of the source text outside comments and string literals, so it
+/// holds what these files call directly; it does not follow a call into
+/// another module. It also reads the `gateway-config` modules the stages call
+/// into (issue #242): path matching, cookie-token and issuer canonicalization,
+/// the route and Connection ID shapes, the request bounds, the TLS, admin
+/// session and discovery settings, and the Connections validators that check
+/// alias, keyring and provider documents. Header-name parsing, the one other
+/// call, is the `http` crate's.
 ///
 /// The outbound HTTP client is not listed: `scripts/check-egress-only.sh`
 /// already refuses it by name anywhere but `gateway/src/egress.rs`, these
@@ -1031,12 +1033,28 @@ fn the_configuration_modules_name_no_input_or_output_api() {
         ("src/config/semantic_diff.rs", 0),
         ("src/config/stage.rs", 0),
         ("src/config/storage.rs", 0),
+        ("../gateway-config/src/auth.rs", 0),
+        ("../gateway-config/src/connections.rs", 0),
+        ("../gateway-config/src/connections/aws_secret.rs", 0),
+        ("../gateway-config/src/connections/azure_secret.rs", 0),
+        ("../gateway-config/src/connections/gcp_secret.rs", 0),
+        ("../gateway-config/src/connections/kubernetes_secret.rs", 0),
+        ("../gateway-config/src/connections/local_secret.rs", 0),
+        ("../gateway-config/src/connections/secret.rs", 0),
+        ("../gateway-config/src/connections/vault_secret.rs", 0),
+        ("../gateway-config/src/discovery.rs", 0),
+        ("../gateway-config/src/inbound_tls.rs", 0),
+        ("../gateway-config/src/opaque_id.rs", 0),
+        ("../gateway-config/src/path_match.rs", 0),
+        ("../gateway-config/src/request_bounds.rs", 0),
+        ("../gateway-config/src/upstream_route.rs", 0),
     ] {
         let source = fs::read_to_string(crate_root.join(file))
             .unwrap_or_else(|error| panic!("failed to read {file}: {error}"));
-        let code: Vec<&str> = source
+        let code: Vec<String> = source
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
+            .map(outside_string_literals)
             .collect();
         for forbidden in FORBIDDEN {
             assert!(
@@ -1052,6 +1070,52 @@ fn the_configuration_modules_name_no_input_or_output_api() {
             "{file} logs a different number of times than the inventory documents"
         );
     }
+}
+
+/// `line` without the contents of the string literals it opens and closes, so
+/// a message that names an operation (a root that "cannot be canonicalized")
+/// is not taken for a call to it. A literal left open at the end of the line
+/// is dropped to the end of the line; the lines that continue it are scanned
+/// as code, which can only refuse more.
+fn outside_string_literals(line: &str) -> String {
+    let mut code = String::with_capacity(line.len());
+    let mut in_literal = false;
+    let mut escaped = false;
+    for character in line.chars() {
+        if in_literal {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_literal = false;
+                code.push(character);
+            }
+        } else {
+            if character == '"' {
+                in_literal = true;
+            }
+            code.push(character);
+        }
+    }
+    code
+}
+
+#[test]
+fn the_scan_reads_code_around_string_literals_but_not_inside_them() {
+    assert_eq!(
+        outside_string_literals(r#"write!(f, "cannot be canonicalized: {x}")"#),
+        r#"write!(f, "")"#
+    );
+    assert_eq!(
+        outside_string_literals(r#"let a = "\"fs::"; std::fs::read(a)"#),
+        r#"let a = ""; std::fs::read(a)"#
+    );
+    assert_eq!(outside_string_literals(r#"call("open"#), r#"call(""#);
+    assert_eq!(
+        outside_string_literals("tokio::spawn(task)"),
+        "tokio::spawn(task)"
+    );
 }
 
 /// One fixture per rule, and the variable its one diagnostic names.

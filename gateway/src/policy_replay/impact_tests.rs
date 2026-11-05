@@ -10,7 +10,10 @@ use serde_json::{json, Value};
 
 use super::{
     impact::{ReplayPolicies, MAX_IMPACT_ELEMENT_ROWS},
-    job::{run, ReplayControl, ReplayOutcome, ReplayScope, ReplaySource, ReplaySourceError},
+    job::{
+        run, ReplayControl, ReplayOutcome, ReplayScope, ReplaySource, ReplaySourceCheck,
+        ReplaySourceError,
+    },
 };
 use crate::{
     audit::{
@@ -262,6 +265,10 @@ impl Window {
 }
 
 impl ReplaySource for Window {
+    fn kind(&self) -> &'static str {
+        "test_rows"
+    }
+
     fn page(&self, query: &ReplayPageQuery) -> Result<Vec<(i64, ReplayRow)>, ReplaySourceError> {
         Ok(self
             .events
@@ -273,8 +280,11 @@ impl ReplaySource for Window {
             .collect())
     }
 
-    fn window_count(&self, _scope: &ReplayScope) -> Result<u64, ReplaySourceError> {
-        Ok(u64::try_from(self.events.len()).expect("a test count fits"))
+    fn check(&self, _scope: &ReplayScope) -> Result<ReplaySourceCheck, ReplaySourceError> {
+        Ok(ReplaySourceCheck {
+            stored: u64::try_from(self.events.len()).expect("a test count fits"),
+            pruned: false,
+        })
     }
 }
 

@@ -1,6 +1,6 @@
 //! PostgreSQL policy analysis suppression store (issue #243, slice 15).
 //!
-//! Implements [`AnalysisSuppressionStore`] against migration 27's
+//! Implements [`AnalysisSuppressionStore`] against migration 28's
 //! `greengateway.policy_analysis_suppressions`, so every replica of a
 //! cluster marks the same findings suppressed. The contract is the one the
 //! standalone SQLite store satisfies (`storage::analysis_suppressions`);

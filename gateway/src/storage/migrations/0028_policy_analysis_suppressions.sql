@@ -1,4 +1,4 @@
--- Migration 27: policy analysis suppressions (issue #243, slice 15).
+-- Migration 28: policy analysis suppressions (issue #243, slice 15).
 --
 -- A suppression is an operator's reviewed decision that one structural
 -- analyzer finding needs no change until a stated time. It is advisory
