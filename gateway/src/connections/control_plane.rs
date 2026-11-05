@@ -8,6 +8,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::sync::{
     Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, OwnedSemaphorePermit, Semaphore,
@@ -83,9 +84,16 @@ const JWKS_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Longest a JWKS fetch waits for a build another fetch started, when it has
 /// no set built from the current configuration to serve meanwhile. A build
-/// reads each key in turn, each read bounded by its provider's own deadline;
-/// a fetch that would wait longer is answered `503` instead of held open.
+/// reads up to [`JWKS_CONCURRENT_KEY_READS`] aliases at a time, each read
+/// bounded by its provider's own deadline; a fetch that would wait longer is
+/// answered `503` instead of held open.
 const JWKS_BUILD_WAIT: Duration = Duration::from_secs(10);
+
+/// How many distinct aliases one JWKS build reads at once. Reading them side
+/// by side keeps a build of many keys from taking the sum of every provider
+/// round trip, and the bound keeps one unauthenticated fetch from putting a
+/// whole configuration's worth of reads on the providers at the same moment.
+const JWKS_CONCURRENT_KEY_READS: usize = 4;
 
 /// How many builds one fetch runs before giving up when every one of them is
 /// overtaken by a save. Two covers the race one save can cause; a fetch that
@@ -2206,20 +2214,31 @@ impl ConnectionControlPlane {
         &self,
         bindings: Vec<PublishedKeyBinding>,
     ) -> (CachedJwks, Vec<BuildFinding>) {
-        // One read per alias, however many keys or Connections name it.
-        let mut materials = BTreeMap::new();
-        for binding in &bindings {
-            let alias = &binding.key.signing_key_id;
-            if materials.contains_key(alias) {
-                continue;
-            }
-            let material = self
-                .secret_resolver
-                .resolve(alias, SecretPurpose::AssertionSigningKey)
-                .await
-                .map_err(|error| error.kind());
-            materials.insert(alias.clone(), material);
-        }
+        // One read per alias, however many keys or Connections name it, and
+        // at most `JWKS_CONCURRENT_KEY_READS` of them in flight at once. The
+        // outcomes are keyed by alias, so the order the reads finish in
+        // changes nothing below, and a read that fails leaves out only the
+        // Connections that name its alias. Each read owns its alias and a
+        // resolver handle: a read that borrowed its alias would keep the
+        // fetch from meeting its handler's `Send` bound.
+        let aliases = bindings
+            .iter()
+            .map(|binding| binding.key.signing_key_id.clone())
+            .collect::<BTreeSet<_>>();
+        let materials = futures_util::stream::iter(aliases)
+            .map(|alias| {
+                let resolver = Arc::clone(&self.secret_resolver);
+                async move {
+                    let material = resolver
+                        .resolve(&alias, SecretPurpose::AssertionSigningKey)
+                        .await
+                        .map_err(|error| error.kind());
+                    (alias, material)
+                }
+            })
+            .buffer_unordered(JWKS_CONCURRENT_KEY_READS)
+            .collect::<BTreeMap<_, _>>()
+            .await;
 
         let mut connections: Vec<BuiltConnectionKeys> = Vec::new();
         for binding in &bindings {
@@ -3677,6 +3696,26 @@ mod tests {
     fn vault_config_declaring(
         alias_id: &str,
     ) -> crate::connections::vault_secret::VaultProviderConfig {
+        vault_config_declaring_each(&[alias_id])
+    }
+
+    /// [`vault_config_declaring`] for several aliases at once.
+    fn vault_config_declaring_each(
+        alias_ids: &[&str],
+    ) -> crate::connections::vault_secret::VaultProviderConfig {
+        let aliases = alias_ids
+            .iter()
+            .map(|alias_id| {
+                serde_json::json!({
+                    "id": alias_id,
+                    "label": "Deferred client certificate",
+                    "profile": "test-profile",
+                    "mount": "secret",
+                    "path": "clients/gateway",
+                    "key": "certificate"
+                })
+            })
+            .collect::<Vec<_>>();
         serde_json::from_value(serde_json::json!({
             "profiles": [{
                 "id": "test-profile",
@@ -3689,14 +3728,7 @@ mod tests {
                     "token_file": "vault-token"
                 }
             }],
-            "aliases": [{
-                "id": alias_id,
-                "label": "Deferred client certificate",
-                "profile": "test-profile",
-                "mount": "secret",
-                "path": "clients/gateway",
-                "key": "certificate"
-            }]
+            "aliases": aliases
         }))
         .expect("test vault provider config should deserialize")
     }
@@ -6367,25 +6399,36 @@ mod tests {
         );
     }
 
-    /// Network provider serving one key that counts every read and holds each
-    /// read until the test releases it.
+    /// Network provider serving one key, or the same key under several
+    /// aliases, that counts every read and holds each read until the test
+    /// releases it.
     ///
     /// The material is taken when a read starts, not when it is released, so
     /// a read held across a change of material answers with what the alias
     /// held before -- a provider read that was in flight while the key was
     /// replaced.
     struct GatedKeyProvider {
-        alias_id: &'static str,
+        alias_ids: Vec<String>,
         pem: Mutex<String>,
+        /// Aliases whose reads, once released, fail as an unreachable
+        /// provider would.
+        unavailable: Mutex<BTreeSet<String>>,
         reads: std::sync::atomic::AtomicUsize,
         gate: Semaphore,
     }
 
     impl GatedKeyProvider {
-        fn new(alias_id: &'static str, pem: String) -> Self {
+        fn new(alias_id: &str, pem: String) -> Self {
+            Self::serving(&[alias_id], pem)
+        }
+
+        /// One provider for every alias in `alias_ids`, each holding `pem`
+        /// and each read held at the same gate.
+        fn serving(alias_ids: &[&str], pem: String) -> Self {
             Self {
-                alias_id,
+                alias_ids: alias_ids.iter().map(|alias| (*alias).to_owned()).collect(),
                 pem: Mutex::new(pem),
+                unavailable: Mutex::new(BTreeSet::new()),
                 reads: std::sync::atomic::AtomicUsize::new(0),
                 gate: Semaphore::new(0),
             }
@@ -6401,6 +6444,13 @@ mod tests {
 
         fn replace_material(&self, pem: String) {
             *self.pem.lock().expect("gated material lock") = pem;
+        }
+
+        fn make_unavailable(&self, alias_id: &str) {
+            self.unavailable
+                .lock()
+                .expect("gated unavailable lock")
+                .insert(alias_id.to_owned());
         }
 
         async fn wait_for_reads(&self, reads: usize) {
@@ -6431,10 +6481,21 @@ mod tests {
                     SecretResolveError::new(alias_id, SecretResolveErrorKind::ProviderFailure)
                 })?
                 .forget();
-            if alias_id != self.alias_id {
+            if !self.contains_alias(alias_id) {
                 return Err(SecretResolveError::new(
                     alias_id,
                     SecretResolveErrorKind::UnknownAlias,
+                ));
+            }
+            if self
+                .unavailable
+                .lock()
+                .expect("gated unavailable lock")
+                .contains(alias_id)
+            {
+                return Err(SecretResolveError::new(
+                    alias_id,
+                    SecretResolveErrorKind::ProviderFailure,
                 ));
             }
             ResolvedSecret::new(purpose, material.into_bytes()).map_err(|_| {
@@ -6443,11 +6504,14 @@ mod tests {
         }
 
         fn contains_alias(&self, alias_id: &str) -> bool {
-            alias_id == self.alias_id
+            self.alias_ids.iter().any(|served| served == alias_id)
         }
 
         fn aliases(&self) -> Vec<SecretAliasMetadata> {
-            vec![network_alias_metadata(self.alias_id)]
+            self.alias_ids
+                .iter()
+                .map(|alias_id| network_alias_metadata(alias_id))
+                .collect()
         }
     }
 
@@ -6868,6 +6932,252 @@ mod tests {
             .await
             .expect("a fetch with no save in its way publishes");
         assert_eq!(published_kids(&settled), vec!["gw-busy"]);
+    }
+
+    /// A control plane whose `alias_ids` are deferred aliases served by one
+    /// gated provider, with nothing built yet.
+    fn gated_control_plane(
+        name: &str,
+        alias_ids: &[&str],
+    ) -> (
+        TemporaryLocalControlPlane,
+        ConnectionControlPlane,
+        Arc<GatedKeyProvider>,
+    ) {
+        let temporary = TemporaryLocalControlPlane::new(name);
+        let mut config = temporary.config();
+        config.connection_vault_provider = vault_config_declaring_each(alias_ids);
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let provider = Arc::new(GatedKeyProvider::serving(alias_ids, es256_pem()));
+        control_plane.install_network_secret_providers(vec![
+            Arc::clone(&provider) as Arc<dyn SecretResolver>
+        ]);
+        (temporary, control_plane, provider)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_with_no_set_to_serve_waits_out_the_build_wait_then_is_answered_unavailable() {
+        let (_temporary, control_plane, provider) =
+            gated_control_plane("assertion-jwks-build-wait", &["gated-key"]);
+        let snapshot = control_plane.runtime_snapshot();
+        control_plane
+            .create_managed(
+                snapshot.collection_etag(),
+                attested_candidate("gated-key", "gw-held", "es256", serde_json::json!([])),
+                &ChangeActor::for_test("test-admin"),
+            )
+            .await
+            .expect("attested Connection should create");
+
+        // The first fetch takes the build lock, and its read is held. No set
+        // has been built yet, so there is nothing to serve meanwhile.
+        let building = {
+            let control_plane = control_plane.clone();
+            tokio::spawn(async move { control_plane.caller_assertion_jwks().await })
+        };
+        provider.wait_for_reads(1).await;
+        assert!(control_plane.caller_assertion_keys.last_built().is_none());
+
+        // A second fetch waits for that build, and no longer than the build
+        // wait: then it is answered unavailable rather than held open.
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            tokio::time::timeout(JWKS_BUILD_WAIT * 2, control_plane.caller_assertion_jwks())
+                .await
+                .expect("a fetch must not wait on a build past the build wait"),
+            Err(CallerAssertionJwksUnavailable)
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= JWKS_BUILD_WAIT && waited < JWKS_BUILD_WAIT + Duration::from_secs(1),
+            "the fetch should give up after the build wait, not after {waited:?}"
+        );
+        // Giving up read no key, cached nothing and recorded nothing.
+        assert_eq!(provider.reads(), 1);
+        assert!(
+            control_plane.caller_assertion_keys.last_built().is_none(),
+            "a fetch that gave up must cache nothing"
+        );
+        assert!(control_plane.caller_assertion_keys.problems().is_empty());
+        assert!(!building.is_finished());
+
+        // The build it gave up on is unaffected: once its read is released it
+        // commits, and later fetches are served what it built.
+        provider.release_one();
+        let built = building
+            .await
+            .expect("the build task should finish")
+            .expect("the held build should publish");
+        assert_eq!(published_kids(&built), vec!["gw-held"]);
+        let cached = control_plane
+            .caller_assertion_keys
+            .last_built()
+            .expect("the held build should be cached");
+        assert!(Arc::ptr_eq(&cached.document, &built));
+        let again = control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("the cached set should serve");
+        assert!(Arc::ptr_eq(&again, &built));
+        assert_eq!(provider.reads(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_that_waited_for_a_build_publishes_from_the_configuration_saved_meanwhile() {
+        let (_temporary, control_plane, provider) =
+            gated_control_plane("assertion-jwks-waited-reread", &["gated-key"]);
+        let snapshot = control_plane.runtime_snapshot();
+        let created = control_plane
+            .create_managed(
+                snapshot.collection_etag(),
+                attested_candidate("gated-key", "gw-before", "es256", serde_json::json!([])),
+                &ChangeActor::for_test("test-admin"),
+            )
+            .await
+            .expect("attested Connection should create");
+
+        // The first fetch takes the build lock, and its read is held.
+        let building = {
+            let control_plane = control_plane.clone();
+            tokio::spawn(async move { control_plane.caller_assertion_jwks().await })
+        };
+        provider.wait_for_reads(1).await;
+        // A second fetch reads the configuration, finds no set for it and
+        // waits for the build. Sleeping lets it run until it does.
+        let waiting = {
+            let control_plane = control_plane.clone();
+            tokio::spawn(async move { control_plane.caller_assertion_jwks().await })
+        };
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(!waiting.is_finished());
+
+        // While both wait, the Connection is saved with another `kid`, so the
+        // bindings the waiting fetch read are no longer the configuration.
+        let saved = control_plane
+            .replace_managed(
+                &created.id,
+                &created.etag(),
+                attested_candidate("gated-key", "gw-after", "es256", serde_json::json!([])),
+                &ChangeActor::for_test("test-admin"),
+            )
+            .await
+            .expect("the new kid should save");
+        assert_eq!(provider.reads(), 1, "saving must not read a deferred key");
+
+        // The held read returns into a build the save voided, and the first
+        // fetch builds again from the saved configuration.
+        provider.release_one();
+        provider.release_one();
+        let rebuilt = building
+            .await
+            .expect("the build task should finish")
+            .expect("the saved kid should publish");
+        assert_eq!(published_kids(&rebuilt), vec!["gw-after"]);
+
+        // The fetch that waited reads the configuration again once it holds
+        // the lock: it neither publishes the bindings it read before the save
+        // nor repeats the build it waited for.
+        let waited = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the waiting fetch must not read the keys again")
+            .expect("the waiting task should finish")
+            .expect("the waiting fetch should be served");
+        assert!(Arc::ptr_eq(&waited, &rebuilt));
+        assert_eq!(provider.reads(), 2);
+        let cached = control_plane
+            .caller_assertion_keys
+            .last_built()
+            .expect("the rebuilt set should be cached");
+        assert!(Arc::ptr_eq(&cached.document, &rebuilt));
+        assert_eq!(
+            cached.bindings,
+            published_key_bindings(&control_plane.runtime_snapshot())
+        );
+        assert_eq!(control_plane.caller_assertion_key_problem(&saved), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_build_reads_distinct_aliases_side_by_side_up_to_its_bound() {
+        // One more alias than a build reads at once, each the signing key of
+        // its own Connection. The provider fails reads of the last one.
+        let names = (0..=JWKS_CONCURRENT_KEY_READS)
+            .map(|index| (format!("gated-key-{index}"), format!("gw-{index}")))
+            .collect::<Vec<_>>();
+        let aliases = names
+            .iter()
+            .map(|(alias, _)| alias.as_str())
+            .collect::<Vec<_>>();
+        let (_temporary, control_plane, provider) =
+            gated_control_plane("assertion-jwks-concurrent-reads", &aliases);
+        let (unavailable_alias, unavailable_kid) = names.last().expect("there are aliases");
+        provider.make_unavailable(unavailable_alias);
+        // A further Connection shares the first one's key.
+        let connections = names
+            .iter()
+            .map(|(alias, kid)| (alias.as_str(), kid.as_str()))
+            .chain([("gated-key-0", "gw-0")]);
+        let mut created = Vec::new();
+        for (alias, kid) in connections {
+            let snapshot = control_plane.runtime_snapshot();
+            let record = control_plane
+                .create_managed(
+                    snapshot.collection_etag(),
+                    attested_candidate(alias, kid, "es256", serde_json::json!([])),
+                    &ChangeActor::for_test("test-admin"),
+                )
+                .await
+                .expect("each Connection should create");
+            created.push((kid.to_owned(), record));
+        }
+
+        let fetch = {
+            let control_plane = control_plane.clone();
+            tokio::spawn(async move { control_plane.caller_assertion_jwks().await })
+        };
+        // As many reads as a build may have in flight start before any of
+        // them returns, and no more: given every chance to run, the build
+        // starts no further read until one returns.
+        provider.wait_for_reads(JWKS_CONCURRENT_KEY_READS).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(provider.reads(), JWKS_CONCURRENT_KEY_READS);
+        assert!(!fetch.is_finished());
+
+        // One read returns, and the next alias is read in its place.
+        provider.release_one();
+        provider.wait_for_reads(JWKS_CONCURRENT_KEY_READS + 1).await;
+        for _ in 0..JWKS_CONCURRENT_KEY_READS {
+            provider.release_one();
+        }
+        let published = fetch
+            .await
+            .expect("the build task should finish")
+            .expect("the readable keys should publish");
+
+        // Each alias was read once, though two Connections name the first.
+        assert_eq!(provider.reads(), JWKS_CONCURRENT_KEY_READS + 1);
+        let readable = names
+            .iter()
+            .map(|(_, kid)| kid.clone())
+            .filter(|kid| kid != unavailable_kid)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            published_kids(&published),
+            readable.into_iter().collect::<Vec<_>>()
+        );
+        // The read that failed leaves out its own Connection and nothing else.
+        for (kid, record) in &created {
+            let expected = if kid == unavailable_kid {
+                key_problem("caller_assertion.signing_key_id", KEY_PROBLEM_UNAVAILABLE)
+            } else {
+                None
+            };
+            assert_eq!(
+                control_plane.caller_assertion_key_problem(record),
+                expected,
+                "{kid}"
+            );
+        }
     }
 
     #[tokio::test]

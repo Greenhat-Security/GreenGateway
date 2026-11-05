@@ -1,23 +1,28 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    time::UNIX_EPOCH,
-};
+use std::{fs, path::PathBuf, time::UNIX_EPOCH};
 
 use super::*;
 use crate::bundle::{BundleReport, Code};
 use crate::ledger::AuthMode;
+use crate::state_dir::StateDirectory;
 
 /// A role name that must never reach an error, a plan or a record.
 const CANARY: &str = "zqcanary";
 
 // --- fixtures -------------------------------------------------------------------
 
-struct TempDir(PathBuf);
+/// A temporary state directory, held under its lock for as long as the
+/// fixture lives, as a gateway would hold it.
+struct TempDir {
+    path: PathBuf,
+    held: Option<StateDirectory>,
+}
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        // Released before the directory is removed: Windows will not remove
+        // a directory with an open file in it.
+        self.held.take();
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -34,11 +39,15 @@ impl TempDir {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
                 .expect("permissions should set");
         }
-        Self(path)
+        let held = StateDirectory::acquire(&path).expect("the state directory locks");
+        Self {
+            path,
+            held: Some(held),
+        }
     }
 
-    fn path(&self) -> &Path {
-        &self.0
+    fn held(&self) -> &StateDirectory {
+        self.held.as_ref().expect("held until the fixture drops")
     }
 }
 
@@ -158,7 +167,7 @@ fn seeded(
 ) {
     let state = TempDir::new(label);
     let (mut ledger, seed) =
-        RevisionLedger::seed(state.path(), &read(files(roles)), operator(), at(0)).expect("seed");
+        RevisionLedger::seed(state.held(), &read(files(roles)), operator(), at(0)).expect("seed");
     ledger.activate(&seed.revision).expect("activate the seed");
     (
         state,
@@ -262,7 +271,7 @@ fn a_plan_reports_the_change_and_its_apply_records_a_live_revision() {
 
     // And the revision survives a reopen with its request.
     drop(service);
-    let mut reopened = RevisionLedger::open(state.path()).expect("reopen");
+    let mut reopened = RevisionLedger::open(state.held()).expect("reopen");
     let verified = reopened.verify().expect("verify");
     assert_eq!(verified.desired, applied.revision);
     assert_eq!(verified.active, Some(applied.revision.revision.clone()));
@@ -393,10 +402,10 @@ fn two_applies_on_one_head_have_exactly_one_winner() {
     );
     assert_eq!(revisions(&mut service), 2);
 
-    // Two services on one ledger, as two processes would hold it: both plan
-    // against the same head and only the first apply is recorded.
+    // Two services on one ledger, through one held state directory: both
+    // plan against the same head and only the first apply is recorded.
     let mut other = RevisionService::new(
-        RevisionLedger::open(state.path()).expect("second handle"),
+        RevisionLedger::open(state.held()).expect("second handle"),
         PublishedSchemasCompiler,
     );
     let here = PlanSubject::Bundle(files(&["auditor", "reviewer"]));
@@ -738,7 +747,7 @@ fn a_live_change_staged_only_leaves_the_active_revision() {
 fn a_ledger_not_yet_activated_takes_staged_revisions_only() {
     let state = TempDir::new("unactivated");
     let (ledger, _seed) = RevisionLedger::seed(
-        state.path(),
+        state.held(),
         &read(files(&["auditor", "operator"])),
         operator(),
         at(0),
@@ -967,7 +976,7 @@ fn stored_content_is_held_to_the_current_validators() {
     // A rollback to content the current validators refuse is refused, with
     // the reader's own diagnostics.
     let mut stricter = RevisionService::new(
-        RevisionLedger::open(state.path()).expect("reopen"),
+        RevisionLedger::open(state.held()).expect("reopen"),
         StricterCompiler,
     );
     match stricter.create_plan(
@@ -987,7 +996,7 @@ fn stored_content_is_held_to_the_current_validators() {
     // A head the current validators refuse cannot be planned against.
     let state = TempDir::new("stricter-head");
     let (ledger, _seed) =
-        RevisionLedger::seed(state.path(), &read(files(&["legacy"])), operator(), at(0))
+        RevisionLedger::seed(state.held(), &read(files(&["legacy"])), operator(), at(0))
             .expect("seed");
     let mut stricter = RevisionService::new(ledger, StricterCompiler);
     assert_eq!(

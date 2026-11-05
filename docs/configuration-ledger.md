@@ -10,15 +10,17 @@ gateway and `ggctl` use the same code.
 
 What exists today is the ledger, the conditional plan, apply, history and
 rollback service over it ([Plans and conditional apply](#plans-and-conditional-apply),
-`gateway_config::revisions`), and their tests. Nothing creates or reads a
-ledger yet: there is no ledger startup mode, no `GATEWAY_STATE_DIR`, no `ggctl
-ledger` or `ggctl plan`/`apply` command and no admin route. Environment
+`gateway_config::revisions`), the state-directory lock it opens under
+([below](#the-state-directory-lock)), and their tests. Nothing creates or reads
+a ledger yet: there is no ledger startup mode, no `GATEWAY_STATE_DIR`, no
+`ggctl ledger` or `ggctl plan`/`apply` command and no admin route. Environment
 configuration and startup are unchanged.
 
 ## Layout
 
-The ledger is the file `config-ledger.sqlite3` in the state directory, with
-SQLite's `-wal` and `-shm` files beside it while it is open. The database
+The ledger is the file `config-ledger.sqlite3` in the state directory, one of
+the [fixed state-directory names](configuration-bundles.md#the-state-directory),
+with SQLite's `-wal` and `-shm` files beside it while it is open. The database
 identifies itself with `PRAGMA application_id` `0x47474C47` ("GGLG") and
 `PRAGMA user_version` `1`, and uses the discipline of the existing standalone
 stores: WAL journaling, `synchronous = FULL`, immediate write transactions,
@@ -36,6 +38,21 @@ It holds four tables, all `STRICT`:
 Triggers refuse every update and delete of revisions, documents and request
 rows, an insert out of sequence, deleting the pointer, and moving either
 pointer backwards. A rollback is therefore always a new forward revision.
+
+## The state directory lock
+
+A ledger is opened and seeded only through a held state directory
+(`gateway_config::state_dir::StateDirectory`): `RevisionLedger::open` and
+`RevisionLedger::seed` take one, so no caller can reach a ledger without
+first taking the directory's exclusive lock on `state.lock`. Each open ledger
+keeps a share of that lock until it closes, whatever happens to the handle it
+was opened through. So while a gateway has its ledger open, an offline `ggctl
+ledger` command cannot open it, and the other way round: the second process
+gets `state_dir.locked` before anything is read. Two ledger handles in one
+process share one held directory, and their writes still serialize through
+SQLite's write lock and compare-and-set on the head. The directory's admission
+rules, the lock's semantics and its codes are described with the
+[state directory](configuration-bundles.md#the-state-directory).
 
 ## Records
 
@@ -87,7 +104,8 @@ reordering any revision changes every later hash.
   when no restart is pending, that is when the head being replaced was active;
   a `restart` revision, a staged one, or any revision while a restart is
   pending, moves only the desired pointer. Two writers appending on the same
-  head, in one process or two, get exactly one winner. A request whose
+  head get exactly one winner; they are in one process, because the
+  state-directory lock keeps a second process out. A request whose
   acknowledged risk codes are not the revision's is refused
   (`acknowledgement_mismatch`).
 - **Rollback** appends a new revision whose bundle must have the target's
@@ -103,9 +121,11 @@ reordering any revision changes every later hash.
 Opening a ledger verifies all of it before anything else is read or written,
 and fails closed:
 
-1. The state directory must be a directory, not a link or reparse point, and
-   on Unix not writable by group or other; the ledger must be a regular file,
-   not a link or reparse point, and on Unix not writable by group or other.
+1. The state directory, which the caller already holds under its lock, must
+   still be a directory, not a link or reparse point, and on Unix not writable
+   by group or other, so permissions widened since it was locked are refused;
+   the ledger must be a regular file, not a link or reparse point, and on Unix
+   not writable by group or other.
 2. The header must name a version-1 ledger (a newer one is
    `ledger.unsupported`), and `PRAGMA quick_check` must pass.
 3. The schema must be exactly the ledger's tables and triggers, with nothing
@@ -280,9 +300,9 @@ slices.
 ## Not yet
 
 Selecting ledger mode at startup (and refusing to start on an empty, unreadable
-or unverifiable ledger), publishing a live revision's runtime snapshot, the
-state-directory lock that keeps offline `ggctl ledger` commands and a running
-gateway apart, `ggctl ledger seed`, `verify` and `rollback`, the admin routes
+or unverifiable ledger, and holding the state-directory lock for the life of
+the process), publishing a live revision's runtime snapshot, `ggctl ledger
+seed`, `verify` and `rollback`, the admin routes
 and `ggctl plan`, `apply`, `history` and `rollback` that will serve the
 service above, online activation of a staged revision, delivery of the
 revisions' evidence to the audit pipeline, protected status, and pruning are

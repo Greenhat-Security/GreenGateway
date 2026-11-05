@@ -302,6 +302,14 @@ pub(super) fn inspect_policy_for_deployment(
             detail,
         );
     }
+    let size_error = inspection.policy().and_then(policy_file_size_refusal);
+    if let Some(detail) = size_error {
+        inspection.refuse(
+            rbac::policy_document::IssueCode::PolicyFileTooLarge,
+            "",
+            detail,
+        );
+    }
     inspection
 }
 
@@ -771,6 +779,7 @@ pub(super) async fn policy_rules_order_put_endpoint(
 
 pub(super) async fn policy_rule_preview_endpoint(
     State(state): State<PolicyAdminState>,
+    Extension(limiter): Extension<Arc<PolicyEvaluationLimiter>>,
     request: AxumRequest,
 ) -> Response {
     record_request(POLICY_RULE_PREVIEW_ADMIN_ROUTE);
@@ -799,8 +808,20 @@ pub(super) async fn policy_rule_preview_endpoint(
         Ok(request) => request,
         Err(errors) => return policy_validation_failed(errors),
     };
+    // Admitted once the request is read and valid, so a slot bounds scans
+    // doing work, and one caller holds at most one.
+    let Some(slot) = limiter.try_acquire(policy_evaluation_actor(principal)) else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": "too many policy rule previews are in progress; retry later",
+                "reason": "policy_rule_preview_busy",
+            })),
+        )
+            .into_response();
+    };
 
-    let previewed = match preview_rule(query_store.as_ref(), preview_request).await {
+    let previewed = match preview_rule(query_store.as_ref(), preview_request, slot).await {
         Ok(response) => response,
         Err(err) => {
             tracing::error!(error = %err, "failed to preview policy rule");
@@ -1442,6 +1463,17 @@ pub(super) fn validate_rule_preview_request(
     if has_tool_name {
         errors.push("rule preview currently supports HTTP path rules only".to_owned());
     }
+    // A condition reads facts a retained observation does not capture, so
+    // every scanned row would be unevaluated however the tree is built, and
+    // an unvalidated tree is evaluated once per row. Refused before any row
+    // is read, as no other bound on its size exists here.
+    if request.rule.conditions.is_some() {
+        errors.push(
+            "rule preview does not support conditions: retained observations do not capture \
+             the facts conditions read"
+                .to_owned(),
+        );
+    }
     if has_path && !request.rule.path.starts_with('/') {
         errors.push(format!(
             "rule.path must start with '/', got '{}'",
@@ -1475,8 +1507,16 @@ pub(super) fn validate_rule_preview_request(
 pub(super) async fn preview_rule(
     query_store: &dyn storage::AuditEventStore,
     request: PolicyRulePreviewRequest,
+    slot: PolicyEvaluationSlot,
 ) -> Result<PolicyRulePreviewResponse, RulePreviewError> {
-    preview_rule_with_scan_limit(query_store, request, MAX_RULE_PREVIEW_SCAN_ROWS).await
+    preview_rule_within(
+        query_store,
+        request,
+        slot,
+        MAX_RULE_PREVIEW_SCAN_ROWS,
+        Instant::now() + POLICY_RULE_PREVIEW_DEADLINE,
+    )
+    .await
 }
 
 /// Why a rule preview failed instead of answering.
@@ -1488,6 +1528,8 @@ pub(super) enum RulePreviewError {
     /// observation's facts. Only a preview bug can cause that, and ADR-0004
     /// fails an analysis on it rather than counting around it.
     Evaluation(policy_eval::EvaluationError),
+    /// A page's evaluation did not finish on its blocking thread.
+    Interrupted(tokio::task::JoinError),
 }
 
 impl std::fmt::Display for RulePreviewError {
@@ -1495,6 +1537,7 @@ impl std::fmt::Display for RulePreviewError {
         match self {
             Self::Storage(error) => write!(formatter, "audit store read failed: {error}"),
             Self::Evaluation(error) => write!(formatter, "policy evaluation failed: {error:?}"),
+            Self::Interrupted(error) => write!(formatter, "policy evaluation interrupted: {error}"),
         }
     }
 }
@@ -1520,34 +1563,117 @@ pub(super) enum PreviewObservationOutcome {
     Unevaluated(&'static str),
 }
 
+/// What stopped a rule preview before it judged every pre-filtered
+/// observation in its window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RulePreviewStop {
+    /// An observation was left after the scan ceiling.
+    Ceiling,
+    /// The deadline passed with an observation still to judge.
+    Deadline,
+}
+
+/// A rule preview's running count. Each page of observations is judged on a
+/// blocking thread, which takes the count and hands it back, so a scan never
+/// evaluates on an async worker.
+struct RulePreviewScan {
+    candidate: policy_eval::CompiledPolicy,
+    sample_limit: usize,
+    max_scan_rows: u64,
+    deadline: Instant,
+    match_count: u64,
+    scanned_event_count: u64,
+    unevaluated_event_count: u64,
+    unevaluated_reasons: BTreeMap<&'static str, u64>,
+    samples: Vec<PolicyRulePreviewSample>,
+    /// The id of the oldest observation judged, which the next page reads
+    /// before.
+    oldest_judged_id: Option<i64>,
+    stopped: Option<RulePreviewStop>,
+}
+
+impl RulePreviewScan {
+    /// Judge one page, newest first, until it ends, the ceiling is reached
+    /// or the deadline passes.
+    fn judge_page(
+        mut self,
+        observations: Vec<audit::query::RequestObservation>,
+    ) -> Result<Self, policy_eval::EvaluationError> {
+        for observation in observations {
+            // Reaching one more row after the ceiling is what proves the
+            // window held more than was scanned; a scan that ends exactly at
+            // the ceiling with nothing left is complete. The deadline is
+            // judged the same way: it stops a scan only with a row unjudged.
+            if self.scanned_event_count >= self.max_scan_rows {
+                self.stopped = Some(RulePreviewStop::Ceiling);
+                break;
+            }
+            if Instant::now() >= self.deadline {
+                self.stopped = Some(RulePreviewStop::Deadline);
+                break;
+            }
+            self.oldest_judged_id = Some(observation.id);
+            self.scanned_event_count = self.scanned_event_count.saturating_add(1);
+            match preview_observation_outcome(&self.candidate, &observation)? {
+                PreviewObservationOutcome::Matched => {
+                    self.match_count = self.match_count.saturating_add(1);
+                    if self.samples.len() < self.sample_limit {
+                        self.samples.push(preview_sample(observation));
+                    }
+                }
+                PreviewObservationOutcome::NotMatched => {}
+                PreviewObservationOutcome::Unevaluated(reason) => {
+                    self.unevaluated_event_count = self.unevaluated_event_count.saturating_add(1);
+                    let count = self.unevaluated_reasons.entry(reason).or_insert(0);
+                    *count = count.saturating_add(1);
+                }
+            }
+        }
+        Ok(self)
+    }
+
+    fn into_response(self) -> PolicyRulePreviewResponse {
+        let scan_truncated = self.stopped.is_some();
+        PolicyRulePreviewResponse {
+            match_count: self.match_count,
+            scanned_event_count: self.scanned_event_count,
+            unevaluated_event_count: self.unevaluated_event_count,
+            unevaluated_reasons: self.unevaluated_reasons,
+            scan_truncated,
+            deadline_exceeded: self.stopped == Some(RulePreviewStop::Deadline),
+            complete: !scan_truncated && self.unevaluated_event_count == 0,
+            sample_strategy: "newest_matches",
+            samples: self.samples,
+        }
+    }
+}
+
 /// Scan at most `max_scan_rows` observations, newest first, however wide the
-/// requested window is. A window holding more rows than that answers with
-/// `scan_truncated` and `complete: false`, so a count over the newest rows is
-/// never presented as a count over the whole window.
+/// requested window is, and stop at `deadline`. A window holding more rows
+/// than the scan judged answers with `scan_truncated` and `complete: false`,
+/// and also `deadline_exceeded` when the deadline stopped it, so a count over
+/// the newest rows is never presented as a count over the whole window.
 ///
 /// Each scanned observation is judged by the shared evaluator
 /// ([`policy_eval::CompiledPolicy::match_direct_rules`]) over the candidate
 /// rule alone. An observation it cannot judge is counted, by reason, in
 /// `unevaluated_reasons` rather than as a non-match, and makes the answer
 /// incomplete: a count that skipped it is a lower bound, not the count.
-pub(super) async fn preview_rule_with_scan_limit(
+///
+/// Pages are read here and judged on a blocking thread that owns `slot`, so
+/// no evaluation runs on an async worker, and a request dropped mid-page
+/// keeps its slot until that page's evaluation ends.
+pub(super) async fn preview_rule_within(
     query_store: &dyn storage::AuditEventStore,
     request: PolicyRulePreviewRequest,
+    slot: PolicyEvaluationSlot,
     max_scan_rows: usize,
+    deadline: Instant,
 ) -> Result<PolicyRulePreviewResponse, RulePreviewError> {
-    let candidate = policy_eval::CompiledPolicy::for_candidate_rule(request.rule.clone());
     let sample_limit = request
         .sample_limit
         .unwrap_or(DEFAULT_RULE_PREVIEW_SAMPLE_LIMIT)
         .min(MAX_RULE_PREVIEW_SAMPLE_LIMIT);
-    let max_scan_rows = u64::try_from(max_scan_rows).unwrap_or(u64::MAX);
-    let mut match_count = 0_u64;
-    let mut scanned_event_count = 0_u64;
-    let mut unevaluated_event_count = 0_u64;
-    let mut unevaluated_reasons = BTreeMap::<&'static str, u64>::new();
-    let mut scan_truncated = false;
-    let mut samples = Vec::with_capacity(sample_limit);
-
     let mut filters = audit::query::RequestObservationFilters {
         from: request.from,
         to: request.to,
@@ -1556,50 +1682,39 @@ pub(super) async fn preview_rule_with_scan_limit(
         path_prefix: prefix_preview_path_filter(&request.rule.path),
         before_id: None,
     };
-    'scan: loop {
+    let mut scan = RulePreviewScan {
+        candidate: policy_eval::CompiledPolicy::for_candidate_rule(request.rule),
+        sample_limit,
+        max_scan_rows: u64::try_from(max_scan_rows).unwrap_or(u64::MAX),
+        deadline,
+        match_count: 0,
+        scanned_event_count: 0,
+        unevaluated_event_count: 0,
+        unevaluated_reasons: BTreeMap::new(),
+        samples: Vec::with_capacity(sample_limit),
+        oldest_judged_id: None,
+        stopped: None,
+    };
+    let mut slot = slot;
+    loop {
         let observations = query_store.query_request_observations(&filters).await?;
         if observations.is_empty() {
             break;
         }
-        for observation in observations {
-            // Reaching one more row after the ceiling is what proves the
-            // window held more than was scanned; a scan that ends exactly at
-            // the ceiling with nothing left is complete.
-            if scanned_event_count >= max_scan_rows {
-                scan_truncated = true;
-                break 'scan;
-            }
-            filters.before_id = Some(observation.id);
-            scanned_event_count = scanned_event_count.saturating_add(1);
-            match preview_observation_outcome(&candidate, &observation)
-                .map_err(RulePreviewError::Evaluation)?
-            {
-                PreviewObservationOutcome::Matched => {
-                    match_count = match_count.saturating_add(1);
-                    if samples.len() < sample_limit {
-                        samples.push(preview_sample(observation));
-                    }
-                }
-                PreviewObservationOutcome::NotMatched => {}
-                PreviewObservationOutcome::Unevaluated(reason) => {
-                    unevaluated_event_count = unevaluated_event_count.saturating_add(1);
-                    let count = unevaluated_reasons.entry(reason).or_insert(0);
-                    *count = count.saturating_add(1);
-                }
-            }
+        let (returned, judged) = slot
+            .run_blocking_step(move || scan.judge_page(observations))
+            .await
+            .map_err(RulePreviewError::Interrupted)?;
+        slot = returned;
+        scan = judged.map_err(RulePreviewError::Evaluation)?;
+        if scan.stopped.is_some() {
+            break;
         }
+        filters.before_id = scan.oldest_judged_id;
     }
+    drop(slot);
 
-    Ok(PolicyRulePreviewResponse {
-        match_count,
-        scanned_event_count,
-        unevaluated_event_count,
-        unevaluated_reasons,
-        scan_truncated,
-        complete: !scan_truncated && unevaluated_event_count == 0,
-        sample_strategy: "newest_matches",
-        samples,
-    })
+    Ok(scan.into_response())
 }
 
 /// Ask the shared evaluator whether the candidate rule matches one retained
@@ -2105,10 +2220,12 @@ pub(super) async fn create_policy_rule(
 }
 
 /// What every policy mutation must satisfy before any authority sees its
-/// candidate: egress cannot change through a mutation endpoint, and the
-/// candidate's proxy dispatch must be valid for this deployment. Pure --
-/// shared by [`persist_policy_mutation`] and by suggestion acceptance,
-/// which commits its candidate inside the suggestion's transaction.
+/// candidate: egress cannot change through a mutation endpoint, the
+/// candidate's proxy dispatch must be valid for this deployment, and the
+/// policy file it would be written as must be one the gateway reads back.
+/// Pure -- shared by [`persist_policy_mutation`] and by suggestion
+/// acceptance, which commits its candidate inside the suggestion's
+/// transaction.
 pub(super) fn validate_policy_mutation_candidate(
     rbac_state: &middleware::rbac::RbacState,
     before_policy: &rbac::Policy,
@@ -2124,7 +2241,27 @@ pub(super) fn validate_policy_mutation_candidate(
         ])));
     }
 
+    if let Some(detail) = policy_file_size_refusal(candidate) {
+        return Err(Box::new(policy_validation_failed(vec![detail])));
+    }
+
     Ok(())
+}
+
+/// Why the policy file `candidate` would be written as -- the pretty-printed
+/// document a standalone commit writes, measured by
+/// [`rbac::Policy::persisted_bytes`] -- is one the gateway would refuse to
+/// read back, or `None` when it fits. The pretty form is larger than the
+/// compact one a body or a draft is measured in, so a candidate under every
+/// other bound can still fail here, and a standalone commit that wrote it
+/// would leave a file that neither its own reload nor the next start reads.
+/// Judged in cluster mode too, so a committed policy always fits a policy
+/// file.
+pub(super) fn policy_file_size_refusal(candidate: &rbac::Policy) -> Option<String> {
+    candidate
+        .persisted_bytes()
+        .err()
+        .map(|error| error.to_string())
 }
 
 /// The request a publication is checked for: who is publishing, how they
@@ -2505,7 +2642,9 @@ pub(super) async fn commit_policy_mutation(
     };
 
     // The file is replaced by an atomic rename, so a failed persist leaves
-    // the previous document in place.
+    // the previous document in place. A candidate whose file would be too
+    // large to read back was refused above, before anything was written,
+    // and the persist measures the same bytes again before it writes them.
     if let Err(err) = candidate.persist_to_file(policy_file) {
         tracing::error!(policy_file = %policy_file.display(), error = %err, "failed to persist policy");
         return Err(PolicyMutationFailure::refused(

@@ -487,6 +487,12 @@ pub(crate) async fn run_one_shot_command() -> Result<bool, Box<dyn std::error::E
                         )
                         .into());
                     }
+                    cluster_maintenance::PassOutcome::TimedOut => {
+                        return Err(format!(
+                            "a maintenance job step exceeded its budget; its session was closed and the remaining jobs did not run (fence={fence})"
+                        )
+                        .into());
+                    }
                 }
             }
         }

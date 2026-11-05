@@ -200,7 +200,11 @@ change committed (the change then answers with
 `X-GreenGateway-Policy-History-Warning`), so only a recorded base can reveal a
 gap; in cluster mode the history is written in the commit's own transaction.
 The policy file's own document is never a history version, so the first
-version recorded after the history was configured has no predecessor.
+version recorded after the history was configured has no predecessor. Nor
+is an edit of `POLICY_FILE` or a restart: in standalone mode an operator can
+change the live policy between two publications without writing a version,
+so the history version before a publication is not necessarily the document
+it replaced, and only a recorded base that matches shows that it was.
 
 **The approval as recorded.** GreenGateway has no approval workflow beyond the
 authorized commit itself, so `approval.basis` is `authorized_commit`. The
@@ -222,12 +226,14 @@ checks at generation time; the history does not record what validation said at
 publication time. It runs the document's own checks, the deployment checks
 (proxy dispatch, the document format this deployment commits) and the
 cross-resource checks a publication runs, reading the resources current now:
-references another resource contradicts, risks, and whether the publication
-leaves `admin:policy:write` reachable. Those checks judge the publication as
-the replacement of its predecessor (of itself when the history holds nothing
-before it), and without the publisher-specific lockout check, because the
-caller asking for evidence is not the one who published and a package must
-not depend on who asks for it. `resource_snapshot` is the snapshot those
+references another resource contradicts, and risks. Those checks judge the
+publication on its own, as the replacement of itself: the checks that compare
+a publication with what it replaced -- `egress_change_requires_restart` and
+`policy_write_unreachable` -- are not repeated, because the history cannot show
+what it replaced (see the predecessor above) and its commit ran them against
+the policy that was live then. Nor is the publisher-specific lockout check,
+because the caller asking for evidence is not the one who published and a
+package must not depend on who asks for it. `resource_snapshot` is the snapshot those
 checks read, with the digest `POST /policy/validate` reports for the same
 resources; a snapshot that could not read every resource adds a
 `resource_unavailable` warning, which blocks complete evidence. A suite or cases cannot be evaluated against a publication

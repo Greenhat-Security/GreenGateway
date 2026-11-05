@@ -12603,12 +12603,16 @@ pub(crate) mod postgres_audit_tests {
     // ------------------------------------------------------------------
 
     use crate::cluster_maintenance::{
-        AuditRetention, AuditRetentionFloor, ExecutionLeaseReaper, JwtRevocationCleanup,
-        MaintenanceJob, MaintenanceRunner, OnePassOutcome, PassOutcome, PendingLoginPrune,
-        RateLimitIdleSweep, StaleMemberSweep, MAINTENANCE_LOCK_KEY, MAINTENANCE_SCOPE,
+        AdminSessionPrune, AuditRetention, AuditRetentionFloor, ExecutionLeaseReaper,
+        JwtRevocationCleanup, MaintenanceJob, MaintenanceRunner, OnePassOutcome, PassOutcome,
+        PendingLoginPrune, RateLimitIdleSweep, StaleMemberSweep, JOB_ADMIN_SESSION_PRUNE,
+        JOB_STEP_LIMIT, MAINTENANCE_LOCK_KEY, MAINTENANCE_SCOPE,
+    };
+    use crate::storage::postgres_session::tests::{
+        assert_released, gated_pool, observer, ReplyGate, ANSWER_BUDGET, BIND, RELEASE_BUDGET,
     };
     use crate::storage::DedicatedSession;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// A job that counts its runs and can be told to fail, so a pass is
     /// observable without touching a real table.
@@ -12654,6 +12658,37 @@ pub(crate) mod postgres_audit_tests {
                 .await
                 .map(|_| 1)
                 .map_err(|_| RepositoryError::new(RepositoryErrorKind::Unavailable, "sleeping_job"))
+        }
+    }
+
+    /// The real admin session prune, run behind the reply gate the first
+    /// time: the step's simple `BEGIN` passes, the logins prune is its
+    /// first bound statement and the sessions prune its second, so holding
+    /// the replies from that second `Bind` lets the sessions prune run on
+    /// the server -- withdrawing, writing expiry evidence and journaling
+    /// it, which takes the journal's state row -- while the step never
+    /// hears the answer and waits inside its open transaction until its
+    /// budget cuts it short.
+    struct HeldAdminSessionPrune {
+        gate: ReplyGate,
+        armed: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl MaintenanceJob for HeldAdminSessionPrune {
+        fn name(&self) -> &'static str {
+            JOB_ADMIN_SESSION_PRUNE
+        }
+
+        async fn run_step(&self, client: &tokio_postgres::Client) -> Result<u64, RepositoryError> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.gate.hold_replies_from_nth(BIND, 2);
+            }
+            AdminSessionPrune {
+                limit: JOB_STEP_LIMIT,
+            }
+            .run_step(client)
+            .await
         }
     }
 
@@ -13335,6 +13370,216 @@ pub(crate) mod postgres_audit_tests {
                 }
             }
         }
+        leases.release(&lease).await.expect("release");
+    }
+
+    /// A step that overruns its budget is cut short wherever it was parked.
+    /// For the admin session prune that is inside the transaction it
+    /// opened, after the sessions prune has journaled an expiry and so
+    /// holds the authority-event journal's state row, which every journaled
+    /// change on every replica needs. The runner must close that session:
+    /// running the next job on it would run inside the open transaction,
+    /// and unlocking it would hand the pool a connection idle in that
+    /// transaction, the state row still locked, until something recycled
+    /// it. So the step is recorded as `timeout`, the pass ends `TimedOut`
+    /// without the job after it, the state row and the advisory key are
+    /// free once the server has ended the session, nothing the cut step
+    /// wrote was committed, and the pool keeps no connection. The next pass
+    /// withdraws the session with its evidence.
+    #[tokio::test]
+    async fn an_overrun_step_closes_its_session_and_leaves_the_journal_unlocked() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let ledger = Arc::new(member_store(&pool));
+        let observer = observer(&database.dsn).await;
+
+        // One expired session for the prune to withdraw; journaling its
+        // expiry is what takes the state row.
+        pool.get()
+            .await
+            .expect("client")
+            .batch_execute(
+                "INSERT INTO greengateway.admin_sessions (session_hash, id, csrf_hash, user_id, \
+                     issuer, key_id, token_nonce, token_ct, created_at, last_seen_at, \
+                     expires_at, idle_expires_at) \
+                 VALUES (repeat('e', 64), gen_random_uuid(), repeat('c', 64), 'operator', NULL, \
+                         'k', decode(repeat('00', 24), 'hex'), decode(repeat('00', 17), 'hex'), \
+                         now() - interval '2 hours', now() - interval '2 hours', \
+                         now() - interval '1 hour', now() - interval '1 hour')",
+            )
+            .await
+            .expect("an expired session");
+        let sessions = "SELECT count(*) FROM greengateway.admin_sessions";
+        let expiries = "SELECT count(*) FROM greengateway.admin_session_evidence \
+                        WHERE reason = 'expired'";
+        let journaled = "SELECT count(*) FROM greengateway.authority_event_journal";
+        let journaled_before = scalar_count(&pool, journaled).await;
+
+        // The runner's session comes from a pool behind the gate; the
+        // ledger and the leases use the ordinary one, so the gate sees the
+        // session's messages and nothing else.
+        let gate = ReplyGate::new();
+        let gated = gated_pool(&database.dsn, &gate);
+        let runs = Arc::new(AtomicU64::new(0));
+        let holder = uuid::Uuid::new_v4();
+        let leases = maintenance_leases(&pool, holder, Duration::from_secs(30));
+        let runner = MaintenanceRunner::new(
+            gated.clone(),
+            Arc::clone(&leases),
+            Arc::clone(&ledger),
+            vec![
+                Arc::new(HeldAdminSessionPrune {
+                    gate: gate.clone(),
+                    armed: AtomicBool::new(true),
+                }),
+                Arc::new(CountingJob {
+                    runs: Arc::clone(&runs),
+                    fail: false,
+                }),
+            ],
+            Duration::from_secs(60),
+            holder,
+        )
+        .with_job_budget_for_test(Duration::from_secs(1));
+        let lease = match leases
+            .try_acquire(MAINTENANCE_SCOPE, 1, "x")
+            .await
+            .expect("acquire")
+        {
+            LeaseAttempt::Acquired(lease) => lease,
+            LeaseAttempt::Full => panic!("free slot"),
+        };
+        assert!(ledger
+            .adopt_jobs(&runner.job_names(), lease.fence)
+            .await
+            .expect("adopt"));
+
+        let pass = tokio::spawn({
+            let runner = Arc::clone(&runner);
+            async move { runner.run_pass(lease.fence).await }
+        });
+
+        // The sessions prune has run on the server, inside the step's
+        // transaction, and holds the state row; the step does not know.
+        tokio::time::timeout(ANSWER_BUDGET, gate.answered())
+            .await
+            .expect("the server answers the sessions prune");
+        let locked = observer
+            .query_opt(
+                "SELECT 1 FROM greengateway.authority_event_state WHERE singleton \
+                 FOR UPDATE NOWAIT",
+                &[],
+            )
+            .await;
+        assert!(
+            locked
+                .as_ref()
+                .err()
+                .and_then(|error| error.code())
+                .is_some_and(|code| *code == tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+            "the sessions prune journaled an expiry, so its open transaction must hold the state \
+             row; the gate stopped the step somewhere other than the window this test covers: \
+             {locked:?}"
+        );
+
+        // The budget cuts the step short, and the ledger records it.
+        let started = std::time::Instant::now();
+        loop {
+            let records = ledger.maintenance_jobs().await.expect("ledger");
+            let prune = records
+                .iter()
+                .find(|record| record.job == JOB_ADMIN_SESSION_PRUNE)
+                .expect("prune row");
+            if prune.last_failure_code.as_deref() == Some("timeout") {
+                break;
+            }
+            assert!(
+                started.elapsed() < ANSWER_BUDGET,
+                "the step never overran its budget"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // The answer was delayed, not lost: let it reach whatever still
+        // listens on the cut step's connection, as the network would.
+        gate.open();
+        let outcome = tokio::time::timeout(ANSWER_BUDGET, pass)
+            .await
+            .expect("the pass ends")
+            .expect("pass task");
+
+        // The state row is free, asked the way the next journaled change
+        // would ask: waiting for it, within a bound.
+        observer
+            .batch_execute(&format!(
+                "SET lock_timeout = {}",
+                RELEASE_BUDGET.as_millis()
+            ))
+            .await
+            .expect("the observer bounds its wait");
+        if let Err(error) = observer
+            .query_one(
+                "SELECT last_position FROM greengateway.authority_event_state WHERE singleton \
+                 FOR UPDATE",
+                &[],
+            )
+            .await
+        {
+            panic!(
+                "the journal's state row was still locked after the overrun step's pass ended \
+                 ({error}): the cut step's connection went back to the pool idle inside its \
+                 prune transaction, and every journaled change on every replica waits on it"
+            );
+        }
+        assert_eq!(
+            outcome,
+            PassOutcome::TimedOut,
+            "an overrun step ends the pass"
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "nothing ran on the cut step's connection after it"
+        );
+        assert_eq!(
+            gated.status().size,
+            0,
+            "the cut step's connection was closed, not returned to the pool"
+        );
+        assert_released(
+            &observer,
+            *MAINTENANCE_LOCK_KEY,
+            "the overrun step's session was closed",
+        )
+        .await;
+        assert_eq!(
+            scalar_count(&pool, sessions).await,
+            1,
+            "nothing the cut step wrote was committed"
+        );
+        assert_eq!(scalar_count(&pool, expiries).await, 0);
+        assert_eq!(scalar_count(&pool, journaled).await, journaled_before);
+        let records = ledger.maintenance_jobs().await.expect("ledger");
+        let counting = records
+            .iter()
+            .find(|record| record.job == "counting")
+            .expect("counting row");
+        assert!(counting.last_started_at.is_none());
+
+        // The next pass, with nothing withholding its answers, withdraws
+        // the session with its evidence and runs the job after it.
+        assert_eq!(
+            runner.run_pass(lease.fence).await,
+            PassOutcome::Completed { failed_jobs: 0 }
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(scalar_count(&pool, sessions).await, 0);
+        assert_eq!(scalar_count(&pool, expiries).await, 1);
+        assert_eq!(scalar_count(&pool, journaled).await, journaled_before + 1);
         leases.release(&lease).await.expect("release");
     }
 

@@ -173,6 +173,7 @@ pub(crate) enum IssueCode {
     StableIdsUnavailable,
     DispatchNotConfigured,
     DocumentFormatUnsupportedInCluster,
+    PolicyFileTooLarge,
     ConversionRequiresV0,
     PolicyWriteUnreachable,
     PublisherPolicyWriteLost,
@@ -206,7 +207,7 @@ pub(crate) enum IssueCode {
 impl IssueCode {
     /// Every code, so tests can check the vocabulary as a whole.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 68] = [
+    pub(crate) const ALL: [Self; 69] = [
         Self::InvalidJson,
         Self::DocumentTooLarge,
         Self::DuplicateMember,
@@ -247,6 +248,7 @@ impl IssueCode {
         Self::StableIdsUnavailable,
         Self::DispatchNotConfigured,
         Self::DocumentFormatUnsupportedInCluster,
+        Self::PolicyFileTooLarge,
         Self::ConversionRequiresV0,
         Self::PolicyWriteUnreachable,
         Self::PublisherPolicyWriteLost,
@@ -319,6 +321,7 @@ impl IssueCode {
             Self::StableIdsUnavailable => "stable_ids_unavailable",
             Self::DispatchNotConfigured => "dispatch_not_configured",
             Self::DocumentFormatUnsupportedInCluster => "document_format_unsupported_in_cluster",
+            Self::PolicyFileTooLarge => "policy_file_too_large",
             Self::ConversionRequiresV0 => "conversion_requires_v0",
             Self::PolicyWriteUnreachable => "policy_write_unreachable",
             Self::PublisherPolicyWriteLost => "publisher_policy_write_lost",
@@ -418,6 +421,9 @@ impl IssueCode {
             }
             Self::DocumentFormatUnsupportedInCluster => {
                 "cluster mode does not yet commit documents of this schema_version"
+            }
+            Self::PolicyFileTooLarge => {
+                "the policy as a policy file holds it would be larger than a policy file may be"
             }
             Self::ConversionRequiresV0 => "only a 0.x document is converted to policy v1",
             Self::PolicyWriteUnreachable => {
@@ -607,6 +613,10 @@ impl IssueCode {
             Self::DocumentFormatUnsupportedInCluster => {
                 "Keep a cluster deployment on a 0.x document until a release that gates v1 \
                  documents on every replica's capability."
+            }
+            Self::PolicyFileTooLarge => {
+                "Keep the pretty-printed document, as the gateway writes a policy file, within \
+                 1048576 bytes."
             }
             Self::ConversionRequiresV0 => {
                 "The document already is policy v1; validate it instead of converting it."
@@ -806,8 +816,12 @@ impl DiagnosticBlocks {
     fn of(code: IssueCode, severity: DiagnosticSeverity) -> Self {
         match (severity, code) {
             // The document itself is sound; only this deployment cannot
-            // commit it.
-            (DiagnosticSeverity::Error, IssueCode::DocumentFormatUnsupportedInCluster) => Self {
+            // commit it, or the policy file it would be written as is larger
+            // than the gateway reads one.
+            (
+                DiagnosticSeverity::Error,
+                IssueCode::DocumentFormatUnsupportedInCluster | IssueCode::PolicyFileTooLarge,
+            ) => Self {
                 simulation: false,
                 tests: false,
                 publication: true,
