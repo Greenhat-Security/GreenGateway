@@ -351,11 +351,18 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         .with_pinned_checksum("40c65674b78059e9b60f0861f96eb9c02dab758e5ded580ba27639e59045f6ae"),
         Migration::new(
             27,
-            "policy_analysis_suppressions",
-            include_str!("migrations/0027_policy_analysis_suppressions.sql"),
+            "service_token_issue_evidence",
+            include_str!("migrations/0027_service_token_issue_evidence.sql"),
         )
         .finalize()
-        .with_pinned_checksum("b393066bbc843bfd20627e427106e5a29d85e80919f9107b727fa0381d18d00f"),
+        .with_pinned_checksum("47cf1be700027c1798c0e03c8f9b25c47b379043f2effe02396dafb174f0c786"),
+        Migration::new(
+            28,
+            "policy_analysis_suppressions",
+            include_str!("migrations/0028_policy_analysis_suppressions.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("ed485e0e3b9e4af3ab73da2988e051e7f081fb1f8e7ffc9c0304086e72e26bca"),
     ]
 });
 
@@ -388,20 +395,20 @@ impl SchemaCompatibility {
     }
 }
 
-// This build's manifest ends at 27, and it serves exactly schema 27: it
-// approves no migration above its manifest, and it does not serve schema 26.
-// The move from 26 to 27 (policy analysis suppressions, #243 slice 15) is
-// coordinated, without an overlap: a schema-26 binary left serving after
-// migration 27 would analyze policies without the suppressions other
+// This build's manifest ends at 28, and it serves exactly schema 28: it
+// approves no migration above its manifest, and it does not serve schema 27.
+// The move from 27 to 28 (policy analysis suppressions, #243 slice 15) is
+// coordinated, without an overlap: a schema-27 binary left serving after
+// migration 28 would analyze policies without the suppressions other
 // replicas record, so one finding would read as suppressed through one
 // replica and as open through another.
 //
-// The move from 25 to 26 (admin session evidence in the authority-event
-// journal, with capacity held for every session's withdrawal, #425) was
-// coordinated too: a schema-25 binary left serving after migration 26 would
-// grant and withdraw admin sessions without journaling their evidence, and
-// its other producers would spend journal capacity a session holds for its
-// withdrawal, so a logout could no longer be promised.
+// The move from 26 to 27 (service-token issue evidence, #425) was
+// coordinated too: a schema-26 binary left serving after migration 27 would
+// issue tokens without their evidence, so the issue-to-revoke chain of a
+// token issued during the overlap would start at a rotate, and a schema-27
+// binary cannot issue against a schema-26 table, whose CHECK refuses the
+// issue's row.
 //
 // The step from 24 to 25 rolled, between migration 25's prepared release and
 // its successor, the last build whose manifest ended at 25: the prepared
@@ -411,7 +418,7 @@ impl SchemaCompatibility {
 // the same explicit column list (`connections::pg_store::
 // record_catalog_change_evidence`). This build is not that successor: it
 // carries migration 25 byte for byte, so its migrator records the approved
-// checksum, but it serves only schema 27, so from a prepared fleet it is a
+// checksum, but it serves only schema 28, so from a prepared fleet it is a
 // coordinated drain/migrate/restart like every other step.
 // `migration_twenty_five_is_the_extension_its_prepared_release_approved` pins
 // the manifest entry to the checksum that release approved, and the
@@ -425,17 +432,20 @@ impl SchemaCompatibility {
 // authority-event journal, #425 PR 3), from 21 to 22 (server-side policy
 // drafts, #243 slice 9), from 22 to 23 (policy, tools and catalog change
 // evidence, #425 PR 2c), from 23 to 24 (the actor metadata of the
-// journaled authority evidence, #425), from 25 to 26 and from 26 to 27. A
-// schema-23 binary must not keep writing evidence after migration 24: its
-// Connection, service-token and JWT revocation rows would record no actor
-// kind, auth mode or issuer. A schema-22 binary would also commit policy,
-// tools and catalog changes without their evidence, and a schema-20 one
-// would write evidence that is never journaled. The fence keeps covering
-// every binary that can serve this database: none that predates it accepts
-// this ledger either.
+// journaled authority evidence, #425), from 25 to 26 (admin session evidence
+// in the authority-event journal, with capacity held for every session's
+// withdrawal, #425), from 26 to 27 and from 27 to 28. A schema-25 binary
+// left serving after migration 26 would grant and withdraw admin sessions
+// without journaling their evidence. A schema-23 binary must not keep
+// writing evidence after migration 24: its Connection, service-token and JWT
+// revocation rows would record no actor kind, auth mode or issuer. A
+// schema-22 binary would also commit policy, tools and catalog changes
+// without their evidence, and a schema-20 one would write evidence that is
+// never journaled. The fence keeps covering every binary that can serve this
+// database: none that predates it accepts this ledger either.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (27, 27),
-    write: (27, 27),
+    read: (28, 28),
+    write: (28, 28),
     approved_extensions: &[],
 };
 
@@ -470,7 +480,7 @@ const APPROVED_EXTENSION_SOURCES: &[ExtensionSource] = &[];
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 27.
+/// contract the schema. The shipped contract accepts only schema 28.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1390,18 +1400,18 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            27,
+            28,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (27, 27));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (27, 27));
-        assert_eq!(schema_version_range(), (27, 27));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (28, 28));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (28, 28));
+        assert_eq!(schema_version_range(), (28, 28));
         assert!(
             BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty(),
             "this build approves no migration above its manifest"
         );
         // Readiness samples the manifest and one row more.
-        assert_eq!(runtime_ledger_row_limit(), 28);
+        assert_eq!(runtime_ledger_row_limit(), 29);
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
             Ok(SchemaStatus::Current)
@@ -1409,19 +1419,19 @@ mod tests {
         // The next migration is refused whatever it is: nothing prepared this
         // build for one.
         let mut beyond = ledger_for(&MANIFEST, MANIFEST.len(), "");
-        beyond.push((28, hex_checksum("-- migration 28")));
+        beyond.push((29, hex_checksum("-- migration 29")));
         assert_eq!(
             validate_runtime_ledger(&beyond),
             Err(LedgerProblem::UnknownVersion)
         );
 
-        // The previous releases' schemas are not served: schemas 26 and 25 are
-        // left by coordinated upgrades, and so are the prepared release's
+        // The previous releases' schemas are not served: schemas 27, 26 and 25
+        // are left by coordinated upgrades, and so are the prepared release's
         // schema 24 and every earlier point. The overlap of the rolling step
         // from 24 to 25 belonged to the prepared release and the schema-25
-        // successor, both of which serve 25; this build serves none of 24, 25
-        // or 26.
-        for behind in 1..=11 {
+        // successor, both of which serve 25; this build serves none of 24, 25,
+        // 26 or 27.
+        for behind in 1..=12 {
             assert_eq!(
                 validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - behind, "")),
                 Ok(SchemaStatus::NeedsUpgrade {
@@ -2059,13 +2069,16 @@ mod tests {
 
     // --- real-database tests -------------------------------------------------
     //
-    // Gated on the same test-harness locator as the foundation tests: a file
-    // naming a DSN a disposable database answers (CI sets it; a checkout
-    // without a database skips instead of failing). The tests share that one
-    // database, so a module mutex serializes them and each starts by
-    // dropping the gateway schema for a clean slate.
+    // Gated on the shared test-harness locator (`postgres::test_support`): a
+    // file naming a DSN a disposable database answers (CI sets it; a checkout
+    // without a database skips instead of failing), reached under the
+    // harness's TLS policy. The tests share that one database, so a module
+    // mutex serializes them and each starts by dropping the gateway schema
+    // for a clean slate.
 
     use tokio::sync::Mutex;
+
+    use super::super::postgres::test_support;
 
     /// Serializes the real-database tests: they share one disposable
     /// database and each starts by resetting its schema. Async-aware
@@ -2073,18 +2086,7 @@ mod tests {
     static REAL_DATABASE: Mutex<()> = Mutex::const_new(());
 
     fn real_dsn() -> Option<String> {
-        let key = test_dsn_file_key();
-        let file = std::env::var(&key).ok()?;
-        if file.trim().is_empty() {
-            return None;
-        }
-        let contents = std::fs::read_to_string(file).ok()?;
-        let trimmed = contents.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_owned())
-    }
-
-    fn test_dsn_file_key() -> String {
-        "GATEWAY_TEST_POSTGRES_URL_FILE".to_owned()
+        test_support::locator()
     }
 
     fn no_ddl_dsn() -> Option<String> {
@@ -2099,10 +2101,7 @@ mod tests {
     }
 
     fn test_settings() -> DatabaseSettings {
-        DatabaseSettings {
-            tls_mode: crate::config::DatabaseTlsMode::LoopbackDev,
-            ..DatabaseSettings::default()
-        }
+        test_support::test_settings()
     }
 
     /// A DSN file the bounded reader accepts, plus a guard keeping the
@@ -2225,9 +2224,10 @@ mod tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-migration-tests".to_owned());
         config.database.url_file = Some(guard.path.clone());
-        // The test database is the loopback-dev shape CI and local runs use;
-        // verify mode would (correctly) refuse it.
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        // Verified TLS when the run names a CA bundle, otherwise the
+        // loopback-dev shape of a plaintext test database; verify mode
+        // would (correctly) refuse that one.
+        test_support::use_test_tls(&mut config.database);
         config
     }
 
@@ -2812,24 +2812,40 @@ mod tests {
         }
         drop(client);
 
-        // Schema-17 state: a create needs no evidence table, and the
-        // rotate, the revoke and the JWT revocation are written the way a
-        // schema-17 gateway wrote them, without any.
+        // Schema-17 state: two tokens created, one then rotated and one
+        // revoked, and a JWT revocation, each written the way a schema-17
+        // gateway wrote it, without any evidence. (This build's create
+        // records its issue's evidence, so it cannot stand in for that
+        // gateway's create.)
         let store = crate::storage::postgres_service_tokens::PostgresServiceTokenStore::new(
             foundation.pool().clone(),
         );
-        let request = || crate::auth::tokens::CreateTokenRequest {
-            scopes: vec!["admin:tokens:read".to_owned()],
-            created_by: "schema-17-admin".to_owned(),
-            expires_at: None,
-        };
-        let live = store.create(request()).await.expect("live token");
-        let revoked = store.create(request()).await.expect("revoked token");
+        let (live, revoked) = ("token_schema_17_live", "token_schema_17_revoked");
         let client = foundation.pool().get().await.expect("fixture checkout");
+        for (id, digit, revision) in [(live, '1', 1_i64), (revoked, '2', 2)] {
+            client
+                .execute(
+                    "INSERT INTO greengateway.service_tokens \
+                         (id, token_hash, token_prefix, scopes_json, created_by, revision, \
+                          security_revision) \
+                     VALUES ($1, repeat($2, 64), 'ggw_' || repeat($2, 10), \
+                             '[\"admin:tokens:read\"]', 'schema-17-admin', 1, $3)",
+                    &[&id, &digit.to_string(), &revision],
+                )
+                .await
+                .expect("a schema-17 create");
+        }
+        client
+            .execute(
+                "UPDATE greengateway.security_revision_state SET last_revision = 2",
+                &[],
+            )
+            .await
+            .expect("the creates' shared revisions");
         client
             .execute(
                 "UPDATE greengateway.service_tokens SET revision = 2 WHERE id = $1",
-                &[&live.record.id],
+                &[&live],
             )
             .await
             .expect("a schema-17 rotate");
@@ -2837,7 +2853,7 @@ mod tests {
             .execute(
                 "UPDATE greengateway.service_tokens SET revoked_at = now(), revision = 2 \
                  WHERE id = $1",
-                &[&revoked.record.id],
+                &[&revoked],
             )
             .await
             .expect("a schema-17 revoke");
@@ -2892,7 +2908,7 @@ mod tests {
 
         store
             .rotate(
-                &live.record.id,
+                live,
                 &crate::auth::change_actor::ChangeActor::for_test("schema-18-admin"),
             )
             .await
@@ -3349,19 +3365,20 @@ mod tests {
         let store = crate::storage::postgres_service_tokens::PostgresServiceTokenStore::new(
             foundation.pool().clone(),
         );
+        let actor = crate::auth::change_actor::ChangeActor::for_test("schema-21-admin");
         let token = store
-            .create(crate::auth::tokens::CreateTokenRequest {
-                scopes: vec!["admin:tokens:read".to_owned()],
-                created_by: "schema-21-admin".to_owned(),
-                expires_at: None,
-            })
+            .create(
+                crate::auth::tokens::CreateTokenRequest {
+                    scopes: vec!["admin:tokens:read".to_owned()],
+                    created_by: "schema-21-admin".to_owned(),
+                    expires_at: None,
+                },
+                &actor,
+            )
             .await
             .expect("a token creates");
         store
-            .revoke(
-                &token.record.id,
-                &crate::auth::change_actor::ChangeActor::for_test("schema-21-admin"),
-            )
+            .revoke(&token.record.id, &actor)
             .await
             .expect("the revoke commits")
             .expect("the token exists");
@@ -3377,7 +3394,8 @@ mod tests {
             .await
             .expect("the journal reads")
             .get(0);
-        assert_eq!(head, Some(4));
+        // The issue (since migration 27) and the revoke, after the three.
+        assert_eq!(head, Some(5));
     }
 
     /// Migration 24 adds the actor's kind, auth mode and issuer to the three
@@ -3969,13 +3987,214 @@ mod tests {
         clean_database(foundation.pool()).await;
     }
 
+    /// Migration 27 lets the token evidence table record an issue and
+    /// backfills nothing: a token a schema-26 gateway issued, rotated and
+    /// revoked keeps its row and its two evidence rows exactly, gains no
+    /// issue row, and keeps `created_by` as the only record of who issued it.
+    /// From then on an issue records no prior version and new version 1, a
+    /// rotate or a revoke a prior version of at least 1 and a strictly greater
+    /// new one, and no other action is admitted. This build's create writes
+    /// exactly the row the rule admits, bound to its outbox row and journaled.
+    #[tokio::test]
+    async fn migration_twenty_seven_admits_token_issue_evidence_and_backfills_nothing() {
+        use crate::storage::ServiceTokenStore;
+
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let config = migration_config(&dsn_file);
+        let foundation = establish(&config).await;
+        clean_database(foundation.pool()).await;
+        let client = foundation.pool().get().await.expect("checkout");
+        bootstrap_ledger(&client)
+            .await
+            .expect("migration ledger should bootstrap");
+        let through_v26 = MANIFEST
+            .iter()
+            .take_while(|migration| migration.version <= 26)
+            .count();
+        for migration in &MANIFEST[..through_v26] {
+            apply_one(&client, migration, &test_settings())
+                .await
+                .expect("migrations through 26 should apply");
+        }
+
+        // A token a schema-26 gateway issued (no evidence), rotated and
+        // revoked (one row each).
+        client
+            .batch_execute(
+                "UPDATE greengateway.security_revision_state SET last_revision = 3; \
+                 INSERT INTO greengateway.service_tokens \
+                     (id, token_hash, token_prefix, scopes_json, created_by, revoked_at, \
+                      revision, security_revision) \
+                 VALUES ('token_schema_26', repeat('3', 64), 'ggw_3333333333', \
+                         '[\"admin:tokens:read\"]', 'schema-26-issuer', now(), 3, 3); \
+                 INSERT INTO greengateway.service_token_change_evidence \
+                     (event_id, operation_id, actor_user_id, action, token_id, \
+                      prior_version, new_version, security_revision, actor_kind, \
+                      actor_auth_mode) \
+                 VALUES (gen_random_uuid(), gen_random_uuid(), 'schema-26-admin', \
+                         'service_token.rotate', 'token_schema_26', 1, 2, 2, 'principal', \
+                         'bearer_token'), \
+                        (gen_random_uuid(), gen_random_uuid(), 'schema-26-admin', \
+                         'service_token.revoke', 'token_schema_26', 2, 3, 3, 'principal', \
+                         'bearer_token');",
+            )
+            .await
+            .expect("a schema-26 token's state and evidence");
+        let snapshot = |table: &'static str| {
+            let client = &client;
+            async move {
+                client
+                    .query(
+                        &format!(
+                            "SELECT row_to_json(t)::text FROM greengateway.{table} t \
+                             ORDER BY row_to_json(t)::text"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .expect("snapshot rows")
+                    .iter()
+                    .map(|row| row.get::<_, String>(0))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let tokens_before = snapshot("service_tokens").await;
+        let evidence_before = snapshot("service_token_change_evidence").await;
+        assert_eq!(evidence_before.len(), 2);
+
+        apply_one(&client, &MANIFEST[through_v26], &test_settings())
+            .await
+            .expect("migration 27 should apply");
+        assert_eq!(snapshot("service_tokens").await, tokens_before);
+        assert_eq!(
+            snapshot("service_token_change_evidence").await,
+            evidence_before,
+            "no issue row is guessed for a token issued before the migration"
+        );
+
+        const INSERT: &str = "INSERT INTO greengateway.service_token_change_evidence \
+                 (event_id, operation_id, actor_user_id, action, token_id, prior_version, \
+                  new_version, security_revision, actor_kind, actor_auth_mode) \
+             VALUES (gen_random_uuid(), gen_random_uuid(), 'schema-27-admin', $1, \
+                     'token_schema_27', $2, $3, 9, 'principal', 'bearer_token')";
+        for (action, prior, new) in [
+            ("service_token.issue", None, 1_i64),
+            ("service_token.rotate", Some(1_i64), 2),
+            ("service_token.revoke", Some(2), 9),
+        ] {
+            client
+                .execute(INSERT, &[&action, &prior, &new])
+                .await
+                .unwrap_or_else(|error| panic!("{action} {prior:?} -> {new} is admitted: {error}"));
+        }
+        for (action, prior, new) in [
+            // An issue is the token's first revision and nothing before it.
+            ("service_token.issue", Some(1_i64), 2_i64),
+            ("service_token.issue", None, 2),
+            ("service_token.issue", None, 0),
+            // A rotate or a revoke always advances an existing revision.
+            ("service_token.rotate", None, 1),
+            ("service_token.revoke", None, 2),
+            ("service_token.rotate", Some(0), 1),
+            ("service_token.rotate", Some(2), 2),
+            ("service_token.revoke", Some(3), 2),
+            // The vocabulary stays closed.
+            ("service_token.create", None, 1),
+            ("service_token.delete", Some(1), 2),
+        ] {
+            assert!(
+                client
+                    .execute(INSERT, &[&action, &prior, &new])
+                    .await
+                    .is_err(),
+                "{action} {prior:?} -> {new} is refused"
+            );
+        }
+        client
+            .execute(
+                "DELETE FROM greengateway.service_token_change_evidence \
+                 WHERE token_id = 'token_schema_27'",
+                &[],
+            )
+            .await
+            .expect("the probe rows go");
+        drop(client);
+        assert_eq!(
+            apply_missing(foundation.pool(), &test_settings())
+                .await
+                .expect("nothing is left to apply"),
+            MigrateOutput::UpToDate {
+                applied: MANIFEST.len()
+            }
+        );
+
+        // This build's create writes the row the rule admits: no prior
+        // version, revision 1, the create outbox row's shared revision, and
+        // the next journal position.
+        let store = crate::storage::postgres_service_tokens::PostgresServiceTokenStore::new(
+            foundation.pool().clone(),
+        );
+        let created = store
+            .create(
+                crate::auth::tokens::CreateTokenRequest {
+                    scopes: vec!["admin:tokens:read".to_owned()],
+                    created_by: "schema-27-admin".to_owned(),
+                    expires_at: None,
+                },
+                &crate::auth::change_actor::ChangeActor::for_test("schema-27-admin"),
+            )
+            .await
+            .expect("a token issues after the migration");
+        let client = foundation.pool().get().await.expect("checkout");
+        let issued = client
+            .query_one(
+                "SELECT e.prior_version, e.new_version, e.security_revision, o.revision, \
+                        o.from_version, o.to_version, j.source \
+                 FROM greengateway.service_token_change_evidence e \
+                 JOIN greengateway.security_outbox o \
+                   ON o.resource_type = 'service_token' AND o.resource_id = e.token_id \
+                 JOIN greengateway.authority_event_journal j ON j.event_id = e.event_id \
+                 WHERE e.token_id = $1 AND e.action = 'service_token.issue'",
+                &[&created.record.id],
+            )
+            .await
+            .expect("one journaled issue row bound to the create's outbox row");
+        assert_eq!(
+            (
+                issued.get::<_, Option<i64>>(0),
+                issued.get::<_, i64>(1),
+                issued.get::<_, i64>(2),
+                issued.get::<_, i64>(3),
+                issued.get::<_, Option<i64>>(4),
+                issued.get::<_, i64>(5),
+                issued.get::<_, String>(6),
+            ),
+            (
+                None,
+                1,
+                4,
+                4,
+                None,
+                1,
+                "service_token_change_evidence".to_owned()
+            )
+        );
+        drop(client);
+        clean_database(foundation.pool()).await;
+    }
+
     /// The schema-24 ledger migration 25's prepared release leaves, as this
     /// build sees it. This build serves nothing there: validate-only startup
     /// refuses naming the missing migrations and readiness reports the schema
     /// incompatible, so a replica of it started before the migration stalls
     /// the rollout rather than serving. Its `migrate check` reports exactly
-    /// migrations 25, 26 and 27 unapplied, and its `migrate up` applies them and
-    /// nothing else, recording for migration 25 exactly the checksum the
+    /// migrations 25 through 28 unapplied, and its `migrate up` applies them
+    /// and nothing else, recording for migration 25 exactly the checksum the
     /// prepared release approved. From then on it serves, with and without
     /// development auto-migration, and its migrator has nothing left to do.
     /// A ledger whose migration 25 carries other bytes is refused by the
@@ -4031,7 +4250,7 @@ mod tests {
 
         // The prepared release's schema: not served here.
         let missing = MANIFEST.len() - through_v24;
-        assert_eq!(missing, 3, "migrations 25, 26 and 27");
+        assert_eq!(missing, 4, "migrations 25 through 28");
         let authority = PostgresReadinessAuthority::new(pool.clone());
         assert_eq!(
             read_and_validate_runtime(pool).await,
@@ -4046,7 +4265,7 @@ mod tests {
                 error,
                 PostgresFoundationError::SchemaNotReady {
                     applied: 24,
-                    missing: 3,
+                    missing: 4,
                     auto_migrate: false
                 }
             ),
@@ -4064,8 +4283,8 @@ mod tests {
             })
         );
 
-        // The migration role's `migrate up`: migrations 25, 26 and 27 and nothing
-        // else, migration 25 under the approved checksum.
+        // The migration role's `migrate up`: migrations 25 through 28 and
+        // nothing else, migration 25 under the approved checksum.
         assert_eq!(
             execute(&strict, false).await,
             Ok(MigrateOutput::Applied { applied: missing })
@@ -4094,7 +4313,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 27 }
+            AuthorityObservation::Writable { schema_version: 28 }
         );
         assert_eq!(
             execute(&strict, true).await,
@@ -4134,7 +4353,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 27 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 28 }
         );
         drop(client);
         clean_database(pool).await;

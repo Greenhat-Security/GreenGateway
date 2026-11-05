@@ -72,9 +72,14 @@ conditions (#243, item 16) moved the bodies of `select_rate_lane` and
 original names are now one-line calls of them with no fact captured, which is
 what every serving adapter calls. The targets moved with the bodies, the
 rendered-HTTP mutation now replaces the three-valued rule scan with
-`RuleScan::NoMatch`, and the same tests are selected. When ownership moves again, update the
-target, function hash and exact tests in the same reviewed change, remove the
-retired target, and remeasure.
+`RuleScan::NoMatch`, and the same tests are selected. The path functions moved,
+unchanged, into the shared `gateway-config` library (issue #242), so their two
+targets name `gateway-config/src/path_match.rs` with the same function hashes.
+The gateway's `path_match` module re-exports them and keeps the selected tests,
+because the campaign builds and runs only the gateway's test binary
+(`cargo test -p gateway --bin gateway`), which compiles the library in. When
+ownership moves again, update the target, function hash and exact tests in the
+same reviewed change, remove the retired target, and remeasure.
 
 The tool-lane targets select tests that state the evaluator's answers
 outright. The live adapters ask this same evaluator, so a test that only
@@ -408,7 +413,7 @@ module-level function, `\n    }\n` for a method. To recompute one, for example:
 ```sh
 python - <<'PY'
 import hashlib, pathlib
-source = pathlib.Path("gateway/src/path_match.rs").read_bytes()
+source = pathlib.Path("gateway-config/src/path_match.rs").read_bytes()
 start = source.index(b"pub fn path_prefix_matches(")
 print(hashlib.sha256(source[start:source.index(b"\n}\n", start) + 3]).hexdigest())
 source = pathlib.Path("gateway/src/policy_eval/mod.rs").read_bytes()

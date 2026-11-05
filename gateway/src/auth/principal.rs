@@ -25,32 +25,11 @@ impl AuthMethod {
     }
 }
 
-pub(crate) const PROVIDER_ISSUER_PREFIX: &str = "provider:";
-
-/// Canonical issuer form used by authentication, policy, audit, and discovery.
-pub(crate) fn canonical_issuer(issuer: &str) -> Option<String> {
-    let issuer = issuer.trim().trim_end_matches('/');
-    if issuer.is_empty() {
-        return None;
-    }
-
-    Some(issuer.to_owned())
-}
-
-/// Stable identity-boundary label for configured providers without an issuer.
-pub(crate) fn provider_issuer(provider_name: &str) -> String {
-    let mut encoded = String::with_capacity(provider_name.len());
-    for byte in provider_name.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            use std::fmt::Write as _;
-            write!(&mut encoded, "%{byte:02X}").expect("writing to a string cannot fail");
-        }
-    }
-
-    format!("{PROVIDER_ISSUER_PREFIX}{encoded}")
-}
+// Issuer canonicalization and the issuer bound, which the configuration
+// compiler shares with `ggctl` (issue #242).
+pub(crate) use gateway_config::auth::{
+    canonical_issuer, provider_issuer, MAX_PRINCIPAL_ISSUER_BYTES, PROVIDER_ISSUER_PREFIX,
+};
 
 /// Authenticated caller identity used for authorization and audit attribution.
 #[derive(Debug, Clone)]
@@ -81,8 +60,6 @@ pub(crate) const MAX_PRINCIPAL_ROLES: usize = 256;
 pub(crate) const MAX_PRINCIPAL_ROLE_BYTES: usize = 256;
 /// Longest subject (`user_id`), in bytes.
 pub(crate) const MAX_PRINCIPAL_SUBJECT_BYTES: usize = 4096;
-/// Longest issuer, in bytes.
-pub(crate) const MAX_PRINCIPAL_ISSUER_BYTES: usize = 4096;
 
 /// Why a principal's identity facts are outside the shape every consumer of a
 /// [`Principal`] is entitled to assume.
@@ -268,22 +245,6 @@ mod tests {
         let actor = actor_from_principal(&principal);
 
         assert_eq!(actor.email, None);
-    }
-
-    #[test]
-    fn canonical_issuer_trims_whitespace_and_trailing_slashes() {
-        assert_eq!(
-            canonical_issuer(" https://idp.example/// "),
-            Some("https://idp.example".to_owned())
-        );
-        assert_eq!(canonical_issuer("///"), None);
-    }
-
-    #[test]
-    fn provider_issuer_encodes_reserved_provider_name_bytes() {
-        assert_eq!(provider_issuer("workforce"), "provider:workforce");
-        assert_eq!(provider_issuer("team/red"), "provider:team%2Fred");
-        assert_ne!(provider_issuer("team/red"), provider_issuer("team%2Fred"));
     }
 
     #[test]

@@ -328,6 +328,59 @@ selected while the job ran, the result says `source_changed` and is
 incomplete, never silently short. A window reaching back past audit retention
 simply holds fewer rows; the cutoff's count says how many.
 
+### The cluster reader
+
+In cluster mode the audit authority is PostgreSQL's `audit_events` and its
+commit-ordered `audit_stream`, and the reader over them
+(`storage::postgres_audit_replay`) answers the job engine exactly as the
+standalone reader does. Cluster mode still answers every replay route `503`
+(see [below](#standalone-only-and-process-local)); the reader is what a cluster
+job will read.
+
+- **Cutoff.** `high_water` is the highest stream position assigned when the
+  job is created, read in the same statement as the window's rows at or below
+  it. A writer cannot take a stream position until the writer before it has
+  committed, so every position at or below the cutoff was committed when it
+  was read, and an event committed later -- whatever its timestamp, including
+  one a replica had not flushed yet -- has a higher position and never enters
+  the job.
+- **Pages.** The job walks the stream by position above the last row it read
+  and at or below the cutoff, keeping the events inside `[from, to)`, with the
+  standalone page and row bounds. An oversized row's JSON never leaves the
+  database. An actor that is not the shape the audit sink writes is
+  `unreadable_record`. Every other row goes to the same adapters, so malformed
+  and legacy records get the same codes.
+- **Pruning and gaps.** Stream positions are gapless from 1 and never
+  renumbered, so a missing position at or below the cutoff is a deleted event.
+  When the job has read its window it counts the window's rows again (rows gone
+  since the cutoff are `source_changed`, as standalone) and checks every
+  position from the newest retained event older than the window to the oldest
+  retained event at or after its end, across every position the cutoff
+  selected. When no event older than the window is retained, the check starts
+  at position 1. Any missing position makes the result `completed_incomplete`
+  with `source_pruned`, whether retention reached past the window's start
+  before or during the job, or a row was removed from inside it. A window that
+  retention emptied is `source_pruned` as well as `no_data`. The check relies
+  on commit order: an event deleted below the newest retained event older than
+  the window is taken to be older than the window.
+- **Sharing the database.** Every read checks a connection out under its own
+  pool class, `policy_replay` (timed in
+  `greengateway_database_pool_acquire_seconds`). It runs in a short read-only
+  transaction with `SET LOCAL` bounds: 10 seconds per statement and 1 second
+  per lock wait, or the session's `DATABASE_STATEMENT_TIMEOUT_MS` and
+  `DATABASE_LOCK_TIMEOUT_MS` when those are shorter. A job holds one
+  connection per replica, for one statement or two at a time. It keeps no
+  snapshot between pages, takes only the shared lock every read takes and
+  never the stream's write lock, and gives its connection back rather than
+  wait behind a migration. Request decisions, the audit writer and retention
+  never queue behind it. The cutoff and the closing check count the window's
+  rows, so a window too large to count within the statement bound fails
+  (`503` when the job is created, `source_unavailable` at its end) rather than
+  being cut short.
+- **Errors** are classified where they happen and logged there. No SQL, window
+  bound, position or record value reaches the job, its result or its
+  lifecycle records.
+
 ### Bounds
 
 | Bound | Value | When reached |
@@ -367,7 +420,7 @@ already admitted is answered before a slot is asked for.
 | State | Meaning |
 | --- | --- |
 | `completed` | Every record the cutoff selected was read and classified, the window was unchanged at the end, and at least one record was replayed |
-| `completed_incomplete` | A result whose `limitations` say what it does not cover: `scan_truncated`, `deadline_exceeded`, `source_changed`, or `no_data` when nothing in the window was replayable. It satisfies no gate |
+| `completed_incomplete` | A result whose `limitations` say what it does not cover: `scan_truncated`, `deadline_exceeded`, `source_changed`, `source_pruned` (cluster audit stream only: rows the window may have held are gone), or `no_data` when nothing in the window was replayable. It satisfies no gate |
 | `failed` | No result, with a stable `failure.reason`: `source_unavailable`, `compile_failed`, `evaluator_failed` (the evaluator broke its own contract; nothing it counted is an answer), `result_too_large`, `audit_unavailable` or `internal` |
 | `cancelled` | No result. A queued job stops at once; a running one before its next record |
 | `expired` | 15 minutes have passed since the job finished: its result, if it had one, is gone, and it no longer counts against any quota |
@@ -483,6 +536,10 @@ shape. `impact` is described in [Impact comparison](#impact-comparison).)
 | `stale` | `reason: base_changed`: the active policy changed after the job was pinned. The result stays the answer for the policies it was pinned to, but it is not evidence about the live policy, and must not be reused to justify a change to it: start a new job |
 | `unknown` | This response did not check (a cancellation's `202`, or a retry that raced its job's admission) |
 
+- **`source`** names what was read -- `standalone_audit_log`, or
+  `cluster_audit_stream` for the [cluster reader](#the-cluster-reader), whose
+  `high_water` is a stream position rather than a row id -- with the window,
+  the cutoff and the record bound.
 - **`records`** classifies every row read: the adapter code of each, as in
   [Reading the audit records the gateway writes today](#reading-the-audit-records-the-gateway-writes-today),
   plus `unreadable_record` (actor or payload JSON that does not parse) and
@@ -520,8 +577,8 @@ its next record. A restart forgets every job: its id is `404` afterwards,
 never resumed and never a partial result. Cluster mode answers every replay
 route `503 policy_replay_unsupported_in_cluster`, after the permission checks
 and before a body is read, a cutoff fixed or a job admitted: a replicated job
-needs the durable leases of #241, and the cluster audit authority is
-PostgreSQL, which no replay reader covers yet. Without a
+needs the durable leases of #241. The [cluster reader](#the-cluster-reader)
+over PostgreSQL's audit stream exists, but no route uses it yet. Without a
 standalone audit log (`AUDIT_SQLITE_PATH` unset) the start route is
 `503 audit_evidence_unavailable`, never an empty result.
 
@@ -745,6 +802,20 @@ principals, roles, route permissions and dispatch facts never appear.
   oversized and unreadable rows are counted without their JSON being read; the
   same cutoff and candidate give byte-identical results however the log is
   paged; no result repeats a record value; and the run records no metric.
+- The cluster reader is run against a real PostgreSQL. A job reads exactly
+  the window's rows at or below its cutoff, and rows committed after it with
+  timestamps inside the window never enter. A batch that had already inserted
+  its events but was still waiting for the stream lock when the cutoff was
+  read is not counted. Under racing writers, every cutoff's count is exactly
+  what its pages later read. Retention that stays before the window leaves a
+  job complete. Retention past the window's start, before or during the job,
+  a row deleted from inside the window and a window retention emptied are
+  each `source_pruned`. Oversized, unreadable, legacy, malformed and
+  non-request rows are counted by their codes, and an oversized row's JSON is
+  never read. A locked stream fails a read within the replay's lock bound,
+  not the session's. Every failure is classified, and no error carries SQL,
+  schema names, the driver's message, a window bound or a record value. Each
+  read is timed under the `policy_replay` checkout class.
 - Through the application: every route refuses a caller missing any of its
   three permissions, and serves a job only to its owner; a stale base, an
   invalid window, edit or candidate creates no job; an idempotent retry starts

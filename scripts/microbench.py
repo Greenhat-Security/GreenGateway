@@ -35,10 +35,15 @@ INITIAL_HARNESS_SHA256 = "0e005f7903991f9f4eb7b22cf2b56871c9a0d0a554f3d4ecf4d9a8
 HARNESS_PATH = "scripts/benchmarks/pure_paths.rs"
 BUDGET_PATH = "microbench-budget.json"
 SOURCE_PATHS = (
-    "gateway/src/path_match.rs",
+    "gateway-config/src/path_match.rs",
     "gateway/src/egress.rs",
     "gateway/src/rbac/matcher.rs",
 )
+# Where a selected source lived before it moved. The path functions moved,
+# byte for byte, into the shared `gateway-config` library (issue #242), so a
+# base revision from before that move is read from the old path; its projection
+# is the same text either way.
+MOVED_SOURCE_PATHS = {"gateway-config/src/path_match.rs": "gateway/src/path_match.rs"}
 TARGET_IDS = ("request_path", "path_prefix", "rule_path", "egress_host")
 # These dataset descriptors are part of schema 1; changing them needs a reviewed
 # protocol update as well as the base-owned benchmark digest.
@@ -760,6 +765,17 @@ def _blob(root, revision, path):
     return _git(root, "show", revision + ":" + path)
 
 
+def _source_blob(root, revision, path):
+    """One selected source at `revision`, from where that revision holds it."""
+    try:
+        return _blob(root, revision, path)
+    except ValueError:
+        if path not in MOVED_SOURCE_PATHS:
+            raise
+        # A missing revision fails here too, with the same error.
+        return _blob(root, revision, MOVED_SOURCE_PATHS[path])
+
+
 def _has_blob(root, revision, path):
     return subprocess.run(["git", "-C", str(root), "cat-file", "-e", revision + ":" + path],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -889,7 +905,7 @@ def _measure(root, revision, label, output, compiler, harness, context, deadline
     directory.mkdir()
     source_dir = directory / "source"
     source_dir.mkdir()
-    sources = {name: _blob(root, revision, name) for name in SOURCE_PATHS}
+    sources = {name: _source_blob(root, revision, name) for name in SOURCE_PATHS}
     projected = project_sources(sources)
     for name, text in projected.items():
         (source_dir / name).write_text(text, encoding="utf-8")

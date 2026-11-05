@@ -267,10 +267,11 @@ Per replica, independent of request rate unless noted:
 `greengateway_database_pool_acquire_seconds{operation_class, error_class}`
 times the checkouts of the six authority stores: policy and the revision
 counter, service tokens, JWT revocations, rate limits, execution leases and the
-dedicated session. A checkout is recorded when the pool hands it a connection,
+dedicated session; and historical policy replay's reads of the audit stream.
+A checkout is recorded when the pool hands it a connection,
 when the pool refuses it, and when its caller stops waiting first. A checkout
 that was dropped before it started waiting has no wait to record.
-`operation_class` is one of seven fixed names:
+`operation_class` is one of eight fixed names:
 
 | `operation_class` | What is waiting for a connection |
 | --- | --- |
@@ -281,6 +282,7 @@ that was dropped before it started waiting has no wait to record.
 | `security_state_read` | Activation revisions and active documents for reconciliation, and admin reads of policy, history and tokens |
 | `control_plane_write` | Policy commits, service-token create, revoke and rotate, JWT revocations |
 | `maintenance` | The dedicated maintenance session, cleanup sweeps and operator commands |
+| `policy_replay` | A historical policy replay job's cutoff, pages and closing check, one connection per replica at a time (no route runs a cluster replay yet) |
 
 A class says what kind of work waited, not which caller waited. Two classes mix
 callers with different deadlines:
@@ -318,7 +320,7 @@ itself only a lower bound on how long that caller would have waited.
 
 No label carries a principal, token, route, key, statement or request ID. The
 registry audit in `cluster_app_tests.rs` holds every rendered value to its declared
-list and the family to exactly one series per class and outcome: seven classes
+list and the family to exactly one series per class and outcome: eight classes
 by eight outcomes today (six classified kinds, `none` and `cancelled`), with
 the class list capped at eight.
 
@@ -464,7 +466,7 @@ numbers describe that machine, not yours.
 | --- | --- |
 | `requests` | Completed requests, throughput, status counts (`200` and `503` only in a complete cell), client timeouts, `rate_503`, `rate_client_timeout`, and nearest-rank p50/p95/p99/max latency over all requests (`latency_ms`) and over served ones (`served_latency_ms`), overall and per request kind. |
 | `pool.replicas[].acquire` | Per replica, one row per `operation_class` and `error_class` whose count moved during the window. Each row has the exact count and sum delta, and the exporter's p50/p95/p99/max in milliseconds (see [Reading it](#reading-it) for how those are computed). |
-| `pool.acquire_counts` | Deployment-wide counts for all 56 class and outcome pairs, zeros included. A `cancelled` of zero is stated, not left out. |
+| `pool.acquire_counts` | Deployment-wide counts for all 64 class and outcome pairs, zeros included. A `cancelled` of zero is stated, not left out. |
 | `pool.replicas[]` | The `greengateway_database_pool_timeouts_total` and `audit_events_dropped_total` deltas. Also the largest `size`, smallest `available` and largest `waiting` sampled every 500 ms. |
 | `pool.connection_ceiling` | `replicas x DATABASE_POOL_MAX`, as configured. |
 | `database` | `pg_stat_activity` sampled every 500 ms, as max and mean per sample. It covers the runtime role's sessions (`runtime_backends`, `active`, `idle`, `idle_in_transaction`), every session in the database waiting on `Lock`, `LWLock` and `IO`, and ungranted `pg_locks` entries. It also has `longest_lock_wait_ms`: the longest time any session seen waiting on `Lock` had spent in its current statement (`clock_timestamp() - query_start`), which is an upper bound on that lock wait rather than the wait itself. Last come the `pg_stat_database` deltas (`xact_commit`, `xact_rollback`, `deadlocks`, `blks_hit`, `blks_read`, `temp_files`). |

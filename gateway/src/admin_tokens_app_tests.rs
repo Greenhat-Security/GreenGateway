@@ -178,11 +178,14 @@ async fn assert_token_rotation_delegation_contract(store: Arc<dyn storage::Servi
         ),
     ] {
         let created = store
-            .create(auth::tokens::CreateTokenRequest {
-                scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
-                created_by: "bootstrap-admin".to_owned(),
-                expires_at: None,
-            })
+            .create(
+                auth::tokens::CreateTokenRequest {
+                    scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+                    created_by: "bootstrap-admin".to_owned(),
+                    expires_at: None,
+                },
+                &auth::change_actor::ChangeActor::for_test("bootstrap-admin"),
+            )
             .await
             .expect("fixture token should create");
         let capture = audit::sink::tests::CaptureSink::new();
@@ -299,7 +302,7 @@ async fn token_rotation_delegation_contract_postgres() {
     config.state_backend = config::StateBackend::Postgres;
     config.deployment_id = Some("deploy-token-rotation-contract".to_owned());
     config.database.url_file = Some(dsn_file.path.clone());
-    config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+    storage::postgres::test_support::use_test_tls(&mut config.database);
     let foundation = storage::postgres::PostgresFoundation::establish(&config)
         .await
         .expect("test database should establish");
@@ -353,11 +356,14 @@ async fn admin_token_changes_record_the_authenticated_actor(
     for _ in 0..2 {
         ids.push(
             store
-                .create(auth::tokens::CreateTokenRequest {
-                    scopes: vec!["probe-reader".to_owned()],
-                    created_by: "bootstrap-admin".to_owned(),
-                    expires_at: None,
-                })
+                .create(
+                    auth::tokens::CreateTokenRequest {
+                        scopes: vec!["probe-reader".to_owned()],
+                        created_by: "bootstrap-admin".to_owned(),
+                        expires_at: None,
+                    },
+                    &auth::change_actor::ChangeActor::for_test("bootstrap-admin"),
+                )
                 .await
                 .expect("fixture token should create")
                 .record
@@ -420,7 +426,20 @@ async fn admin_token_changes_record_the_authenticated_actor(
     }
 
     let owned = |value: &str| value.to_owned();
+    let issued = |id: &String| {
+        (
+            owned("service_token.issue"),
+            id.clone(),
+            owned("bootstrap-admin"),
+            None,
+            Some(owned("principal")),
+            Some(owned("bearer_token")),
+        )
+    };
     vec![
+        // The fixture tokens' issues come first, then the changes.
+        issued(&ids[0]),
+        issued(&ids[1]),
         (
             owned("service_token.rotate"),
             ids[0].clone(),
@@ -496,7 +515,7 @@ async fn admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issu
     config.state_backend = config::StateBackend::Postgres;
     config.deployment_id = Some("deploy-token-change-actor".to_owned());
     config.database.url_file = Some(dsn_file.path.clone());
-    config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+    storage::postgres::test_support::use_test_tls(&mut config.database);
     let foundation = storage::postgres::PostgresFoundation::establish(&config)
         .await
         .expect("test database should establish");
@@ -532,6 +551,247 @@ async fn admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issu
         })
         .collect::<Vec<TokenChangeActorRow>>();
     assert_eq!(recorded, expected);
+}
+
+/// What the admin create endpoint should have recorded, and the plaintexts
+/// its responses returned, which no evidence row may hold.
+struct IssuedThroughTheEndpoint {
+    expected: Vec<TokenChangeActorRow>,
+    plaintexts: Vec<String>,
+}
+
+/// Issue #425: the admin create endpoint passes the authenticated principal
+/// to the store, which records it -- subject, canonical issuer, actor kind
+/// and auth mode -- as the issue's evidence in the create's own transaction,
+/// beside the token row's `created_by`. A person signed in through a provider
+/// issues one token and a service token another.
+async fn admin_token_create_records_the_authenticated_actor(
+    store: Arc<dyn storage::ServiceTokenStore>,
+) -> IssuedThroughTheEndpoint {
+    let policy = parse_policy_body(&Bytes::from(token_policy_document_string()))
+        .expect("token policy should parse");
+    let config = test_config(Vec::new());
+    let audit_log = test_audit_log();
+    let state = TokenAdminState {
+        store: Some(store),
+        validator: None,
+        rbac_state: Some(middleware::rbac::RbacState::new(
+            policy,
+            Vec::new(),
+            false,
+            audit_log.clone(),
+        )),
+        audit: audit_log,
+        client_ip_policy: client_ip::ClientIpPolicy::from_config(&config),
+        max_body_size: config.max_body_size,
+    };
+    let principal = |user_id: &str, issuer: Option<&str>, auth_method| auth::Principal {
+        user_id: user_id.to_owned(),
+        issuer: issuer.map(str::to_owned),
+        auth_method,
+        ..test_principal(&["superadmin"])
+    };
+    let owned = |value: &str| value.to_owned();
+    let mut issued = IssuedThroughTheEndpoint {
+        expected: Vec::new(),
+        plaintexts: Vec::new(),
+    };
+    for (actor, issuer, kind, auth_mode) in [
+        (
+            principal(
+                "issuing-admin",
+                Some(" https://idp.example.test/ "),
+                auth::AuthMethod::Cookie,
+            ),
+            Some("https://idp.example.test"),
+            "principal",
+            "session_cookie",
+        ),
+        (
+            principal(
+                "service-token:token_issuer",
+                None,
+                auth::AuthMethod::ServiceToken,
+            ),
+            None,
+            "service_token",
+            "service_token",
+        ),
+    ] {
+        let subject = actor.user_id.clone();
+        let response = token_create_endpoint(
+            State(state.clone()),
+            token_admin_request(
+                Method::POST,
+                TOKENS_ADMIN_ROUTE,
+                Some(actor),
+                Some(json!({ "scopes": ["probe-reader"] }).to_string()),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["token"]["created_by"],
+            json!(subject),
+            "the token row still names its creator"
+        );
+        let id = body["token"]["id"]
+            .as_str()
+            .expect("the created token carries its id")
+            .to_owned();
+        issued.plaintexts.push(
+            body["plaintext_token"]
+                .as_str()
+                .expect("the create returns the plaintext once")
+                .to_owned(),
+        );
+        issued.expected.push((
+            owned("service_token.issue"),
+            id,
+            subject,
+            issuer.map(owned),
+            Some(owned(kind)),
+            Some(owned(auth_mode)),
+        ));
+    }
+    issued
+}
+
+/// The evidence the create endpoint left is exactly the expected rows, and
+/// no stored column holds a plaintext the responses returned or its hash.
+fn assert_issue_evidence(
+    issued: &IssuedThroughTheEndpoint,
+    recorded: &[TokenChangeActorRow],
+    stored: &str,
+) {
+    assert_eq!(recorded, issued.expected.as_slice());
+    for plaintext in &issued.plaintexts {
+        assert!(
+            !stored.contains(plaintext.as_str()),
+            "plaintext in evidence"
+        );
+        assert!(
+            !stored.contains(auth::tokens::hash_token(plaintext).as_str()),
+            "token hash in evidence"
+        );
+    }
+    assert!(!stored.contains("ggw_"), "no display prefix: {stored}");
+}
+
+#[tokio::test]
+async fn admin_token_create_records_the_authenticated_actor_as_issue_evidence_sqlite() {
+    let token_db = TempDb::new("token-issue-actor-evidence");
+    let store =
+        auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+    let issued = admin_token_create_records_the_authenticated_actor(Arc::new(store)).await;
+    let connection = Connection::open(&token_db.path).expect("token database should open");
+    let mut statement = connection
+        .prepare(
+            "SELECT action, token_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode, \
+                    event_id, operation_id, committed_at \
+             FROM service_token_change_evidence ORDER BY sequence",
+        )
+        .expect("evidence query should prepare");
+    let mut stored = String::new();
+    let recorded = statement
+        .query_map([], |row| {
+            for index in 6..9 {
+                stored.push_str(&row.get::<_, String>(index)?);
+                stored.push('|');
+            }
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .expect("evidence query should run")
+        .collect::<Result<Vec<TokenChangeActorRow>, _>>()
+        .expect("evidence rows should decode");
+    for row in &recorded {
+        stored.push_str(&format!("{row:?}"));
+    }
+    assert_issue_evidence(&issued, &recorded, &stored);
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_token_create_records_the_authenticated_actor_as_issue_evidence_postgres() {
+    use storage::contract_tests::postgres_audit_tests::{
+        create_test_database, locator, write_dsn_file, DATABASE,
+    };
+
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping PostgreSQL issue-actor evidence: no test database locator");
+        return;
+    };
+    let _serial = DATABASE.lock().await;
+    let database = create_test_database(&admin_dsn).await;
+    let dsn_file = write_dsn_file(&database.dsn);
+    let mut config = config::Config::test_defaults();
+    config.state_backend = config::StateBackend::Postgres;
+    config.deployment_id = Some("deploy-token-issue-actor".to_owned());
+    config.database.url_file = Some(dsn_file.path.clone());
+    config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+    let foundation = storage::postgres::PostgresFoundation::establish(&config)
+        .await
+        .expect("test database should establish");
+    storage::migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+        .await
+        .expect("test database should migrate");
+    let store =
+        storage::postgres_service_tokens::PostgresServiceTokenStore::new(foundation.pool().clone());
+    let issued = admin_token_create_records_the_authenticated_actor(Arc::new(store)).await;
+    let client = foundation.pool().get().await.expect("evidence checkout");
+    let recorded = client
+        .query(
+            "SELECT action, token_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode \
+             FROM greengateway.service_token_change_evidence \
+             ORDER BY security_revision",
+            &[],
+        )
+        .await
+        .expect("evidence rows should read")
+        .iter()
+        .map(|row| {
+            (
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+            )
+        })
+        .collect::<Vec<TokenChangeActorRow>>();
+    let stored = client
+        .query(
+            "SELECT row_to_json(t)::text FROM greengateway.service_token_change_evidence t",
+            &[],
+        )
+        .await
+        .expect("evidence text should read")
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_issue_evidence(&issued, &recorded, &stored);
+    // Each issue is journaled for delivery in its own transaction.
+    let journaled: i64 = client
+        .query_one(
+            "SELECT count(*) FROM greengateway.authority_event_journal j \
+             JOIN greengateway.service_token_change_evidence e USING (event_id) \
+             WHERE e.action = 'service_token.issue'",
+            &[],
+        )
+        .await
+        .expect("the journal reads")
+        .get(0);
+    assert_eq!(journaled, 2);
 }
 
 /// Pins the narrowed create mapping restored from the #340 review: a
@@ -624,11 +884,14 @@ async fn token_rotate_of_a_record_with_scopes_outside_the_role_bounds_is_a_confl
         auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
     // The store does not judge scopes; this is a record from before the bound.
     let created = store
-        .create(auth::tokens::CreateTokenRequest {
-            scopes: vec!["probe-reader".to_owned(), String::new()],
-            created_by: "bootstrap-admin".to_owned(),
-            expires_at: None,
-        })
+        .create(
+            auth::tokens::CreateTokenRequest {
+                scopes: vec!["probe-reader".to_owned(), String::new()],
+                created_by: "bootstrap-admin".to_owned(),
+                expires_at: None,
+            },
+            &auth::change_actor::ChangeActor::for_test("bootstrap-admin"),
+        )
         .expect("fixture token should create");
 
     let rotated = router
@@ -1058,11 +1321,14 @@ async fn token_admin_rotate_returns_new_plaintext_and_invalidates_old_bearer() {
     let token_store =
         auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
     let created = token_store
-        .create(auth::tokens::CreateTokenRequest {
-            scopes: vec!["token-admin".to_owned(), "probe-reader".to_owned()],
-            created_by: "bootstrap-admin".to_owned(),
-            expires_at: None,
-        })
+        .create(
+            auth::tokens::CreateTokenRequest {
+                scopes: vec!["token-admin".to_owned(), "probe-reader".to_owned()],
+                created_by: "bootstrap-admin".to_owned(),
+                expires_at: None,
+            },
+            &auth::change_actor::ChangeActor::for_test("bootstrap-admin"),
+        )
         .expect("service token should create");
     let policy = TempPolicyFile::new(&service_token_policy_document());
     let capture = audit::sink::tests::CaptureSink::new();

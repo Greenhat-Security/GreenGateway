@@ -192,7 +192,7 @@ impl PostgresPolicyStore {
     }
 
     /// The analysis suppression store on the same pool (issue #243, slice
-    /// 15): migration 27's table, shared by every replica.
+    /// 15): migration 28's table, shared by every replica.
     pub fn analysis_suppression_store(
         &self,
     ) -> super::postgres_analysis_suppressions::PostgresAnalysisSuppressionStore {

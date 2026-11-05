@@ -515,7 +515,7 @@ pub(super) struct PolicyAdminState {
     /// cluster mode. `None` leaves the draft routes answering `503`.
     pub(super) draft_store: Option<Arc<dyn storage::PolicyDraftStore>>,
     /// Analyzer finding suppressions (issue #243, slice 15): a table in the
-    /// policy history database standalone, migration 27's table in cluster
+    /// policy history database standalone, migration 28's table in cluster
     /// mode. `None` leaves the suppression routes answering `503` and every
     /// analysis reporting its suppressions unavailable.
     pub(super) analysis_suppression_store: Option<Arc<dyn storage::AnalysisSuppressionStore>>,

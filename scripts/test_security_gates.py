@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import struct
 import subprocess
@@ -864,7 +865,8 @@ class DependentRequiredJobGate(unittest.TestCase):
     required check, so every such job runs under `always()` and itself
     requires `success` from each job it waits on.
     """
-    SHARDS = ['postgres-foundation-pg', 'postgres-foundation-no-default', 'postgres-foundation-lint']
+    SHARDS = ['postgres-foundation-pg', 'postgres-foundation-no-default', 'postgres-foundation-lint',
+              'postgres-foundation-tls']
     OUTCOMES = ['failure', 'skipped', 'cancelled', '']
 
     def setUp(self):
@@ -894,7 +896,7 @@ class DependentRequiredJobGate(unittest.TestCase):
         for name in ('image-scan', 'image-verification'):
             self.assertEqual(self.jobs[name]['if'], "github.event_name == 'push'")
 
-    def test_postgres_foundation_is_exactly_its_three_original_passes(self):
+    def test_postgres_foundation_keeps_its_three_original_passes(self):
         aggregator = self.jobs['postgres-foundation']
         self.assertEqual(aggregator['needs'], self.SHARDS)
         self.assertEqual(aggregator['name'], 'postgres-foundation')
@@ -923,21 +925,88 @@ class DependentRequiredJobGate(unittest.TestCase):
         names = [step.get('name') for step in pg['steps']]
         self.assertLess(names.index('Create the no-DDL runtime role'), names.index('Test against a real PostgreSQL (feature on)'))
 
+    def tls_step(self, name):
+        return next(step for step in self.jobs['postgres-foundation-tls']['steps'] if step.get('name') == name)
+
+    def test_the_tls_pass_runs_the_evidence_suites_against_a_server_that_requires_verified_tls(self):
+        job = self.jobs['postgres-foundation-tls']
+        self.assertEqual(job['name'], 'postgres-foundation-tls')
+        for optional in ('if', 'needs', 'continue-on-error', 'strategy', 'env', 'services'):
+            self.assertNotIn(optional, job)
+        self.assertIn('postgres-foundation-tls', self.jobs['promote-image']['needs'])
+        names = [step.get('name') for step in job['steps']]
+        order = [names.index(name) for name in (
+            'Generate a throwaway CA and server certificate', 'Start PostgreSQL with TLS required',
+            'Write the test DSN file', 'Test the authority-evidence suites over verified TLS')]
+        self.assertEqual(order, sorted(order))
+
+        # The plaintext shard's pinned image, TLS on, and plaintext refused
+        # by the server itself rather than merely not attempted.
+        start = self.tls_step('Start PostgreSQL with TLS required')
+        image = self.jobs['postgres-foundation-pg']['services']['postgres']['image']
+        self.assertRegex(image, r'^postgres:16@sha256:[0-9a-f]{64}$')
+        self.assertIn(image, start['run'])
+        for setting in ('-c ssl=on', '-c ssl_cert_file=', '-c ssl_key_file=', '-c hba_file=',
+                        '-p 127.0.0.1:5432:5432'):
+            self.assertIn(setting, start['run'])
+        generate = self.tls_step('Generate a throwaway CA and server certificate')
+        self.assertIn("'hostssl all all all trust'", generate['run'])
+        self.assertIn("'hostnossl all all all reject'", generate['run'])
+        self.assertNotIn("'host ", generate['run'])
+        self.assertIn('rm -f "${tls}/ca.key"', generate['run'])
+
+        test = self.tls_step('Test the authority-evidence suites over verified TLS')
+        self.assertEqual(test['env'], {
+            'GATEWAY_TEST_POSTGRES_URL_FILE': '${{ runner.temp }}/pg/database-url',
+            'GATEWAY_TEST_POSTGRES_TLS_CA_FILE': '${{ runner.temp }}/pg-tls/ca.crt',
+        })
+        for optional in ('if', 'continue-on-error'):
+            self.assertNotIn(optional, test)
+        self.assertIn('cargo test -p gateway --locked --bin gateway -- "${suites[@]}"', test['run'])
+        self.assertIn('selects no test', test['run'])
+        tokens = test['run'].split()
+        for suite in ('storage::postgres::test_support::tests::', 'connections::pg_store::tests::',
+                      'storage::postgres_documents::tests::', 'storage::postgres_admin_sessions::tests::',
+                      'authority_events::dispatcher::tests::'):
+            self.assertIn(suite, tokens)
+        for flag in ('--release', '--no-default-features', 'RUSTFLAGS', '--skip', '--ignored'):
+            self.assertNotIn(flag, test['run'])
+
+    @unittest.skipUnless(shutil.which('openssl'), 'openssl is not installed')
+    def test_the_tls_pass_generates_a_server_certificate_that_chains_and_names_loopback(self):
+        generate = self.tls_step('Generate a throwaway CA and server certificate')
+        with tempfile.TemporaryDirectory() as temporary:
+            result = run_bash(generate['run'], {'RUNNER_TEMP': temporary})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            tls = Path(temporary) / 'pg-tls'
+            # The CA key, the request and the configurations are gone.
+            self.assertEqual(sorted(path.name for path in tls.iterdir()), ['ca.crt', 'server'])
+            self.assertEqual(sorted(path.name for path in (tls / 'server').iterdir()),
+                             ['pg_hba.conf', 'server.crt', 'server.key'])
+            def extensions(certificate, names):
+                return subprocess.run(['openssl', 'x509', '-in', str(certificate), '-noout', '-ext', names],
+                                      capture_output=True, text=True, check=True).stdout
+            server = extensions(tls / 'server' / 'server.crt', 'subjectAltName,basicConstraints,extendedKeyUsage')
+            for expected in ('IP Address:127.0.0.1', 'DNS:localhost', 'CA:FALSE', 'TLS Web Server Authentication'):
+                self.assertIn(expected, server)
+            self.assertIn('CA:TRUE', extensions(tls / 'ca.crt', 'basicConstraints'))
+
     def aggregate(self, results):
         step = next(step for step in self.jobs['postgres-foundation']['steps']
                     if step.get('name') == 'Require every PostgreSQL foundation pass')
         self.assertEqual(step['shell'], 'bash')
         expected = {f'{key}': '${{ needs.' + shard + '.result }}' for key, shard in
-                    zip(('FEATURE_ON_RESULT', 'NO_DEFAULT_RESULT', 'LINT_RESULT'), self.SHARDS)}
+                    zip(('FEATURE_ON_RESULT', 'NO_DEFAULT_RESULT', 'LINT_RESULT', 'TLS_RESULT'), self.SHARDS)}
         self.assertEqual(step['env'], expected)
         return run_bash(step['run'], dict(zip(expected, results)))
 
     def test_the_aggregate_passes_only_when_every_shard_succeeded(self):
-        self.assertEqual(self.aggregate(['success'] * 3).returncode, 0)
-        for index in range(3):
+        shards = len(self.SHARDS)
+        self.assertEqual(self.aggregate(['success'] * shards).returncode, 0)
+        for index in range(shards):
             for outcome in self.OUTCOMES:
                 with self.subTest(shard=self.SHARDS[index], outcome=outcome):
-                    results = ['success'] * 3
+                    results = ['success'] * shards
                     results[index] = outcome
                     result = self.aggregate(results)
                     self.assertNotEqual(result.returncode, 0)

@@ -480,7 +480,7 @@ Standalone mode keeps suppressions in a `policy_analysis_suppressions` table
 of the policy history database (`POLICY_HISTORY_SQLITE_PATH`, or the
 `<POLICY_FILE>.history.sqlite` default), judged on the process clock. Cluster
 mode keeps them in `greengateway.policy_analysis_suppressions` (PostgreSQL
-migration 27), shared by every replica and judged on database time; a create
+migration 28), shared by every replica and judged on database time; a create
 takes a transaction-scoped advisory lock so the bound holds across replicas.
 At most 256 suppressions that have not ended may exist. An ended suppression
 stays listed, and keeps its findings reading `suppression_expired`, until a

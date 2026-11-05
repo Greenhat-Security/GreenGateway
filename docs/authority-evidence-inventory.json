@@ -1135,35 +1135,82 @@
           "anchor": "async fn token_create_endpoint("
         }
       ],
-      "boundary": "create locks token resource state, inserts token, advances shared revision/high-water and appends outbox in one transaction.",
-      "record": "Token created_by/created_at and immutable create outbox revision survive token rotate/revoke; raw token never stored in event/outbox.",
-      "actor": "created_by retains creating subject; issuer/auth mode absent.",
-      "identity": "Token ID and row revision 1 plus security revision; no operation ID.",
-      "delivery": "post_commit_telemetry",
+      "boundary": "create refuses an actor the evidence cannot record exactly (ChangeActor::is_recordable) before checkout, then takes the token high-water mark, reserves the shared revision, inserts the token row at revision 1, sets the high-water mark, appends the create outbox row, writes one service_token_change_evidence row carrying the same shared revision (no prior revision, revision 1 after) and journals it, and commits once. An evidence insert or journal append failure rolls the whole create back, so no token is minted, and is reported as a store failure, never a conflict; a full journal refuses the create with 503.",
+      "record": "Token created_by/created_at and the immutable create outbox revision as before. Since migration 27, service_token_change_evidence (no foreign key) holds one service_token.issue row per committed create: the actor (subject, kind, auth mode and canonical issuer), event/operation UUIDs, prior_version NULL, new_version 1, the outbox row's shared revision and database-clock committed_at, never the returned plaintext, its hash, the display prefix or the scopes. Tokens created before migration 27 have no issue row and keep created_by as their only record; nothing is backfilled.",
+      "actor": "The authenticated principal the admin create endpoint passes through ServiceTokenStore as a ChangeActor, committed with the create: actor_user_id (the subject, 1 to 4096 bytes), actor_kind (principal, or service_token for a service-token caller), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). created_by still names the creating subject on the token row. A keyed safe actor reference exists only in what is delivered.",
+      "identity": "Generated event_id and operation_id UUIDs per create (not bound to a client idempotency key), token ID, row revision 1, shared revision equal to the create outbox row, database-clock committed_at. A lost create response cannot return its plaintext: the evidence shows the issue committed, and creating again issues a second token with its own row.",
+      "delivery": "journaled_dispatch",
       "disposition": [
-        "missing_metadata",
-        "missing_delivery"
+        "missing_metadata"
       ],
-      "follow_up": "PR2: retain scoped creator/action/event identity at existing create transaction; returned plaintext must not enter evidence.",
+      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the store and derive an issuer-scoped subject reference. Delivery journals each issue row in the create's transaction and dispatches it as authority_event_delivery.v1 service_token.issue on the token axis (before null, after 1); AUTHORITY_EVIDENCE_DURABILITY=required makes a configured sink mandatory and admits this row; nothing qualifies it yet.",
       "sources": [
         {
+          "path": "gateway/src/storage/migrations/0027_service_token_issue_evidence.sql",
+          "anchor": "ADD CONSTRAINT service_token_change_evidence_versions CHECK ("
+        },
+        {
           "path": "gateway/src/storage/postgres_service_tokens.rs",
-          "anchor": "async fn create("
+          "anchor": "validate_change_actor(OPERATION_CREATE, actor)?;"
+        },
+        {
+          "path": "gateway/src/storage/postgres_service_tokens.rs",
+          "anchor": "action: crate::auth::tokens::TOKEN_CHANGE_ACTION_ISSUE,"
         },
         {
           "path": "gateway/src/storage/postgres_service_tokens.rs",
           "anchor": "async fn record_revision("
+        },
+        {
+          "path": "gateway/src/storage/postgres_service_tokens.rs",
+          "anchor": "async fn record_change_evidence("
+        },
+        {
+          "path": "gateway/src/admin_tokens.rs",
+          "anchor": "store.create(request, &actor)"
+        },
+        {
+          "path": "gateway/src/authority_events/delivery.rs",
+          "anchor": "const ACTION_SERVICE_TOKEN_ISSUE: &str = \"service_token.issue\";"
         }
       ],
       "tests": [
         {
           "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn postgres_service_token_issue_evidence_satisfies_the_contract("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn service_token_change_evidence_matches_the_outbox_and_survives_deletion_and_restart("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
           "anchor": "async fn service_token_mutations_advance_the_shared_revision_and_set_the_high_water_mark("
+        },
+        {
+          "path": "gateway/src/storage/migrations.rs",
+          "anchor": "async fn migration_twenty_seven_admits_token_issue_evidence_and_backfills_nothing("
+        },
+        {
+          "path": "gateway/src/admin_tokens_app_tests.rs",
+          "anchor": "async fn admin_token_create_records_the_authenticated_actor_as_issue_evidence_postgres("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing("
+        },
+        {
+          "path": "gateway/src/authority_events/delivery_tests.rs",
+          "anchor": "fn an_issue_projects_only_as_the_tokens_first_revision("
         }
       ],
       "required_durability_supported": false,
       "required_mode": "admitted",
-      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional issue evidence and its journaled delivery: the actor recorded, rollback on a failed evidence insert, capacity refusal, commit order and the contiguous issue, rotate and revoke chain. They do not certify the proposed authority_event.v1 contract."
     },
     {
       "id": "token_issue_standalone",
@@ -1179,20 +1226,40 @@
           "anchor": "async fn token_create_endpoint("
         }
       ],
-      "boundary": "SQLite INSERT persists hashed token and creator; async adapter delegates to that store.",
-      "record": "Current token row retains creator/time; no independent authority-event record.",
-      "actor": "created_by only, not issuer/auth context.",
-      "identity": "Token ID; SQLite token rows do not expose PostgreSQL shared/row revision counters.",
+      "boundary": "SqliteTokenStore create refuses an actor the evidence cannot record exactly (ChangeActor::is_recordable), then runs one IMMEDIATE transaction on the SERVICE_TOKEN_SQLITE_PATH database: insert the token row, append one service_token_change_evidence row, commit. An evidence insert failure rolls the create back, so no token is minted, and is reported as a store failure, never a conflict. A database whose evidence table predates the issue action has that table rebuilt once on open, in one IMMEDIATE transaction that keeps every row, its sequence and the AUTOINCREMENT high-water mark and recreates the index.",
+      "record": "Token row with hash and created_by/created_at as before. The same database's service_token_change_evidence (no foreign key) keeps one append-only service_token.issue row per committed create: actor (subject, kind, auth mode and canonical issuer), event/operation UUIDs, token ID and committed_at (the token's own created_at), never the returned plaintext, its hash, the display prefix or the scopes. Tokens created before this build have no issue row and keep created_by as their only record; nothing is backfilled. import-standalone does not carry these rows.",
+      "actor": "The authenticated principal the admin create endpoint passes through ServiceTokenStore as a ChangeActor, committed with the create: the subject (1 to 4096 bytes), actor_kind (principal or service_token), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). created_by still names the creator on the token row.",
+      "identity": "Generated event_id/operation_id UUIDs, token ID, a store sequence and the process-clock committed_at. SQLite token rows have no revision chain, so the row records no prior/new revision; no caller-bound operation ID.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR4: wrap token insert and bounded evidence in one SERVICE_TOKEN_SQLITE_PATH transaction; no audit database dual write.",
+      "follow_up": "PR4: a store-owned revision per change; delivery from this same database, with no audit-database dual write.",
       "sources": [
         {
           "path": "gateway/src/auth/tokens.rs",
-          "anchor": "fn create(&self, request:"
+          "anchor": "pub(crate) const TOKEN_CHANGE_ACTION_ISSUE: &str = \"service_token.issue\";"
+        },
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "action: TOKEN_CHANGE_ACTION_ISSUE,"
+        },
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "const CHANGE_EVIDENCE_COLUMNS_SQL: &str"
+        },
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "fn rebuild_change_evidence_for_issue(connection: &Connection)"
+        },
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "fn record_change_evidence("
+        },
+        {
+          "path": "gateway/src/admin_tokens.rs",
+          "anchor": "store.create(request, &actor)"
         }
       ],
       "tests": [
@@ -1201,13 +1268,33 @@
           "anchor": "fn create_returns_plaintext_once_and_never_exposes_hash_or_plaintext_again("
         },
         {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "fn an_evidence_table_written_before_issue_evidence_is_rebuilt_once_and_keeps_its_rows("
+        },
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "fn change_evidence_actions_match_both_schemas("
+        },
+        {
           "path": "gateway/src/storage/contract_tests.rs",
-          "anchor": "async fn sqlite_service_token_store_satisfies_the_contract("
+          "anchor": "async fn sqlite_service_token_issue_evidence_satisfies_the_contract("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn sqlite_service_token_change_evidence_satisfies_the_contract("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn sqlite_change_evidence_survives_token_deletion_and_restart("
+        },
+        {
+          "path": "gateway/src/admin_tokens_app_tests.rs",
+          "anchor": "async fn admin_token_create_records_the_authenticated_actor_as_issue_evidence_sqlite("
         }
       ],
       "required_durability_supported": false,
       "required_mode": "admitted",
-      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+      "test_claim": "Standalone regression anchors for the transactional issue evidence in the token store's own database and the one-time table rebuild that admits it. They do not certify the proposed authority-event contract or delivery."
     },
     {
       "id": "token_change_postgres",
@@ -1236,7 +1323,7 @@
       "disposition": [
         "missing_metadata"
       ],
-      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the store and derive an issuer-scoped subject reference; token issue still records only created_by and is not journaled. Issuer, actor kind and auth mode are recorded since migration 24. Delivery (PR3) journals each row in the change's transaction and dispatches it as authority_event_delivery.v1 behind a persisted cursor; AUTHORITY_EVIDENCE_DURABILITY=required makes a configured sink mandatory and admits this row; nothing qualifies it yet.",
+      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the store and derive an issuer-scoped subject reference. Token issue is recorded and journaled in the same table since migration 27 (token_issue_postgres). Issuer, actor kind and auth mode are recorded since migration 24. Delivery (PR3) journals each row in the change's transaction and dispatches it as authority_event_delivery.v1 behind a persisted cursor; AUTHORITY_EVIDENCE_DURABILITY=required makes a configured sink mandatory and admits this row; nothing qualifies it yet.",
       "sources": [
         {
           "path": "gateway/src/storage/migrations/0018_service_token_and_jwt_evidence.sql",
@@ -1256,7 +1343,7 @@
         },
         {
           "path": "gateway/src/storage/service_token.rs",
-          "anchor": "Rotate and revoke are told who is acting."
+          "anchor": "Create, rotate and revoke are told who is acting."
         },
         {
           "path": "gateway/src/admin_tokens.rs",
@@ -1377,7 +1464,7 @@
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR4: a store-owned revision per change; delivery from this same database, with no audit-database dual write. Token issue evidence remains open. Issuer, actor kind and auth mode are recorded.",
+      "follow_up": "PR4: a store-owned revision per change; delivery from this same database, with no audit-database dual write. Token issue is recorded in the same table (token_issue_standalone). Issuer, actor kind and auth mode are recorded.",
       "sources": [
         {
           "path": "gateway/src/auth/tokens.rs",
