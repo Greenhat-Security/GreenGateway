@@ -35,6 +35,13 @@
 //!   request checked that connection out next, invisibly and for as long
 //!   as the pool kept it; closing the connection is the only release the
 //!   server guarantees.
+//! - **Work the caller cut short** ([`DedicatedSession::close`]) leaves
+//!   the connection in a state nobody on the client side knows: a
+//!   statement may still be running, and a transaction the work opened
+//!   may still be open, holding its row locks. The caller closes the
+//!   session rather than run anything else on it or hand it back; the
+//!   server then rolls that transaction back and releases every lock the
+//!   session held once its statement in flight has ended.
 //! - **A drop without release** (the job's future was cancelled: the
 //!   lease was lost, or the lifecycle is draining) detaches the connection
 //!   for the same reason. Nothing is remembered, nothing dangles.
@@ -184,6 +191,23 @@ impl DedicatedSession {
             return Err(classify_query(error, OPERATION_PROBE));
         }
         Ok(())
+    }
+
+    /// Close the connection without unlocking, for a session whose work the
+    /// caller cut short (the maintenance runner's step budget ran out). The
+    /// cut came at an `await` nobody chose: the statement in flight may
+    /// still be running, and a transaction the work opened with a bare
+    /// `BEGIN` may still be open -- a dropped future sends no `COMMIT` and
+    /// no `ROLLBACK`. Anything sent next would run inside that transaction, and
+    /// a release would hand it to the pool still open, holding its row
+    /// locks until the pool next recycled the connection. Closing is the
+    /// end the server guarantees: it rolls the transaction back and
+    /// releases every lock the session held, the advisory lock included.
+    /// The session is broken afterwards; [`Self::client`] answers `None`.
+    pub fn close(&mut self) {
+        if let Some(client) = self.client.take() {
+            detach(client);
+        }
     }
 
     /// Unlock and return the connection to the pool. On a failed unlock
