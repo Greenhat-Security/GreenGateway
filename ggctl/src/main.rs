@@ -3,15 +3,15 @@
 //! A separate binary: the `gateway` server keeps its name, its no-argument
 //! startup and its one-shot commands. It provides the command table, the
 //! output contract (human, `--format json` reports, SARIF for `validate` and
-//! `diff`), the stable exit codes, shell completion, secure bearer-token
-//! input, the version handshake with a running gateway, offline bundle
-//! validation, pinning, diagnosis and semantic diff with the gateway's own
-//! bundle reader and diff engine, the same offline validation, diagnosis and
-//! diff of an environment file with the gateway's own configuration compiler
-//! (`gateway-config`), the offline commands over a standalone revision
-//! ledger (`ggctl ledger`), offline backups of a standalone state directory
-//! and their restore (`ggctl backup`), the policy commands, which ask a
-//! gateway's own validator and evaluator (`ggctl policy`), and offline
+//! `diff`), the stable exit codes, shell completion and manual pages, secure
+//! bearer-token input, the version handshake with a running gateway, offline
+//! bundle validation, pinning, diagnosis and semantic diff with the gateway's
+//! own bundle reader and diff engine, the same offline validation, diagnosis
+//! and diff of an environment file with the gateway's own configuration
+//! compiler (`gateway-config`), the offline commands over a standalone
+//! revision ledger (`ggctl ledger`), offline backups of a standalone state
+//! directory and their restore (`ggctl backup`), the policy commands, which
+//! ask a gateway's own validator and evaluator (`ggctl policy`), and offline
 //! evidence package verification (`ggctl evidence verify`).
 //!
 //! `ggctl` reads no configuration file of its own and no environment
@@ -33,6 +33,7 @@ mod help;
 mod init;
 mod input;
 mod ledger;
+mod man;
 mod mcp_config;
 mod output;
 mod pin;
@@ -73,6 +74,7 @@ fn run(arguments: &[OsString], io: &mut Io<'_>) -> Exit {
     match cli::parse(arguments) {
         Err(diagnostic) => report::error(io, diagnostic),
         Ok(Parsed::Help(topic)) => report::artifact(io, &help::text(topic)),
+        Ok(Parsed::Manual(topic)) => report::artifact(io, &man::page(topic)),
         Ok(Parsed::Version) => {
             report::artifact(io, concat!("ggctl ", env!("CARGO_PKG_VERSION"), "\n"))
         }
@@ -127,6 +129,15 @@ mod tests {
             let (exit, captured) = run_words(words);
             assert_eq!(exit, Exit::Success, "{words:?}");
             assert!(captured.stdout().contains("Usage: ggctl"), "{words:?}");
+            assert!(captured.stderr().is_empty());
+        }
+        for (words, title) in [
+            (&["help", "--man"][..], "\n.TH GGCTL 1 "),
+            (&["help", "--man", "schema"], "\n.TH GGCTL\\-SCHEMA 1 "),
+        ] {
+            let (exit, captured) = run_words(words);
+            assert_eq!(exit, Exit::Success, "{words:?}");
+            assert!(captured.stdout().contains(title), "{words:?}");
             assert!(captured.stderr().is_empty());
         }
     }

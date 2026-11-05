@@ -1,11 +1,11 @@
 //! The command table and the argument parser.
 //!
 //! One static table defines every command, argument and option. Help text
-//! (`help.rs`) and shell completion (`completion.rs`) are generated from it,
-//! and the parser accepts exactly what it lists, so the three cannot drift.
-//! A command family (`ggctl ledger`, `ggctl backup`, `ggctl policy`) is a
-//! name whose commands are listed in the table under their full names
-//! (`ledger seed`, `backup create`).
+//! (`help.rs`), manual pages (`man.rs`) and shell completion
+//! (`completion.rs`) are generated from it, and the parser accepts exactly
+//! what it lists, so the four cannot drift. A command family (`ggctl ledger`,
+//! `ggctl backup`, `ggctl policy`) is a name whose commands are listed in the
+//! table under their full names (`ledger seed`, `backup create`).
 //!
 //! Before anything else the parser refuses any argument that looks like a
 //! secret-carrying or verification-disabling option, wherever it appears, so
@@ -386,6 +386,12 @@ const API_VERSION: OptionSpec = OptionSpec {
     value: Some(("VERSION", ValueKind::Text)),
     repeatable: false,
     help: "the document version to print (default: the newest this ggctl publishes)",
+};
+const MAN: OptionSpec = OptionSpec {
+    name: "--man",
+    value: None,
+    repeatable: false,
+    help: "print the same text as a manual page in man(7) roff",
 };
 const STATE_DIR: OptionSpec = OptionSpec {
     name: "--state-dir",
@@ -1106,6 +1112,11 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             "Prints the help for COMMAND, or the overview without one. For a command family \
              such as ledger, backup or policy, prints the family's commands, or with \
              SUBCOMMAND that command's help.",
+            "With --man, prints the same text as a manual page in man(7) roff: ggctl(1) for \
+             the overview, ggctl-COMMAND(1) for a command or family and \
+             ggctl-COMMAND-SUBCOMMAND(1) for a family's command. The release archives carry \
+             these pages under man/man1. For example: ggctl help --man validate > \
+             ggctl-validate.1",
         ],
         arguments: &[
             ArgumentSpec {
@@ -1121,7 +1132,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 help: "a command of the COMMAND family",
             },
         ],
-        options: &[],
+        options: &[MAN],
         run: crate::help::run,
     },
 ];
@@ -1184,6 +1195,8 @@ pub(crate) enum Parsed {
     Run(Invocation),
     /// `--help`, `-h` or `help`.
     Help(HelpTopic),
+    /// `help --man`: the same as a manual page.
+    Manual(HelpTopic),
     /// `--version`.
     Version,
 }
@@ -1284,7 +1297,11 @@ pub(crate) fn parse(arguments: &[OsString]) -> Result<Parsed, Diagnostic> {
         return Ok(Parsed::Help(HelpTopic::Spec(command)));
     }
     if command.name == "help" {
-        return help_topic(&invocation).map(Parsed::Help);
+        let topic = help_topic(&invocation)?;
+        if invocation.flag("--man").is_some() {
+            return Ok(Parsed::Manual(topic));
+        }
+        return Ok(Parsed::Help(topic));
     }
     Ok(Parsed::Run(invocation))
 }
