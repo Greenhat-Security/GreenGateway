@@ -40,8 +40,9 @@ OpenAPI tool registration), `mcp_app_tests.rs` (the MCP endpoint),
 suggestions, principals and schema coverage), `cluster_app_tests.rs` (cluster
 status, readiness and the HA metric registry) and `routing_app_tests.rs`
 (listeners, routing, proxying and the middleware order), beside the
-per-feature `*_app_tests.rs`, `admin_policy_*_tests.rs` and
-`admin_suggestion_drafts_tests.rs` modules it already declared and the
+per-feature `*_app_tests.rs`, `admin_policy_*_tests.rs`,
+`admin_suggestion_drafts_tests.rs` and `admin_suggestion_acceptance_tests.rs`
+modules it already declared and the
 acceptance modules under `tests/`. `app_tests.rs` itself
 defines no tests; it owns the fixtures more than one of these modules uses.
 [The application test inventory](../testing/application-test-inventory.md)

@@ -5393,6 +5393,20 @@ mod cluster_policy_tests {
         );
         let gate: Arc<dyn middleware::rbac::SecurityRevisionGate> =
             Arc::new(BackgroundBudgetGate(runtime));
+        let policy_state = PolicyAdminState {
+            policy_file: None,
+            rbac_state: Some(rbac_state.clone().with_revision_gate(gate.clone())),
+            history_store: Some(store.clone() as Arc<dyn storage::PolicyHistory>),
+            draft_store: Some(Arc::new(store.draft_store()) as Arc<dyn storage::PolicyDraftStore>),
+            control_plane: Some(store as Arc<dyn storage::PolicyControlPlane>),
+            membership,
+            event_store: None,
+            query_store: None,
+            authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(),
+            audit,
+            client_ip_policy: client_ip::ClientIpPolicy::default(),
+            max_body_size: 1024 * 1024,
+        };
         let router = Router::new()
             .route(
                 POLICY_ADMIN_ROUTE,
@@ -5411,32 +5425,26 @@ mod cluster_policy_tests {
                     .delete(policy_draft_delete_endpoint),
             )
             .route(
-                POLICY_DRAFT_PUBLISH_ADMIN_ROUTE,
-                post(policy_draft_publish_endpoint),
-            )
-            .route(
                 POLICY_SIMULATIONS_ADMIN_ROUTE,
                 post(policy_simulations_endpoint).layer(Extension(Arc::new(
                     PolicyEvaluationLimiter::new(MAX_CONCURRENT_POLICY_SIMULATIONS),
                 ))),
             )
-            .with_state(PolicyAdminState {
-                policy_file: None,
-                rbac_state: Some(rbac_state.clone().with_revision_gate(gate.clone())),
-                history_store: Some(store.clone() as Arc<dyn storage::PolicyHistory>),
-                draft_store: Some(
-                    Arc::new(store.draft_store()) as Arc<dyn storage::PolicyDraftStore>
-                ),
-                control_plane: Some(store as Arc<dyn storage::PolicyControlPlane>),
-                membership,
-                event_store: None,
-                query_store: None,
-                authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(
-                ),
-                audit,
-                client_ip_policy: client_ip::ClientIpPolicy::default(),
-                max_body_size: 1024 * 1024,
-            })
+            .with_state(policy_state.clone())
+            // Publication shares the suggestion routes' state, as production
+            // routes it; no discovery engine is configured here.
+            .merge(
+                Router::new()
+                    .route(
+                        POLICY_DRAFT_PUBLISH_ADMIN_ROUTE,
+                        post(policy_draft_publish_endpoint),
+                    )
+                    .with_state(SuggestionsAdminState {
+                        suggestion_engine: None,
+                        policy: policy_state,
+                        lifecycle_guard: Arc::default(),
+                    }),
+            )
             .layer(axum::middleware::from_fn_with_state(
                 gate,
                 admin_revision_gate_middleware,

@@ -4456,7 +4456,7 @@ async fn suggestions_admin_without_engine_answers_not_configured() {
                 client_ip_policy: client_ip::ClientIpPolicy::default(),
                 max_body_size: 1024 * 1024,
             },
-            lifecycle_guard: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle_guard: Arc::default(),
         });
     let not_configured_error = "suggestions API requires DISCOVERY_SQLITE_PATH to be configured";
 
@@ -8397,6 +8397,9 @@ mod cluster_discovery_tests {
         rbac_state: middleware::rbac::RbacState,
         policy_store: Arc<PostgresPolicyStore>,
         audit: audit::sink::tests::CaptureSink,
+        /// A handle on the engine's lifecycle store, sharing its test-only
+        /// crash hook.
+        lifecycle_store: storage::postgres_discovery_lifecycle::PostgresDiscoveryLifecycleStore,
     }
 
     async fn cluster_suggestions_harness(
@@ -8432,12 +8435,14 @@ mod cluster_discovery_tests {
             .await
             .expect("the authority's revision should install");
 
+        let lifecycle_store =
+            storage::postgres_discovery_lifecycle::PostgresDiscoveryLifecycleStore::new(
+                pool.clone(),
+            );
         let engine = discovery::cluster_suggestions::ClusterRuleSuggestionEngine::new(
             Arc::new(PostgresDiscoveryReadStore::new(pool.clone())),
             audit_store,
-            storage::postgres_discovery_lifecycle::PostgresDiscoveryLifecycleStore::new(
-                pool.clone(),
-            ),
+            lifecycle_store.clone(),
             discovery::suggestions::RuleSuggestionConfig {
                 baseline_window_hours: 876_000,
             },
@@ -8456,6 +8461,14 @@ mod cluster_discovery_tests {
                 SUGGESTION_ACCEPT_ADMIN_ROUTE,
                 post(rule_suggestion_accept_endpoint),
             )
+            .route(
+                SUGGESTION_DRAFT_ADMIN_ROUTE,
+                post(rule_suggestion_draft_endpoint),
+            )
+            .route(
+                POLICY_DRAFT_PUBLISH_ADMIN_ROUTE,
+                post(policy_draft_publish_endpoint),
+            )
             .with_state(SuggestionsAdminState {
                 suggestion_engine: Some(discovery::suggestions::SuggestionEngineHandle::Cluster(
                     Arc::new(engine),
@@ -8464,7 +8477,9 @@ mod cluster_discovery_tests {
                     policy_file: None,
                     rbac_state: Some(rbac_state.clone()),
                     history_store: Some(policy_store.clone() as Arc<dyn storage::PolicyHistory>),
-                    draft_store: None,
+                    draft_store: Some(
+                        Arc::new(policy_store.draft_store()) as Arc<dyn storage::PolicyDraftStore>
+                    ),
                     control_plane: Some(
                         policy_store.clone() as Arc<dyn storage::PolicyControlPlane>
                     ),
@@ -8477,7 +8492,7 @@ mod cluster_discovery_tests {
                     client_ip_policy: client_ip::ClientIpPolicy::default(),
                     max_body_size: 1024 * 1024,
                 },
-                lifecycle_guard: Arc::new(tokio::sync::Mutex::new(())),
+                lifecycle_guard: Arc::default(),
             });
 
         ClusterSuggestionsHarness {
@@ -8485,6 +8500,7 @@ mod cluster_discovery_tests {
             rbac_state,
             policy_store,
             audit: capture,
+            lifecycle_store,
         }
     }
 
@@ -9612,5 +9628,275 @@ mod cluster_discovery_tests {
         assert_eq!(retried.rule_count, 1);
         assert_eq!(retried.suggestion_state, "accepted");
         assert_eq!(retried.suggestion_revision, 2);
+    }
+
+    /// Open `id` in a new draft against `policy_etag`: `(draft_id,
+    /// draft_etag)`.
+    async fn open_in_draft(router: &Router, id: &str, policy_etag: &str) -> (String, String) {
+        let opened = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                &format!("/v1/admin/suggestions/{id}/draft"),
+                Some(test_principal(&["suggestions-policy-writer"])),
+                None,
+                Some(policy_etag),
+            ))
+            .await
+            .expect("draft request should complete");
+        assert_eq!(opened.status(), StatusCode::CREATED);
+        let draft_etag = policy_etag_header(&opened);
+        let draft_id = json_body(opened).await["draft"]["draft_id"]
+            .as_str()
+            .expect("the draft names its id")
+            .to_owned();
+        (draft_id, draft_etag)
+    }
+
+    /// A draft publication bound to suggestion `id` at `revision`.
+    fn bound_publish_request(
+        draft: &(String, String),
+        policy_etag: &str,
+        id: &str,
+        revision: i64,
+    ) -> Request<Body> {
+        let mut request = suggestions_admin_request(
+            Method::POST,
+            &format!("{POLICY_DRAFTS_ADMIN_ROUTE}/{}/publish", draft.0),
+            Some(test_principal(&["suggestions-policy-writer"])),
+            Some(json!({ "suggestion": { "id": id, "revision": revision } }).to_string()),
+            Some(policy_etag),
+        );
+        request.headers_mut().insert(
+            HeaderName::from_static(POLICY_DRAFT_ETAG_HEADER),
+            HeaderValue::from_str(&draft.1).expect("draft ETag header should build"),
+        );
+        request
+    }
+
+    /// Give the generated suggestion an id of this test's own, so a crash
+    /// armed for it cannot fire in another test generating the same one.
+    async fn renamed_suggestion(pool: &deadpool_postgres::Pool, id: &str, unique: &str) {
+        let client = pool.get().await.expect("client");
+        let renamed = client
+            .execute(
+                "UPDATE greengateway.discovery_rule_suggestions SET id = $1 WHERE id = $2",
+                &[&unique, &id],
+            )
+            .await
+            .expect("the suggestion renames");
+        assert_eq!(renamed, 1);
+    }
+
+    /// A draft publication bound to a suggestion in cluster mode (issue
+    /// #243): the draft's candidate and the suggestion's transition commit
+    /// in the acceptance transaction. A crash between the policy write and
+    /// the transition inside it applies neither half, and the retry applies
+    /// both; a second publication is refused without writing.
+    #[tokio::test]
+    async fn a_cluster_publication_bound_to_a_suggestion_commits_both_halves_or_neither() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database.dsn).await;
+        let audit_store = cluster_audit_store(&pool).await;
+        seed_baseline_generation_fixture(&pool, &audit_store).await;
+        let harness = cluster_suggestions_harness(&pool, audit_store).await;
+        let id = generate_one_suggestion(&harness.router).await;
+        let before = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+        let draft = open_in_draft(&harness.router, &id, &before.active_etag).await;
+
+        harness.lifecycle_store.crash_before_transition_for_tests();
+        let crashed = harness
+            .router
+            .clone()
+            .oneshot(bound_publish_request(&draft, &before.active_etag, &id, 1))
+            .await
+            .expect("publication should complete");
+        assert_eq!(crashed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            acceptance_footprint(&harness.policy_store, &pool, &id).await,
+            before,
+            "the rolled-back transaction wrote neither the policy nor the transition"
+        );
+
+        let published = harness
+            .router
+            .clone()
+            .oneshot(bound_publish_request(&draft, &before.active_etag, &id, 1))
+            .await
+            .expect("publication should complete");
+        assert_eq!(published.status(), StatusCode::OK);
+        let published_etag = policy_etag_header(&published);
+        let after = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+        assert_eq!(after.active_etag, published_etag);
+        assert_eq!(after.rule_count, 1);
+        assert_eq!(after.suggestion_state, "accepted");
+        assert_eq!(after.suggestion_revision, 2);
+        // The aborted attempt's version number is a gap, never a row.
+        assert_eq!(after.document_rows, 2);
+        assert_eq!(after.outbox_rows, 2);
+        let history = storage::PolicyHistory::list_versions(
+            harness.policy_store.as_ref(),
+            &PolicyHistoryListFilters {
+                limit: 1,
+                cursor: None,
+                include_policy: false,
+            },
+        )
+        .await
+        .expect("history should list");
+        let summary = &history.versions[0].diff_summary;
+        assert_eq!(summary["action"], json!("policy_draft_published"));
+        assert_eq!(summary["draft_id"], json!(draft.0));
+        assert_eq!(summary["suggestion"]["id"], json!(id));
+        assert_eq!(summary["suggestion"]["revision"], json!(1));
+
+        let repeated = harness
+            .router
+            .clone()
+            .oneshot(bound_publish_request(&draft, &published_etag, &id, 1))
+            .await
+            .expect("publication should complete");
+        assert_eq!(repeated.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(repeated).await["reason"],
+            json!("policy_draft_published")
+        );
+        assert_eq!(
+            acceptance_footprint(&harness.policy_store, &pool, &id).await,
+            after
+        );
+    }
+
+    /// A dismissal that commits on another replica while a bound
+    /// publication waits for the suggestion row wins: the publication's
+    /// transaction sees the dismissed row, refuses with `suggestion_stale`,
+    /// and rolls its policy commit back.
+    #[tokio::test]
+    async fn a_cluster_publication_loses_to_a_dismissal_it_waited_for_and_writes_nothing() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database.dsn).await;
+        let audit_store = cluster_audit_store(&pool).await;
+        seed_baseline_generation_fixture(&pool, &audit_store).await;
+        let harness = cluster_suggestions_harness(&pool, audit_store).await;
+        let id = generate_one_suggestion(&harness.router).await;
+        let before = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+        let draft = open_in_draft(&harness.router, &id, &before.active_etag).await;
+
+        // A peer replica's dismissal, mid-transaction, holding the row.
+        let peer = pool.get().await.expect("peer client");
+        peer.batch_execute("BEGIN").await.expect("BEGIN");
+        peer.query_one(
+            "SELECT id FROM greengateway.discovery_rule_suggestions WHERE id = $1 FOR UPDATE",
+            &[&id.as_str()],
+        )
+        .await
+        .expect("the row locks");
+
+        let request = bound_publish_request(&draft, &before.active_etag, &id, 1);
+        let router = harness.router.clone();
+        let publishing = tokio::spawn(async move {
+            router
+                .oneshot(request)
+                .await
+                .expect("publication should complete")
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !publishing.is_finished(),
+            "the publication must wait for the suggestion row"
+        );
+        storage::postgres_discovery_lifecycle::transition_suggestion_with(
+            &peer,
+            &id,
+            discovery::suggestions::RuleSuggestionLifecycleState::Dismissed,
+            Some("admin-b"),
+            discovery::lifecycle::TransitionPrecondition::from_state(
+                discovery::suggestions::RuleSuggestionLifecycleState::Open,
+            ),
+        )
+        .await
+        .expect("the peer dismisses")
+        .expect_applied("the peer holds the lock");
+        peer.batch_execute("COMMIT").await.expect("COMMIT");
+        drop(peer);
+
+        let refused = publishing
+            .await
+            .expect("the publication task should finish");
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        let refused = json_body(refused).await;
+        assert_eq!(refused["reason"], json!("suggestion_stale"));
+        assert_eq!(refused["suggestion"]["state"], json!("dismissed"));
+        let after = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+        assert_eq!(after.active_version, before.active_version);
+        assert_eq!(after.document_rows, before.document_rows);
+        assert_eq!(after.rule_count, 0);
+        assert_eq!(after.suggestion_state, "dismissed");
+        assert_eventually(Duration::from_secs(2), || {
+            harness.audit.events().iter().any(|event| {
+                event.event_type == audit::event::POLICY_DRAFT_PUBLISH_REFUSED
+                    && event.payload["reason"] == json!("suggestion_stale")
+            })
+        });
+    }
+
+    /// A replica that dies after the acceptance transaction committed has
+    /// lost only what follows it -- the replica install, the events and the
+    /// draft's mark -- and both halves are durable together. Retrying the
+    /// publication commits nothing a second time.
+    #[tokio::test]
+    async fn a_cluster_publication_that_dies_after_its_commit_keeps_both_halves() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database.dsn).await;
+        let audit_store = cluster_audit_store(&pool).await;
+        seed_baseline_generation_fixture(&pool, &audit_store).await;
+        let harness = cluster_suggestions_harness(&pool, audit_store).await;
+        let generated = generate_one_suggestion(&harness.router).await;
+        let id = format!("cluster-crash-{}", uuid::Uuid::new_v4().simple());
+        renamed_suggestion(&pool, &generated, &id).await;
+        let before = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+        let draft = open_in_draft(&harness.router, &id, &before.active_etag).await;
+
+        acceptance_crash::arm(&id, AcceptanceBoundary::PolicyCommitted);
+        let crashed = harness
+            .router
+            .clone()
+            .oneshot(bound_publish_request(&draft, &before.active_etag, &id, 1))
+            .await
+            .expect("publication should complete");
+        assert_eq!(crashed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let after = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+        assert_eq!(after.active_version, before.active_version + 1);
+        assert_eq!(after.rule_count, 1);
+        assert_eq!(after.suggestion_state, "accepted");
+        assert_eq!(after.suggestion_revision, 2);
+
+        let retried = harness
+            .router
+            .clone()
+            .oneshot(bound_publish_request(&draft, &after.active_etag, &id, 1))
+            .await
+            .expect("publication should complete");
+        assert_eq!(retried.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(retried).await["reason"],
+            json!("policy_draft_base_stale")
+        );
+        assert_eq!(
+            acceptance_footprint(&harness.policy_store, &pool, &id).await,
+            after
+        );
     }
 }

@@ -7,6 +7,7 @@ use std::{
 };
 
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
+use rusqlite::{OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
@@ -73,7 +74,24 @@ ON discovery_rule_suggestions(state, created_at, id);
 
 CREATE INDEX IF NOT EXISTS idx_discovery_rule_suggestions_source_signal
 ON discovery_rule_suggestions(source_signal_id);
+
+CREATE TABLE IF NOT EXISTS discovery_suggestion_acceptance_intents (
+    suggestion_id TEXT PRIMARY KEY NOT NULL,
+    suggestion_revision INTEGER NOT NULL CHECK (suggestion_revision >= 1),
+    candidate_etag TEXT NOT NULL,
+    base_etag TEXT NOT NULL,
+    history_floor INTEGER CHECK (history_floor IS NULL OR history_floor >= 0),
+    actor TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK (origin IN ('accept', 'draft_publish')),
+    created_at TEXT NOT NULL
+);
 "#;
+
+/// The most acceptance intents one reconciliation pass reads. Standalone
+/// acceptances run one at a time under the suggestion lifecycle lock and
+/// every pass clears what it reads, so more than one pending intent means a
+/// pass failed; the bound keeps a pass's work fixed regardless.
+const MAX_ACCEPTANCE_INTENTS_PER_PASS: i64 = 64;
 
 const INSERT_RULE_SUGGESTION_SQL: &str = r#"
 INSERT OR IGNORE INTO discovery_rule_suggestions (
@@ -170,6 +188,78 @@ impl RuleSuggestion {
             || (!auth_methods.is_empty()
                 && (!self.proposed_rule.principal.issuers.is_empty() || service_token_bound))
     }
+}
+
+/// Which route a standalone acceptance came from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SuggestionAcceptanceOrigin {
+    /// `POST .../suggestions/{id}/accept`.
+    Accept,
+    /// `POST .../policy/drafts/{id}/publish` with a suggestion binding.
+    DraftPublish,
+}
+
+impl SuggestionAcceptanceOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::DraftPublish => "draft_publish",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "accept" => Some(Self::Accept),
+            "draft_publish" => Some(Self::DraftPublish),
+            _ => None,
+        }
+    }
+}
+
+/// A standalone acceptance that is about to write, or has written, the
+/// policy and has not yet moved its suggestion (issue #243).
+///
+/// Standalone mode cannot commit the policy file and the suggestion row in
+/// one transaction, so an acceptance records this row in the suggestion's
+/// own database before it writes the policy, and clears it in the same
+/// transaction that moves the suggestion to `accepted`. A row that outlives
+/// its acceptance (the process died, or the transition failed) is settled
+/// by the reconciler from what the policy authority shows: the suggestion
+/// is accepted when `candidate_etag` was committed, and the row is dropped
+/// otherwise.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SuggestionAcceptanceIntent {
+    pub suggestion_id: String,
+    /// The suggestion revision the acceptance validated; the transition
+    /// requires it.
+    pub suggestion_revision: i64,
+    /// The ETag the policy carries once the acceptance's candidate is
+    /// committed.
+    pub candidate_etag: String,
+    /// The live policy ETag the candidate replaces.
+    pub base_etag: String,
+    /// The newest policy history version before the commit, or `None` when
+    /// no history store is configured. The acceptance's own history row,
+    /// if it was appended, is the first one after it.
+    pub history_floor: Option<i64>,
+    /// Recorded as the suggestion's `transitioned_by`.
+    pub actor: String,
+    pub origin: SuggestionAcceptanceOrigin,
+    pub created_at: String,
+}
+
+/// How a pending acceptance intent was settled.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AcceptanceIntentCompletion {
+    /// The suggestion moved to `accepted` and the intent was cleared, in
+    /// one transaction.
+    Accepted(RuleSuggestion),
+    /// The suggestion is no longer open at the intent's revision (or no
+    /// longer exists, `None`): the intent was cleared and the suggestion
+    /// left as it is.
+    Refused(Option<RuleSuggestion>),
+    /// No intent for that suggestion and candidate exists.
+    Missing,
 }
 
 #[derive(Serialize)]
@@ -413,6 +503,47 @@ impl RuleSuggestionEngine {
     ) -> Result<TransitionOutcome<RuleSuggestion>, RuleSuggestionError> {
         self.suggestion_store
             .transition_suggestion(suggestion_id, state, transitioned_by, expected)
+    }
+
+    /// Record that an acceptance is about to commit `intent.candidate_etag`.
+    /// Refused when the suggestion already has a pending intent: the
+    /// reconciler settles every pending intent before an acceptance starts,
+    /// so a second one is never silently replaced.
+    pub fn record_acceptance_intent(
+        &self,
+        intent: &SuggestionAcceptanceIntent,
+    ) -> Result<(), RuleSuggestionError> {
+        self.suggestion_store.record_acceptance_intent(intent)
+    }
+
+    /// The pending acceptance intents, oldest first, at most
+    /// [`MAX_ACCEPTANCE_INTENTS_PER_PASS`].
+    pub fn acceptance_intents(
+        &self,
+    ) -> Result<Vec<SuggestionAcceptanceIntent>, RuleSuggestionError> {
+        self.suggestion_store.acceptance_intents()
+    }
+
+    /// Drop the intent for a candidate that was not committed. `false` when
+    /// there was none.
+    pub fn discard_acceptance_intent(
+        &self,
+        suggestion_id: &str,
+        candidate_etag: &str,
+    ) -> Result<bool, RuleSuggestionError> {
+        self.suggestion_store
+            .discard_acceptance_intent(suggestion_id, candidate_etag)
+    }
+
+    /// Move the intent's suggestion to `accepted` and clear the intent, in
+    /// one transaction, for a candidate that was committed.
+    pub fn complete_acceptance_intent(
+        &self,
+        suggestion_id: &str,
+        candidate_etag: &str,
+    ) -> Result<AcceptanceIntentCompletion, RuleSuggestionError> {
+        self.suggestion_store
+            .complete_acceptance_intent(suggestion_id, candidate_etag)
     }
 
     /// Re-validate a stored suggestion's routing context against the
@@ -973,6 +1104,83 @@ impl SuggestionEngineHandle {
             Self::Cluster(engine) => engine.direct_rule_suggestion_safety(&suggestion).await,
         }
     }
+
+    /// See [`RuleSuggestionEngine::record_acceptance_intent`]. Cluster mode
+    /// commits an acceptance in one transaction and keeps no intents, so
+    /// asking it to record one is refused.
+    pub async fn record_acceptance_intent(
+        &self,
+        intent: SuggestionAcceptanceIntent,
+    ) -> Result<(), RuleSuggestionError> {
+        match self {
+            Self::Standalone(engine) => {
+                let engine = Arc::clone(engine);
+                blocking(move || engine.record_acceptance_intent(&intent)).await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Cluster(_) => Err(cluster_keeps_no_acceptance_intents()),
+        }
+    }
+
+    /// See [`RuleSuggestionEngine::acceptance_intents`]. Always empty in
+    /// cluster mode.
+    pub async fn acceptance_intents(
+        &self,
+    ) -> Result<Vec<SuggestionAcceptanceIntent>, RuleSuggestionError> {
+        match self {
+            Self::Standalone(engine) => {
+                let engine = Arc::clone(engine);
+                blocking(move || engine.acceptance_intents()).await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Cluster(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// See [`RuleSuggestionEngine::discard_acceptance_intent`].
+    pub async fn discard_acceptance_intent(
+        &self,
+        suggestion_id: String,
+        candidate_etag: String,
+    ) -> Result<bool, RuleSuggestionError> {
+        match self {
+            Self::Standalone(engine) => {
+                let engine = Arc::clone(engine);
+                blocking(move || engine.discard_acceptance_intent(&suggestion_id, &candidate_etag))
+                    .await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Cluster(_) => Err(cluster_keeps_no_acceptance_intents()),
+        }
+    }
+
+    /// See [`RuleSuggestionEngine::complete_acceptance_intent`].
+    pub async fn complete_acceptance_intent(
+        &self,
+        suggestion_id: String,
+        candidate_etag: String,
+    ) -> Result<AcceptanceIntentCompletion, RuleSuggestionError> {
+        match self {
+            Self::Standalone(engine) => {
+                let engine = Arc::clone(engine);
+                blocking(move || engine.complete_acceptance_intent(&suggestion_id, &candidate_etag))
+                    .await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Cluster(_) => Err(cluster_keeps_no_acceptance_intents()),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn cluster_keeps_no_acceptance_intents() -> RuleSuggestionError {
+    tracing::error!(
+        "a cluster-mode suggestion engine was asked for a standalone acceptance intent; refusing"
+    );
+    RuleSuggestionError::Repository(RepositoryError::new(
+        RepositoryErrorKind::Internal,
+        "rule_suggestion_acceptance_intent",
+    ))
 }
 
 /// Run one synchronous SQLite engine call on the blocking pool. A task that
@@ -1421,6 +1629,186 @@ impl RuleSuggestionStore {
             (_, Some(transitioned)) => TransitionOutcome::Applied(transitioned),
             (_, None) => TransitionOutcome::NotFound,
         })
+    }
+
+    fn sqlite_error(&self, source: rusqlite::Error) -> RuleSuggestionError {
+        RuleSuggestionError::Sqlite {
+            path: self.path.clone(),
+            source,
+        }
+    }
+
+    fn record_acceptance_intent(
+        &self,
+        intent: &SuggestionAcceptanceIntent,
+    ) -> Result<(), RuleSuggestionError> {
+        let connection = self.connection_guard();
+        // A plain INSERT: the primary key refuses a second pending intent
+        // for one suggestion instead of replacing the first.
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_suggestion_acceptance_intents (
+                    suggestion_id, suggestion_revision, candidate_etag, base_etag,
+                    history_floor, actor, origin, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    intent.suggestion_id,
+                    intent.suggestion_revision,
+                    intent.candidate_etag,
+                    intent.base_etag,
+                    intent.history_floor,
+                    intent.actor,
+                    intent.origin.as_str(),
+                    intent.created_at,
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(())
+    }
+
+    fn acceptance_intents(&self) -> Result<Vec<SuggestionAcceptanceIntent>, RuleSuggestionError> {
+        let connection = self.connection_guard();
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT suggestion_id, suggestion_revision, candidate_etag, base_etag,
+                       history_floor, actor, origin, created_at
+                FROM discovery_suggestion_acceptance_intents
+                ORDER BY created_at, suggestion_id
+                LIMIT ?1
+                "#,
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![MAX_ACCEPTANCE_INTENTS_PER_PASS], |row| {
+                Ok((
+                    SuggestionAcceptanceIntent {
+                        suggestion_id: row.get(0)?,
+                        suggestion_revision: row.get(1)?,
+                        candidate_etag: row.get(2)?,
+                        base_etag: row.get(3)?,
+                        history_floor: row.get(4)?,
+                        actor: row.get(5)?,
+                        origin: SuggestionAcceptanceOrigin::Accept,
+                        created_at: row.get(7)?,
+                    },
+                    row.get::<_, String>(6)?,
+                ))
+            })
+            .map_err(|source| self.sqlite_error(source))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| self.sqlite_error(source))?;
+        rows.into_iter()
+            .map(|(mut intent, origin)| {
+                // The CHECK constraint admits only the two origins; a row
+                // that names another was not written by this store.
+                intent.origin = SuggestionAcceptanceOrigin::parse(&origin)
+                    .ok_or(RuleSuggestionError::InvalidState { state: origin })?;
+                Ok(intent)
+            })
+            .collect()
+    }
+
+    fn discard_acceptance_intent(
+        &self,
+        suggestion_id: &str,
+        candidate_etag: &str,
+    ) -> Result<bool, RuleSuggestionError> {
+        let connection = self.connection_guard();
+        let deleted = connection
+            .execute(
+                "DELETE FROM discovery_suggestion_acceptance_intents
+                 WHERE suggestion_id = ?1 AND candidate_etag = ?2",
+                params![suggestion_id, candidate_etag],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(deleted == 1)
+    }
+
+    /// One IMMEDIATE transaction: read the intent, move its suggestion from
+    /// `open` at the intent's revision to `accepted` as the intent's actor,
+    /// and delete the intent. The transition and the deletion commit
+    /// together, so a crash leaves either both or neither, and a pending
+    /// intent always means the suggestion has not moved yet.
+    fn complete_acceptance_intent(
+        &self,
+        suggestion_id: &str,
+        candidate_etag: &str,
+    ) -> Result<AcceptanceIntentCompletion, RuleSuggestionError> {
+        let mut connection = self.connection_guard();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| self.sqlite_error(source))?;
+        let intent = transaction
+            .query_row(
+                "SELECT suggestion_revision, actor FROM discovery_suggestion_acceptance_intents
+                 WHERE suggestion_id = ?1 AND candidate_etag = ?2",
+                params![suggestion_id, candidate_etag],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))?;
+        let Some((revision, actor)) = intent else {
+            return Ok(AcceptanceIntentCompletion::Missing);
+        };
+
+        let completion = match load_suggestion_by_id(&transaction, &self.path, suggestion_id)? {
+            None => AcceptanceIntentCompletion::Refused(None),
+            // The acceptance validated this row before it wrote anything, so
+            // a row that moved or lost its identity binding since is not one
+            // this intent may accept.
+            Some(current)
+                if current.state != RuleSuggestionLifecycleState::Open
+                    || current.revision != revision
+                    || !current.is_identity_bound_for_acceptance() =>
+            {
+                AcceptanceIntentCompletion::Refused(Some(current))
+            }
+            Some(_) => {
+                let transitioned_at = utc_timestamp_rfc3339();
+                let changed = transaction
+                    .execute(
+                        r#"
+                        UPDATE discovery_rule_suggestions
+                        SET state = ?2,
+                            updated_at = ?3,
+                            transitioned_at = ?3,
+                            transitioned_by = ?4,
+                            revision = revision + 1
+                        WHERE id = ?1 AND state = ?5 AND revision = ?6
+                        "#,
+                        params![
+                            suggestion_id,
+                            RuleSuggestionLifecycleState::Accepted.as_str(),
+                            transitioned_at,
+                            actor,
+                            RuleSuggestionLifecycleState::Open.as_str(),
+                            revision,
+                        ],
+                    )
+                    .map_err(|source| self.sqlite_error(source))?;
+                let current = load_suggestion_by_id(&transaction, &self.path, suggestion_id)?;
+                match current {
+                    Some(accepted) if changed == 1 => {
+                        AcceptanceIntentCompletion::Accepted(accepted)
+                    }
+                    current => AcceptanceIntentCompletion::Refused(current),
+                }
+            }
+        };
+        transaction
+            .execute(
+                "DELETE FROM discovery_suggestion_acceptance_intents
+                 WHERE suggestion_id = ?1 AND candidate_etag = ?2",
+                params![suggestion_id, candidate_etag],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        transaction
+            .commit()
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(completion)
     }
 
     fn connection_guard(&self) -> MutexGuard<'_, Connection> {
@@ -3444,6 +3832,148 @@ mod tests {
             )
             .expect("unknown transition")
             .is_not_found());
+    }
+
+    fn acceptance_intent(suggestion_id: &str, candidate_etag: &str) -> SuggestionAcceptanceIntent {
+        SuggestionAcceptanceIntent {
+            suggestion_id: suggestion_id.to_owned(),
+            suggestion_revision: 1,
+            candidate_etag: candidate_etag.to_owned(),
+            base_etag: "\"sha256:base\"".to_owned(),
+            history_floor: Some(4),
+            actor: "admin-a".to_owned(),
+            origin: SuggestionAcceptanceOrigin::DraftPublish,
+            created_at: "2024-06-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    /// The standalone acceptance intent (issue #243): one pending intent per
+    /// suggestion, read back exactly, completed by moving the suggestion and
+    /// clearing the intent together, and dropped without touching the
+    /// suggestion.
+    #[test]
+    fn an_acceptance_intent_completes_with_its_transition_and_is_never_replaced() {
+        let db = TempDb::new("acceptance-intent");
+        let store = RuleSuggestionStore::open(&db.path).expect("suggestion store should open");
+        let connection = Connection::open(&db.path).expect("suggestion database should open");
+        insert_stored_baseline(
+            &connection,
+            "intended",
+            &["provider:test"],
+            &["bearer_token"],
+        );
+        insert_stored_baseline(
+            &connection,
+            "dropped",
+            &["provider:test"],
+            &["bearer_token"],
+        );
+
+        let intent = acceptance_intent("intended", "\"sha256:candidate\"");
+        store
+            .record_acceptance_intent(&intent)
+            .expect("the intent records");
+        assert!(
+            store
+                .record_acceptance_intent(&acceptance_intent("intended", "\"sha256:other\""))
+                .is_err(),
+            "a second pending intent for one suggestion is refused, not replaced"
+        );
+        store
+            .record_acceptance_intent(&acceptance_intent("dropped", "\"sha256:never\""))
+            .expect("another suggestion's intent records");
+        assert_eq!(
+            store.acceptance_intents().expect("intents read"),
+            vec![
+                acceptance_intent("dropped", "\"sha256:never\""),
+                intent.clone()
+            ]
+        );
+
+        // Completion names the candidate it was recorded for.
+        assert_eq!(
+            store
+                .complete_acceptance_intent("intended", "\"sha256:other\"")
+                .expect("an unknown candidate completes nothing"),
+            AcceptanceIntentCompletion::Missing
+        );
+        let AcceptanceIntentCompletion::Accepted(accepted) = store
+            .complete_acceptance_intent("intended", "\"sha256:candidate\"")
+            .expect("the intent completes")
+        else {
+            panic!("an open suggestion at the intent's revision is accepted");
+        };
+        assert_eq!(accepted.state, RuleSuggestionLifecycleState::Accepted);
+        assert_eq!(accepted.revision, 2);
+        assert_eq!(accepted.transitioned_by.as_deref(), Some("admin-a"));
+
+        assert!(store
+            .discard_acceptance_intent("dropped", "\"sha256:never\"")
+            .expect("the intent drops"));
+        assert!(store.acceptance_intents().expect("intents read").is_empty());
+        let untouched = store
+            .get_suggestion("dropped")
+            .expect("suggestion reads")
+            .expect("suggestion exists");
+        assert_eq!(untouched.state, RuleSuggestionLifecycleState::Open);
+        assert_eq!(untouched.revision, 1);
+    }
+
+    /// An intent whose suggestion moved (another transition, a revision the
+    /// intent did not validate, or a deleted row) never overwrites it: the
+    /// intent is cleared and the suggestion left exactly as it is.
+    #[test]
+    fn an_acceptance_intent_never_moves_a_suggestion_it_did_not_validate() {
+        let db = TempDb::new("acceptance-intent-refused");
+        let store = RuleSuggestionStore::open(&db.path).expect("suggestion store should open");
+        let connection = Connection::open(&db.path).expect("suggestion database should open");
+        insert_stored_baseline(
+            &connection,
+            "dismissed",
+            &["provider:test"],
+            &["bearer_token"],
+        );
+        insert_stored_baseline(&connection, "unbound", &[], &[]);
+        store
+            .transition_suggestion(
+                "dismissed",
+                RuleSuggestionLifecycleState::Dismissed,
+                Some("admin-b"),
+                TransitionPrecondition::from_state(RuleSuggestionLifecycleState::Open),
+            )
+            .expect("dismiss")
+            .expect_applied("the dismissal applies");
+
+        for id in ["dismissed", "unbound", "deleted"] {
+            store
+                .record_acceptance_intent(&acceptance_intent(id, "\"sha256:candidate\""))
+                .expect("the intent records");
+        }
+        let AcceptanceIntentCompletion::Refused(Some(current)) = store
+            .complete_acceptance_intent("dismissed", "\"sha256:candidate\"")
+            .expect("completion")
+        else {
+            panic!("a dismissed suggestion refuses the intent");
+        };
+        assert_eq!(current.state, RuleSuggestionLifecycleState::Dismissed);
+        assert_eq!(current.transitioned_by.as_deref(), Some("admin-b"));
+        let AcceptanceIntentCompletion::Refused(Some(current)) = store
+            .complete_acceptance_intent("unbound", "\"sha256:candidate\"")
+            .expect("completion")
+        else {
+            panic!("an unbound baseline refuses the intent");
+        };
+        assert_eq!(current.state, RuleSuggestionLifecycleState::Open);
+        assert_eq!(
+            store
+                .complete_acceptance_intent("deleted", "\"sha256:candidate\"")
+                .expect("completion"),
+            AcceptanceIntentCompletion::Refused(None)
+        );
+        assert!(
+            store.acceptance_intents().expect("intents read").is_empty(),
+            "a refused completion still clears its intent"
+        );
     }
 
     fn suggestion_engine(

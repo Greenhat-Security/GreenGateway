@@ -807,8 +807,9 @@ Enforcement:
   naming the inventory operation code and nothing from the request. Every policy
   mutation asks at `commit_policy_mutation`, the commit path they share (so draft
   publication asks as `policy.publish`, and its own `policy.draft_publish_refused`
-  record carries the same reason), and suggestion acceptance asks as
-  `policy.suggestion.accept` before its rule is written. A catalog refresh asks as
+  record carries the same reason), and suggestion acceptance, including a draft
+  publication bound to a suggestion, asks as `policy.suggestion.accept` before
+  its acceptance intent or its rule is written. A catalog refresh asks as
   the MCP or OpenAPI publication its discovery names; an OpenAPI catalog
   registration asks as `catalog.openapi.publish`, an overlay write or removal as
   `catalog.overlay.replace` or `catalog.overlay.delete`. Connection and local-secret
