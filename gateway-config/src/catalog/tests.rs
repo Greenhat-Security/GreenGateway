@@ -208,11 +208,12 @@ fn bundle_mappings_follow_the_rules_adr_0008_states() {
             resource,
             "{name}: POLICY_FILE, TOOLS_FILE and every *_SQLITE_PATH are replaced by bundle resources"
         );
-        let legacy_provider = name.starts_with("JWT_") || name == "ROLES_CLAIM";
+        let not_representable =
+            name.starts_with("JWT_") || name == "ROLES_CLAIM" || name == "OPENAPI_SPEC_PATH";
         assert_eq!(
             field.bundle == BundleMapping::NotRepresentable,
-            legacy_provider,
-            "{name}: the single-provider JWT fallback is what a bundle cannot represent"
+            not_representable,
+            "{name}: the single-provider JWT fallback and OPENAPI_SPEC_PATH are what a bundle cannot represent"
         );
         if let BundleMapping::Bootstrap(category) = field.bundle {
             assert_eq!(field.reload(), ReloadClass::Bootstrap, "{name}");
@@ -233,10 +234,9 @@ fn bundle_mappings_follow_the_rules_adr_0008_states() {
                 field.sensitivity != Sensitivity::HostPath,
                 "{name}: host paths never enter a bundle"
             );
-            assert_eq!(
+            assert!(
                 path.is_some(),
-                field.field_type != FieldType::Json,
-                "{name}: every deployment field but the JSON documents has a document path"
+                "{name}: every deployment field has a document path"
             );
             if let Some(path) = path {
                 assert!(

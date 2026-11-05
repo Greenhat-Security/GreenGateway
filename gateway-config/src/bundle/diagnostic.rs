@@ -172,6 +172,7 @@ pub enum Code {
     InvalidName,
     InvalidDecimal,
     NotApplicable,
+    NotRepresentable,
     // References between bundle files.
     InvalidPath,
     ReservedPath,
@@ -256,6 +257,7 @@ impl Code {
         Self::InvalidName,
         Self::InvalidDecimal,
         Self::NotApplicable,
+        Self::NotRepresentable,
         Self::InvalidPath,
         Self::ReservedPath,
         Self::DuplicatePath,
@@ -497,6 +499,10 @@ impl Code {
             Self::NotApplicable => (
                 "schema.not_applicable",
                 "a member does not apply given the value of another member",
+            ),
+            Self::NotRepresentable => (
+                "schema.not_representable",
+                "a member has no form in this document version; the reference says what to use instead",
             ),
             Self::InvalidPath => (
                 "reference.invalid_path",
