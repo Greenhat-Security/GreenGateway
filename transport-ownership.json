@@ -1111,6 +1111,7 @@
           "jsonschema@0.60.2|registry+https://github.com/rust-lang/crates.io-index",
           "proptest@1.11.0|registry+https://github.com/rust-lang/crates.io-index",
           "rusqlite@0.40.2|registry+https://github.com/rust-lang/crates.io-index",
+          "rustix@1.1.5|registry+https://github.com/rust-lang/crates.io-index",
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
           "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index",
           "sha2@0.11.1|registry+https://github.com/rust-lang/crates.io-index",
@@ -6235,6 +6236,19 @@
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           {
+            "name": "rustix",
+            "rename": null,
+            "kind": null,
+            "target": "cfg(any(target_os = \"linux\", target_os = \"macos\"))",
+            "req": "^1.1.4",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "fs"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
             "name": "uuid",
             "rename": null,
             "kind": "dev",
@@ -9160,24 +9174,75 @@
       "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): creates the seed's temporary database file beneath the state directory with create_new and, on Unix, mode 0600 through std::os::unix::fs::OpenOptionsExt. Local file creation only; it adds no network or process capability."
     },
     {
-      "file": "gateway-config/src/ledger/location.rs",
+      "file": "gateway-config/src/state_dir.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway_config::ledger::location::owner_alone_can_write#1",
-      "sha256": "a487c6b6631e24091b1d3bfd421e698411fd856b0b08aa474fcd693ce08f04e5",
+      "scope": "gateway_config::state_dir::is_reparse_point#1",
+      "sha256": "b614645a054675446906c5e5bd9cd95dfc6bdbcdab6ca5c8d79e8f422cbd3882",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): reads the Unix mode bits of state-directory and ledger-file metadata through std::os::unix::fs::MetadataExt to refuse an entry group or other can write. Read-only metadata; it adds no network or process capability."
+      "purpose": "Reviewed for #242 (standalone state directory; moved here from the revision ledger's location checks): reads the Windows reparse-point attribute of state-directory, lock-file and ledger-file metadata through std::os::windows::fs::MetadataExt to refuse links and junctions. Read-only metadata; it adds no network or process capability."
     },
     {
-      "file": "gateway-config/src/ledger/location.rs",
+      "file": "gateway-config/src/state_dir.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway_config::ledger::location::is_reparse_point#1",
-      "sha256": "b38daad4bb5a2611dccf7b648e45aa79aa9af9944222f0319f6ec5b8b24f642b",
+      "scope": "gateway_config::state_dir::owner_alone_can_write#1",
+      "sha256": "f6f79cbe6fedfbc2e5d6b350c8cafc01c7654a31162958c6caff88fbe7c03c26",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): reads the Windows reparse-point attribute of state-directory and ledger-file metadata through std::os::windows::fs::MetadataExt to refuse links and junctions. Read-only metadata; it adds no network or process capability."
+      "purpose": "Reviewed for #242 (standalone state directory; moved here from the revision ledger's location checks): reads the Unix mode bits of state-directory, lock-file and ledger-file metadata through std::os::unix::fs::MetadataExt to refuse an entry group or other can write. Read-only metadata; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/state_dir.rs",
+      "reasons": [
+        "capability-import-or-glob",
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::state_dir::owner_only#1",
+      "sha256": "8301c68cd1972a550663c8a7545e452e9d0dc763cbf2f69e5333d5781caed181",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (standalone state directory): sets mode 0600 on a newly created lock file through cap-std's Unix OpenOptionsExt, called by path because its name is a reviewed capability alias, which is also why the guard flags the call. Local file creation mode only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/state_dir.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::state_dir::use cap_fs_ext :: { DirExt as _ , FollowSymlinks , OpenOptionsFollowExt as _ , OpenOptionsSyncExt as _ }#1",
+      "sha256": "08af99e590ccd695cec1fcc5a48a67f625139d56718313dc9db727445cce05a3",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (standalone state directory): opens the admitted state directory and its lock file without following a link at the last component (open_dir_nofollow, FollowSymlinks::No) and without blocking on a FIFO swapped in for the lock file (nonblock). Local filesystem access beneath one directory only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/state_dir.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::state_dir::use cap_std :: { ambient_authority , fs :: { Dir , OpenOptions as CapabilityOpenOptions } , }#1",
+      "sha256": "195f6c89077f4e307f3177b3c7d3c177e0e7b8004353c1e9b857d2d1b820e3aa",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (standalone state directory): opens the canonicalized state directory's parent as a cap-std directory and the lock file beneath the directory handle, so the lock is taken on the directory that was admitted. Local filesystem access only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/state_dir/filesystem.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::state_dir::filesystem::platform_kind#1",
+      "sha256": "d7bc41f299db5a5f2d42c247cd4e155c558a034c4252794109f4de9bb9574e27",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (standalone state directory, Linux): calls rustix::fs::statfs on the state directory path and compares f_type with network-filesystem magic numbers for doctor's best-effort warning. The guard flags rustix as a raw crate; statfs reads filesystem metadata only and adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/state_dir/filesystem.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::state_dir::filesystem::platform_kind#2",
+      "sha256": "ec54e5b48289695a478243eae1cdd78740cebffd8c269a6c323445a25500c7cc",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (standalone state directory, macOS): calls rustix::fs::statfs on the state directory path and compares f_fstypename with network-filesystem type names for doctor's best-effort warning. The guard flags rustix as a raw crate; statfs reads filesystem metadata only and adds no network or process capability."
     },
     {
       "file": "gateway-config/src/ledger/store.rs",
