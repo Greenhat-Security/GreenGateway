@@ -1391,6 +1391,14 @@ fn connection_admin_preview_schema_describes_swagger_conversion_reports() {
                 "operation_omitted": true,
                 "method": "POST",
                 "path_template": "/widgets"
+            },
+            {
+                "code": "credential_parameter_not_mapped",
+                "message": "this parameter carries the credential the operation's security names, which the Connection supplies; it is not a tool argument and generated tools never send it",
+                "operation_omitted": false,
+                "method": "GET",
+                "path_template": "/conversations.history",
+                "subject": "token"
             }
         ]
     });

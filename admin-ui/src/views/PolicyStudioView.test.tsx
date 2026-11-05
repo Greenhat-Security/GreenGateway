@@ -6,10 +6,13 @@ import {
   waitFor,
   within,
 } from '@testing-library/react';
+import { StrictMode } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { AdminShell } from '../App';
 import { clearMemoryToken } from '../lib/auth';
+import { heldPolicyEdits, releaseHeldPolicyEdits } from './policy-studio/heldEdits';
 import { PolicyStudioView } from './PolicyStudioView';
 
 const DRAFT_ID = `pd_${'a'.repeat(32)}`;
@@ -24,6 +27,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   clearMemoryToken();
+  releaseHeldPolicyEdits();
 });
 
 describe('PolicyStudioView', () => {
@@ -221,6 +225,74 @@ describe('PolicyStudioView', () => {
     expect(gateway.live.etag).toBe(LIVE_ETAG);
   });
 
+  it('withdraws a publish confirmation when the draft changes and publishes only what was reviewed', async () => {
+    const gateway = fakeGateway();
+    gateway.drafts.get(DRAFT_ID)!.policy = { ...draftPolicy(), default_action: 'allow' };
+    gateway.validate = (source) =>
+      jsonResponse(200, {
+        ...validInspection(),
+        diagnostics:
+          (JSON.parse(source) as { default_action?: string }).default_action === 'allow'
+            ? [allowDefaultRisk()]
+            : [],
+      });
+    renderStudio(gateway);
+    await openDraft();
+    expect(await screen.findByText('Valid, with 1 risk.', undefined, WAIT)).toBeTruthy();
+    const publish = screen.getByRole('button', { name: 'Publish draft' }) as HTMLButtonElement;
+    await waitFor(() => expect(publish.disabled).toBe(false), WAIT);
+
+    fireEvent.click(publish);
+    expect(
+      within(screen.getByRole('group', { name: 'Publish this draft?' })).getByText(
+        /no rule or route matches are allowed/,
+      ),
+    ).toBeTruthy();
+
+    // Still in the confirmation, the saved allow default is switched to
+    // deny without saving: the confirmation goes, and nothing is published.
+    fireEvent.click(
+      within(screen.getByRole('group', { name: 'Default action' })).getByRole('radio', {
+        name: /^Deny/,
+      }),
+    );
+    expect(screen.queryByRole('group', { name: 'Publish this draft?' })).toBeNull();
+    expect(publish.disabled).toBe(true);
+    expect(
+      await screen.findByText('Valid: the gateway reports no diagnostics.', undefined, WAIT),
+    ).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Confirm publish' })).toBeNull();
+
+    // Discarding the edit leaves nothing to confirm until the saved text
+    // has been validated again.
+    fireEvent.click(screen.getByRole('button', { name: 'Discard edits' }));
+    expect(screen.getByText('Wait for the gateway to validate the saved draft.')).toBeTruthy();
+    expect(publish.disabled).toBe(true);
+    expect(await screen.findByText('Valid, with 1 risk.', undefined, WAIT)).toBeTruthy();
+    await waitFor(() => expect(publish.disabled).toBe(false), WAIT);
+
+    // A new validation answer withdraws it too.
+    fireEvent.click(publish);
+    fireEvent.click(screen.getByRole('button', { name: 'Validate again' }));
+    expect(screen.queryByRole('group', { name: 'Publish this draft?' })).toBeNull();
+    await waitFor(() => expect(publish.disabled).toBe(false), WAIT);
+    expect(gateway.requests('POST', `/v1/admin/policy/drafts/${DRAFT_ID}/publish`)).toHaveLength(0);
+
+    fireEvent.click(publish);
+    const confirmation = screen.getByRole('group', { name: 'Publish this draft?' });
+    expect(within(confirmation).getByText(/no rule or route matches are allowed/)).toBeTruthy();
+    fireEvent.click(within(confirmation).getByRole('button', { name: 'Confirm publish' }));
+
+    expect(await screen.findByText('Draft published', undefined, WAIT)).toBeTruthy();
+    const publications = gateway.requests('POST', `/v1/admin/policy/drafts/${DRAFT_ID}/publish`);
+    expect(publications).toHaveLength(1);
+    expect(publications[0].headers.get('X-GreenGateway-Policy-Draft-ETag')).toBe(
+      draftEtag(DRAFT_ID, 1),
+    );
+    expect(publications[0].headers.get('X-GreenGateway-Resource-Snapshot')).toBe(SNAPSHOT_DIGEST);
+    expect(gateway.live.policy).toMatchObject({ default_action: 'allow' });
+  });
+
   it('shows a stale base and rebases only when asked, without merging', async () => {
     const gateway = fakeGateway();
     gateway.live = { policy: { ...draftPolicy(), default_action: 'allow' }, etag: '"sha256:live-2"' };
@@ -299,6 +371,91 @@ describe('PolicyStudioView', () => {
     const [create] = gateway.requests('POST', '/v1/admin/policy/drafts');
     expect(create.headers.get('If-Match')).toBe(LIVE_ETAG);
     expect(JSON.parse(create.body ?? '{}')).toMatchObject({ policy: { id: 'kept' } });
+  });
+
+  it('holds unsaved edits while signed out and restores them once the gateway answers their draft', async () => {
+    const gateway = fakeGateway();
+    renderShell(gateway);
+    await openDraft();
+    fireEvent.change(screen.getByLabelText('Policy id'), { target: { value: 'held-candidate' } });
+
+    await endSessionOnSave(gateway);
+
+    // The ended session replaces the Studio; only the notice says what is held.
+    expect(screen.queryByLabelText('Policy id')).toBeNull();
+    expect(document.body.textContent).not.toContain('held-candidate');
+    expect(screen.getByText(/Only your unsaved Policy Studio edits are still held/)).toBeTruthy();
+    // Leaving the page would discard them, so it asks first.
+    const unload = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(unload);
+    expect(unload.defaultPrevented).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Check session' }));
+
+    expect(await screen.findByText('Unsaved edits restored', undefined, WAIT)).toBeTruthy();
+    expect((screen.getByLabelText('Policy id') as HTMLInputElement).value).toBe('held-candidate');
+    expect(screen.getByText('Unsaved edits', { selector: '.result-count' })).toBeTruthy();
+    expect(heldPolicyEdits()).toBeNull();
+    // Nothing is saved on the operator's behalf: the refused save is the only one.
+    expect(gateway.requests('PATCH', `/v1/admin/policy/drafts/${DRAFT_ID}`)).toHaveLength(1);
+  });
+
+  it('never shows held edits to a session their draft does not belong to', async () => {
+    const gateway = fakeGateway();
+    renderShell(gateway);
+    await openDraft();
+    fireEvent.change(screen.getByLabelText('Policy id'), { target: { value: 'held-candidate' } });
+    await endSessionOnSave(gateway);
+    const reads = gateway.requests('GET', `/v1/admin/policy/drafts/${DRAFT_ID}`).length;
+
+    // Another principal signs in: the gateway answers that owner's draft as missing.
+    gateway.drafts.clear();
+    fireEvent.click(screen.getByRole('button', { name: 'Check session' }));
+
+    await waitFor(() => expect(heldPolicyEdits()).toBeNull(), WAIT);
+    expect(
+      await screen.findByText(
+        'You have no policy drafts. Create one from the live policy to start editing.',
+        undefined,
+        WAIT,
+      ),
+    ).toBeTruthy();
+    expect(gateway.requests('GET', `/v1/admin/policy/drafts/${DRAFT_ID}`).length).toBeGreaterThan(
+      reads,
+    );
+    expect(document.body.textContent).not.toContain('held-candidate');
+    expect(screen.queryByText('Unsaved edits restored')).toBeNull();
+  });
+
+  it('restores held edits on the revision they were made on when the draft changed meanwhile', async () => {
+    const gateway = fakeGateway();
+    renderShell(gateway);
+    await openDraft();
+    fireEvent.change(screen.getByLabelText('Policy id'), { target: { value: 'held-candidate' } });
+    await endSessionOnSave(gateway);
+    gateway.bumpDraft(DRAFT_ID);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Check session' }));
+
+    expect(
+      await screen.findByText(
+        /the draft changed in another tab or session while you were signed out/,
+        undefined,
+        WAIT,
+      ),
+    ).toBeTruthy();
+    expect((screen.getByLabelText('Policy id') as HTMLInputElement).value).toBe('held-candidate');
+    fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+    expect(
+      await screen.findByText(
+        'The draft changed in another tab or session since it was opened here. Your edits are kept here and were not saved.',
+        undefined,
+        WAIT,
+      ),
+    ).toBeTruthy();
+    const patches = gateway.requests('PATCH', `/v1/admin/policy/drafts/${DRAFT_ID}`);
+    expect(patches).toHaveLength(2);
+    expect(patches[1].headers.get('If-Match')).toBe(draftEtag(DRAFT_ID, 1));
   });
 
   it('is read-only without admin:policy:write and shows egress without editing it', async () => {
@@ -405,6 +562,7 @@ function fakeGateway({ permissions = [READ, WRITE] }: { permissions?: string[] }
       jsonResponse(200, validInspection()),
     log: [] as LoggedRequest[],
     failures: [] as Array<{ method: string; error: Error }>,
+    answers: [] as Array<{ method: string; response: Response }>,
     liveRevision: 1,
     requests(method: string, path: string) {
       return gateway.log.filter(
@@ -422,6 +580,9 @@ function fakeGateway({ permissions = [READ, WRITE] }: { permissions?: string[] }
     failNext(method: string, error: Error) {
       gateway.failures.push({ method, error });
     },
+    answerNext(method: string, response: Response) {
+      gateway.answers.push({ method, response });
+    },
     fetch: vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input), 'http://localhost');
       const method = init?.method ?? 'GET';
@@ -432,6 +593,11 @@ function fakeGateway({ permissions = [READ, WRITE] }: { permissions?: string[] }
       if (failure >= 0) {
         const [{ error }] = gateway.failures.splice(failure, 1);
         return Promise.reject(error);
+      }
+      const answer = gateway.answers.findIndex((entry) => entry.method === method);
+      if (answer >= 0) {
+        const [{ response }] = gateway.answers.splice(answer, 1);
+        return Promise.resolve(response);
       }
       return Promise.resolve(gateway.answer(method, url.pathname, headers, body));
     }),
@@ -631,6 +797,17 @@ function validInspection() {
   };
 }
 
+function allowDefaultRisk() {
+  return diagnostic({
+    code: 'default_action_allow',
+    severity: 'risk',
+    pointer: '/default_action',
+    message: 'Requests that no rule or route matches are allowed.',
+    remediation: 'Set default_action to deny.',
+    blocks: { simulation: false, tests: false, publication: false, evidence: false },
+  });
+}
+
 function diagnostic(overrides: Record<string, unknown> = {}) {
   return {
     code: 'test_code',
@@ -664,6 +841,24 @@ function renderStudio(gateway: ReturnType<typeof fakeGateway>) {
       </Routes>
     </MemoryRouter>,
   );
+}
+
+// The whole admin shell, which replaces every view when the session ends.
+function renderShell(gateway: ReturnType<typeof fakeGateway>) {
+  vi.stubGlobal('fetch', gateway.fetch);
+  render(
+    <StrictMode>
+      <MemoryRouter initialEntries={['/policy/studio']}>
+        <AdminShell />
+      </MemoryRouter>
+    </StrictMode>,
+  );
+}
+
+async function endSessionOnSave(gateway: ReturnType<typeof fakeGateway>) {
+  gateway.answerNext('PATCH', jsonResponse(401, { error: 'unauthorized' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+  await screen.findByRole('heading', { name: 'Admin session expired' }, WAIT);
 }
 
 async function openDraft() {
