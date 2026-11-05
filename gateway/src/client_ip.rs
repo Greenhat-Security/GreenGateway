@@ -52,23 +52,34 @@ pub fn canonical_client_ip(
     extensions: &Extensions,
     policy: &ClientIpPolicy,
 ) -> String {
-    let Some(peer_ip) = peer_ip(extensions).map(canonical_ip) else {
-        return "unknown".to_owned();
-    };
+    canonical_client_addr(headers, extensions, policy)
+        .map_or_else(|| "unknown".to_owned(), |ip| ip.to_string())
+}
+
+/// [`canonical_client_ip`] as an address: `None` exactly when that answers
+/// `unknown`, because the request carries no connection peer. Policy facts
+/// read this, so a typed matcher sees the address audit records and never a
+/// forwarding header the trust boundary did not admit.
+pub(crate) fn canonical_client_addr(
+    headers: &HeaderMap,
+    extensions: &Extensions,
+    policy: &ClientIpPolicy,
+) -> Option<IpAddr> {
+    let peer_ip = peer_ip(extensions).map(canonical_ip)?;
 
     if !policy.trusts(peer_ip) {
-        return peer_ip.to_string();
+        return Some(peer_ip);
     }
 
     match forwarded_for(headers) {
-        Ok(Some(chain)) => return forwarded_client_ip(&chain, policy).to_string(),
-        Err(()) => return peer_ip.to_string(),
+        Ok(Some(chain)) => return Some(forwarded_client_ip(&chain, policy)),
+        Err(()) => return Some(peer_ip),
         Ok(None) => {}
     }
 
     match single_ip_header(headers, &X_REAL_IP) {
-        Ok(Some(ip)) => ip.to_string(),
-        Ok(None) | Err(()) => peer_ip.to_string(),
+        Ok(Some(ip)) => Some(ip),
+        Ok(None) | Err(()) => Some(peer_ip),
     }
 }
 

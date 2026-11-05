@@ -10931,9 +10931,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::mcp::invocation_context_from_request#1",
-      "sha256": "ba4b2c68cb3cba2fc1dcf8990e556d1e394735176b205563aa472e958e3b12f6",
+      "sha256": "a1878e3928e84a484c3e47941f0bb219edfb2aa12e4380cb825b358106b2cdd6",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review. Reviewed for #463: the item now also projects the authenticated Principal into the caller a signed caller assertion names (AttestedCaller::from_principal), a pure data copy that adds no network, process or transport capability. Reviewed for #243: the item also copies the authenticated Principal's verified organization (org_id) into the invocation context as a policy fact identity mappings read, a pure data copy that adds no network, process or transport capability."
+      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review. Reviewed for #463: the item now also projects the authenticated Principal into the caller a signed caller assertion names (AttestedCaller::from_principal), a pure data copy that adds no network, process or transport capability. Reviewed for #243: the item also copies the authenticated Principal's verified organization (org_id) into the invocation context as a policy fact identity mappings read, a pure data copy that adds no network, process or transport capability. Reviewed for #243 (request conditions): the item also records the canonical client address (client_ip::canonical_client_addr, the trusted-proxy-aware address it already audits as source_ip) as the typed policy fact a source_network condition reads, a pure data read of the connection peer and admitted headers that adds no network, process or transport capability."
     },
     {
       "file": "gateway/src/mcp.rs",
@@ -11005,6 +11005,26 @@
       "sha256": "2599f19fc482be175583f24236f4ae2df95403e1f7a0bb41510d39e79a58faac",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/middleware/policy_facts.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::middleware::policy_facts::use std :: { borrow :: Cow , net :: IpAddr , time :: { SystemTime , UNIX_EPOCH } , }#1",
+      "sha256": "df1d11f0603edbbe7b7f70ea076951d7e252000a6b5b9bc9f24fc3ef9436bee1",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #243 live fact builder for rule conditions: imports the IpAddr value type for the canonical client address a source_network condition reads, and SystemTime/UNIX_EPOCH for the injected policy clock. Value types only; no socket, resolver, process or transport capability."
+    },
+    {
+      "file": "gateway/src/middleware/policy_facts.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::middleware::policy_facts::PolicyClock#1",
+      "sha256": "baa369a0fd9a9427b084978f8adea76216c39b7b826078e11135881dae91e980",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #243 policy clock: the system clock in production and a test-only fixed clock behind #[cfg(test)]; derive and cfg attributes only, no transport, provider, resolver or process authority."
     },
     {
       "file": "gateway/src/middleware/rate_limit.rs",
@@ -11109,6 +11129,46 @@
     {
       "file": "gateway/src/middleware/rbac.rs",
       "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::middleware::rbac::impl  RbacState::tool_call#1",
+      "sha256": "50875fabc5f3dc1f00655587a5531702adebb41830076e6691e88dfbd4099289",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #243 tool lanes: bundles the canonical client address a call entered with (std::net::IpAddr, a value) and the state's policy clock as the facts a tool-lane condition reads; no network, process or transport capability."
+    },
+    {
+      "file": "gateway/src/middleware/rbac.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::middleware::rbac::impl  RbacState::evaluate_tool_authorization#1",
+      "sha256": "0370b17a9b5d0ac912b875882aa1620bf06ff6dbf790dab3b3f9e98f193de30b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #243 tool lanes: tool admission now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact for source_network conditions; a pure data parameter that adds no network, process or transport capability."
+    },
+    {
+      "file": "gateway/src/middleware/rbac.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::middleware::rbac::impl  RbacState::tool_visible#1",
+      "sha256": "d156788665d97d243a3d8b0f4a505f76d46737340bbb06f7e1dbe73f60526433",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #243 tool lanes: tool listing now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact for source_network conditions; a pure data parameter that adds no network, process or transport capability."
+    },
+    {
+      "file": "gateway/src/middleware/rbac.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::middleware::rbac::impl  RbacState::evaluate_tool_http_rule#1",
+      "sha256": "2029b1f26131bd86220fca37c5e613666c8f3452af8267dacfd4615261737956",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #243 tool lanes: the rendered-HTTP rule check now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact; it still only decides, before the existing egress path, and adds no network, process or transport capability."
+    },
+    {
+      "file": "gateway/src/middleware/rbac.rs",
+      "reasons": [
         "capability-in-macro-input"
       ],
       "scope": "gateway::middleware::rbac::policy_file_watch_loop#1",
@@ -11122,9 +11182,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::rbac_middleware#1",
-      "sha256": "0b8e6218f00d6b632fc8b31ee7d57b7d87bfd5c31eddb982ed993d7657489b3b",
+      "sha256": "67c5fb7a91f70ca6e31e5898fbc64b9611a43d5f5c1f20405a5c9db1b8231400",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority. Reviewed for #243: the decision is now asked with the facts serving_facts takes from the authenticated principal (its verified organization in mapped-role mode), a pure data read that adds no transport, provider, resolver or process authority."
+      "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority. Reviewed for #243: the decision is now asked with the facts serving_facts takes from the authenticated principal (its verified organization in mapped-role mode), a pure data read that adds no transport, provider, resolver or process authority. Reviewed for #243 (request conditions): the facts now come from policy_facts::http_request_facts -- the canonical client address under the state's ClientIpPolicy, the referenced request headers, the strictly decoded query and an injected clock -- and a query that does not decode strictly is refused as policy_query_undecodable; pure reads of the admitted request that add no transport, provider, resolver or process authority."
     },
     {
       "file": "gateway/src/middleware/validate.rs",
@@ -11315,6 +11375,16 @@
       "sha256": "54a6a9a8dcff73aefeffeb33ec7c4e3e2a5c5e6cf7351496a4925f485491e960",
       "owner": "policy replay contexts (#243)",
       "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module: the replay job engine (#243 slice 13) calls the adapters and evaluator and the impact comparison (#243 slice 14) reads the recorded result, while the serialized form and egress replay wait for a record that states them. The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability."
+    },
+    {
+      "file": "gateway/src/policy_testing/suite.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::policy_testing::suite::use std :: net :: IpAddr#1",
+      "sha256": "abf89a0dd5d2b68df48d2445831118062ac113c2f71cf08f3d392ad95b31637d",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #243 synthetic case facts: imports the IpAddr value type to parse a case's hypothetical source_ip; parsing only, never connected to, so no network, process or transport capability."
     },
     {
       "file": "gateway/src/proxy/admission.rs",
@@ -15111,6 +15181,16 @@
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
+      "file": "gateway/src/tools/runtime.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::tools::runtime::ToolInvocationContext#1",
+      "sha256": "3fc8dc1df9da2c65ac9c629d99e86b57132e7defebb09c7c11910a74ad182493",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #243 tool invocation context: carries the canonical client address the call entered with (Option<std::net::IpAddr>, a value set by the MCP and admin playground entry points) as the policy fact a source_network condition reads; a data field that adds no network, process or transport capability."
+    },
+    {
       "file": "gateway/src/upstream_route.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -15841,6 +15921,46 @@
       "sha256": "20384981a436de131afe8257495ef57025659ae96bdcbd9cde301e0cae28d20d",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/config/restore.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::config::restore::file_attributes#1",
+      "sha256": "8e22caf29fe6590ed0d9fa20b0a1d6a587b5935f30836b2073e7f477913fdb56",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the gateway's restore-marker start step, which the bundle and ledger startup modes (later #242 slices) will call: it reads the marker through the shared library, records config.restore_detected through the existing audit log and removes the marker, and has no transport or process capability."
+    },
+    {
+      "file": "gateway-config/src/backup/marker.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::backup::marker::use cap_fs_ext :: { FollowSymlinks , OpenOptionsFollowExt as _ , OpenOptionsSyncExt as _ }#1",
+      "sha256": "9c15e3a6c284601e78f748e33b0858a66193afed8893e44523b0710940fd4850",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 15 (standalone backup restore): opens the restore marker beneath the held state directory without following a link and without blocking on a FIFO swapped into its place, so a marker that is not a regular file is refused from its open handle. Local filesystem access only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/backup/marker.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::backup::marker::use cap_std :: { ambient_authority , fs :: { Dir , OpenOptions as CapabilityOpenOptions } , }#1",
+      "sha256": "195f6c89077f4e307f3177b3c7d3c177e0e7b8004353c1e9b857d2d1b820e3aa",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 15 (standalone backup restore): opens the held state directory as a cap-std directory so the restore marker is read beneath the directory that was locked, never through a link. Local filesystem access only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/backup/restore.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::backup::restore::refuse_mount_point#1",
+      "sha256": "fc1b302367c7376a3ce2327e04e7abc623a558e0ac4258679f52777cdffcb3d4",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 15 (standalone backup restore): imports MetadataExt on Unix to compare the device numbers of the target state directory and the directory holding it, refusing a mount point that no rename within its parent can move. Read-only metadata; it adds no network or process capability."
     }
   ]
 }
