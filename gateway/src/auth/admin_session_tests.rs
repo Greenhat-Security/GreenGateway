@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use gateway_config::auth::{MAX_SESSION_ENTRIES, MAX_SESSION_TTL_SECS};
+
 use super::*;
 
 /// The CSRF header the test fronts are configured with.

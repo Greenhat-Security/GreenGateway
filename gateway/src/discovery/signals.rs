@@ -9,10 +9,13 @@ pub const PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_TYPE: &str = "principal_new_to_endpoi
 pub const VOLUME_OUTLIER_SIGNAL_TYPE: &str = "volume_outlier";
 pub const ENDPOINT_TARGET_KIND: &str = "endpoint";
 pub const PRINCIPAL_ENDPOINT_TARGET_KIND: &str = "principal_endpoint";
-pub const DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD: u64 = 5;
-pub const DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD: f64 = 0.40;
-pub const DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD: u64 = 1;
-pub const DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD: f64 = 3.0;
+// The thresholds the configuration compiler reads, shared with `ggctl`
+// (issue #242).
+pub(crate) use gateway_config::discovery::{
+    SignalDetectorConfig, DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
+    DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD, DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD,
+    DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
+};
 pub const ERROR_RATE_SPIKE_MIN_SAMPLE_COUNT: u64 = 20;
 pub const VOLUME_OUTLIER_WINDOW_SAMPLE_COUNT: u64 = 20;
 pub const VOLUME_OUTLIER_MIN_BASELINE_WINDOWS: u64 = 3;
@@ -209,25 +212,6 @@ pub struct EndpointSignalObservation<'a> {
     pub status: u16,
     pub latency_ms: u64,
     pub user_id: Option<&'a str>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SignalDetectorConfig {
-    pub schema_mismatch_threshold: u64,
-    pub error_rate_spike_threshold: f64,
-    pub principal_new_to_endpoint_threshold: u64,
-    pub volume_outlier_threshold: f64,
-}
-
-impl Default for SignalDetectorConfig {
-    fn default() -> Self {
-        Self {
-            schema_mismatch_threshold: DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD,
-            error_rate_spike_threshold: DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
-            principal_new_to_endpoint_threshold: DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
-            volume_outlier_threshold: DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]

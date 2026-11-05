@@ -13,11 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def sources():
     return {
         name: (ROOT / name).read_text(encoding="utf-8")
-        for name in (
-            "gateway/src/path_match.rs",
-            "gateway/src/egress.rs",
-            "gateway/src/rbac/matcher.rs",
-        )
+        for name in bench.SOURCE_PATHS
     }
 
 
@@ -36,11 +32,41 @@ class SourceProjectionTests(unittest.TestCase):
 
     def test_unexpected_test_module_cannot_be_silently_stripped(self):
         data = sources()
-        data["gateway/src/path_match.rs"] = data["gateway/src/path_match.rs"].replace(
-            "mod property_tests;", "mod replacement_tests;"
+        path = "gateway-config/src/path_match.rs"
+        data[path] = data[path].replace(
+            "#[cfg(test)]\nmod tests {",
+            "#[cfg(test)]\nmod replacement_tests;\n\n#[cfg(test)]\nmod tests {",
+            1,
         )
         with self.assertRaises(ValueError):
             bench.project_sources(data)
+
+    def test_a_moved_source_is_read_from_its_old_path_at_a_revision_before_the_move(self):
+        moved = "gateway-config/src/path_match.rs"
+        self.assertEqual(bench.MOVED_SOURCE_PATHS, {moved: "gateway/src/path_match.rs"})
+        held = {("head", moved), ("head", "gateway/src/egress.rs"),
+                ("base", "gateway/src/path_match.rs"), ("base", "gateway/src/egress.rs")}
+
+        def blob(root, revision, path):
+            if (revision, path) not in held:
+                raise ValueError("Git object lookup failed: " + revision + ":" + path)
+            return f"{revision}:{path}"
+
+        original_blob = bench._blob
+        bench._blob = blob
+        try:
+            self.assertEqual(bench._source_blob(ROOT, "head", moved), "head:" + moved)
+            self.assertEqual(bench._source_blob(ROOT, "base", moved), "base:gateway/src/path_match.rs")
+            self.assertEqual(bench._source_blob(ROOT, "base", "gateway/src/egress.rs"),
+                             "base:gateway/src/egress.rs")
+            # Only a moved source has somewhere else to look, and a revision
+            # that holds neither path still fails.
+            with self.assertRaises(ValueError):
+                bench._source_blob(ROOT, "base", "gateway/src/rbac/matcher.rs")
+            with self.assertRaises(ValueError):
+                bench._source_blob(ROOT, "missing", moved)
+        finally:
+            bench._blob = original_blob
 
     def test_deleted_selected_function_is_an_error(self):
         data = sources()
