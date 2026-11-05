@@ -535,19 +535,20 @@ pub(super) async fn policy_evidence_endpoint(
     };
     let mut inspection = inspect_policy_for_deployment(&state, rbac_state, &stored_source);
     // The cross-resource checks a publication runs, against the resources
-    // current now, judging the publication as the replacement of what it
-    // replaced (itself, when the history holds nothing before it). No
-    // publisher is named: the caller asking for evidence is not the one who
+    // current now, judging the publication on its own: as the replacement of
+    // itself, so the checks that compare it with what it replaced (an egress
+    // change, the loss of every policy-write role) find nothing to compare.
+    // The history cannot say what it replaced -- a POLICY_FILE edit or a
+    // restart between two publications writes no version, so the version
+    // before it need not be the document that was live -- and the commit
+    // already ran those checks against the policy that was. No publisher is
+    // named either: the caller asking for evidence is not the one who
     // published, and a package must not depend on who asks for it.
     let mut resource_snapshot = None;
     let review = inspection.policy().map(|candidate| {
-        let base = reading
-            .predecessor
-            .as_ref()
-            .map_or(&reading.policy, |(_, predecessor)| predecessor);
         rbac::policy_resources::validate_resources(
             candidate,
-            base,
+            candidate,
             &rbac_state.policy_resource_view(),
             None,
         )
