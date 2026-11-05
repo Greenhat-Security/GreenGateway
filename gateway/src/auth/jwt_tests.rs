@@ -14,16 +14,21 @@ fn retired_development_key_is_never_trusted_even_with_a_new_id() {
 use std::{
     collections::{HashMap, HashSet},
     io::ErrorKind,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::egress::{EgressClient, EgressConfig};
 
+use super::corpus::{NoDns, NoRevocation};
 use super::*;
 
 const KID: &str = "test-kid";
@@ -1407,6 +1412,129 @@ async fn a_not_yet_valid_token_is_rejected_until_its_nbf() {
         .expect("a token inside its nbf window should decode");
 }
 
+/// How far each boundary case sits from its leeway edge. The validator
+/// reads its own whole-second clock after the test has read one, so ten
+/// seconds keeps every case on its side of the edge on a loaded runner.
+const LEEWAY_EDGE_MARGIN_SECS: u64 = 10;
+
+#[test]
+fn an_exp_inside_the_leeway_is_accepted_and_one_past_it_is_rejected() {
+    let validator = validator(
+        default_cfg(),
+        Arc::new(NoopRevocationStore),
+        TEST_PUBLIC_KEY,
+    );
+    let key = test_decoding_key();
+    let now = now_seconds();
+
+    let mut claims = base_claims();
+    claims["exp"] = json!(now - JWT_EXP_LEEWAY_SECS + LEEWAY_EDGE_MARGIN_SECS);
+    validator
+        .decode_with_key(&signed_token(claims, TEST_PRIVATE_KEY), &key)
+        .expect("an exp that lapsed less than the leeway ago is still accepted");
+
+    let mut claims = base_claims();
+    claims["exp"] = json!(now - JWT_EXP_LEEWAY_SECS - LEEWAY_EDGE_MARGIN_SECS);
+    let error = validator
+        .decode_with_key(&signed_token(claims, TEST_PRIVATE_KEY), &key)
+        .expect_err("an exp that lapsed more than the leeway ago is rejected");
+    assert_invalid_session(error, INVALID_TOKEN);
+}
+
+#[test]
+fn an_nbf_inside_the_leeway_is_accepted_and_one_past_it_is_rejected() {
+    let validator = validator(
+        default_cfg(),
+        Arc::new(NoopRevocationStore),
+        TEST_PUBLIC_KEY,
+    );
+    let key = test_decoding_key();
+    let now = now_seconds();
+
+    let mut claims = base_claims();
+    claims["nbf"] = json!(now + JWT_EXP_LEEWAY_SECS - LEEWAY_EDGE_MARGIN_SECS);
+    validator
+        .decode_with_key(&signed_token(claims, TEST_PRIVATE_KEY), &key)
+        .expect("an nbf less than the leeway ahead is already accepted");
+
+    let mut claims = base_claims();
+    claims["nbf"] = json!(now + JWT_EXP_LEEWAY_SECS + LEEWAY_EDGE_MARGIN_SECS);
+    let error = validator
+        .decode_with_key(&signed_token(claims, TEST_PRIVATE_KEY), &key)
+        .expect_err("an nbf more than the leeway ahead is rejected");
+    assert_invalid_session(error, INVALID_TOKEN);
+}
+
+/// `exp` and `nbf` must be non-negative integers that fit a `u64`. Each
+/// malformed spelling replaces an integer the validator accepts in the same
+/// payload, so only its form can refuse it, and most are what a wrapping,
+/// saturating, rounding or string-coercing parse would read as an accepted
+/// instant. Every one is the generic invalid token, refused before the
+/// revocation store is asked and without a JWKS fetch.
+#[tokio::test]
+async fn malformed_numeric_exp_and_nbf_fail_closed_with_the_generic_error() {
+    let dns_calls = Arc::new(AtomicUsize::new(0));
+    let revocation_calls = Arc::new(AtomicUsize::new(0));
+    let egress = EgressClient::new_with_resolver(
+        EgressConfig {
+            allowed_hosts: HashSet::from(["issuer.example.test".to_owned()]),
+            ..EgressConfig::default()
+        },
+        Arc::new(NoDns(Arc::clone(&dns_calls))),
+    )
+    .expect("test egress client should build");
+    let validator = JwtValidator::new_with_keys(
+        default_cfg(),
+        Arc::new(egress),
+        Arc::new(NoRevocation(Arc::clone(&revocation_calls))),
+        decoding_keys(TEST_PUBLIC_KEY),
+    )
+    .expect("validator should build");
+    let key = test_decoding_key();
+    let now = now_seconds();
+
+    for (claim, valid) in [("exp", now + 3600), ("nbf", now - 3600)] {
+        let token_with = |value: &str| {
+            signed_raw_payload(&match claim {
+                "exp" => format!(r#"{{"sub":"user-123","jti":"session-123","exp":{value}}}"#),
+                _ => format!(
+                    r#"{{"sub":"user-123","jti":"session-123","exp":{},"nbf":{value}}}"#,
+                    now + 3600
+                ),
+            })
+        };
+        // The integer spelling of the same instant is accepted, so each
+        // refusal below is the form's, not the instant's or the signer's.
+        validator
+            .decode_with_key(&token_with(&valid.to_string()), &key)
+            .unwrap_or_else(|error| panic!("{claim} = {valid} should be accepted: {error:?}"));
+
+        for form in malformed_numeric_dates(valid) {
+            let token = token_with(&form);
+            let error = validator
+                .decode_with_key(&token, &key)
+                .err()
+                .unwrap_or_else(|| panic!("{claim} = {form} must be rejected"));
+            assert!(
+                matches!(&error, AuthError::InvalidSession(message) if message == INVALID_TOKEN),
+                "{claim} = {form}: {error:?}"
+            );
+            let error = validator
+                .validate_session(&SessionCredential::Bearer(token))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{claim} = {form} must not authenticate"));
+            assert!(
+                matches!(&error, AuthError::InvalidSession(message) if message == INVALID_TOKEN),
+                "{claim} = {form}: {error:?}"
+            );
+        }
+    }
+
+    assert_eq!(dns_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(revocation_calls.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn an_aged_key_set_is_not_trusted_without_a_successful_refresh() {
     let validator = validator(
@@ -1495,8 +1623,6 @@ async fn claims_at_the_principal_bounds_authenticate_and_one_past_them_do_not() 
 
 #[tokio::test]
 async fn an_out_of_bounds_credential_is_refused_before_the_revocation_store_is_consulted() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     #[derive(Debug)]
     struct CountingRevocation(AtomicUsize);
 
@@ -1585,6 +1711,53 @@ fn signed_token_with_key(mut claims: Value, algorithm: Algorithm, key: EncodingK
         .or_insert_with(|| json!(future_timestamp()));
 
     encode(&header, &claims, &key).expect("test token should sign")
+}
+
+/// Signs `payload` byte for byte, so a claim can carry number text that a
+/// `serde_json::Value` would not round-trip: an exponent, a fraction, or an
+/// integer past `u64::MAX`.
+fn signed_raw_payload(payload: &str) -> String {
+    let header = json!({"alg": "RS256", "typ": "JWT", "kid": KID}).to_string();
+    let signing_input = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(header),
+        URL_SAFE_NO_PAD.encode(payload)
+    );
+    let key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY.as_bytes())
+        .expect("test RSA private key should parse");
+    let signature = jsonwebtoken::crypto::sign(signing_input.as_bytes(), &key, Algorithm::RS256)
+        .expect("test payload should sign");
+    format!("{signing_input}.{signature}")
+}
+
+/// Malformed spellings of the NumericDate `valid`, each chosen so that a
+/// lenient parse would read it as `valid` or as another instant at which
+/// the token is still accepted: `-1` wraps to `u64::MAX` (an `exp` that
+/// never lapses) and is in the past as a signed `nbf`; a fraction or an
+/// exponent rounds or scales to about `valid`; a string coerces to it;
+/// `null` reads as an absent `nbf`; `2^64` saturates to `u64::MAX` or
+/// wraps to 0, and `2^64 + valid` wraps to `valid` itself.
+fn malformed_numeric_dates(valid: u64) -> Vec<String> {
+    let wraps_to_valid = (1_u128 << 64) + u128::from(valid);
+    vec![
+        "-1".to_owned(),
+        format!("-{valid}"),
+        format!("{valid}.5"),
+        format!("{valid}.0"),
+        format!("{}e1", valid / 10),
+        format!("{}E1", valid / 10),
+        format!("{}.{:09}e9", valid / 1_000_000_000, valid % 1_000_000_000),
+        format!("\"{valid}\""),
+        "null".to_owned(),
+        (1_u128 << 64).to_string(),
+        wraps_to_valid.to_string(),
+    ]
+}
+
+fn test_decoding_key() -> CachedDecodingKey {
+    decoding_keys(TEST_PUBLIC_KEY)
+        .remove(KID)
+        .expect("test key should be seeded under its kid")
 }
 
 fn jwks_key(value: Value) -> JwksKey {

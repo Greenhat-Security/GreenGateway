@@ -2,26 +2,37 @@
 
 A policy analysis reads one policy and reports what is provably wrong with its
 structure, or risky about its defaults: rules, routes and rate-limit overrides
-that can never decide a request because an earlier element always does,
-elements whose written intent never applies, allows and shadows that match
-every caller on every path, and permissive defaults.
+that can never decide a request because an earlier element always does, or
+decide only part of what they match; elements whose written intent never
+applies, or applies differently to MCP alias requests and selected virtual
+upstreams; tool-name rules their tool's own entry contradicts; grants broader
+than they look; egress entries that admit more than the web; references other
+resources contradict; and a change that would leave nobody able to change the
+policy again.
 `POST /v1{ADMIN_PREFIX}/policy/analyses` analyzes the active policy or a
 candidate -- position-aware edits over it, a complete document you send, one of
 your server-side drafts, or a version of the policy history -- and answers
 stable findings, each with an optional advisory patch (issue #243, slice 15).
 
-An analysis is structural. It reads the policy and the gateway's configured
-MCP alias paths, never retained traffic, so it never says anything about what
-was or was not observed, and it never calls an element unreachable because it
-was not seen. A report with no findings is not a statement that a policy is
-safe: the analyzer reports only what it can prove (see
+An analysis is structural. It reads the policy, the active policy it would
+replace, the gateway's configured MCP alias paths, the configured limits of the
+global rate lanes, and the resources a publication's
+[cross-resource checks](configuration.md#policy_file) read -- the tool
+registry, the Connections, the static egress lane and the configuration
+identity -- read once for the analysis. It never reads retained traffic, so it
+never says anything about what was or was not observed, and it never calls an
+element unreachable because it was not seen. A report with no findings is not
+a statement that a policy is safe: the analyzer reports only what it can prove
+or, for a heuristic, what it can name (see
 [False-positive bias](#false-positive-bias)), and a policy can be wrong in
 ways no structural check sees.
 
 An analysis changes nothing. It does not write, activate or rewrite a policy
 -- a candidate is validated, analyzed and discarded, and a patch is returned,
 never applied -- emits no data-plane authorization event, records no metric
-of its own, and touches no rate bucket, tool permit, resolver or upstream.
+of its own, and touches no rate bucket, tool permit, resolver or upstream: an
+egress question is put to the static egress lane with the witness's own
+resolution facts, and nothing is looked up.
 Beyond the access record every admin request gets, the only record it leaves
 is one `policy.analysis_run` audit event.
 
@@ -95,6 +106,13 @@ Content-Type: application/json
 
 ## The result
 
+The JSON rendering is published as
+[`docs/schemas/policy-analysis-results.v1.schema.json`](schemas/policy-analysis-results.v1.schema.json).
+It pins the members every result and finding carries and closes their
+vocabularies -- finding codes, in SARIF rule order, severities, proof bases,
+lanes, sections, access effects and limitations; a member it does not list is
+not refused.
+
 ```json
 {
   "schema_version": "policy-analysis-results.v1",
@@ -149,20 +167,20 @@ Content-Type: application/json
 | --- | --- |
 | `base`, `analyzed` | The pinned active policy, and the document analyzed: the base itself, or the candidate, with its own ETag. A `draft` adds the `draft_id` and `draft_revision` it was read at, and a `revision` the `version`. Every position, pointer and patch names the analyzed document. SARIF carries the same identity in its run properties, as `analyzed_draft_id` and `analyzed_draft_revision`, or `analyzed_version`. |
 | `resources.mcp_alias_paths` | How many MCP alias paths the analysis read from this gateway's static configuration (their values are not repeated). |
-| `complete` | Every check ran over every element. `false` means the analysis stopped at a bound named in `limitations`, and says nothing about the elements it did not reach. |
-| `limitations` | `comparison_budget_exhausted`, `deadline_exceeded` or `findings_truncated`. |
+| `complete` | Every check ran over every element. `false` means the analysis stopped at a bound, or could not read a resource a check needs, as `limitations` names, and says nothing about the elements or checks it did not reach. |
+| `limitations` | `comparison_budget_exhausted`, `deadline_exceeded`, `findings_truncated`, or `resources_unavailable`: part of the cross-resource view could not be read, or the global rate lanes could not for a policy with rate overrides, so the checks that need them did not run. |
 | `summary` | Counts only, the same counts the audit event carries. |
-| `findings` | Sorted by severity, then section, position and code. |
+| `findings` | Sorted by severity, then section, position, code and pointer. |
 
-A finding never repeats a path, permission, caller or any other value from
-the policy: it names elements by section, pointer, position and stable id, and
-a role by its name, as validation diagnostics do. `rationale` and
-`remediation` are fixed texts per code.
+A finding never repeats a path, permission, caller, host, address, port or any
+other value from the policy: it names elements by section, pointer, position
+and stable id, and a role or a tool by its name, as validation diagnostics do.
+`rationale` and `remediation` are fixed texts per code.
 
 | Finding member | Meaning |
 | --- | --- |
 | `code` | The stable finding code; see the table below. The rationale and remediation texts may be reworded; the code is the contract. |
-| `fingerprint` | `sha256:` over the code and the identities of `element` and `related` -- each element's stable id, a role's name, or its position when it has neither. It does not change when unrelated elements change, or when an element with an id moves, so a later suppression or a CI baseline can name it. |
+| `fingerprint` | `sha256:` over the code and the identities of `element` and `related` -- each element's stable id, a role's or tool's name, or its position when it has neither, and, for a finding about one member of an element (one role a rule names, one egress CIDR), that member's pointer relative to the element. It does not change when unrelated elements change, or when an element with an id moves, so a later suppression or a CI baseline can name it. |
 | `severity` | `high`, `medium` or `low`: how likely the finding is to be an exposure rather than clutter. |
 | `proof_basis` | How the finding was established; see below. |
 | `element`, `related` | The element the finding is about, and the element that establishes it (the earlier rule that covers it, the route or rule that decides first, the catch-all that masks a default). |
@@ -198,11 +216,21 @@ reaches them, so a reachability claim says in which lanes it holds.
   lane; for a route a rule pre-empts, the whole HTTP decision), and reports the
   claim only when an earlier element does. The other lanes a claim names are
   covered by the brute-force tests, not by a witness at run time.
-- `heuristic`: a statement whose risk depends on the deployment rather than on
-  the policy alone.
+  An overlap, lane-effect or grant claim says that some request or caller
+  exists -- one a rule matches that an earlier, less restrictive rule decides;
+  one the MCP alias lane decides by a later rule; one a grant names that the
+  tool's entry refuses -- and it is `proven` only when the evaluator answers
+  the witness the analyzer built that way. An egress CIDR claim is confirmed
+  by the static egress lane on one address of each category it names, refused
+  without the CIDR and admitted with it.
+- `heuristic`: a statement whose risk depends on the deployment or on intent
+  rather than on the policy alone: whether a wildcard is too much, whether a
+  port is unusual, whether an undefined role or an ungranted permission is a
+  mistake, whether a lost writer locks anybody out.
 - `inconclusive`: a relation the evaluator did not confirm on its witness --
   for example a pattern whose only matching path the evaluator refuses as
-  unsafe. It is reported, never dropped, and carries no patch.
+  unsafe, or an overlap whose witness an even earlier rule decides. It is
+  reported, never dropped, and carries no patch.
 
 `bounded_replay`, the basis of a finding informed by retained traffic, is
 reserved: this analyzer reads no traffic.
@@ -223,9 +251,32 @@ reserved: this analyzer reads no traffic.
 | `route_bypassed` | high | proven | delete the rule (narrowing) | A direct allow or shadow for every caller, with no dispatch binding, decides every ordinary request the route matches, so its permission is never checked; a host-bound route still decides a selected upstream (`may_decide_in`). `details.rule_action`. |
 | `rate_override_unreachable` | low | proven | delete the override (equivalent) | An earlier override with the same limits selects every request this one matches. |
 | `rate_override_shadowed` | medium when stricter; low otherwise | proven | move the override before the covering one (narrowing when stricter, expanding when looser, otherwise unknown) | An earlier override with different limits covers it. `details.limits` is `stricter`, `looser` or `mixed`. |
+| `rule_partially_shadowed` | medium for a deny; low for a shadow | proven or inconclusive | none | An earlier, less restrictive enabled rule decides some of the requests this rule matches, short of all of them (all of them is `rule_shadowed`). The witness is a request both rules match, built from their methods, callers, dispatch bindings and paths; `related` names the rule the evaluator found deciding it. `details.action`, `details.preempting_action`, and `details.pre_empted_in` (`http`, `rendered_tool_http`). |
+| `mcp_alias_rule_overridden` | low | proven | none | For a request reaching the MCP endpoint by a configured alias path, this allow or shadow is the first rule in source order matching either identity, and a later, more restrictive rule (`related`) decides instead: the alias lane decides by the most restrictive action anywhere. Reported only when the evaluator confirms it on the witness. `details.action`, `details.deciding_action`, `details.lane`. |
+| `mcp_alias_route_precedence` | medium | proven or inconclusive | none | An alias request selects this route by its exact prefix before the route that decides the canonical MCP path (`related`), and a caller the evaluator forwards at the alias is blocked at the canonical path. Route lane only, unbound routes only. `details.permission_differs`, `details.mode_differs`. |
+| `selected_upstream_allow_ignored` | low | proven | none | An unbound allow or shadow decides and forwards a request addressed to a host-bound route's host (`related`), and the evaluator blocks the same request once that host's virtual upstream is selected: a selected upstream reads direct denies only, then needs a host-bound route. Reported only when the evaluator confirms it on the witness: an allow whose callers the route admits anyway loses nothing. `details.action`, `details.lane`. |
+| `tool_rule_never_decides` | low | proven or inconclusive | delete the rule (equivalent) | The tool's entry refuses every caller this tool-name rule matches before any tool-name rule is read: `details.reason` is `tool_absent`, `tool_disabled`, `issuers_disjoint` or `auth_methods_disjoint`. `never_decides_in` is `tool`. |
+| `tool_rule_grant_narrowed` | low | proven | none | The tool's entry refuses the very caller this allow or shadow tool-name rule names, so the rule grants less than it names. Reported only when the evaluator confirms it. |
+| `issuerless_role_grant` | high for an allow rule; medium for a shadow rule or a tool entry | proven or inconclusive | none | Claimed-role mode: an allow or shadow rule, or a tool entry, names a role that is bound to issuers and names no issuer itself, so it admits that role claimed from any issuer, while a route permission the role grants applies only for its issuers. The pointer names the role (`/rules/N/principal/roles/M`, `/tools/T/allowed_roles/M`); `details.lane` is `http` or `tool`. |
+| `wildcard_permission` | low | heuristic | none | A role bound to issuers grants `*`. (Without issuers it is `wildcard_grant_without_issuer`.) |
+| `broad_path_grant` | medium | proven or inconclusive | none | An enabled allow or shadow, constrained to some callers and bound to no dispatch, matches every path. `details.action`, `details.all_methods`. |
+| `all_methods_grant` | medium | proven or inconclusive | none | An enabled allow or shadow for every caller, bound to no dispatch, matches every method on less than every path (every path too is `broad_unconstrained_*`). `details.action`. |
+| `rate_override_looser_than_global` | low | proven or inconclusive | none | The override allows more requests per second or a larger burst than the global lane its methods are charged in (`read` for `GET` and `HEAD`, `write` for the rest). The global lane limits each client address first. `details.lanes`, `details.requests_per_second_higher`, `details.burst_higher`. |
+| `egress_broad_wildcard_host` | medium | heuristic | none | An `egress.hosts` pattern `*.X` where `X` is one label: a top-level domain or a bare internal name. The pointer names the entry. |
+| `egress_non_public_cidr` | high for loopback or link-local; medium for a whole private range; low otherwise | proven or inconclusive | none | An `egress.cidrs` entry admits addresses the gateway otherwise refuses: `details.categories` lists `loopback` (127.0.0.0/8, ::1), `link_local` (169.254.0.0/16, fe80::/10) and `private` (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, fc00::/7) as the CIDR overlaps them; `details.covers_whole_range` says it holds a whole private range. |
+| `egress_unusual_port` | low | heuristic | none | An `egress.ports` entry other than 80, 443, 8080 or 8443. |
+| `egress_change_requires_restart` | medium | proven | none | The `egress` section differs from the active policy's; the policy API refuses that change, which needs an edit of the policy file and a restart. |
+| `role_not_defined` | low | heuristic | none | A rule, rate override or tool entry names a role no `roles` entry defines (the cross-resource check). |
+| `route_permission_ungranted` | low | heuristic | none | No role grants a route's permission. |
+| `tool_not_registered` | low | heuristic | none | A tool entry or tool-name rule names a tool the gateway's registry does not hold. |
+| `connection_endpoint_egress_denied` | medium | heuristic | none | The static egress lane refuses an enabled Connection's endpoint, judged without resolution facts as publication judges it. |
+| `name_case_collision` | low | heuristic | none | Two role or two tool names differ only in case. |
+| `policy_write_unreachable` | high | heuristic | none | The active policy lets some principal hold `admin:policy:write` and the analyzed one lets none (the publication check). A publication also refuses a change that takes the permission from its own publisher; an analysis names no publisher and does not run that check. |
 
 A route that some direct rule pre-empts is reported for that and is not also
-compared with earlier routes.
+compared with earlier routes. A rule reported as `rule_unreachable`,
+`rule_shadowed` or `tool_rule_never_decides` is not also reported for a
+partial overlap or a lane effect.
 
 ### Access effects
 
@@ -254,28 +305,59 @@ lane, a less restrictive one only where rules decide by first match, and a
 broader earlier route does not stop a route at an MCP alias path from
 deciding the alias first.
 
+An overlap or lane-effect claim rests on a witness instead: a request two
+elements both match, built the same way -- the methods they share, a caller
+carrying a value every constrained principal field of either admits, a
+dispatch binding one covers, and a path found by one alignment of the two
+patterns (literals as written, one `w` segment where both accept any one
+segment, nothing where a `**` absorbs nothing). A tool-entry or grant claim's
+witness is the caller the rule or entry names. The evaluator then answers the
+witness in the lane the claim is about.
+
 Before a claim is reported as `proven`, the evaluator confirms it on a witness
 request, as described under [Proof bases](#proof-bases). The tests also check
 every proven claim and every patch's access effect by brute force: random
 small policies are analyzed, and every request of a small universe -- every
-path of up to three segments, three methods, nine callers, in every lane -- is
-decided by the evaluator before and after each patch (`policy_analysis::tests`).
+path of up to three segments, three methods, thirteen callers, in every lane --
+is decided by the evaluator before and after each patch; every proven
+existential claim is shown by a request or caller of that universe, asked of
+the evaluator directly; and every egress CIDR claim names exactly the
+categories of a set of sample addresses the CIDR holds, each refused by the
+static egress lane without the CIDR and admitted with it
+(`policy_analysis::tests`).
 
 ## False-positive bias
 
 The analyzer is biased toward missing findings rather than inventing them.
-When it cannot prove that one element covers another it says nothing. It
-does not report:
+When it cannot prove that one element covers another it says nothing, and
+an overlap it can show only on a witness the evaluator does not confirm is
+`inconclusive`, never `proven`. It does not report:
 
-- an element covered only by the union of several earlier elements, or any
-  partial overlap between two elements;
-- a pattern inclusion that needs different alignments for different paths;
+- an element covered only by the union of several earlier elements as
+  covered (each earlier element that decides part of it may still be a
+  `rule_partially_shadowed`), or a partial overlap with a conditioned rule,
+  with an earlier rule at least as restrictive -- the ordinary exception
+  pattern -- or between routes or rate overrides;
+- a pattern inclusion or intersection that needs different alignments for
+  different paths;
 - two spellings of one legacy upstream origin as one dispatch binding, or a
   dispatch-bound rule as covering an unbound one;
 - a route at a configured MCP alias path covered by a broader earlier route,
-  because the alias selects it by exact prefix first;
-- a rule scoped to a dispatch, or constrained to any principal field, as
-  broad, and an allow narrower than every path as broad at all;
+  because the alias selects it by exact prefix first; a direct rule deciding
+  an alias request before any route is judged in the rule lane, and the route
+  comparison is in the route lane alone;
+- a rule scoped to a dispatch as broad, a rule constrained to a principal
+  field as broad for every caller (it may be a `broad_path_grant`), and an
+  allow narrower than every path for named callers as broad at all;
+- a tool entry and a tool-name rule as disjoint by their roles: a caller may
+  hold roles from both;
+- an egress wildcard over more than one label, such as a public suffix with
+  a dot in it, as broad: which suffixes are public is not knowable here;
+- an MCP alias override, a selected-upstream effect or a narrowed tool grant
+  the evaluator does not confirm on its witness: those say that a request or
+  caller exists, and without the evaluator's answer nothing is claimed;
+- an issuerless role grant in mapped-role mode, where a caller holds only the
+  roles its issuer's mappings grant;
 - a role's coverage through the permissions other roles grant: principal
   constraints are compared field by field;
 - a rule with typed `conditions` as covering another element, as broad, as
@@ -323,11 +405,19 @@ patches are not guaranteed to compose, and positions shift once one is applied.
 An analysis runs on a blocking thread behind its own limiter: at most two per
 replica and one per caller, a body within 2 MiB, a two-second deadline, at
 most 2,000,000 element comparisons and 1,000 findings, and an 8 MiB result.
-The linear checks (defaults, wildcard grants, broad rules) run first; the
-pairwise checks stop when the budget or deadline is spent, and analysis stops
-at the findings cap. Any of these makes `complete` `false` and names the
-bound in `limitations`; the findings already reported stand, each proven on
-its own, and nothing is said about the elements not reached.
+The linear checks (defaults, wildcard grants, broad rules and grants,
+tool entries, rate lanes, egress and the cross-resource checks) run first;
+the pairwise checks (coverage, partial overlaps, tool-name rules, the MCP
+alias lane, selected upstreams, routes and rate overrides) stop when the
+budget or deadline is spent, and analysis stops at the findings cap. A
+linear check counts each element it asks the evaluator about against the same
+budget and deadline, so a large policy cannot outrun the deadline in the
+linear checks either. Any of these makes `complete` `false` and names the
+bound in `limitations`; the
+findings already reported stand, each established on its own, and nothing is
+said about the elements not reached. A resource the endpoint could not read
+does the same, as `resources_unavailable`: the checks that need it did not
+run, and their silence is not a clean result.
 
 ## Audit
 
@@ -347,10 +437,10 @@ analysis.
   and policy binding. Until they exist nothing hides a finding.
 - Findings informed by retained traffic (`bounded_replay`), and unused roles
   and permissions.
-- Partial overlaps and first-match conflicts short of full coverage, MCP
-  alias and host-qualified exception effects beyond reachability, tool policy
-  versus tool-name rule conflicts, egress lints, unknown cross-resource
-  references and administrator lockout (the
-  [cross-resource checks](configuration.md#policy_file) run at publication for the last
-  two).
+- Partial overlaps between routes or between rate overrides, and coverage by
+  the union of several elements.
+- Issuer and provider names, admin permission spellings and secret
+  references, which the [cross-resource checks](configuration.md#policy_file)
+  do not check either, and the publisher's own loss of `admin:policy:write`,
+  which publication checks for the principal publishing.
 - The Policy Studio Optimize view, and `ggctl` integration.

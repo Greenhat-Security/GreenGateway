@@ -15,6 +15,7 @@ import {
   testConnection,
 } from '../lib/connections';
 import { CallerAssertionSummary } from './CallerAssertionSummary';
+import { ConnectionCatalogImport } from './ConnectionCatalogImport';
 import { DelegatedIssuerTokenSummary } from './DelegatedIssuerTokenSummary';
 import { GoogleDomainWideDelegationSummary } from './GoogleDomainWideDelegationSummary';
 
@@ -373,6 +374,20 @@ export function ConnectionDetail() {
                   <ConnectionRefreshPanel result={refreshResult} />
                 ) : null}
               </div>
+            ) : null}
+
+            {detail.kind === 'http_api' &&
+            detail.source === 'managed' &&
+            !detail.read_only ? (
+              <ConnectionCatalogImport
+                detail={detail}
+                onReloadConnection={() => {
+                  setTestResult(null);
+                  setRefreshResult(null);
+                  setMutationError(null);
+                  setReloadVersion((current) => current + 1);
+                }}
+              />
             ) : null}
           </>
         ) : null}

@@ -25,11 +25,10 @@
 //! the 0.x document with the same members would. v1 adds identity and
 //! strictness, not behaviour -- and two members a 0.x document cannot carry:
 //! `identity_mappings` and rule `conditions` (`super::identity_mappings`,
-//! `super::conditions`). This build validates both, the kernel evaluates
-//! both, and every serving lane enforces both, except a `tool_argument`
-//! condition, which no lane captures a fact for yet: a document whose
-//! conditions read one is refused with every check but that one reported
-//! first.
+//! `super::conditions`). This build validates both and the kernel evaluates
+//! both. The serving lanes enforce identity mappings and every condition
+//! leaf but `tool_argument`, so a document whose conditions use that leaf is
+//! refused, with every check but that one reported first.
 //!
 //! ## Diagnostics
 //!
@@ -119,7 +118,7 @@ impl PolicySchema {
     }
 
     /// The document format major the cluster roster advertises a range of
-    /// (`cluster_membership::DOCUMENT_VERSION_RANGE`).
+    /// (`cluster_membership::DOCUMENT_VERSION_RANGE`, `0..=1` in this build).
     #[cfg(any(test, feature = "postgres"))]
     pub(crate) const fn document_format_major(self) -> i32 {
         match self {
@@ -420,7 +419,8 @@ impl IssueCode {
                  configuration"
             }
             Self::DocumentFormatUnsupportedInCluster => {
-                "cluster mode does not yet commit documents of this schema_version"
+                "not every live replica of this cluster can be shown to read documents of this \
+                 schema_version, so cluster mode does not commit one yet"
             }
             Self::PolicyFileTooLarge => {
                 "the policy as a policy file holds it would be larger than a policy file may be"
@@ -611,8 +611,8 @@ impl IssueCode {
                  current UPSTREAM_ROUTES."
             }
             Self::DocumentFormatUnsupportedInCluster => {
-                "Keep a cluster deployment on a 0.x document until a release that gates v1 \
-                 documents on every replica's capability."
+                "Finish the rollout so every replica runs a release that serves this document \
+                 format, or wait for departed replicas to go stale, then publish again."
             }
             Self::PolicyFileTooLarge => {
                 "Keep the pretty-printed document, as the gateway writes a policy file, within \

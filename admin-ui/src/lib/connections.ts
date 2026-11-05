@@ -964,7 +964,9 @@ function projectConnectionRevisions(value: unknown): ConnectionRevisions {
   };
 }
 
-function projectConnectionStatus(value: unknown): ConnectionStatus {
+// Exported for the catalog import client, whose publication result carries
+// the same bounded status.
+export function projectConnectionStatus(value: unknown): ConnectionStatus {
   const source = responseObject(value, 'connection status');
   if (
     !isConnectionOperationalState(source.state) ||

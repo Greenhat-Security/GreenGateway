@@ -10630,7 +10630,7 @@ pub(crate) mod postgres_audit_tests {
         );
         assert_eq!(
             (first.document_version_min, first.document_version_max),
-            (0, 0)
+            (0, 1)
         );
         assert_eq!(first.compiled_security_revision, 0);
         assert_eq!(first.observed_security_revision, 0);
@@ -11288,7 +11288,8 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(
             members[0].capabilities,
             "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
-             operation_requirements,policy_role_descriptions"
+             operation_requirements,policy_document_v1,policy_role_descriptions,\
+             policy_rule_conditions"
         );
         assert!(RecognizedCapabilities::parse(&members[0].capabilities)
             .contains(Capability::OperationRequirements));
@@ -11300,6 +11301,18 @@ pub(crate) mod postgres_audit_tests {
             .contains(Capability::DelegatedTokenPurges));
         assert!(RecognizedCapabilities::parse(&members[0].capabilities)
             .contains(Capability::OpenApiDiscoveryCatalogs));
+        assert!(RecognizedCapabilities::parse(&members[0].capabilities)
+            .contains(Capability::PolicyDocumentV1));
+        assert!(RecognizedCapabilities::parse(&members[0].capabilities)
+            .contains(Capability::PolicyRuleConditions));
+        assert_eq!(
+            (
+                members[0].document_version_min,
+                members[0].document_version_max
+            ),
+            (0, 1),
+            "this build advertises document formats 0 and 1"
+        );
 
         // A newer gateway on the same instance would write names this one
         // does not know; the next heartbeat writes this binary's own set
@@ -11326,7 +11339,8 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(
             store.members(window).await.expect("members")[0].capabilities,
             "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
-             operation_requirements,policy_role_descriptions"
+             operation_requirements,policy_document_v1,policy_role_descriptions,\
+             policy_rule_conditions"
         );
 
         let older = insert_pre_protocol_member(&pool).await;
@@ -11550,6 +11564,495 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(events[2].payload["operation"], "policy.role_descriptions");
         assert_eq!(events[2].payload["capability"], "policy_role_descriptions");
         assert_eq!(events[5].payload["operation"], "fixture.gated_write");
+    }
+
+    /// Write a roster row the way the build before policy v1 in cluster
+    /// mode does: this schema and every capability it implemented, but not
+    /// `policy_document_v1`, and document formats `0..=0`. Returns the row's
+    /// instance ID.
+    async fn insert_pre_v1_member(pool: &deadpool_postgres::Pool) -> uuid::Uuid {
+        let instance = uuid::Uuid::new_v4();
+        let (schema_min, schema_max) = migrations::schema_version_range();
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint,
+                      capabilities)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, 'pre-v1', $4, $5, 0, 0,
+                         repeat('a', 64),
+                         'delegated_token_purges,openapi_discovery_catalogs,'
+                         || 'openapi_swagger2_catalogs,operation_requirements,'
+                         || 'policy_role_descriptions')",
+                &[
+                    &MEMBERS_DEPLOYMENT,
+                    &instance.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    &schema_min,
+                    &schema_max,
+                ],
+            )
+            .await
+            .expect("a pre-v1 member row inserts");
+        instance
+    }
+
+    /// A policy v1 document (issue #243) with an id on every element kind.
+    fn contract_policy_v1(id: &str) -> Policy {
+        Policy::validate_json_value(json!({
+            "schema_version": "1.0.0",
+            "id": id,
+            "default_action": "deny",
+            "roles": { "reader": { "permissions": ["data:read"] } },
+            "routes": [
+                { "id": "data-read", "methods": ["GET"], "path_prefix": "/data", "permission": "data:read" }
+            ],
+            "rules": [{ "id": "deny-admin", "path": "/admin/**", "action": "deny" }],
+            "rate_limits": [{
+                "id": "reader-burst",
+                "principal": { "roles": ["reader"] },
+                "requests_per_second": 2.5,
+                "burst": 5
+            }]
+        }))
+        .expect("the v1 fixture should validate")
+    }
+
+    /// Policy v1 in the cluster authority, behind the roster capability
+    /// (issue #243). While a live member of the build before it is on the
+    /// roster -- document formats `0..=0`, no `policy_document_v1` -- the
+    /// gate refuses `policy.document_v1`, and so it does for a member that
+    /// advertises the capability with a range that stops at 0; every refusal
+    /// is audited. Once only members that read format 1 remain it admits, a
+    /// v1 document commits, the active read serves it under v1 with its
+    /// element ids and its ETag, and history returns it as committed. A 0.x
+    /// revision committed after it is served as 0.x, at its own ETag.
+    #[tokio::test]
+    async fn policy_v1_documents_commit_read_and_serve_once_every_live_member_reads_them() {
+        use crate::audit::{sink::tests::CaptureSink, AuditLog};
+        use crate::cluster_membership::GatedWriteRequest;
+        use crate::storage::compatibility::{
+            OperationAdmission, OperationRefusal, POLICY_DOCUMENT_V1,
+        };
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_store(&database).await;
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()));
+        let request = GatedWriteRequest {
+            request_id: "request-policy-v1".to_owned(),
+            source_ip: "203.0.113.9".to_owned(),
+            actor: None,
+        };
+        let replica = ClusterMembership::new(
+            member_store(&pool),
+            registration('a'),
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        );
+        replica.register_boot().await.expect("boot");
+        assert_eq!(
+            replica
+                .admit_operation(&POLICY_DOCUMENT_V1, &audit, &request)
+                .await,
+            Ok(OperationAdmission { live_members: 1 }),
+            "a deployment of this build alone admits v1"
+        );
+
+        let older = insert_pre_v1_member(&pool).await;
+        assert_eq!(
+            replica
+                .admit_operation(&POLICY_DOCUMENT_V1, &audit, &request)
+                .await,
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![older],
+                live: 2
+            })
+        );
+        assert_eq!(
+            replica.check_operation(&POLICY_DOCUMENT_V1).await,
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![older],
+                live: 2
+            }),
+            "the read-only check reaches the same decision"
+        );
+        // The capability alone is not enough: the member must read format 1.
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "UPDATE greengateway.cluster_members
+                 SET capabilities = capabilities || ',policy_document_v1'
+                 WHERE instance_id = $1::text::uuid",
+                &[&older.to_string()],
+            )
+            .await
+            .expect("advertise the capability without the format");
+        assert!(matches!(
+            replica
+                .admit_operation(&POLICY_DOCUMENT_V1, &audit, &request)
+                .await,
+            Err(OperationRefusal::MembersLackRequirement { .. })
+        ));
+        backdate_heartbeat(&pool, older, 60.0).await;
+        assert_eq!(
+            replica
+                .admit_operation(&POLICY_DOCUMENT_V1, &audit, &request)
+                .await,
+            Ok(OperationAdmission { live_members: 1 }),
+            "a stale row no longer holds the operation"
+        );
+
+        // Commit, read and serve.
+        let initial = PolicyControlPlane::commit(
+            &*store,
+            commit_request(
+                PolicyCommitPrecondition::Initialize,
+                &policy_with_role("v0-base", "reader"),
+                "op-1",
+            ),
+        )
+        .await
+        .expect("initialize should commit");
+        let v1 = contract_policy_v1("v1-active");
+        let committed = PolicyControlPlane::commit(
+            &*store,
+            commit_request(
+                PolicyCommitPrecondition::Expected {
+                    etag: initial.etag.clone(),
+                },
+                &v1,
+                "op-2",
+            ),
+        )
+        .await
+        .expect("a v1 document commits in cluster mode");
+        assert_eq!(committed.policy, v1);
+        let active = PolicyControlPlane::active(&*store)
+            .await
+            .expect("active read")
+            .expect("an active policy");
+        assert_eq!(active.policy, v1, "served exactly as committed");
+        assert_eq!(active.policy.schema_version, "1.0.0");
+        assert_eq!(active.etag, committed.etag);
+        assert_eq!(active.version, committed.version);
+        assert_eq!(active.policy.routes[0].id.as_deref(), Some("data-read"));
+        assert_eq!(
+            active.policy.rate_limits[0].id.as_deref(),
+            Some("reader-burst")
+        );
+        let historical = store
+            .get_version(committed.version)
+            .await
+            .expect("history read")
+            .expect("the v1 version is in history");
+        assert_eq!(historical.policy.as_ref(), Some(&v1));
+        let page = store
+            .list_versions(&PolicyHistoryListFilters {
+                limit: 10,
+                cursor: None,
+                include_policy: true,
+            })
+            .await
+            .expect("history list");
+        assert_eq!(page.versions.len(), 2);
+        assert_eq!(page.versions[0].policy.as_ref(), Some(&v1));
+
+        // Back to 0.x: committed and served as 0.x, never as v1.
+        let back = PolicyControlPlane::commit(
+            &*store,
+            commit_request(
+                PolicyCommitPrecondition::Expected {
+                    etag: committed.etag.clone(),
+                },
+                &initial.policy,
+                "op-3",
+            ),
+        )
+        .await
+        .expect("a 0.x revision commits after a v1 one");
+        assert_eq!(back.etag, initial.etag, "the same document, the same ETag");
+        let active = PolicyControlPlane::active(&*store)
+            .await
+            .expect("active read")
+            .expect("an active policy");
+        assert_eq!(active.policy, initial.policy);
+        assert_eq!(active.policy.schema_version, "0.1.0");
+
+        // Two refusals, each audited with the operation and its format.
+        let started = std::time::Instant::now();
+        while capture.len() < 2 && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let events = capture.events();
+        assert_eq!(events.len(), 2, "the read-only check audits nothing");
+        for event in &events {
+            assert_eq!(event.event_type, "cluster.operation_refused");
+            assert_eq!(event.payload["operation"], "policy.document_v1");
+            assert_eq!(event.payload["capability"], "policy_document_v1");
+            assert_eq!(event.payload["document_format"], 1);
+            assert_eq!(event.payload["reason"], "capability_not_advertised");
+            assert!(!event.payload.to_string().contains(&older.to_string()));
+        }
+    }
+
+    /// A policy v1 document with identity mappings (issue #243) in the
+    /// cluster authority is judged exactly as standalone mode judges it:
+    /// this build enforces mappings on every serving lane, so the store
+    /// commits the document, keeps the mappings exactly, and serves it back
+    /// from the active read and from history as the committed policy at the
+    /// committed ETag, in mapped-role mode.
+    #[tokio::test]
+    async fn a_v1_document_with_identity_mappings_is_served_from_the_cluster_authority() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, _pool) = migrated_policy_store(&database).await;
+        let document = json!({
+            "schema_version": "1.0.0",
+            "id": "mapped-roles",
+            "default_action": "deny",
+            "roles": {
+                "admin": { "permissions": ["admin:policy:write"] },
+                "reader": { "permissions": ["data:read"] }
+            },
+            "identity_mappings": [{
+                "id": "idp-readers",
+                "issuer": "https://idp.example.test/",
+                "organizations": ["acme"],
+                "grant_roles": ["reader"]
+            }],
+            "routes": [
+                { "id": "data-read", "methods": ["GET"], "path_prefix": "/data", "permission": "data:read" }
+            ]
+        });
+        let mapped = Policy::validate_json_value(document)
+            .expect("this build accepts identity mappings in both modes");
+        assert!(mapped.identity_mappings.is_some());
+
+        let initial = PolicyControlPlane::commit(
+            &*store,
+            commit_request(
+                PolicyCommitPrecondition::Initialize,
+                &policy_with_role("mapped-base", "reader"),
+                "op-1",
+            ),
+        )
+        .await
+        .expect("initialize should commit");
+        let committed = PolicyControlPlane::commit(
+            &*store,
+            commit_request(
+                PolicyCommitPrecondition::Expected {
+                    etag: initial.etag.clone(),
+                },
+                &mapped,
+                "op-2",
+            ),
+        )
+        .await
+        .expect("a v1 document with identity mappings commits in cluster mode");
+
+        let active = PolicyControlPlane::active(&*store)
+            .await
+            .expect("a document this build enforces is served")
+            .expect("an active policy");
+        assert_eq!(active.etag, committed.etag);
+        assert_eq!(active.policy, mapped, "the mappings are served exactly");
+        let historical = store
+            .get_version(committed.version)
+            .await
+            .expect("history read")
+            .expect("the version is in history");
+        assert_eq!(historical.policy.as_ref(), Some(&mapped));
+    }
+
+    /// A policy v1 document whose rules carry conditions (issue #243) in the
+    /// cluster authority. The store commits format 1 whatever it carries and
+    /// keeps the conditions exactly: the stored document reads back, under
+    /// the reader that admits them, as the committed policy at the committed
+    /// ETag. This build enforces every condition leaf but `tool_argument`, so
+    /// a document whose conditions read the organization, the source network
+    /// and a header is served exactly as committed. One with a `tool_argument`
+    /// condition is not: its replicas refuse to serve it -- the active read
+    /// fails closed as invalid data rather than reading the document without
+    /// it -- and the policy API never hands one to the store
+    /// (`typed_matchers_not_enforced`). Once a release enforces that leaf too,
+    /// this commit is the document its replicas serve. Recovery is forward: a
+    /// document this build serves commits over it.
+    #[tokio::test]
+    async fn a_v1_document_with_rule_conditions_commits_in_cluster_mode_and_is_served_only_once_enforced(
+    ) {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_store(&database).await;
+        let served_document = json!({
+            "schema_version": "1.0.0",
+            "id": "request-conditions",
+            "default_action": "deny",
+            "roles": {
+                "admin": { "permissions": ["admin:policy:write"] },
+                "reader": { "permissions": ["data:read"] }
+            },
+            "identity_mappings": [{
+                "id": "idp-readers",
+                "issuer": "https://idp.example.test/",
+                "organizations": ["acme"],
+                "grant_roles": ["reader"]
+            }],
+            "rules": [{
+                "id": "internal-reads",
+                "path": "/data/**",
+                "action": "allow",
+                "conditions": { "all": [
+                    { "organization": { "issuer": "https://idp.example.test/", "in": ["acme"] } },
+                    { "any": [
+                        { "source_network": { "cidrs": ["10.0.0.0/8"] } },
+                        { "header": { "name": "x-environment", "in": ["staging"] } }
+                    ] }
+                ] }
+            }]
+        });
+        let served = Policy::validate_json_value(served_document)
+            .expect("this build serves organization, source-network and header conditions");
+        let mut document = json!({
+            "schema_version": "1.0.0",
+            "id": "typed-matchers",
+            "default_action": "deny",
+            "roles": {
+                "admin": { "permissions": ["admin:policy:write"] },
+                "reader": { "permissions": ["data:read"] }
+            },
+            "rules": [{
+                "id": "internal-reads",
+                "path": "/data/**",
+                "action": "allow",
+                "conditions": { "source_network": { "cidrs": ["10.0.0.0/8"] } }
+            }, {
+                "id": "eu-exports",
+                "tool_name": "reports.export",
+                "action": "deny",
+                "conditions": { "any": [
+                    { "source_network": { "cidrs": ["10.0.0.0/8"] } },
+                    { "tool_argument": { "pointer": "/region", "in": ["eu"] } }
+                ] }
+            }]
+        });
+        let typed = crate::rbac::policy_document::parse_v1_with_typed_matchers(&document)
+            .expect("the typed-matcher document is sound");
+        assert!(
+            Policy::validate_json_value(document.clone()).is_err(),
+            "this build accepts no document whose conditions read a tool argument"
+        );
+
+        let initial = PolicyControlPlane::commit(
+            &*store,
+            commit_request(
+                PolicyCommitPrecondition::Initialize,
+                &policy_with_role("typed-base", "reader"),
+                "op-1",
+            ),
+        )
+        .await
+        .expect("initialize should commit");
+        let conditioned = PolicyControlPlane::commit(
+            &*store,
+            commit_request(
+                PolicyCommitPrecondition::Expected {
+                    etag: initial.etag.clone(),
+                },
+                &served,
+                "op-2",
+            ),
+        )
+        .await
+        .expect("a document with served conditions commits in cluster mode");
+        let active = PolicyControlPlane::active(&*store)
+            .await
+            .expect("a document this build enforces is served")
+            .expect("an active policy");
+        assert_eq!(active.etag, conditioned.etag);
+        assert_eq!(active.policy, served, "the conditions are served exactly");
+
+        let committed = PolicyControlPlane::commit(
+            &*store,
+            commit_request(
+                PolicyCommitPrecondition::Expected {
+                    etag: conditioned.etag.clone(),
+                },
+                &typed,
+                "op-3",
+            ),
+        )
+        .await
+        .expect("format 1 commits in cluster mode");
+
+        let stored: String = pool
+            .get()
+            .await
+            .expect("client")
+            .query_one(
+                "SELECT document::text FROM greengateway.policy_documents WHERE version = $1",
+                &[&committed.version],
+            )
+            .await
+            .expect("the stored document reads")
+            .get(0);
+        let stored: Value = serde_json::from_str(&stored).expect("the stored document is JSON");
+        let reread = crate::rbac::policy_document::parse_v1_with_typed_matchers(&stored)
+            .expect("the stored document is the committed v1 document");
+        assert_eq!(reread, typed, "the matchers are kept exactly");
+        assert_eq!(
+            crate::policy_etag(&reread).expect("ETag"),
+            committed.etag,
+            "at the committed ETag"
+        );
+
+        let refused = PolicyControlPlane::active(&*store)
+            .await
+            .expect_err("a tool_argument condition this build does not enforce is never served");
+        assert_eq!(refused.kind(), RepositoryErrorKind::InvalidData);
+
+        // Without the tool_argument leaf the same document is one this build
+        // serves; the refusal is that leaf's alone.
+        document["rules"][1]["conditions"] =
+            json!({ "source_network": { "cidrs": ["10.0.0.0/8"] } });
+        assert!(Policy::validate_json_value(document).is_ok());
+
+        let recovered = PolicyControlPlane::commit(
+            &*store,
+            commit_request(
+                PolicyCommitPrecondition::Expected {
+                    etag: committed.etag.clone(),
+                },
+                &contract_policy_v1("recovered"),
+                "op-4",
+            ),
+        )
+        .await
+        .expect("a document this build serves commits over it");
+        let active = PolicyControlPlane::active(&*store)
+            .await
+            .expect("active read")
+            .expect("an active policy");
+        assert_eq!(active.etag, recovered.etag);
+        assert_eq!(active.policy.schema_version, "1.0.0");
     }
 
     // ------------------------------------------------------------------

@@ -1461,7 +1461,11 @@ async fn e2e_04_authenticated_mcp_stream_refresh_lkg_and_delete_workflow() {
     .expect("managed MCP acceptance service should load");
 
     let refreshed = service
-        .refresh(record.id.as_str(), record.etag().as_str(), ACCEPTANCE_ACTOR)
+        .refresh(
+            record.id.as_str(),
+            record.etag().as_str(),
+            &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
+        )
         .await
         .expect("managed MCP discovery should initialize and list");
     assert_eq!(refreshed.total_count, 1);
@@ -1511,7 +1515,11 @@ async fn e2e_04_authenticated_mcp_stream_refresh_lkg_and_delete_workflow() {
     upstream.shutdown();
     tokio::task::yield_now().await;
     let failed_refresh = service
-        .refresh(record.id.as_str(), record.etag().as_str(), ACCEPTANCE_ACTOR)
+        .refresh(
+            record.id.as_str(),
+            record.etag().as_str(),
+            &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
+        )
         .await
         .expect_err("failed refresh must preserve last-known-good catalog");
     assert_eq!(
@@ -1548,7 +1556,7 @@ async fn e2e_04_authenticated_mcp_stream_refresh_lkg_and_delete_workflow() {
             &[],
             &[],
             prior_catalog_revision,
-            ACCEPTANCE_ACTOR,
+            &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
         )
         .await
         .expect("managed MCP catalog should clear before delete");

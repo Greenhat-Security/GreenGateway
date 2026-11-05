@@ -22,8 +22,11 @@ use crate::storage::{
 };
 
 const MIGRATION_23: &str = include_str!("migrations/0023_document_and_catalog_change_evidence.sql");
+/// Migration 29 replaces migration 23's `action` and `resource_type` CHECKs,
+/// so the vocabulary in force is the one it adds.
+const MIGRATION_29: &str = include_str!("migrations/0029_policy_test_suites.sql");
 
-const ALL_ACTIONS: [DocumentAction; 9] = [
+const ALL_ACTIONS: [DocumentAction; 10] = [
     DocumentAction::PolicyPublish,
     DocumentAction::PolicyRollback,
     DocumentAction::PolicyRuleCreate,
@@ -33,6 +36,7 @@ const ALL_ACTIONS: [DocumentAction; 9] = [
     DocumentAction::PolicySuggestionAccept,
     DocumentAction::ToolsPublish,
     DocumentAction::ConfigurationImport,
+    DocumentAction::PolicyTestsPublish,
 ];
 
 /// The quoted values of the CHECK that follows `column` in migration 23's
@@ -43,11 +47,25 @@ fn document_check_values(column: &str) -> BTreeSet<String> {
         .nth(1)
         .and_then(|rest| rest.split("CREATE TABLE").next())
         .expect("migration 23 defines document_change_evidence");
-    let check = table
+    quoted_values(table, column, "migration 23")
+}
+
+/// The quoted values of the replacement CHECK on `column` that migration 29
+/// adds to `document_change_evidence`.
+fn widened_check_values(column: &str) -> BTreeSet<String> {
+    let alter = MIGRATION_29
+        .split("ALTER TABLE greengateway.document_change_evidence")
+        .nth(1)
+        .expect("migration 29 alters document_change_evidence");
+    quoted_values(alter, column, "migration 29")
+}
+
+fn quoted_values(sql: &str, column: &str, migration: &str) -> BTreeSet<String> {
+    let check = sql
         .split(&format!("{column} IN ("))
         .nth(1)
         .and_then(|rest| rest.split(')').next())
-        .unwrap_or_else(|| panic!("migration 23 constrains {column}"));
+        .unwrap_or_else(|| panic!("{migration} constrains {column}"));
     check
         .split(',')
         .map(|value| value.trim().trim_matches('\'').to_owned())
@@ -61,7 +79,17 @@ fn the_action_vocabulary_is_the_migrations_and_the_authority_events() {
         .map(|action| action.code().to_owned())
         .collect();
     assert_eq!(codes.len(), ALL_ACTIONS.len(), "codes are distinct");
-    assert_eq!(codes, document_check_values("action"));
+    assert_eq!(codes, widened_check_values("action"));
+    // Migration 28 widened migration 23's vocabulary and took nothing away.
+    assert!(document_check_values("action").is_subset(&codes));
+    assert_eq!(
+        widened_check_values("resource_type"),
+        BTreeSet::from([
+            "policy".to_owned(),
+            "tools".to_owned(),
+            "policy_tests".to_owned()
+        ])
+    );
 
     let schema: Value = serde_json::from_str(include_str!(
         "../../../docs/schemas/authority_event.v1.schema.json"
@@ -96,6 +124,11 @@ fn the_action_vocabulary_is_the_migrations_and_the_authority_events() {
                 action,
                 DocumentAction::ToolsPublish | DocumentAction::ConfigurationImport
             )
+        );
+        assert_eq!(
+            action.applies_to("policy_tests"),
+            action == DocumentAction::PolicyTestsPublish,
+            "{action:?}"
         );
         assert!(!action.applies_to("connection"), "{action:?}");
     }

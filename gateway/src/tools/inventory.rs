@@ -1943,7 +1943,7 @@ mod tests {
                         mime_type: Some("application/json".to_owned()),
                     }],
                     0,
-                    "test-admin",
+                    &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
                 )
                 .await
                 .expect("managed MCP inventory catalog should persist");
@@ -1966,7 +1966,7 @@ mod tests {
                         definition: serde_json::to_value(&openapi_definition)
                             .expect("OpenAPI definition should serialize"),
                     }],
-                    "test-admin",
+                    &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
                 )
                 .await
                 .expect("managed OpenAPI inventory catalog should persist");

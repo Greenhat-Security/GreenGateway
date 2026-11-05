@@ -2,11 +2,13 @@
 //!
 //! - Standard output carries only what was asked for: an artifact (a schema,
 //!   a completion script, help), the human result, with `--format json`
-//!   exactly one `GgctlReport` document, or with `validate --format sarif`
-//!   exactly one SARIF 2.1.0 log.
+//!   exactly one `GgctlReport` document, with `--format sarif` exactly one
+//!   SARIF 2.1.0 log, or with `policy test --format junit` exactly the
+//!   gateway's JUnit XML report.
 //! - Diagnostics go to standard error in human form. With `--format json` or
 //!   `--format sarif` they are in the document instead, and standard error
-//!   stays empty.
+//!   stays empty. A JUnit report has no place for them, so they stay on
+//!   standard error.
 //! - An argument error found before a command runs is reported on standard
 //!   error only, with exit code 2, and no report is written: the requested
 //!   format is not known to be trustworthy yet.
@@ -18,19 +20,22 @@ use std::{
 };
 
 use gateway_config::{
+    archive::{ArchiveCode, ArchiveRefusal},
     bundle::{self, BundleDiagnostic},
     documents::{API_VERSION_V1ALPHA1, REPORT_KIND},
 };
 use serde::Serialize;
 
 use crate::{
-    cli::{Invocation, FORMAT_JSON, FORMAT_SARIF},
+    cli::{Invocation, FORMAT_JSON, FORMAT_JUNIT, FORMAT_SARIF},
     diagnostic::{Code, Diagnostic, Exit},
     sarif,
 };
 
 /// Where `docs/configuration-bundles.md` explains every bundle reader code.
 pub(crate) const BUNDLE_REMEDIATION: &str = "docs/configuration-bundles.md#diagnostics";
+/// Where `docs/archive-admission.md` explains every archive admission code.
+pub(crate) const ARCHIVE_REMEDIATION: &str = "docs/archive-admission.md#codes";
 
 /// The process's standard streams.
 pub(crate) struct Io<'a> {
@@ -44,8 +49,10 @@ pub(crate) struct Io<'a> {
 pub(crate) enum Format {
     Human,
     Json,
-    /// SARIF 2.1.0: `validate` is the only command whose `--format` offers it.
+    /// SARIF 2.1.0, for `validate`, `diff` and `policy lint`.
     Sarif,
+    /// JUnit XML, for `policy test`: the gateway's own rendering.
+    Junit,
 }
 
 impl Format {
@@ -53,6 +60,7 @@ impl Format {
         match invocation.text("--format") {
             Some((_, FORMAT_JSON)) => Self::Json,
             Some((_, FORMAT_SARIF)) => Self::Sarif,
+            Some((_, FORMAT_JUNIT)) => Self::Junit,
             _ => Self::Human,
         }
     }
@@ -71,6 +79,9 @@ pub(crate) enum ReportDiagnostic {
         argument: usize,
         diagnostic: BundleDiagnostic,
     },
+    /// The shared archive admission rules refused a backup archive, located
+    /// by the position of the entry they refused.
+    Archive(ArchiveRefusal),
 }
 
 impl ReportDiagnostic {
@@ -80,6 +91,7 @@ impl ReportDiagnostic {
             Self::Bundle(diagnostic) | Self::Document { diagnostic, .. } => {
                 diagnostic.code.as_str()
             }
+            Self::Archive(refusal) => refusal.code.as_str(),
         }
     }
 
@@ -89,6 +101,7 @@ impl ReportDiagnostic {
             Self::Bundle(diagnostic) | Self::Document { diagnostic, .. } => {
                 diagnostic.severity.as_str()
             }
+            Self::Archive(_) => "error",
         }
     }
 
@@ -98,13 +111,14 @@ impl ReportDiagnostic {
             Self::Bundle(diagnostic) | Self::Document { diagnostic, .. } => {
                 diagnostic.code.message()
             }
+            Self::Archive(refusal) => refusal.code.message(),
         }
     }
 
     pub(crate) fn hint(&self) -> Option<&'static str> {
         match self {
             Self::Ggctl(diagnostic) => diagnostic.hint,
-            Self::Bundle(_) | Self::Document { .. } => None,
+            Self::Bundle(_) | Self::Document { .. } | Self::Archive(_) => None,
         }
     }
 
@@ -112,6 +126,7 @@ impl ReportDiagnostic {
         match self {
             Self::Ggctl(diagnostic) => diagnostic.code.remediation(),
             Self::Bundle(_) | Self::Document { .. } => BUNDLE_REMEDIATION,
+            Self::Archive(_) => ARCHIVE_REMEDIATION,
         }
     }
 
@@ -120,6 +135,7 @@ impl ReportDiagnostic {
         match self {
             Self::Ggctl(diagnostic) => diagnostic.code.exit(),
             Self::Bundle(diagnostic) | Self::Document { diagnostic, .. } => bundle_exit(diagnostic),
+            Self::Archive(refusal) => archive_exit(refusal),
         }
     }
 
@@ -143,7 +159,20 @@ impl ReportDiagnostic {
                 line: diagnostic.position.map(|position| position.line),
                 column: diagnostic.position.map(|position| position.column),
             }),
+            Self::Archive(refusal) => refusal.entry.map(|entry| LocationRecord::Entry {
+                entry,
+                conflicts_with: refusal.conflicts_with,
+            }),
         }
+    }
+}
+
+/// The exit code an archive refusal produces: an integrity failure, unless
+/// the archive or the staging copy could not be read or written at all.
+fn archive_exit(refusal: &ArchiveRefusal) -> Exit {
+    match refusal.code {
+        ArchiveCode::ReadFailed | ArchiveCode::WriteFailed => Exit::Failure,
+        _ => Exit::Integrity,
     }
 }
 
@@ -179,6 +208,22 @@ impl fmt::Display for ReportDiagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (diagnostic, argument) = match self {
             Self::Ggctl(diagnostic) => return diagnostic.fmt(formatter),
+            Self::Archive(refusal) => {
+                write!(
+                    formatter,
+                    "ggctl: {}: {}: {}",
+                    self.severity(),
+                    self.code(),
+                    self.message()
+                )?;
+                if let Some(entry) = refusal.entry {
+                    write!(formatter, "\n  at: archive entry {entry}")?;
+                }
+                if let Some(earlier) = refusal.conflicts_with {
+                    write!(formatter, " (conflicts with entry {earlier})")?;
+                }
+                return write!(formatter, "\n  see: {}", self.remediation());
+            }
             Self::Bundle(diagnostic) => (diagnostic, None),
             Self::Document {
                 argument,
@@ -264,6 +309,13 @@ pub(crate) enum LocationRecord {
         #[serde(skip_serializing_if = "Option::is_none")]
         column: Option<u32>,
     },
+    /// The 1-based position of a backup archive's entry and, for a
+    /// duplicate or a collision, of the earlier entry it clashes with.
+    Entry {
+        entry: usize,
+        #[serde(rename = "conflictsWith", skip_serializing_if = "Option::is_none")]
+        conflicts_with: Option<usize>,
+    },
 }
 
 impl From<&ReportDiagnostic> for DiagnosticRecord {
@@ -331,6 +383,8 @@ pub(crate) fn finish_report<T: Serialize>(
         Format::Human => human(result, io.stdout)
             .and_then(|()| io.stdout.flush())
             .and_then(|()| write_diagnostics(io.stderr, diagnostics)),
+        // Without the report itself there is nothing to write but why.
+        Format::Junit => write_diagnostics(io.stderr, diagnostics),
     };
     match written {
         Ok(()) => exit,
@@ -350,6 +404,22 @@ pub(crate) fn sarif_log(
         .map_err(io::Error::from)
         .and_then(|()| writeln!(io.stdout))
         .and_then(|()| io.stdout.flush())
+    {
+        Ok(()) => exit,
+        Err(_) => write_failed(io),
+    }
+}
+
+/// Writes an artifact a server answered to standard output, then
+/// `diagnostics` to standard error, and returns the exit code they
+/// determine.
+pub(crate) fn served_artifact(io: &mut Io<'_>, bytes: &[u8], diagnostics: &[Diagnostic]) -> Exit {
+    let exit = Exit::worst(diagnostics.iter().map(|diagnostic| diagnostic.code.exit()));
+    match io
+        .stdout
+        .write_all(bytes)
+        .and_then(|()| io.stdout.flush())
+        .and_then(|()| write_diagnostics(io.stderr, diagnostics))
     {
         Ok(()) => exit,
         Err(_) => write_failed(io),

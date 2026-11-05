@@ -53,6 +53,7 @@ mod listeners;
 mod parity_tests;
 mod plan;
 mod proxy;
+mod restore;
 mod revisions;
 mod runtime;
 mod semantic_diff;

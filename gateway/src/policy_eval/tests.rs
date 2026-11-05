@@ -1322,6 +1322,96 @@ fn a_host_qualified_permission_route_requires_a_present_matching_host() {
 }
 
 #[test]
+fn a_permission_route_never_grants_an_anonymous_caller() {
+    // Only a principal can hold a permission, so a matching route refuses an
+    // anonymous caller itself. `default_action: allow` governs only requests no
+    // route matches, so it must not soften that refusal.
+    let compiled = compile(json!({
+        "schema_version":"0.1.0","default_action":"allow",
+        "roles":{"reader":{"permissions":["read"]}},
+        "routes":[{"path_prefix":"/data","permission":"read"}]
+    }));
+    let anonymous = context(&compiled);
+    let result = compiled.evaluate(&anonymous).unwrap();
+    assert_eq!(result.matched, Some(RuleReference::Route(0)));
+    assert_eq!(result.logical, LogicalDecision::Deny);
+    assert_eq!(result.effect, PolicyEffect::Block);
+    assert_eq!(result.reason, Reason::MissingPrincipal);
+    assert!(result.complete);
+
+    // The same route grants a caller who holds its permission.
+    let mut reader = context(&compiled);
+    reader.principal =
+        PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&principal(&["reader"])));
+    let result = compiled.evaluate(&reader).unwrap();
+    assert_eq!(result.matched, Some(RuleReference::Route(0)));
+    assert_eq!(result.logical, LogicalDecision::Allow);
+    assert_eq!(result.effect, PolicyEffect::Allow);
+    assert_eq!(result.reason, Reason::MatchedRule);
+}
+
+#[test]
+fn a_route_or_default_denial_is_observed_only_in_shadow_mode() {
+    // Enforcement mode decides what a denial does, and nothing else: shadow
+    // mode forwards it as a would-deny, enforce mode blocks it, and neither
+    // turns it into an allow. A route's own mode overrides the policy's for
+    // that route; the default lane always uses the policy's.
+    for (global, route_mode, route_effect) in [
+        ("enforce", None, PolicyEffect::Block),
+        ("shadow", None, PolicyEffect::Observe),
+        ("enforce", Some("shadow"), PolicyEffect::Observe),
+        ("shadow", Some("enforce"), PolicyEffect::Block),
+    ] {
+        let mut route = json!({"path_prefix":"/data","permission":"read"});
+        if let Some(mode) = route_mode {
+            route["enforcement_mode"] = json!(mode);
+        }
+        let compiled = compile(json!({
+            "schema_version":"0.1.0","default_action":"deny","enforcement_mode":global,
+            "roles":{"reader":{"permissions":["read"]},"writer":{"permissions":["write"]}},
+            "routes":[route]
+        }));
+        let label = format!("{global}/{route_mode:?}");
+
+        let writer = principal(&["writer"]);
+        let mut denied = context(&compiled);
+        denied.principal = PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&writer));
+        let result = compiled.evaluate(&denied).unwrap();
+        assert_eq!(result.matched, Some(RuleReference::Route(0)), "{label}");
+        assert_eq!(result.logical, LogicalDecision::Deny, "{label}");
+        assert_eq!(result.reason, Reason::MissingPermission, "{label}");
+        assert_eq!(result.effect, route_effect, "{label}");
+
+        // A granted route is allowed in either mode.
+        let reader = principal(&["reader"]);
+        let mut granted = denied.clone();
+        granted.principal =
+            PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&reader));
+        assert_eq!(
+            compiled.evaluate(&granted).unwrap().effect,
+            PolicyEffect::Allow,
+            "{label}"
+        );
+
+        let mut unrouted = denied.clone();
+        unrouted.path = Some("/elsewhere".to_owned());
+        let result = compiled.evaluate(&unrouted).unwrap();
+        assert_eq!(result.matched, None, "{label}");
+        assert_eq!(result.logical, LogicalDecision::Deny, "{label}");
+        assert_eq!(result.reason, Reason::DefaultDeny, "{label}");
+        assert_eq!(
+            result.effect,
+            if global == "shadow" {
+                PolicyEffect::Observe
+            } else {
+                PolicyEffect::Block
+            },
+            "{label}"
+        );
+    }
+}
+
+#[test]
 fn the_in_memory_constructor_accepts_what_production_accepts() {
     // Trap this deliberately: `compile` has exact `0.1.0` dispatch and rejects
     // unknown top-level keys, which is right for untrusted bytes. The live parser
