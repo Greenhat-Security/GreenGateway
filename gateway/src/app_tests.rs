@@ -3572,3 +3572,5 @@ mod admin_policy_replays_tests;
 mod admin_policy_analyses_tests;
 #[path = "admin_policy_evidence_tests.rs"]
 mod admin_policy_evidence_tests;
+#[path = "admin_policy_stored_candidates_tests.rs"]
+mod admin_policy_stored_candidates_tests;

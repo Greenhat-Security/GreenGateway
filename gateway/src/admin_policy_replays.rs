@@ -3,8 +3,9 @@
 //! and cancel a bounded historical replay job.
 //!
 //! A job decides one window of the standalone audit log again under a
-//! candidate -- the active policy itself, position-aware edits over it, or an
-//! inline document -- and under the active policy it was written against,
+//! candidate -- the active policy itself, position-aware edits over it, an
+//! inline document, a server-side draft the caller owns, or a version of the
+//! policy history -- and under the active policy it was written against,
 //! through the shared policy kernel, and compares the two with each other and
 //! with what was recorded. The engine is [`policy_replay::job`] and the
 //! comparison [`policy_replay::impact`]; this module owns the job's
@@ -66,7 +67,10 @@ use policy_replay::{
     },
     request::{parse_request, resolve_window, ReplayRequest},
 };
-use policy_simulation::{request::CandidateSource, Projection};
+use policy_simulation::{
+    request::{CandidateSource, StoredCandidate},
+    Projection,
+};
 
 /// Most replay jobs queued or running at once across this replica: the
 /// bound of the replay route's [`PolicyEvaluationLimiter`], which also holds
@@ -153,6 +157,8 @@ struct ReplayJobBinding {
     candidate_source: &'static str,
     candidate_etag: String,
     edit_count: usize,
+    /// The draft or history version the candidate was read as.
+    stored: Option<StoredCandidate>,
     projections: Vec<Projection>,
 }
 
@@ -162,6 +168,15 @@ impl ReplayJobBinding {
             .iter()
             .map(|projection| projection.as_str())
             .collect()
+    }
+
+    fn candidate_view(&self) -> Value {
+        candidate_view(
+            self.candidate_source,
+            &self.candidate_etag,
+            self.edit_count,
+            self.stored.as_ref(),
+        )
     }
 }
 
@@ -381,15 +396,7 @@ impl PolicyReplayJobs {
         let Some(result) = record.result.as_ref() else {
             return Err(ReplayJobEvidenceRefusal::Unfinished(record.state.as_str()));
         };
-        let mut candidate = json!({
-            "source": job.binding.candidate_source,
-            "etag": job.binding.candidate_etag,
-        });
-        if job.binding.candidate_source == "edits" {
-            if let Some(candidate) = candidate.as_object_mut() {
-                candidate.insert("edits".to_owned(), json!(job.binding.edit_count));
-            }
-        }
+        let candidate = job.binding.candidate_view();
         // The job id is left out: it names a process-local job its owner
         // can poll, and the result digest already ties the section to the
         // job's `policy.replay_completed` record.
@@ -595,15 +602,7 @@ fn job_view(job: &ReplayJob, base_current: Option<bool>) -> Value {
     if let (Some(current), Some(base)) = (base_current, base.as_object_mut()) {
         base.insert("current".to_owned(), json!(current));
     }
-    let mut candidate = json!({
-        "source": job.binding.candidate_source,
-        "etag": job.binding.candidate_etag,
-    });
-    if job.binding.candidate_source == "edits" {
-        if let Some(candidate) = candidate.as_object_mut() {
-            candidate.insert("edits".to_owned(), json!(job.binding.edit_count));
-        }
-    }
+    let candidate = job.binding.candidate_view();
     let expires_at = record.finished.and_then(|(_, finished)| {
         time::Duration::try_from(POLICY_REPLAY_RESULT_TTL)
             .ok()
@@ -690,7 +689,7 @@ async fn record_lifecycle(
 }
 
 fn started_payload(job: &ReplayJob) -> Value {
-    json!({
+    let mut payload = json!({
         "job_id": job.id,
         "request_digest": job.request_digest,
         "base_etag": job.binding.base_etag,
@@ -705,7 +704,12 @@ fn started_payload(job: &ReplayJob) -> Value {
         "max_records": job.scope.max_records,
         "http_semantics_version": policy_eval::HTTP_SEMANTICS_VERSION,
         "tool_semantics_version": policy_eval::tools::TOOL_SEMANTICS_VERSION,
-    })
+    });
+    // Which draft or history version, never its content.
+    if let (Some(stored), Some(payload)) = (&job.binding.stored, payload.as_object_mut()) {
+        stored.describe("candidate_", payload);
+    }
+    payload
 }
 
 /// Finish a job without a result, recording why. The state is set whether or
@@ -986,10 +990,23 @@ pub(super) async fn policy_replay_create_endpoint(
         )
             .into_response();
     }
-    let candidate = match resolve_candidate(&state, rbac_state, &base, &replay.candidate) {
+    let ResolvedCandidate {
+        policy: candidate,
+        stored,
+    } = match resolve_candidate(
+        &state,
+        rbac_state,
+        &principal,
+        &base,
+        &base_etag,
+        &replay.candidate,
+    )
+    .await
+    {
         Ok(candidate) => candidate,
         Err(CandidateRefusal::Edits(diagnostics)) => return replay_invalid(&diagnostics),
         Err(CandidateRefusal::Invalid(errors)) => return simulation_candidate_refused(errors),
+        Err(CandidateRefusal::Stored(response)) => return *response,
         Err(CandidateRefusal::Internal) => return internal_server_error("policy replay failed"),
     };
     let candidate_etag = match candidate.as_ref().map(policy_etag) {
@@ -1042,6 +1059,7 @@ pub(super) async fn policy_replay_create_endpoint(
             candidate_source: replay.candidate.as_str(),
             candidate_etag,
             edit_count,
+            stored,
             projections: replay.projections.clone(),
         },
         scope: ReplayScope {
