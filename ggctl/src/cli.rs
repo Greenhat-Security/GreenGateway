@@ -648,9 +648,9 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
              gateway import-standalone reads, and runs the gateway's own configuration compiler \
              over the variables it sets and nothing else. Findings name a line and a setting, \
              never a value; a key assigned twice is a warning, and an error with --strict.",
-            "The gateway's production policy and tools validators are not part of ggctl and do \
-             not run, and the report says so. Exits 0 when valid, 3 when invalid (or any warning \
-             with --warnings-as-errors), and 1 when the bundle or file could not be read.",
+            "A bundled policy or tools document is also held to the production validator the \
+             gateway's loader runs. Exits 0 when valid, 3 when invalid (or any warning with \
+             --warnings-as-errors), and 1 when the bundle or file could not be read.",
         ],
         arguments: &[BUNDLE_OR_ENV],
         options: &[ENV, STRICT_OR_ENV, WARNINGS_AS_ERRORS, VALIDATE_FORMAT],
@@ -759,9 +759,9 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
              name and linked into place only once complete, so an interrupted seed leaves no \
              ledger. A state directory that already holds a ledger, or a ledger's -wal, -shm \
              or -journal file, is refused and left as it is.",
-            "The gateway's production policy and tools validators are not part of ggctl and do \
-             not run, and the report says so: a gateway starting from the ledger compiles the \
-             revision again with them and refuses to start if it does not compile. Exits 0 when \
+            "The bundled policy and tools documents are held to the production validators, and \
+             a gateway starting from the ledger compiles the revision again with them and \
+             refuses to start if it does not compile. Exits 0 when \
              seeded, 3 for an invalid bundle or an unusable state directory, 5 when the state \
              directory is locked or already holds a ledger, and 1 when the bundle or the ledger \
              could not be read or written.",

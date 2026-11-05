@@ -827,12 +827,13 @@ this reader implements (`resource.unsupported_schema_version`). Then:
 A failure of either is `resource.invalid`. Validator messages can quote document
 values, so they are not repeated.
 
-The production validators are the gateway's own and depend on the rest of the
-gateway, so the reader takes them from its caller. The gateway passes them;
-`ggctl`, which cannot link them, applies everything above except the production
-validators and says so in every report about a bundled policy or tools document
-(`validate.production_validators_not_run`). A document `ggctl validate` accepts can
-therefore still be refused by the gateway.
+The production validators are the validating parses the gateway's policy and
+tools loaders run in environment mode, and they live in the shared
+`gateway-config` library with the reader (`gateway_config::rbac` and
+`gateway_config::tools`; issue #242). The reader takes them from its caller as
+`ResourceValidators`, and the gateway and every `ggctl` command pass the same
+`ProductionValidators`, so a bundle `ggctl validate` accepts is one the gateway's
+loaders accept.
 
 ## Deployment profiles
 
@@ -859,14 +860,15 @@ authentication off is accepted by the reader, and no gateway can start from it.
 ## Generated bundles
 
 `ggctl init --profile PROFILE --output DIR` writes a bundle that the reader
-accepts strictly, and the gateway's own tests hold every one it can write to the
-production policy and tools validators and to the policy enforcement it
-configures. The output is deterministic: the same profile and answers always
-give the same bytes, and so the same digests. `init` writes only the profile
-into the deployment document. Every setting it leaves out keeps its default,
-which is already what the production profile asks for (authentication required,
-private-address egress denied, CSRF on, required audit durability), so what
-`init` writes is the same safe starting point for every profile:
+accepts strictly with the production policy and tools validators, which `init`
+reads it back with, and `gateway-config`'s tests hold every one it can write to
+them and to the policy enforcement it configures. The output is deterministic:
+the same profile and answers always give the same bytes, and so the same
+digests. `init` writes only the profile into the deployment document. Every
+setting it leaves out keeps its default, which is already what the production
+profile asks for (authentication required, private-address egress denied, CSRF
+on, required audit durability), so what `init` writes is the same safe starting
+point for every profile:
 
 | File | Standalone topology (default) | Cluster topology |
 | --- | --- | --- |

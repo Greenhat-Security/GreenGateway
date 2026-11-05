@@ -49,10 +49,6 @@ pub(crate) fn greenpm_research_operation(
     }
 }
 
-// The stable route ID grammar the configuration compiler shares with `ggctl`
-// (issue #242).
-pub(crate) use gateway_config::upstream_route::is_valid_stable_route_id;
-
 pub(crate) trait RouteMatch {
     fn path_prefix(&self) -> Option<&str>;
     fn host(&self) -> Option<&str>;

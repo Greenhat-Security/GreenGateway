@@ -1,5 +1,8 @@
 //! admin policy boundary extracted from the application composition root.
 use super::*;
+#[cfg(feature = "postgres")]
+use crate::rbac::policy::ClusterDocumentFormat;
+use crate::rbac::policy::PolicyFile;
 
 pub(super) async fn policy_get_endpoint(
     State(state): State<PolicyAdminState>,

@@ -7,9 +7,9 @@
 //! published schema and the loader give it, so spelling a default out is
 //! not a change. Ordered lists stay ordered, because first match wins, and
 //! their entries (routes, rules, rate-limit overrides, tool definitions) are
-//! compared as given: a caller passes both sides in one form, and the
-//! gateway passes its validators' normalized form. Sets are compared as
-//! sets.
+//! compared as given: a caller passes both sides in one form, and
+//! [`compare_production_bundles`] passes the production validators'
+//! normalized form. Sets are compared as sets.
 //!
 //! Every top-level member is compared, either by its own detector or, for
 //! one this module does not model, as an opaque value whose change is
@@ -24,7 +24,11 @@ use super::{
     unmatched, ChangeClass, ChangeKind, Comparison, Display, EntryCounts, Field, Impact, Redaction,
     RiskCode, Rule, Section, SemanticDiff, SetCounts,
 };
-use crate::bundle::{Bundle, BundledResource, POLICY_TOP_LEVEL_MEMBERS};
+use crate::{
+    bundle::{Bundle, BundledResource, ProductionBundle, POLICY_TOP_LEVEL_MEMBERS},
+    rbac::Policy,
+    tools::definitions::ToolDefinition,
+};
 
 /// Where a bundle's policy or tools document comes from.
 #[derive(Clone, Copy, Debug)]
@@ -129,6 +133,68 @@ fn document(resource: &Option<BundledResource<Value>>) -> Option<&Value> {
         Some(BundledResource::Bundle { document, .. }) => Some(document),
         _ => None,
     }
+}
+
+/// Compares two bundles read with the [`ProductionValidators`], by the
+/// documents those validators built rather than as they were written: every
+/// default filled in, issuers canonicalized. This is what the gateway would
+/// run, so spelling a default out moves only the pin. `ggctl diff` and the
+/// revision ledger's plans both compare bundles this way.
+///
+/// [`ProductionValidators`]: crate::bundle::ProductionValidators
+pub fn compare_production_bundles(
+    base: &ProductionBundle,
+    candidate: &ProductionBundle,
+) -> SemanticDiff {
+    let (base_policy, base_tools) = (production_policy(base), production_tools(base));
+    let (candidate_policy, candidate_tools) =
+        (production_policy(candidate), production_tools(candidate));
+    let mut comparison = Comparison::new();
+    compare_bundles(
+        &mut comparison,
+        &BundleView::of(base, base_policy.as_ref(), base_tools.as_ref()),
+        &BundleView::of(
+            candidate,
+            candidate_policy.as_ref(),
+            candidate_tools.as_ref(),
+        ),
+    );
+    comparison.finish()
+}
+
+/// The validated policy as its loader models it, with every default filled
+/// in. `None` when it cannot be serialized, which the engine reports as an
+/// `unknown` change whenever the pins differ.
+fn production_policy(bundle: &ProductionBundle) -> Option<Value> {
+    match &bundle.policy {
+        Some(BundledResource::Bundle { document, .. }) => policy_document_value(document),
+        _ => None,
+    }
+}
+
+/// The validated tool definitions, as a tools document.
+fn production_tools(bundle: &ProductionBundle) -> Option<Value> {
+    match &bundle.tools {
+        Some(BundledResource::Bundle {
+            schema_version,
+            document,
+            ..
+        }) => tools_document_value(schema_version, document),
+        _ => None,
+    }
+}
+
+/// A policy the production validator built, as the JSON its loader models:
+/// what a diff and a ledger plan compare.
+pub fn policy_document_value(policy: &Policy) -> Option<Value> {
+    serde_json::to_value(policy).ok()
+}
+
+/// Tool definitions the production validator built, as a tools document of
+/// `schema_version`.
+pub fn tools_document_value(schema_version: &str, tools: &[ToolDefinition]) -> Option<Value> {
+    let tools = serde_json::to_value(tools).ok()?;
+    Some(serde_json::json!({"schema_version": schema_version, "tools": tools}))
 }
 
 /// The profiles from the most guarantees to the fewest.

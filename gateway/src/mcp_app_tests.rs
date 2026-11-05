@@ -3,6 +3,7 @@
 //! upstream MCP tools, the MCP route's streaming body limit, and the traffic
 //! inventory rows MCP calls record. Shared fixtures stay in `app_tests.rs`.
 use super::*;
+use crate::rbac::policy::PolicyFile;
 
 #[tokio::test]
 async fn mcp_initialize_handshake_succeeds() {

@@ -70,6 +70,8 @@
 //! time and the plan ID.
 
 #[cfg(test)]
+mod production_tests;
+#[cfg(test)]
 mod tests;
 
 use std::{
@@ -82,7 +84,7 @@ use serde_json::{json, Value};
 
 use crate::bundle::{
     read_bundle_files, sha256_pin, Bundle, BundleDiagnostic, BundledResource, FileName,
-    PublishedSchemasOnly, ReadOptions, ResourceValidators,
+    ProductionValidators, PublishedSchemasOnly, ReadOptions, ResourceValidators,
 };
 use crate::canonical_json;
 use crate::ledger::{
@@ -90,9 +92,12 @@ use crate::ledger::{
     Operation, PlanId, Proposal, RevisionCodes, RevisionId, RevisionLedger, RevisionRequest,
     RevisionSummary, MAX_REVISION_PAGE,
 };
+use crate::rbac::Policy;
 use crate::semantic_diff::{
-    compare_bundles, BundleView, ChangeClass, Comparison, Display, RiskCode, Section, SemanticDiff,
+    compare_bundles, policy_document_value, tools_document_value, BundleView, ChangeClass,
+    Comparison, Display, RiskCode, Section, SemanticDiff,
 };
+use crate::tools::definitions::ToolDefinition;
 
 /// How long a plan can be acknowledged and applied (ADR-0008, "Bounds").
 pub const PLAN_LIFETIME: Duration = Duration::from_secs(15 * 60);
@@ -146,9 +151,38 @@ pub type PolicyOf<C> = <<C as PlanCompiler>::Validators as ResourceValidators>::
 /// What a compiler's validators build from a tools document.
 pub type ToolsOf<C> = <<C as PlanCompiler>::Validators as ResourceValidators>::Tools;
 
+/// Compiles with the [`ProductionValidators`], comparing the documents they
+/// build, exactly as
+/// [`compare_production_bundles`](crate::semantic_diff::compare_production_bundles)
+/// does: the gateway's and
+/// `ggctl`'s ledger plans. A rollback target or a head the current
+/// validators refuse is therefore refused too.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProductionCompiler;
+
+impl PlanCompiler for ProductionCompiler {
+    type Validators = ProductionValidators;
+
+    fn validators(&self) -> &ProductionValidators {
+        &ProductionValidators
+    }
+
+    fn policy_value(&self, policy: &Policy) -> Option<Value> {
+        policy_document_value(policy)
+    }
+
+    fn tools_value(
+        &self,
+        schema_version: &'static str,
+        tools: &Vec<ToolDefinition>,
+    ) -> Option<Value> {
+        tools_document_value(schema_version, tools)
+    }
+}
+
 /// Compiles with the published schemas only, comparing documents as they
-/// were written: what `ggctl` can run, since it cannot link the gateway's
-/// production validators. The gateway compiles with those.
+/// were written: for the tests of the protocol, which must not depend on
+/// what the production validators decide.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PublishedSchemasCompiler;
 
