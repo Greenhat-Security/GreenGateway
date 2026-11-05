@@ -377,6 +377,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("738505980f1ff1a51e0845b10064f1c6f4005ff7100acce8b15dd8633a4c113c"),
+        Migration::new(
+            31,
+            "policy_analysis_suppressions",
+            include_str!("migrations/0031_policy_analysis_suppressions.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("21a4635ecdbb9ff352c29531ba454f03575e32c9f37ed673f7f95eec480d441d"),
     ]
 });
 
@@ -409,13 +416,18 @@ impl SchemaCompatibility {
     }
 }
 
-// This build's manifest ends at 30, and it serves exactly schema 30: it
-// approves no migration above its manifest, and it does not serve schema 29.
-// The move from 29 to 30 (durable policy replay jobs, #243) is coordinated,
-// without an overlap: a schema-29 binary left serving after migration 30
-// would still answer every cluster replay route `503` while the new fleet
-// admits jobs into the shared table, so one deployment would give two answers
-// for the same job.
+// This build's manifest ends at 31, and it serves exactly schema 31: it
+// approves no migration above its manifest, and it does not serve schema 30.
+// The move from 30 to 31 (policy analysis suppressions, #243 slice 15) is
+// coordinated, without an overlap: a schema-30 binary left serving after
+// migration 31 would analyze policies without the suppressions other
+// replicas record, so one finding would read as suppressed through one
+// replica and as open through another.
+//
+// The move from 29 to 30 (durable policy replay jobs, #243) was coordinated
+// too: a schema-29 binary left serving after migration 30 would still answer
+// every cluster replay route `503` while the new fleet admits jobs into the
+// shared table, so one deployment would give two answers for the same job.
 //
 // The move from 28 to 29 (the stored policy test suite, #243) was coordinated
 // too: a schema-28 binary left serving after migration 29 would serve no
@@ -438,7 +450,7 @@ impl SchemaCompatibility {
 // the same explicit column list (`connections::pg_store::
 // record_catalog_change_evidence`). This build is not that successor: it
 // carries migration 25 byte for byte, so its migrator records the approved
-// checksum, but it serves only schema 30, so from a prepared fleet it is a
+// checksum, but it serves only schema 31, so from a prepared fleet it is a
 // coordinated drain/migrate/restart like every other step.
 // `migration_twenty_five_is_the_extension_its_prepared_release_approved` pins
 // the manifest entry to the checksum that release approved, and the
@@ -455,19 +467,20 @@ impl SchemaCompatibility {
 // journaled authority evidence, #425), from 25 to 26 (admin session evidence
 // in the authority-event journal, with capacity held for every session's
 // withdrawal, #425), from 26 to 27 (service-token issue evidence, #425),
-// from 27 to 28, from 28 to 29 and from 29 to 30. A schema-26 binary left
-// serving after migration 27 would issue tokens without their evidence, and a
-// schema-25 binary left serving after migration 26 would grant and withdraw
-// admin sessions without journaling their evidence. A schema-23 binary
-// must not keep writing evidence after migration 24: its Connection,
-// service-token and JWT revocation rows would record no actor kind, auth mode
-// or issuer. A schema-22 binary would also commit policy, tools and catalog
-// changes without their evidence, and a schema-20 one would write evidence
-// that is never journaled. The fence keeps covering every binary that can
-// serve this database: none that predates it accepts this ledger either.
+// from 27 to 28, from 28 to 29, from 29 to 30 and from 30 to 31. A schema-26
+// binary left serving after migration 27 would issue tokens without their
+// evidence, and a schema-25 binary left serving after migration 26 would
+// grant and withdraw admin sessions without journaling their evidence. A
+// schema-23 binary must not keep writing evidence after migration 24: its
+// Connection, service-token and JWT revocation rows would record no actor
+// kind, auth mode or issuer. A schema-22 binary would also commit policy,
+// tools and catalog changes without their evidence, and a schema-20 one
+// would write evidence that is never journaled. The fence keeps covering
+// every binary that can serve this database: none that predates it accepts
+// this ledger either.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (30, 30),
-    write: (30, 30),
+    read: (31, 31),
+    write: (31, 31),
     approved_extensions: &[],
 };
 
@@ -502,7 +515,7 @@ const APPROVED_EXTENSION_SOURCES: &[ExtensionSource] = &[];
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 30.
+/// contract the schema. The shipped contract accepts only schema 31.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1422,18 +1435,18 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            30,
+            31,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (30, 30));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (30, 30));
-        assert_eq!(schema_version_range(), (30, 30));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (31, 31));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (31, 31));
+        assert_eq!(schema_version_range(), (31, 31));
         assert!(
             BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty(),
             "this build approves no migration above its manifest"
         );
         // Readiness samples the manifest and one row more.
-        assert_eq!(runtime_ledger_row_limit(), 31);
+        assert_eq!(runtime_ledger_row_limit(), 32);
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
             Ok(SchemaStatus::Current)
@@ -1441,19 +1454,19 @@ mod tests {
         // The next migration is refused whatever it is: nothing prepared this
         // build for one.
         let mut beyond = ledger_for(&MANIFEST, MANIFEST.len(), "");
-        beyond.push((31, hex_checksum("-- migration 31")));
+        beyond.push((32, hex_checksum("-- migration 32")));
         assert_eq!(
             validate_runtime_ledger(&beyond),
             Err(LedgerProblem::UnknownVersion)
         );
 
-        // The previous releases' schemas are not served: schemas 29, 28, 27, 26
-        // and 25 are left by coordinated upgrades, and so are the prepared
+        // The previous releases' schemas are not served: schemas 30, 29, 28, 27,
+        // 26 and 25 are left by coordinated upgrades, and so are the prepared
         // release's schema 24 and every earlier point. The overlap of the
         // rolling step from 24 to 25 belonged to the prepared release and the
         // schema-25 successor, both of which serve 25; this build serves none of
-        // 24 through 29.
-        for behind in 1..=14 {
+        // 24 through 30.
+        for behind in 1..=15 {
             assert_eq!(
                 validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - behind, "")),
                 Ok(SchemaStatus::NeedsUpgrade {
@@ -2625,6 +2638,7 @@ mod tests {
                  DROP TABLE greengateway.policy_test_suite_versions; \
                  DROP TABLE greengateway.policy_replay_jobs; \
                  DROP SEQUENCE greengateway.policy_replay_job_fence; \
+                 DROP TABLE greengateway.policy_analysis_suppressions; \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await
@@ -4736,7 +4750,7 @@ mod tests {
     /// refuses naming the missing migrations and readiness reports the schema
     /// incompatible, so a replica of it started before the migration stalls
     /// the rollout rather than serving. Its `migrate check` reports exactly
-    /// migrations 25 through 30 unapplied, and its `migrate up` applies them
+    /// migrations 25 through 31 unapplied, and its `migrate up` applies them
     /// and nothing else, recording for migration 25 exactly the checksum the
     /// prepared release approved. From then on it serves, with and without
     /// development auto-migration, and its migrator has nothing left to do.
@@ -4793,7 +4807,7 @@ mod tests {
 
         // The prepared release's schema: not served here.
         let missing = MANIFEST.len() - through_v24;
-        assert_eq!(missing, 6, "migrations 25 through 30");
+        assert_eq!(missing, 7, "migrations 25 through 31");
         let authority = PostgresReadinessAuthority::new(pool.clone());
         assert_eq!(
             read_and_validate_runtime(pool).await,
@@ -4808,7 +4822,7 @@ mod tests {
                 error,
                 PostgresFoundationError::SchemaNotReady {
                     applied: 24,
-                    missing: 6,
+                    missing: 7,
                     auto_migrate: false
                 }
             ),
@@ -4826,7 +4840,7 @@ mod tests {
             })
         );
 
-        // The migration role's `migrate up`: migrations 25 through 30 and
+        // The migration role's `migrate up`: migrations 25 through 31 and
         // nothing else, migration 25 under the approved checksum.
         assert_eq!(
             execute(&strict, false).await,
@@ -4856,7 +4870,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 30 }
+            AuthorityObservation::Writable { schema_version: 31 }
         );
         assert_eq!(
             execute(&strict, true).await,
@@ -4896,7 +4910,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 30 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 31 }
         );
         drop(client);
         clean_database(pool).await;

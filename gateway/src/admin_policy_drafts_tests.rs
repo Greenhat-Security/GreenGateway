@@ -1319,6 +1319,7 @@ fn direct_draft_router(
             history_store: None,
             draft_store: Some(store),
             test_suite_store: None,
+            analysis_suppression_store: None,
             #[cfg(feature = "postgres")]
             control_plane: None,
             #[cfg(feature = "postgres")]

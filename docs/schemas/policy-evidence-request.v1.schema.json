@@ -2,10 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://greengateway.dev/schemas/policy-evidence-request.v1.schema.json",
   "title": "GreenGateway policy evidence request",
-  "description": "Draft 2020-12 JSON Schema for a policy-evidence-request.v1 document: the inputs of one policy evidence package. The gateway's parser is authoritative and also enforces what this schema does not state: the suite is a complete policy-tests.v1 suite (see policy-tests.v1.schema.json) and every simulation case a policy-simulation.v1 case (see policy-simulation.v1.schema.json), with unique case ids; repeated member names are refused; and every limit is in bytes, not characters. Unknown members are refused everywhere.",
+  "description": "Draft 2020-12 JSON Schema for a policy-evidence-request.v1 document: the inputs of one policy evidence package, which names exactly one candidate, a publication or a draft. The gateway's parser is authoritative and also enforces what this schema does not state: the suite is a complete policy-tests.v1 suite (see policy-tests.v1.schema.json) and every simulation case a policy-simulation.v1 case (see policy-simulation.v1.schema.json), with unique case ids; repeated member names are refused; and every limit is in bytes, not characters. Whether a named draft belongs to the caller, is still at draft_etag and is pinned to the live policy is the gateway's answer when the request is served. Unknown members are refused everywhere.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "publication"],
+  "required": ["schema_version"],
+  "oneOf": [
+    { "required": ["publication"] },
+    { "required": ["draft"] }
+  ],
   "properties": {
     "schema_version": { "const": "policy-evidence-request.v1" },
     "publication": {
@@ -27,8 +31,18 @@
         }
       }
     },
+    "draft": {
+      "description": "A server-side draft the caller owns, at the strong draft ETag the caller reviewed it at. The package is labelled candidate_kind draft and is never presented as a publication.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["draft_id", "draft_etag"],
+      "properties": {
+        "draft_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "draft_etag": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
     "suite": {
-      "description": "A complete policy-tests.v1 suite, run against the published document, or a reference to the stored suite, pinned to the strong ETag the caller reviewed. An object that names a source is a reference and nothing else.",
+      "description": "A complete policy-tests.v1 suite, run against the candidate, or a reference to the stored suite, pinned to the strong ETag the caller reviewed. An object that names a source is a reference and nothing else.",
       "oneOf": [
         {
           "type": "object",
@@ -56,7 +70,7 @@
       ]
     },
     "simulation": {
-      "description": "Synthetic cases decided under the published document and the history version before it.",
+      "description": "Synthetic cases decided under the candidate and what it replaces: the history version before a publication, the live policy a draft is pinned to.",
       "type": "object",
       "additionalProperties": false,
       "required": ["cases"],
@@ -78,10 +92,14 @@
       }
     },
     "replay_job_id": {
-      "description": "A finished replay job of the caller's whose candidate is the published document.",
+      "description": "A finished replay job of the caller's whose candidate is the packaged document.",
       "type": "string",
       "minLength": 1,
       "maxLength": 64
+    },
+    "analysis": {
+      "description": "true to include the conservative structural analyzer's results over the candidate, with each finding's suppression state, as a manifest artifact. Omitted or false leaves the analysis out.",
+      "type": "boolean"
     }
   }
 }

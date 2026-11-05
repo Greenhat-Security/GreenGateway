@@ -198,6 +198,16 @@ impl PostgresPolicyStore {
         super::postgres_policy_tests::PostgresPolicyTestSuiteStore::new(self.pool.clone())
     }
 
+    /// The analysis suppression store on the same pool (issue #243, slice
+    /// 15): migration 31's table, shared by every replica.
+    pub fn analysis_suppression_store(
+        &self,
+    ) -> super::postgres_analysis_suppressions::PostgresAnalysisSuppressionStore {
+        super::postgres_analysis_suppressions::PostgresAnalysisSuppressionStore::new(
+            self.pool.clone(),
+        )
+    }
+
     /// Outbox entries after a revision, oldest-first. The durable half of
     /// reconciliation: correctness never depends on notifications, only on
     /// these rows plus the revision counter.

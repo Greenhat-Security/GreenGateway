@@ -779,6 +779,7 @@ fn replay_admin_state(
         history_store: None,
         draft_store: None,
         test_suite_store: None,
+        analysis_suppression_store: None,
         #[cfg(feature = "postgres")]
         control_plane: None,
         #[cfg(feature = "postgres")]
@@ -1232,6 +1233,7 @@ async fn a_cluster_job_is_admitted_on_one_replica_run_on_another_and_served_by_a
             history_store: None,
             draft_store: None,
             test_suite_store: None,
+            analysis_suppression_store: None,
             control_plane: Some(Arc::clone(&store) as Arc<dyn storage::PolicyControlPlane>),
             membership: None,
             replay_cluster: Some(Arc::clone(replays)),

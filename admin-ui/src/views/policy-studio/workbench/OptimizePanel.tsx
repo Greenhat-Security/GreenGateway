@@ -8,6 +8,7 @@ import {
 } from '../../../lib/policyDrafts';
 import { blockedUses, severityBadge, severityLabel } from '../model';
 import { StudioAlertPanel, type StudioAlert } from '../StudioAlert';
+import { AnalyzerFindings } from './AnalyzerFindings';
 import { isAbort, plural, runAlert, type WorkbenchCandidate } from './common';
 
 export type DraftValidation = Readonly<{
@@ -39,15 +40,19 @@ const GROUPS: ReadonlyArray<{
 ];
 
 // The Optimize view: the findings the gateway's validator reports about the
-// candidate, each with its remediation, for review. Nothing here changes the
-// policy; a remediation is an edit made in a draft and published through the
-// ordinary review.
+// candidate, each with its remediation, and the analyzer's findings with
+// their suppression state, for review. Nothing here changes the policy; a
+// remediation is an edit made in a draft and published through the ordinary
+// review, and a suppression only labels a finding of the live policy as
+// reviewed until it ends or stops matching.
 export function OptimizePanel({
   candidate,
   candidateProblem,
   liveSource,
   draftValidation,
   canEditDraft,
+  canAnalyze,
+  canWritePolicy,
   onShowInEditor,
 }: {
   candidate: WorkbenchCandidate | null;
@@ -57,6 +62,10 @@ export function OptimizePanel({
   // The Studio's validation of the draft text on screen.
   draftValidation: DraftValidation;
   canEditDraft: boolean;
+  // admin:policy:read and admin:policy:analyze, as the server reports them.
+  canAnalyze: boolean;
+  // admin:policy:write: creating and expiring suppressions.
+  canWritePolicy: boolean;
   onShowInEditor: (diagnostic: PolicyDiagnostic) => void;
 }) {
   const headingId = useId();
@@ -111,13 +120,12 @@ export function OptimizePanel({
         ) : null}
       </div>
       <div className="error-panel alert info" role="note">
-        <h3>The validator’s checks, not a policy analysis</h3>
+        <h3>The validator’s checks, then the analyzer’s</h3>
         <p>
-          The conservative analyzer, which finds shadowed, unreachable and overbroad entries
-          with a proof basis, an access effect and an advisory change for each, answers on
-          the gateway’s policy analyses endpoint, but this view does not run it yet. This
-          view lists what the validator’s structural, cross-resource and risk checks report
-          about the candidate.
+          The first list is what the validator’s structural, cross-resource and risk checks
+          report about the candidate. The analyzer, run below on request, finds shadowed,
+          unreachable and overbroad entries with a proof basis and an advisory change for
+          each.
           An empty list means those checks found nothing; it does not mean the policy has
           none of those problems.
         </p>
@@ -170,6 +178,11 @@ export function OptimizePanel({
               />
             ) : null;
           })}
+          <AnalyzerFindings
+            candidate={candidate}
+            canAnalyze={canAnalyze}
+            canWritePolicy={canWritePolicy}
+          />
         </>
       )}
     </section>

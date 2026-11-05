@@ -3103,6 +3103,28 @@ textarea:focus-visible {
   gap: 4px 9px;
 }
 
+/* An analyzer finding's suppression form: reason, expiry, actions. */
+.workbench-suppress {
+  display: grid;
+  gap: var(--gh-ref-space-2);
+  max-width: 40rem;
+}
+
+.workbench-suppress label {
+  font-size: var(--gh-type-body-sm);
+  font-weight: 650;
+}
+
+.workbench-suppress textarea {
+  min-height: 4.5rem;
+}
+
+.workbench-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gh-ref-space-2);
+}
+
 .workbench-check .rule-hint {
   grid-column: 2;
   margin: 0;

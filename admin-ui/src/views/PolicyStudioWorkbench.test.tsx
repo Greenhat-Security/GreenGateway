@@ -21,6 +21,9 @@ const SIMULATE = 'admin:policy:simulate';
 const AUDIT = 'admin:audit:read';
 const WAIT = { timeout: 4000 };
 const SNAPSHOT_DIGEST = `sha256:${'0'.repeat(64)}`;
+const ANALYZE = 'admin:policy:analyze';
+const FINGERPRINT = `sha256:${'f'.repeat(64)}`;
+const SUPPRESSION_ID = `pas_${'c'.repeat(32)}`;
 
 afterEach(() => {
   cleanup();
@@ -305,7 +308,7 @@ describe('Policy Studio workbench', () => {
     const optimize = viewPanel('Optimize');
     expect(within(optimize).getByText('Risks to review (1)')).toBeTruthy();
     expect(within(optimize).getByText('Set default_action to deny.')).toBeTruthy();
-    expect(within(optimize).getByText(/but this view does not run it yet/)).toBeTruthy();
+    expect(within(optimize).getByText(/The analyzer, run below on request/)).toBeTruthy();
     expect(within(optimize).getByText(/does not mean the policy has\s+none of those problems/)).toBeTruthy();
     fireEvent.click(
       within(optimize).getByRole('button', {
@@ -354,6 +357,101 @@ describe('Policy Studio workbench', () => {
       expect(request.path).not.toContain('synthetic-auditor');
     }
   });
+
+  it('analyzes the live policy, suppresses a finding and expires the suppression', async () => {
+    const gateway = fakeGateway({ permissions: [READ, WRITE, SIMULATE, ANALYZE] });
+    renderStudio(gateway);
+    await studioLoaded();
+    openView('Optimize');
+    const optimize = viewPanel('Optimize');
+    fireEvent.click(within(optimize).getByRole('button', { name: 'Run analysis' }));
+
+    expect(await within(optimize).findByText('rule_shadowed', undefined, WAIT)).toBeTruthy();
+    const [analysis] = gateway.requests('POST', '/v1/admin/policy/analyses');
+    expect(JSON.parse(analysis.body ?? '{}')).toEqual({
+      schema_version: 'policy-analysis.v1',
+      base_etag: LIVE_ETAG,
+      candidate: { source: 'active' },
+      format: 'json',
+    });
+    expect(within(optimize).getByText(/1 finding: 0 suppressed/)).toBeTruthy();
+
+    fireEvent.click(within(optimize).getByRole('button', { name: 'Suppress rule_shadowed at /rules/1' }));
+    const form = within(optimize).getByRole('form', { name: 'Suppress rule_shadowed at /rules/1' });
+    const submit = within(form).getByRole('button', { name: 'Suppress finding' }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    fireEvent.change(within(form).getByLabelText('Reason'), {
+      target: { value: 'kept on purpose for the alias lane' },
+    });
+    fireEvent.click(submit);
+
+    expect(
+      await within(optimize).findByText('◌ Suppressed: reviewed, still reported', undefined, WAIT),
+    ).toBeTruthy();
+    expect(within(optimize).getByText(/kept on purpose for the alias lane/)).toBeTruthy();
+    const [created] = gateway.requests('POST', '/v1/admin/policy/analyses/suppressions');
+    expect(created.headers.get('If-Match')).toBe(LIVE_ETAG);
+    const body = JSON.parse(created.body ?? '{}') as Record<string, unknown>;
+    expect(body).toMatchObject({
+      fingerprint: FINGERPRINT,
+      code: 'rule_shadowed',
+      reason: 'kept on purpose for the alias lane',
+      resource_snapshot_digest: SNAPSHOT_DIGEST,
+    });
+    expect(String(body.expires_at)).toMatch(/^\d{4}-\d{2}-\d{2}T23:59:59Z$/);
+    // A suppressed finding is still listed and cannot be suppressed twice.
+    expect(within(optimize).queryByRole('button', { name: 'Suppress rule_shadowed at /rules/1' })).toBeNull();
+
+    fireEvent.click(
+      within(optimize).getByRole('button', {
+        name: 'Expire the suppression of rule_shadowed at /rules/1',
+      }),
+    );
+    expect(
+      await within(optimize).findByText('↺ Suppression ended: the finding is open again', undefined, WAIT),
+    ).toBeTruthy();
+    const [expired] = gateway.requests('DELETE', `/v1/admin/policy/analyses/suppressions/${SUPPRESSION_ID}`);
+    expect(expired.headers.get('If-Match')).toBe('"sha256:suppression-r1"');
+    // Nothing here wrote the policy.
+    expect(gateway.log.filter((entry) => entry.method === 'PATCH' || entry.method === 'PUT')).toEqual([]);
+  });
+
+  it('offers suppressions only to policy writers', async () => {
+    const gateway = fakeGateway({ permissions: [READ, SIMULATE, ANALYZE] });
+    renderStudio(gateway);
+    await studioLoaded();
+    openView('Optimize');
+    const optimize = viewPanel('Optimize');
+    fireEvent.click(within(optimize).getByRole('button', { name: 'Run analysis' }));
+    expect(await within(optimize).findByText('rule_shadowed', undefined, WAIT)).toBeTruthy();
+    expect(within(optimize).queryByRole('button', { name: /^Suppress / })).toBeNull();
+  });
+
+  it('analyzes the open draft as its text and offers no suppression of it', async () => {
+    const writer = fakeGateway({ permissions: [READ, WRITE, SIMULATE, ANALYZE] });
+    renderStudio(writer);
+    await openDraft();
+    openView('Optimize');
+    const draftView = viewPanel('Optimize');
+    fireEvent.click(within(draftView).getByRole('button', { name: 'Run analysis' }));
+    expect(await within(draftView).findByText('rule_shadowed', undefined, WAIT)).toBeTruthy();
+    expect(JSON.parse(writer.requests('POST', '/v1/admin/policy/analyses')[0].body ?? '{}')).toMatchObject({
+      candidate: { source: 'inline', policy: { id: 'billing-policy' } },
+    });
+    expect(within(draftView).getByText(/Suppressions are bound to the live policy/)).toBeTruthy();
+    expect(within(draftView).queryByRole('button', { name: /^Suppress / })).toBeNull();
+  });
+
+  it('says the analyzer needs its permission rather than offering it', async () => {
+    const gateway = fakeGateway();
+    renderStudio(gateway);
+    await studioLoaded();
+    openView('Optimize');
+    expect(
+      within(viewPanel('Optimize')).getByText(/needs admin:policy:read and admin:policy:analyze/),
+    ).toBeTruthy();
+    expect(within(viewPanel('Optimize')).queryByRole('button', { name: 'Run analysis' })).toBeNull();
+  });
 });
 
 type LoggedRequest = {
@@ -366,6 +464,7 @@ type LoggedRequest = {
 function fakeGateway({ permissions = [READ, WRITE, SIMULATE] }: { permissions?: string[] } = {}) {
   const gateway = {
     live: { policy: draftPolicy() as Record<string, unknown>, etag: LIVE_ETAG },
+    suppression: null as Record<string, unknown> | null,
     log: [] as LoggedRequest[],
     failures: [] as Array<{ method: string; path: string; error: Error }>,
     validate: (_source: string): Response => jsonResponse(200, validInspection()),
@@ -432,10 +531,93 @@ function fakeGateway({ permissions = [READ, WRITE, SIMULATE] }: { permissions?: 
       if (path === `/v1/admin/policy/drafts/${DRAFT_ID}` && method === 'GET') {
         return jsonResponse(200, draftView(), { ETag: '"sha256:draft-r1"' });
       }
+      if (path === '/v1/admin/policy/analyses' && method === 'POST') {
+        return jsonResponse(200, analysisReport(gateway.suppression));
+      }
+      if (path === '/v1/admin/policy/analyses/suppressions' && method === 'GET') {
+        return jsonResponse(200, {
+          suppressions: gateway.suppression === null ? [] : [gateway.suppression],
+          limits: { max_suppressions: 256, max_ttl_seconds: 7776000, max_reason_bytes: 512 },
+        });
+      }
+      if (path === '/v1/admin/policy/analyses/suppressions' && method === 'POST') {
+        const request = JSON.parse(body ?? '{}') as Record<string, unknown>;
+        gateway.suppression = suppressionRecord('active', String(request.reason));
+        return jsonResponse(201, gateway.suppression, { ETag: '"sha256:suppression-r1"' });
+      }
+      if (path === `/v1/admin/policy/analyses/suppressions/${SUPPRESSION_ID}` && method === 'DELETE') {
+        gateway.suppression = {
+          ...suppressionRecord('withdrawn', String(gateway.suppression?.reason ?? '')),
+          withdrawn_at: '2026-10-28T11:00:00Z',
+        };
+        return jsonResponse(200, gateway.suppression);
+      }
       return jsonResponse(405, { error: 'unexpected' });
     },
   };
   return gateway;
+}
+
+function suppressionRecord(state: 'active' | 'withdrawn', reason: string): Record<string, unknown> {
+  return {
+    suppression_id: SUPPRESSION_ID,
+    etag: state === 'active' ? '"sha256:suppression-r1"' : '"sha256:suppression-r2"',
+    revision: state === 'active' ? 1 : 2,
+    state,
+    fingerprint: FINGERPRINT,
+    code: 'rule_shadowed',
+    reason,
+    created_by: { subject: 'reviewer' },
+    created_at: '2026-10-28T10:30:00Z',
+    expires_at: '2026-11-27T23:59:59Z',
+    binding: {
+      policy_etag: LIVE_ETAG,
+      policy_semantic_digest: null,
+      resource_snapshot_digest: SNAPSHOT_DIGEST,
+    },
+  };
+}
+
+function analysisReport(suppression: Record<string, unknown> | null) {
+  const state =
+    suppression === null
+      ? null
+      : suppression.state === 'active'
+        ? { state: 'suppressed', suppression_id: SUPPRESSION_ID }
+        : { state: 'suppression_expired', suppression_id: SUPPRESSION_ID };
+  return {
+    schema_version: 'policy-analysis-results.v1',
+    mode: 'structural',
+    request_digest: 'sha256:request',
+    base: { source: 'active', etag: LIVE_ETAG },
+    analyzed: { source: 'active', etag: LIVE_ETAG },
+    resources: { mcp_alias_paths: 0 },
+    resource_snapshot: { schema_version: '1.0.0', digest: SNAPSHOT_DIGEST, complete: true },
+    complete: true,
+    limitations: [],
+    suppressions: { available: true, records: suppression === null ? 0 : 1 },
+    summary: {
+      findings: 1,
+      by_suppression_state: {
+        suppressed: state?.state === 'suppressed' ? 1 : 0,
+        suppression_expired: state?.state === 'suppression_expired' ? 1 : 0,
+        suppression_mismatched: 0,
+      },
+    },
+    findings: [
+      {
+        code: 'rule_shadowed',
+        fingerprint: FINGERPRINT,
+        severity: 'high',
+        proof_basis: 'proven',
+        element: { section: 'rules', pointer: '/rules/1', position: 1, id: 'deny-admin' },
+        rationale: 'an earlier, less restrictive enabled rule matches every request this rule matches',
+        remediation: 'move the rule before the less restrictive rule that covers it',
+        patch: { access_effect: 'narrowing' },
+        suppression: state,
+      },
+    ],
+  };
 }
 
 function draftView() {

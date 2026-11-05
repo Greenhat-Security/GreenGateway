@@ -2351,6 +2351,7 @@ mod database {
             "jwt_revocations",
             "policy_drafts",
             "policy_replay_jobs",
+            "policy_analysis_suppressions",
         ] {
             assert_eq!(
                 count_of(&pool, &format!("SELECT count(*) FROM greengateway.{table}")).await,

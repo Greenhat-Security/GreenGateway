@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/policy-analysis-suppression.v1.schema.json",
+  "title": "GreenGateway policy analysis suppression request",
+  "description": "Draft 2020-12 JSON Schema for the body of POST /v1{ADMIN_PREFIX}/policy/analyses/suppressions: one analyzer finding, named by the fingerprint and code a policy-analysis-results.v1 report gave it, the resource snapshot digest that report carried, an expiry and a reason. The request names the live policy ETag in If-Match. The gateway's checks are authoritative and also enforce what JSON Schema cannot state here: the reason's bound in bytes (not characters) and that it is not only whitespace, unique member names, and that expires_at is after now and at most 90 days after it on the store's clock. Unknown members are refused: there is no member that suppresses more than one finding.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["fingerprint", "code", "reason", "expires_at", "resource_snapshot_digest"],
+  "properties": {
+    "fingerprint": {"$ref": "#/$defs/digest"},
+    "code": {
+      "enum": [
+        "default_allow",
+        "global_shadow_enforcement",
+        "broad_unconstrained_allow",
+        "broad_unconstrained_shadow",
+        "wildcard_grant_without_issuer",
+        "rule_unreachable",
+        "rule_shadowed",
+        "route_unreachable",
+        "route_shadowed",
+        "route_bypassed",
+        "rate_override_unreachable",
+        "rate_override_shadowed"
+      ]
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$"
+    },
+    "expires_at": {"type": "string", "format": "date-time"},
+    "resource_snapshot_digest": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}

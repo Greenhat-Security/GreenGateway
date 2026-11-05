@@ -321,6 +321,26 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
             .map(storage::SqlitePolicyTestSuiteStore::open)
             .transpose()?
             .map(|store| Arc::new(store) as Arc<dyn storage::PolicyTestSuiteStore>);
+
+    // Analyzer finding suppressions (issue #243, slice 15) live where drafts
+    // do: migration 31's table in cluster mode, and a
+    // `policy_analysis_suppressions` table in the policy history database in
+    // standalone mode. A database that cannot be opened fails startup.
+    #[cfg(feature = "postgres")]
+    let analysis_suppression_store: Option<Arc<dyn storage::AnalysisSuppressionStore>> =
+        match build_overrides.pg_policy.as_ref() {
+            Some(seed) => Some(Arc::new(seed.store.analysis_suppression_store())),
+            None => policy_history_sqlite_path(&config)
+                .map(storage::SqliteAnalysisSuppressionStore::open)
+                .transpose()?
+                .map(|store| Arc::new(store) as Arc<dyn storage::AnalysisSuppressionStore>),
+        };
+    #[cfg(not(feature = "postgres"))]
+    let analysis_suppression_store: Option<Arc<dyn storage::AnalysisSuppressionStore>> =
+        policy_history_sqlite_path(&config)
+            .map(storage::SqliteAnalysisSuppressionStore::open)
+            .transpose()?
+            .map(|store| Arc::new(store) as Arc<dyn storage::AnalysisSuppressionStore>);
     let observation_state =
         middleware::observation::ObservationState::from_config(&config, audit_log.clone())
             .with_conformance(schema_conformance_state);
@@ -1169,6 +1189,7 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
         history_store: policy_history_store,
         draft_store: policy_draft_store,
         test_suite_store: policy_test_suite_store,
+        analysis_suppression_store,
         #[cfg(feature = "postgres")]
         control_plane: policy_control_plane,
         #[cfg(feature = "postgres")]

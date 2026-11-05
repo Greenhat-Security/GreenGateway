@@ -4445,6 +4445,7 @@ async fn suggestions_admin_without_engine_answers_not_configured() {
                 history_store: None,
                 draft_store: None,
                 test_suite_store: None,
+                analysis_suppression_store: None,
                 #[cfg(feature = "postgres")]
                 control_plane: None,
                 #[cfg(feature = "postgres")]
@@ -8469,6 +8470,7 @@ mod cluster_discovery_tests {
                     history_store: Some(policy_store.clone() as Arc<dyn storage::PolicyHistory>),
                     draft_store: None,
                     test_suite_store: None,
+                    analysis_suppression_store: None,
                     control_plane: Some(
                         policy_store.clone() as Arc<dyn storage::PolicyControlPlane>
                     ),

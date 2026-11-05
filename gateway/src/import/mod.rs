@@ -169,6 +169,7 @@ const NOT_IMPORTED: &[&str] = &[
     "jwt_revocations",
     "policy_drafts",
     "policy_replay_jobs",
+    "policy_analysis_suppressions",
     "security_outbox (the import announces nothing; a commit appends its own row)",
     "principal_directory (cluster mode has none; the audit log it projects from is imported)",
     "connection_local_secrets (the local-secret keyring stays with the standalone deployment; \

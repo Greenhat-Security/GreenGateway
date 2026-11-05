@@ -14,6 +14,12 @@
 //! [`PolicyEvaluationLimiter`] and a deadline. Running out of the deadline,
 //! the comparison budget or the findings cap is an incomplete result, never
 //! a clean one.
+//!
+//! Each finding is reported with its suppression state (issue #243, slice
+//! 15): the endpoint reads the deployment's suppression records and the
+//! resource snapshot once, and [`policy_analysis::suppression::apply`] marks
+//! a finding suppressed only when a record binds this analysis exactly. A
+//! store that cannot be read suppresses nothing, and the result says so.
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -22,7 +28,7 @@ use policy_analysis::{
     checks::{analyze, AnalysisResources},
     report::AnalysisBinding,
     request::{parse_request, AnalysisFormat},
-    AnalysisError,
+    suppression, AnalysisError,
 };
 use policy_simulation::request::CandidateSource;
 
@@ -71,6 +77,7 @@ fn emit_policy_analysis_run(
     format: AnalysisFormat,
     binding: &AnalysisBinding<'_>,
     outcome: &policy_analysis::AnalysisOutcome,
+    suppressions: &suppression::SuppressionOutcome,
 ) {
     let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
     let source_ip =
@@ -88,9 +95,11 @@ fn emit_policy_analysis_run(
             .iter()
             .map(|limitation| limitation.as_str())
             .collect::<Vec<_>>(),
-        // Counts by severity, proof basis and code only: no element, pointer
-        // or fingerprint.
-        "summary": policy_analysis::report::summary(outcome),
+        // Counts by severity, proof basis, code and suppression state only:
+        // no element, pointer, fingerprint or suppression id.
+        "summary": policy_analysis::report::summary(outcome, suppressions),
+        "suppressions_available": suppressions.available,
+        "resource_snapshot_complete": binding.resource_snapshot.is_complete(),
         "analyzer_version": policy_analysis::ANALYZER_VERSION,
         "http_semantics_version": policy_eval::HTTP_SEMANTICS_VERSION,
         "tool_semantics_version": policy_eval::tools::TOOL_SEMANTICS_VERSION,
@@ -98,6 +107,9 @@ fn emit_policy_analysis_run(
     if let Some(payload) = payload.as_object_mut() {
         if let Some(revision) = binding.security_revision {
             payload.insert("security_revision".to_owned(), json!(revision));
+        }
+        if let Some(digest) = binding.resource_snapshot.digest() {
+            payload.insert("resource_snapshot_digest".to_owned(), json!(digest));
         }
         // Which draft or history version, never its content.
         if let Some(stored) = binding.stored {
@@ -215,11 +227,21 @@ pub(super) async fn policy_analyses_endpoint(
     };
     let alias_paths = rbac_state.mcp_alias_paths();
     let alias_count = alias_paths.len();
+    let analyzed = candidate.unwrap_or(base);
+    let analyzed_semantic_digest = match policy_semantic_digest(&analyzed) {
+        Ok(digest) => digest,
+        Err(response) => return *response,
+    };
+    // What a suppression binds besides the policy: the resources as they
+    // are now, and the records as the store reads them now. Neither changes
+    // what the analyzer finds; together they decide how a finding reads.
+    let resource_snapshot =
+        rbac::policy_resources::PolicyResourceSnapshot::of(&rbac_state.policy_resource_view());
+    let suppression_read = read_analysis_suppressions(&state).await;
 
     // The blocking thread owns the slot, so a request dropped mid-analysis
     // keeps its slot until the analysis it started has ended. The deadline
     // starts before compilation, so compiling counts against it.
-    let analyzed = candidate.unwrap_or(base);
     let outcome = match slot
         .run_blocking(move || {
             let deadline = Instant::now() + POLICY_ANALYSIS_DEADLINE;
@@ -248,7 +270,7 @@ pub(super) async fn policy_analyses_endpoint(
     };
     let binding = AnalysisBinding {
         request_digest: &analysis.digest,
-        base_etag: &base_etag,
+        base_etag: Some(&base_etag),
         security_revision: match authority {
             policy_eval::PolicyAuthority::PostgreSql { security_revision } => {
                 Some(security_revision)
@@ -257,21 +279,40 @@ pub(super) async fn policy_analyses_endpoint(
         },
         source: analysis.candidate.as_str(),
         analyzed_etag: &analyzed_etag,
+        analyzed_semantic_digest: analyzed_semantic_digest.as_deref(),
         edit_count: match &analysis.candidate {
             CandidateSource::Edits(edits) => edits.len(),
             _ => 0,
         },
         stored: stored.as_ref(),
         mcp_alias_paths: alias_count,
+        resource_snapshot: &resource_snapshot,
+    };
+    let suppressions = match suppression::apply(
+        &outcome.findings,
+        &suppression_read,
+        &suppression::SuppressionBinding {
+            policy_etag: &analyzed_etag,
+            policy_semantic_digest: analyzed_semantic_digest.as_deref(),
+            resource_snapshot_digest: resource_snapshot
+                .digest()
+                .filter(|_| resource_snapshot.is_complete()),
+        },
+    ) {
+        Ok(suppressions) => suppressions,
+        Err(AnalysisError::Internal(code)) => {
+            tracing::error!(code, "policy analysis suppressions could not be applied");
+            return internal_server_error("policy analysis failed");
+        }
     };
     let (content_type, rendered) = match analysis.format {
         AnalysisFormat::Json => (
             "application/json",
-            policy_analysis::report::to_json(&outcome, &binding),
+            policy_analysis::report::to_json(&outcome, &binding, &suppressions),
         ),
         AnalysisFormat::Sarif => (
             "application/sarif+json",
-            policy_analysis::report::to_sarif(&outcome, &binding),
+            policy_analysis::report::to_sarif(&outcome, &binding, &suppressions),
         ),
     };
     let body = match rendered.map(|value| serde_json::to_vec(&value)) {
@@ -299,6 +340,7 @@ pub(super) async fn policy_analyses_endpoint(
         analysis.format,
         &binding,
         &outcome,
+        &suppressions,
     );
     (
         StatusCode::OK,

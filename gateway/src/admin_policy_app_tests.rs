@@ -5661,6 +5661,7 @@ mod cluster_policy_tests {
                 test_suite_store: Some(
                     Arc::new(store.test_suite_store()) as Arc<dyn storage::PolicyTestSuiteStore>
                 ),
+                analysis_suppression_store: None,
                 control_plane: Some(store as Arc<dyn storage::PolicyControlPlane>),
                 membership,
                 replay_cluster: None,
