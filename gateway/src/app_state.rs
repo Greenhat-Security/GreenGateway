@@ -33,6 +33,8 @@ pub(super) const POLICY_RULE_SHADOW_REVIEW_ADMIN_ROUTE: &str =
     "/v1/admin/policy/rules/shadow-review";
 pub(super) const POLICY_VALIDATE_ADMIN_ROUTE: &str = "/v1/admin/policy/validate";
 pub(super) const POLICY_CONVERT_ADMIN_ROUTE: &str = "/v1/admin/policy/convert";
+/// The stored `policy-tests.v1` suite (issue #243).
+pub(super) const POLICY_TESTS_ADMIN_ROUTE: &str = "/v1/admin/policy/tests";
 /// Run a `policy-tests.v1` suite (issue #243, slice 11).
 pub(super) const POLICY_TEST_RUNS_ADMIN_ROUTE: &str = "/v1/admin/policy/tests/runs";
 /// Simulate synthetic cases against the active policy and a candidate
@@ -266,6 +268,7 @@ pub(super) struct AdminRoutes {
     pub(super) policy_rule_shadow_review_route: String,
     pub(super) policy_validate_route: String,
     pub(super) policy_convert_route: String,
+    pub(super) policy_tests_route: String,
     pub(super) policy_test_runs_route: String,
     pub(super) policy_simulations_route: String,
     pub(super) policy_replays_route: String,
@@ -381,6 +384,7 @@ impl AdminRoutes {
             policy_rule_shadow_review_route: format!("{api_prefix}/policy/rules/shadow-review"),
             policy_validate_route: format!("{api_prefix}/policy/validate"),
             policy_convert_route: format!("{api_prefix}/policy/convert"),
+            policy_tests_route: format!("{api_prefix}/policy/tests"),
             policy_test_runs_route: format!("{api_prefix}/policy/tests/runs"),
             policy_simulations_route: format!("{api_prefix}/policy/simulations"),
             policy_replays_route: format!("{api_prefix}/policy/replays"),
@@ -506,6 +510,11 @@ pub(super) struct PolicyAdminState {
     /// the policy history database standalone, migration 22's table in
     /// cluster mode. `None` leaves the draft routes answering `503`.
     pub(super) draft_store: Option<Arc<dyn storage::PolicyDraftStore>>,
+    /// The stored policy test suite (issue #243): a table in the policy
+    /// history database standalone, migration 29's tables in cluster mode.
+    /// `None` leaves the suite routes, and every run or evidence package
+    /// that names the stored suite, answering `503`.
+    pub(super) test_suite_store: Option<Arc<dyn storage::PolicyTestSuiteStore>>,
     /// Cluster mode's authoritative control plane. Present exactly when
     /// `policy_file` is absent-but-cluster: mutations commit through its
     /// CAS transaction instead of the file, and history is its documents.

@@ -3569,6 +3569,9 @@ mod issue_463_caller_assertion_jwks;
 #[path = "admin_policy_test_runs_tests.rs"]
 mod admin_policy_test_runs_tests;
 
+#[path = "admin_policy_tests_tests.rs"]
+mod admin_policy_tests_tests;
+
 #[path = "admin_policy_simulations_tests.rs"]
 mod admin_policy_simulations_tests;
 

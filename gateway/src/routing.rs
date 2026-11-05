@@ -400,6 +400,10 @@ pub(super) fn add_admin_api_routes(
                     post(policy_convert_endpoint),
                 )
                 .route(
+                    routes.admin.policy_tests_route.as_str(),
+                    get(policy_tests_get_endpoint).put(policy_tests_put_endpoint),
+                )
+                .route(
                     routes.admin.policy_test_runs_route.as_str(),
                     // One limiter per route and router: its concurrency
                     // bounds belong to this endpoint of this application,

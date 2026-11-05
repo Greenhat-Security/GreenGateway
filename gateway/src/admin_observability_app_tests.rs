@@ -4444,6 +4444,7 @@ async fn suggestions_admin_without_engine_answers_not_configured() {
                 rbac_state: Some(rbac_state.clone()),
                 history_store: None,
                 draft_store: None,
+                test_suite_store: None,
                 #[cfg(feature = "postgres")]
                 control_plane: None,
                 #[cfg(feature = "postgres")]
@@ -8480,6 +8481,7 @@ mod cluster_discovery_tests {
                     draft_store: Some(
                         Arc::new(policy_store.draft_store()) as Arc<dyn storage::PolicyDraftStore>
                     ),
+                    test_suite_store: None,
                     control_plane: Some(
                         policy_store.clone() as Arc<dyn storage::PolicyControlPlane>
                     ),
