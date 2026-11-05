@@ -28,6 +28,7 @@ pub(super) fn forbidden() -> Response {
             permission: None,
             path_prefix: None,
             matched_rule_id: None,
+            facts: None,
         });
     response
 }
