@@ -35,7 +35,7 @@ const FUTURE_EXP: u64 = 4_102_444_800;
 const FUTURE_NBF: u64 = 7_258_118_400;
 const EXPIRED: u64 = 1;
 
-struct NoDns(Arc<AtomicUsize>);
+pub(super) struct NoDns(pub(super) Arc<AtomicUsize>);
 
 #[async_trait::async_trait]
 impl DnsResolver for NoDns {
@@ -45,7 +45,7 @@ impl DnsResolver for NoDns {
     }
 }
 
-struct NoRevocation(Arc<AtomicUsize>);
+pub(super) struct NoRevocation(pub(super) Arc<AtomicUsize>);
 
 #[async_trait::async_trait]
 impl RevocationStore for NoRevocation {
