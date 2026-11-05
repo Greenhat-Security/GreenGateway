@@ -1582,8 +1582,7 @@ mod database {
     /// `policy.rule_conditions`, and nothing authoritative is written. Once
     /// it has left, the apply imports the document with its conditions.
     #[tokio::test]
-    async fn a_policy_v1_import_with_rule_conditions_waits_for_every_live_member_to_enforce_them(
-    ) {
+    async fn a_policy_v1_import_with_rule_conditions_waits_for_every_live_member_to_enforce_them() {
         let Some(admin_dsn) = locator() else {
             eprintln!("skipping: no test database locator; CI runs this test");
             return;

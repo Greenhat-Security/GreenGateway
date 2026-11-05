@@ -776,7 +776,12 @@ mod gate_tests {
         );
         let successor = reads(PEER, true, CURRENT);
         assert_eq!(
-            gate(&POLICY_RULE_CONDITIONS, &shipped, OWN, &[current, successor]),
+            gate(
+                &POLICY_RULE_CONDITIONS,
+                &shipped,
+                OWN,
+                &[current, successor]
+            ),
             Ok(OperationAdmission { live_members: 2 })
         );
     }
