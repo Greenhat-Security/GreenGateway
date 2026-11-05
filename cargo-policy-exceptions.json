@@ -106,7 +106,7 @@
           "chacha20@0.10.2",
           "poly1305@0.9.1",
           "sha1@0.11.0",
-          "sha2@0.11.0"
+          "sha2@0.11.1"
         ]
       }
     },
@@ -150,7 +150,7 @@
           "hmac@0.13.0",
           "md-5@0.11.0",
           "sha1@0.11.0",
-          "sha2@0.11.0"
+          "sha2@0.11.1"
         ]
       }
     },
@@ -372,7 +372,7 @@
       "name": "syn",
       "versions": [
         "2.0.119",
-        "3.0.6"
+        "3.0.9"
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
@@ -398,7 +398,7 @@
           "zerofrom-derive@0.1.7",
           "zeroize_derive@1.5.0"
         ],
-        "3.0.6": [
+        "3.0.9": [
           "async-trait@0.1.92",
           "displaydoc@0.2.7",
           "futures-macro@0.3.34",
@@ -484,7 +484,7 @@
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "0.7.1": [
-          "aws-lc-rs@1.18.2"
+          "aws-lc-rs@1.19.0"
         ],
         "0.9.0": [
           "ring@0.17.14",
@@ -543,7 +543,7 @@
           "nu-ansi-term@0.50.3",
           "quinn-udp@0.5.15",
           "rustix@1.1.5",
-          "rustls-platform-verifier@0.7.0",
+          "rustls-platform-verifier@0.7.1",
           "schannel@0.1.29",
           "socket2@0.6.5",
           "tempfile@3.27.0",
