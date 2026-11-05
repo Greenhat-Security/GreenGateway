@@ -10,7 +10,11 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 UPLOAD = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
-CONTROLLER = "python scripts/security_mutations.py --report target/security-mutations/report.json"
+CAMPAIGN_SECONDS = 12600
+CONTROLLER = (
+    "python scripts/security_mutations.py --campaign-seconds " + str(CAMPAIGN_SECONDS)
+    + " --report target/security-mutations/report.json"
+)
 REGISTRY_CHECK = "python scripts/security_mutations.py --validate-registry"
 WORKFLOW_CONTRACTS = "python scripts/test_security_mutations_workflows.py"
 REGISTRY_UNIT_TESTS = "python scripts/test_security_mutations.py ManifestTests TestListTests"
@@ -79,7 +83,10 @@ class WorkflowTests(unittest.TestCase):
 
     def test_job_is_bounded_and_builds_are_serial(self):
         self.assertEqual(self.job["runs-on"], "ubuntu-latest")
-        self.assertEqual(self.job["timeout-minutes"], "150")
+        self.assertEqual(self.job["timeout-minutes"], "240")
+        # The controller's own campaign bound ends the run with a bounded
+        # report; the job timeout must leave room for setup and that upload.
+        self.assertLessEqual(CAMPAIGN_SECONDS + 30 * 60, int(self.job["timeout-minutes"]) * 60)
         self.assertEqual(self.job["env"], {
             "CARGO_BUILD_JOBS": "1", "CARGO_TERM_COLOR": "never",
         })

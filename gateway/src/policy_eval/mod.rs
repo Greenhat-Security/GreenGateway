@@ -760,11 +760,11 @@ impl CompiledPolicy {
         self.decide(context, facts, &mut NoStages)
     }
 
-    fn decide<S: StageSink>(
+    fn decide(
         &self,
         context: &PolicyEvaluationContext,
         facts: &PolicyFacts,
-        stages: &mut S,
+        stages: &mut impl StageSink,
     ) -> Result<Evaluation, EvaluationError> {
         context.validate(self.snapshot)?;
         validate_facts(facts)?;

@@ -262,6 +262,96 @@
           "new": "answers.iter().take(1).position(|answer| {"
         }
       ]
+    },
+    {
+      "id": "kernel-http-decision",
+      "path": "gateway/src/policy_eval/mod.rs",
+      "function": "policy_eval::CompiledPolicy::decide",
+      "start_marker": "    fn decide(",
+      "end_marker": "\n    }\n",
+      "source_sha256": "8c83cac0bbd33c558038e8785c1486136f9f20e8856f11ee242dd43eafd95192",
+      "tests": [
+        "policy_eval::tests::a_direct_allow_cannot_authorize_a_selected_upstream_but_a_deny_still_blocks",
+        "policy_eval::tests::a_permissive_default_does_not_authorize_an_unrouted_virtual_upstream",
+        "policy_eval::tests::an_alias_uses_the_most_restrictive_action_across_both_identities",
+        "policy_eval::tests::a_permission_route_never_grants_an_anonymous_caller"
+      ],
+      "mutations": [
+        {
+          "id": "keep-direct-allow-for-selected-upstream",
+          "old": "                dispatch_context,\n                true,\n",
+          "new": "                dispatch_context,\n                false,\n"
+        },
+        {
+          "id": "default-for-unrouted-upstream",
+          "old": "if host_binding_required {\n            stages.record(HttpStage::HostPolicyRequired);",
+          "new": "if false {\n            stages.record(HttpStage::HostPolicyRequired);"
+        },
+        {
+          "id": "shadow-rule-allows",
+          "old": "RuleAction::Shadow => (LogicalDecision::Deny, PolicyEffect::Observe),",
+          "new": "RuleAction::Shadow => (LogicalDecision::Deny, PolicyEffect::Allow),"
+        },
+        {
+          "id": "grant-route-without-principal",
+          "old": "let allowed = principal.is_some_and(|principal| {",
+          "new": "let allowed = principal.is_none_or(|principal| {"
+        }
+      ]
+    },
+    {
+      "id": "kernel-route-match",
+      "path": "gateway/src/policy_eval/mod.rs",
+      "function": "policy_eval::CompiledPolicy::match_route",
+      "start_marker": "    fn match_route(",
+      "end_marker": "\n    }\n",
+      "source_sha256": "bc0fe7b96c7a4ad779906791488e7f0ff6f51d92f08b506af1957d94cfafe413",
+      "tests": [
+        "policy_eval::tests::an_alias_never_inherits_a_broad_prefix_permission_from_its_request_path"
+      ],
+      "mutations": [
+        {
+          "id": "prefix-match-alias-request-path",
+          "old": "route.path_prefix == path",
+          "new": "path_prefix_matches(path, &route.path_prefix)"
+        }
+      ]
+    },
+    {
+      "id": "kernel-enforcement-effect",
+      "path": "gateway/src/policy_eval/mod.rs",
+      "function": "policy_eval::effect",
+      "start_marker": "fn effect(allowed: bool, mode: EnforcementMode) -> PolicyEffect {",
+      "end_marker": "\n}\n",
+      "source_sha256": "a9dde2d047658b0213f61410433e6b2a9b86ac6d02fd61b92bb4c18f328e5f2d",
+      "tests": [
+        "policy_eval::tests::a_route_or_default_denial_is_observed_only_in_shadow_mode"
+      ],
+      "mutations": [
+        {
+          "id": "shadow-denial-allows",
+          "old": "PolicyEffect::Observe",
+          "new": "PolicyEffect::Allow"
+        }
+      ]
+    },
+    {
+      "id": "rbac-alias-precedence",
+      "path": "gateway/src/rbac/matcher.rs",
+      "function": "rbac::matcher::RuleMatcher::scan_matching_paths_by_action",
+      "start_marker": "    fn scan_matching_paths_by_action(",
+      "end_marker": "\n    }\n",
+      "source_sha256": "9fbb41a85838989ec0f0235b0dfbece2f3c41660eb38f384633972d6b699fb9a",
+      "tests": [
+        "policy_eval::tests::an_alias_uses_the_most_restrictive_action_across_both_identities"
+      ],
+      "mutations": [
+        {
+          "id": "least-restrictive-action-first",
+          "old": "for action in actions {",
+          "new": "for action in actions.iter().rev() {"
+        }
+      ]
     }
   ],
   "exceptions": []
