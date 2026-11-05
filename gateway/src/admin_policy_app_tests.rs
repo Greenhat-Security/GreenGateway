@@ -5,6 +5,7 @@
 //! PostgreSQL is the `cluster_policy_tests` module at the end. Shared
 //! fixtures stay in `app_tests.rs`.
 use super::*;
+use crate::rbac::policy::PolicyFile;
 
 #[tokio::test]
 async fn startup_returns_actionable_error_for_invalid_policy_file() {

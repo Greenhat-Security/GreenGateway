@@ -2,24 +2,27 @@
 //! [--format human|json|sarif]`.
 //!
 //! The bundle is read by the shared reader in `gateway-config`, the code the
-//! gateway reads bundles with (ADR-0008, "One compiler"), so the two cannot
-//! disagree about anything the reader decides. `ggctl` cannot link the
-//! gateway's production policy and tools validators, so it reads with
-//! [`PublishedSchemasOnly`], and every report about a bundled policy or tools
-//! document says those validators did not run. Nothing is written, no
-//! network request is made and no environment variable is read.
+//! gateway reads bundles with (ADR-0008, "One compiler"), with the same
+//! [`ProductionValidators`]: a bundled policy or tools document is held to
+//! the validating parse the gateway's policy and tools loaders run, so the
+//! two cannot disagree about anything the reader or those validators decide.
+//! Nothing is written, no network request is made and no environment
+//! variable is read.
 
 use std::{
     io::{self, Write},
     path::Path,
 };
 
-use gateway_config::bundle::{
-    self, Bundle, BundleReport, BundledResource, ManifestSummary, Profile, PublishedSchemasOnly,
-    ReadOptions, ResourceDeclaration,
+use gateway_config::{
+    bundle::{
+        self, BundleReport, BundledResource, ManifestSummary, ProductionBundle,
+        ProductionValidators, Profile, ReadOptions, ResourceDeclaration,
+    },
+    rbac::Policy,
+    tools::definitions::ToolDefinition,
 };
 use serde::Serialize;
-use serde_json::Value;
 
 use crate::{
     cli::Invocation,
@@ -27,8 +30,8 @@ use crate::{
     report::{self, Format, Io, ReportDiagnostic},
 };
 
-/// What the schema-only reader returns.
-pub(crate) type BundleRead = BundleReport<Value, Value>;
+/// What the reader returns with the production validators.
+pub(crate) type BundleRead = BundleReport<Policy, Vec<ToolDefinition>>;
 
 /// Reads the bundle the command's `BUNDLE` argument names, or `None` when
 /// there is no such argument (the parser requires one).
@@ -37,7 +40,7 @@ pub(crate) fn read(invocation: &Invocation, strict: bool) -> Option<BundleRead> 
     Some(bundle::read_bundle(
         Path::new(path),
         ReadOptions { strict },
-        &PublishedSchemasOnly,
+        &ProductionValidators,
     ))
 }
 
@@ -90,8 +93,9 @@ struct ResourceRecord {
     schema_version: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sha256: Option<String>,
-    /// For a document the bundle supplies, always `not_run`: the production
-    /// validators are not part of `ggctl`.
+    /// For a document the bundle supplies, `passed` once the bundle was
+    /// read with no error: the production validator built it. Absent
+    /// otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     production_validator: Option<&'static str>,
 }
@@ -109,7 +113,7 @@ impl BundleRecord {
         Self::from_parts(manifest, None)
     }
 
-    fn from_parts(manifest: &ManifestSummary, bundle: Option<&Bundle<Value, Value>>) -> Self {
+    fn from_parts(manifest: &ManifestSummary, bundle: Option<&ProductionBundle>) -> Self {
         Self {
             api_version: manifest.api_version.as_str(),
             name: manifest.name.clone(),
@@ -176,7 +180,7 @@ impl BundleRecord {
 }
 
 impl ResourceRecord {
-    fn of(declaration: &ResourceDeclaration, read: Option<&BundledResource<Value>>) -> Self {
+    fn of<T>(declaration: &ResourceDeclaration, read: Option<&BundledResource<T>>) -> Self {
         match declaration {
             ResourceDeclaration::Server => Self {
                 source: "server",
@@ -196,7 +200,10 @@ impl ResourceRecord {
                     Some(BundledResource::Bundle { sha256, .. }) => Some(sha256.clone()),
                     _ => None,
                 },
-                production_validator: Some("not_run"),
+                production_validator: match read {
+                    Some(BundledResource::Bundle { .. }) => Some("passed"),
+                    _ => None,
+                },
             },
         }
     }
@@ -232,9 +239,6 @@ pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
         return report::error(io, Diagnostic::new(Code::MissingArgument));
     };
     let mut diagnostics = diagnostics(&read);
-    if supplies_a_resource(&read) {
-        diagnostics.push(Diagnostic::new(Code::ProductionValidatorsNotRun).into());
-    }
     let errors = read
         .diagnostics
         .iter()

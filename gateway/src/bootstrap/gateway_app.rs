@@ -2,6 +2,7 @@
 //! admin state the configuration and preflight's seeds call for, and the
 //! routers that serve them, in the order startup has always built them.
 use super::*;
+use crate::rbac::policy::PolicyFile;
 
 #[cfg(test)]
 pub(crate) fn app(

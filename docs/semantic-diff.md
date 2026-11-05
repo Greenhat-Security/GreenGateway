@@ -5,8 +5,9 @@ and [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md) ("Change
 classes" and "Plan, risk acknowledgment, and conditional apply"): what it
 compares, how it classifies each change, the stable risk codes, and what it
 never shows. [`ggctl diff`](ggctl.md#diff) reports it for two bundles. The
-gateway compares two compiled environment configurations and two bundles it
-read with its production validators, and the standalone ledger's plans
+gateway compares two compiled environment configurations, `ggctl diff` and the
+gateway compare two bundles read with the production validators, and the
+standalone ledger's plans
 ([configuration-ledger.md](configuration-ledger.md#plans-and-conditional-apply))
 diff a candidate against the head this way and require every risk code to be
 acknowledged before an apply. Nothing serves or logs those comparisons yet:
@@ -25,7 +26,7 @@ a default never register:
 | Input | Compared as | Field identifiers |
 | --- | --- | --- |
 | Two environment configurations | the configuration compiler's validated plan (`gateway-config/src/compiler/plan.rs`), setting by setting | the environment variable name, for example `EGRESS_ALLOWED_HOSTS` |
-| Two [configuration bundles](configuration-bundles.md) | what the shared bundle reader accepted: the manifest, the deployment document, and the policy and tools documents, as written and checked against their published schemas (`ggctl diff`) or in the form the gateway's production validators produce (the gateway) | a dotted document path, for example `policy.egress.hosts` or `resources.policy.sha256` |
+| Two [configuration bundles](configuration-bundles.md) | what the shared bundle reader accepted with the production validators: the manifest, the deployment document, and the policy and tools documents in the form those validators produce, every default filled in (`gateway_config::semantic_diff::compare_production_bundles`, which `ggctl diff` and the ledger's plans both run) | a dotted document path, for example `policy.egress.hosts` or `resources.policy.sha256` |
 
 Every compiler input is compared exactly once: the environment adapter
 destructures every domain plan field by field, so a setting added to a plan
@@ -178,9 +179,9 @@ code or lowers the severity.
 ## Output in `ggctl diff`
 
 [`ggctl diff BUNDLE --against BUNDLE`](ggctl.md#diff) reads both bundles with
-the shared reader, as `ggctl validate` does (so the production policy and
-tools validators do not run and the report says so), and compares the
-documents as they were written. It writes:
+the shared reader and the production policy and tools validators, as `ggctl
+validate` does, and compares the documents those validators built, as the
+ledger's plans do: spelling out a default moves only the pin. It writes:
 
 - human output: one line per change (severity, field, kind, the value or
   `(value withheld)` / `(reference changed)` with entry counts, class, effect

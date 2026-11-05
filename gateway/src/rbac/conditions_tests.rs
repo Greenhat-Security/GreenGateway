@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::auth::{AuthMethod, Principal};
+use crate::rbac::policy_document::{IssueCode, PolicyIssue};
 
 const ISSUER: &str = "https://idp.example.test";
 

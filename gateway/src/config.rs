@@ -38,13 +38,12 @@ use crate::{
     inbound_tls::TlsMinVersion,
 };
 
-mod bundle;
 #[cfg(test)]
 mod environment_reads;
 #[cfg(test)]
 mod fingerprint_tests;
+#[cfg(test)]
 mod revisions;
-mod semantic_diff;
 
 /// The configuration compiler, its settings, defaults and bounds, and the
 /// setting types it parses, at the paths the gateway names them by. Serving

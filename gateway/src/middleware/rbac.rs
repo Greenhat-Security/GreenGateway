@@ -42,7 +42,8 @@ use crate::{
         RuleReference,
     },
     rbac::{
-        policy::ToolPolicyEntry, EgressPolicy, Policy, RouteRule, RuleAction, RuleDispatchKind,
+        policy::{PolicyFile, ToolPolicyEntry},
+        EgressPolicy, Policy, RouteRule, RuleAction, RuleDispatchKind,
     },
     request_bounds::MAX_TOOL_NAME_BYTES,
     upstream_route::{

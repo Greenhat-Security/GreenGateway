@@ -164,9 +164,9 @@ standalone deployment, as ADR-0008 states.
 online ([ADR-0008, "Plan, risk acknowledgment, and conditional
 apply"](adr/0008-setup-cli-and-configuration-bundles.md#plan-risk-acknowledgment-and-conditional-apply)).
 It owns one ledger and the plans made against it, and a caller supplies how
-bundles are compiled: the gateway passes its production policy and tools
-validators (`config::revisions::ProductionCompiler`), and the
-published-schemas compiler is what `ggctl` could run. A client's preview never
+bundles are compiled: the gateway and `ggctl` both pass the production policy
+and tools validators (`gateway_config::revisions::ProductionCompiler`); the
+published-schemas compiler serves the protocol's own tests. A client's preview never
 authorizes anything; every decision below is made from what the service
 compiles itself, and nothing is written unless every check passes.
 

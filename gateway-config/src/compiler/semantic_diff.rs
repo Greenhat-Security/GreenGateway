@@ -10,9 +10,9 @@
 //! field, so a setting added to a plan does not compile until it is named
 //! here and is an unused binding, which CI's warnings-as-errors builds
 //! refuse, until it is compared; a test holds the compared names to the
-//! inventory's `CONFIG_INPUTS`. The gateway compares bundles, whose policy
-//! and tools documents its own validators build, beside this
-//! (`config::semantic_diff::bundles`).
+//! inventory's `CONFIG_INPUTS`. Bundles, whose policy and tools documents
+//! the production validators build, are compared beside this
+//! (`crate::semantic_diff::compare_production_bundles`).
 //!
 //! Every environment setting is read at startup, so every change is a
 //! `restart` change, except a change of state backend or deployment, which is

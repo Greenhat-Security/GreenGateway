@@ -3359,7 +3359,9 @@ fn proxy_definition(server: &McpUpstreamServerConfig, tool: Tool) -> ToolDefinit
         remote_tool_name,
     );
     definition.title = tool.title;
-    definition.annotations = tool.annotations.map(Into::into);
+    definition.annotations = tool
+        .annotations
+        .map(crate::tools::definitions::tool_annotations_from_mcp);
     definition
 }
 
@@ -3377,7 +3379,9 @@ fn connection_proxy_definition(connection_id: &str, tool: Tool) -> ToolDefinitio
         remote_tool_name,
     );
     definition.title = tool.title;
-    definition.annotations = tool.annotations.map(Into::into);
+    definition.annotations = tool
+        .annotations
+        .map(crate::tools::definitions::tool_annotations_from_mcp);
     definition
 }
 

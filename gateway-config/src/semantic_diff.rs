@@ -45,7 +45,8 @@ mod resources;
 mod tests;
 
 pub use resources::{
-    compare_bundles, compare_policy, compare_read_bundles, compare_tools, BundleView, ResourceView,
+    compare_bundles, compare_policy, compare_production_bundles, compare_read_bundles,
+    compare_tools, policy_document_value, tools_document_value, BundleView, ResourceView,
     DEFAULT_TOOL_MAX_CONCURRENT, DEFAULT_TOOL_TIMEOUT_MS,
 };
 

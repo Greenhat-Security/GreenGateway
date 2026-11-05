@@ -20,7 +20,14 @@
 //!   `GET /v1{ADMIN_PREFIX}/config/capabilities`, which `ggctl` reads before
 //!   any configuration operation and refuses to proceed without;
 //! - [`bundle`]: the configuration bundle reader, which `ggctl validate` and
-//!   `ggctl doctor` run and the gateway will start from in bundle mode;
+//!   `ggctl doctor` run and the gateway will start from in bundle mode, with
+//!   the [`bundle::ProductionValidators`] both pass it;
+//! - [`rbac`] and [`tools`]: the policy and tools documents (policy v0 and
+//!   v1, tools 0.1.0), their models and their validating parses
+//!   ([`rbac::Policy::validate_json_value`] and
+//!   [`tools::definitions::definitions_from_json_value`]), which the
+//!   gateway's policy and tools loaders run and which are the production
+//!   validators a bundle's documents are held to;
 //! - [`canonical_json`]: RFC 8785 canonical JSON and ADR-0004's digest frame;
 //! - [`opaque_id`] and [`permissions`]: the opaque ID grammar and the
 //!   projected-volume permission rule the reader shares with the gateway's
@@ -46,29 +53,35 @@
 //!   configurations and its risk classification, which `ggctl diff` reports
 //!   for two bundles and the ledger's plans gate applies on;
 //! - the leaves the compiler calls: [`connections`] (the secret alias,
-//!   keyring and provider documents and their validators, and the Connection
-//!   ID grammar), [`auth`] (issuer canonicalization, the JWKS key age bounds,
+//!   keyring and provider documents and their validators, the Connection
+//!   ID grammar and the origin-relative path grammar), [`auth`] (issuer
+//!   canonicalization, the principal identity bounds, the JWKS key age bounds,
 //!   the cookie-name grammar, the client-certificate identity source and the
 //!   admin session settings), [`inbound_tls`], [`path_match`],
 //!   [`request_bounds`], [`upstream_route`] (the stable route ID grammar) and
 //!   [`discovery`] (the signal and suggestion defaults).
 //!
-//! The gateway re-exports the compiler and each leaf from the module it moved
-//! out of, so its call sites did not change. With the bundle reader and the
+//! The gateway re-exports the compiler, the policy and tools models and each
+//! leaf from the module it moved out of, so its call sites keep their paths.
+//! An inherent method that needs the gateway -- a file, an authenticated
+//! principal, the cluster roster -- is a method of a gateway-side trait of
+//! the same name there. With the bundle reader and the
 //! compiler both here, `ggctl` can link ADR-0008's pipeline stages 1 to 5:
 //! bounded reading and document validation, normalization, the typing of
 //! secret locators, and cross-field validation. The compiler's contract is
 //! `docs/architecture/configuration-compiler.md`.
 //!
 //! Still in the gateway crate: `Config` and the startup stages that act on a
-//! compiled plan, and the production policy and tools validators. The bundle
-//! reader takes those validators as a [`bundle::ResourceValidators`]
-//! argument, so the gateway runs them and `ggctl`, which cannot link the
-//! gateway crate, reports that it did not.
+//! compiled plan, and everything that acts on a policy or tools document --
+//! loading and watching its file, its history, the tool registry, and
+//! evaluating policy and executing tools. The bundle reader takes its
+//! validators as a [`bundle::ResourceValidators`] argument; the gateway and
+//! `ggctl` both pass the production ones.
 //!
 //! Nothing here touches the environment, a clock or the network, and the
-//! compiler and its leaves touch nothing at all: the compiler's one side
-//! effect is a log line naming a setting. The bundle reader reads files only
+//! compiler, the policy and tools parses and the leaves touch nothing at all:
+//! the compiler's one side effect is a log line naming a setting, and the
+//! policy 0.x reader's is one naming the unknown top-level members it drops. The bundle reader reads files only
 //! beneath the bundle root it is given, and never writes. The archive guard reads and writes only the readers and writers
 //! it is handed. The ledger is the one store: it reads and writes only its own
 //! database and journal files beneath the state directory it is given, and
@@ -91,8 +104,10 @@ pub mod ledger;
 pub mod opaque_id;
 pub mod path_match;
 pub mod permissions;
+pub mod rbac;
 pub mod request_bounds;
 pub mod revisions;
 pub mod semantic_diff;
 pub mod state_dir;
+pub mod tools;
 pub mod upstream_route;

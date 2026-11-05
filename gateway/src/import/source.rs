@@ -52,6 +52,7 @@ use crate::{
         suggestions::{RuleSuggestion, RuleSuggestionConfig, RuleSuggestionEngine},
     },
     rbac::{
+        policy::{ClusterDocumentFormat, PolicyFile},
         policy_history::{PolicyHistoryListFilters, PolicyHistoryStore, PolicyVersion},
         Policy,
     },

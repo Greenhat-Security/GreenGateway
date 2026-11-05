@@ -47,6 +47,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::rbac::{
+    policy::ClusterDocumentFormat,
     policy_history::{PolicyHistoryListFilters, PolicyHistoryPage, PolicyVersion},
     Policy,
 };

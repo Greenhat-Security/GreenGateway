@@ -14,17 +14,21 @@ use crate::rbac::conditions::{
 };
 use crate::{
     auth::{AuthMethod, Principal},
+    canonical_json,
     policy_eval::{
         CompiledPolicy, HostFact, HttpTarget, PolicyAuthority, PolicyEvaluationContext,
         PrincipalFact, PrincipalIdentity, CONTEXT_VERSION,
     },
     rbac::{
+        identity_mappings::IdentityMapping,
         policy::{
+            EgressPolicy, EnforcementMode, Policy, PolicyFile, RoleEntry, ToolPolicyEntry,
             DEFAULT_TOOL_POLICY_MAX_CONCURRENT, DEFAULT_TOOL_POLICY_TIMEOUT_MS,
-            KNOWN_TOP_LEVEL_KEYS, V1_ONLY_TOP_LEVEL_KEYS,
+            KNOWN_TOP_LEVEL_KEYS, MAX_POLICY_FILE_BYTES, V1_ONLY_TOP_LEVEL_KEYS, V1_TOP_LEVEL_KEYS,
         },
-        PrincipalMatcher, RuleAction, RuleDispatchMatcher,
+        PrincipalMatcher, RateLimitRule, RouteRule, Rule, RuleAction, RuleDispatchMatcher,
     },
+    request_bounds::MAX_TOOL_NAME_BYTES,
 };
 
 fn inspect(document: &Value) -> PolicyInspection {

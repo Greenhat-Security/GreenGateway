@@ -20,12 +20,18 @@ cap-std.workspace = true
 hex.workspace = true
 # The configuration compiler (`src/compiler`) parses header names and values
 # (CSRF, CORS, route headers) with the types the gateway serves them with, and
-# trusted-proxy, NAT64 and egress networks as IP prefixes. Parsing only: no
-# connection is opened.
+# trusted-proxy, NAT64 and egress networks as IP prefixes; the tools document
+# (`src/tools`) parses a tool mapping's HTTP method, and the policy document
+# (`src/rbac`) its egress and condition networks. Parsing only: no connection
+# is opened.
 http.workspace = true
 ipnet.workspace = true
-# Referenced policy and tools documents must pass their published schemas.
+# Referenced policy and tools documents must pass their published schemas,
+# and a tool definition's input schema must compile (`src/tools`).
 jsonschema.workspace = true
+# Percent-decoding the segments of an origin-relative path and a JSON Schema
+# `$ref` fragment (`src/connections.rs`, `src/tools/definitions.rs`).
+percent-encoding.workspace = true
 # The standalone configuration revision ledger (`src/ledger`), the same
 # bundled SQLite the gateway's standalone stores use.
 rusqlite.workspace = true
@@ -33,8 +39,13 @@ serde.workspace = true
 serde_json.workspace = true
 # Pinned file digests and the ADR-0004 digest frame.
 sha2.workspace = true
+# A policy v1 time-window condition's bounds are RFC 3339 UTC instants
+# (`src/rbac/conditions.rs`). Parsing only: no clock is read.
+time.workspace = true
 # The compiler's one log line: an audit retention of `0` days is taken as no
 # pruning and warned about, by setting name only, as the gateway always has.
+# The policy 0.x reader's one log line: the unknown top-level members it
+# drops, by name (`src/rbac/policy.rs`), as the gateway always has.
 tracing.workspace = true
 # The secret provider documents' endpoint and address validators parse the
 # URLs an operator configures (they never dial them).
@@ -51,3 +62,9 @@ rustix.workspace = true
 proptest.workspace = true
 # Unique temporary bundle directories for the reader's tests.
 uuid.workspace = true
+
+[features]
+# Exposes the test-only policy v1 reading that admits rule conditions
+# (`rbac::policy_document::parse_v1_with_typed_matchers`) to the gateway's
+# tests, through the gateway's dev-dependency. Never enabled by a build.
+test-support = []

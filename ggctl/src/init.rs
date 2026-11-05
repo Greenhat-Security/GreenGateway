@@ -2,10 +2,11 @@
 //! [--format human|json]` (issue #242 PR 6; ADR-0008, "Initialization
 //! profiles" and "Bootstrap model").
 //!
-//! The bundle comes from `gateway_config::bundle::init`, the generator the
-//! gateway's own tests hold to its production validators, and is written by
-//! [`output::write_new_bundle`]: into a new staging directory, read back with
-//! the bundle reader, and only then renamed into place. Without `--answers`
+//! The bundle comes from `gateway_config::bundle::init`, the generator
+//! `gateway-config`'s tests hold to the production validators, and is
+//! written by [`output::write_new_bundle`]: into a new staging directory,
+//! read back with the bundle reader and those validators, and only then
+//! renamed into place. Without `--answers`
 //! the defaults are used; `ggctl` never prompts. The answers file is read
 //! like a trust anchor (a regular file of at most 64 KiB that no other
 //! account can change on Unix), because it decides which issuer the operator
@@ -83,9 +84,6 @@ pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
             Ok(read) => {
                 result.created = true;
                 result.bundle = BundleRecord::of(&read);
-                if validate::supplies_a_resource(&read) {
-                    diagnostics.push(Diagnostic::new(Code::ProductionValidatorsNotRun).into());
-                }
             }
             Err(error) => {
                 if let WriteError::Invalid(read) = &error {

@@ -180,7 +180,6 @@ pub(crate) enum Code {
     // Published schemas.
     UnsupportedSchemaVersion,
     // Bundle validation and the offline doctor.
-    ProductionValidatorsNotRun,
     WarningsAsErrors,
     RequiredCheckFailed,
     // The semantic diff.
@@ -281,7 +280,6 @@ impl Code {
         Self::UnsupportedCapabilitiesVersion,
         Self::CapabilitiesInvalid,
         Self::UnsupportedSchemaVersion,
-        Self::ProductionValidatorsNotRun,
         Self::WarningsAsErrors,
         Self::RequiredCheckFailed,
         Self::DriftFound,
@@ -348,7 +346,7 @@ impl Code {
     }
 
     fn entry(self) -> (&'static str, &'static str, Exit) {
-        use Exit::{Conflict, Denied, Drift, Failure, Invalid, Success, Unavailable, Usage};
+        use Exit::{Conflict, Denied, Drift, Failure, Invalid, Unavailable, Usage};
         match self {
             Self::MissingCommand => ("usage.missing_command", "no command was given", Usage),
             Self::UnknownCommand => ("usage.unknown_command", "the command is not one this ggctl implements", Usage),
@@ -488,11 +486,6 @@ impl Code {
                 "schema.unsupported_api_version",
                 "this ggctl publishes no schema for that kind at that document version",
                 Invalid,
-            ),
-            Self::ProductionValidatorsNotRun => (
-                "validate.production_validators_not_run",
-                "the gateway's production policy and tools validators are not part of ggctl and did not run; the gateway can still refuse a document these checks accept",
-                Success,
             ),
             Self::WarningsAsErrors => (
                 "validate.warnings_as_errors",

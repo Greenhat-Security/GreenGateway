@@ -2,11 +2,12 @@
 //! [--format human|json|sarif]` (issue #242, PR 9; ADR-0008, "Plan, risk
 //! acknowledgment, and conditional apply").
 //!
-//! Both bundles are read by the shared reader, exactly as `ggctl validate`
-//! reads them, and compared by `gateway_config::semantic_diff`, the engine
-//! the gateway's plans will use, so the CLI cannot approximate either. The
-//! change is from the `--against` bundle to `BUNDLE`. Everything written is
-//! value-free because the diff is:
+//! Both bundles are read by the shared reader with the production
+//! validators, exactly as `ggctl validate` reads them, and compared by
+//! `gateway_config::semantic_diff::compare_production_bundles`, the diff the
+//! revision ledger's plans make, by the documents those validators built:
+//! the CLI cannot approximate either. The change is from the `--against`
+//! bundle to `BUNDLE`. Everything written is value-free because the diff is:
 //!
 //! - human: one line per change, then the sorted risk codes;
 //! - `--format json`: one `GgctlReport` whose `result` carries the
@@ -23,8 +24,8 @@
 use std::path::Path;
 
 use gateway_config::{
-    bundle::{self, PublishedSchemasOnly, ReadOptions},
-    semantic_diff::{compare_read_bundles, Change, Display, SemanticDiff, Severity, Shown},
+    bundle::{self, ProductionValidators, ReadOptions},
+    semantic_diff::{compare_production_bundles, Change, Display, SemanticDiff, Severity, Shown},
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -67,15 +68,12 @@ pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
     let base = bundle::read_bundle(
         Path::new(against),
         ReadOptions { strict },
-        &PublishedSchemasOnly,
+        &ProductionValidators,
     );
     let mut diagnostics = validate::diagnostics(&candidate);
     diagnostics.extend(validate::diagnostics(&base));
-    if validate::supplies_a_resource(&candidate) || validate::supplies_a_resource(&base) {
-        diagnostics.push(Diagnostic::new(Code::ProductionValidatorsNotRun).into());
-    }
     let diff = match (&base.bundle, &candidate.bundle) {
-        (Some(base), Some(candidate)) => Some(compare_read_bundles(base, candidate)),
+        (Some(base), Some(candidate)) => Some(compare_production_bundles(base, candidate)),
         _ => None,
     };
     if let (Some(diff), Some(position)) = (&diff, invocation.flag("--check")) {

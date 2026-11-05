@@ -176,7 +176,7 @@ pub(crate) fn assert_no_canary(captured: &Captured) {
 }
 
 #[test]
-fn a_valid_bundle_exits_0_and_says_the_production_validators_did_not_run() {
+fn a_valid_bundle_exits_0_and_says_the_production_validators_passed() {
     let fixture = Fixture::valid();
     let (exit, captured) = run(&["validate", fixture.path()]);
     assert_eq!(exit, Exit::Success);
@@ -196,21 +196,14 @@ fn a_valid_bundle_exits_0_and_says_the_production_validators_did_not_run() {
              connections    server\n"
         )
     );
-    assert_eq!(
-        captured.stderr(),
-        format!(
-            "ggctl: info: validate.production_validators_not_run: {}\n  see: docs/ggctl.md#validate-diagnostics\n",
-            Code::ProductionValidatorsNotRun.message()
-        )
-    );
+    assert_eq!(captured.stderr(), "");
 
     let (exit, captured) = run(&["validate", fixture.path(), "--format", "json"]);
     assert_eq!(exit, Exit::Success);
     let found = report(&captured);
     assert_eq!(found["command"], "validate");
     assert_eq!(found["outcome"], "success");
-    assert_eq!(codes(&found), ["validate.production_validators_not_run"]);
-    assert_eq!(found["diagnostics"][0]["severity"], "info");
+    assert!(codes(&found).is_empty());
     let result = &found["result"];
     assert_eq!(result["valid"], true);
     let bundle = &result["bundle"];
@@ -234,10 +227,42 @@ fn a_valid_bundle_exits_0_and_says_the_production_validators_did_not_run() {
             "file": "policy.json",
             "schemaVersion": "0.1.0",
             "sha256": fixture.pin_of("policy.json"),
-            "productionValidator": "not_run",
+            "productionValidator": "passed",
         })
     );
+    assert_eq!(bundle["tools"]["productionValidator"], "passed");
     assert_eq!(bundle["connections"], "server");
+}
+
+#[test]
+fn a_document_only_the_production_validator_refuses_is_refused_by_code_alone() {
+    // Two route hosts that differ only in case pass the published schema,
+    // whose uniqueness check is exact. The policy loader compares hosts
+    // without case and refuses them, and so does `ggctl validate`, by code
+    // alone: the hosts are never echoed.
+    let policy = format!(
+        "{{\"schema_version\": \"0.1.0\", \"routes\": [{{\"path_prefix\": \"/a\", \"permission\": \"p\", \"hosts\": [\"{CANARY}.example\", \"{}.example\"]}}]}}\n",
+        CANARY.to_ascii_uppercase()
+    );
+    let fixture = Fixture::with("production", &policy);
+    let (exit, captured) = run(&["validate", fixture.path(), "--format", "json"]);
+    assert_eq!(exit, Exit::Invalid);
+    let found = report(&captured);
+    assert_eq!(found["outcome"], "invalid");
+    assert_eq!(found["result"]["valid"], false);
+    assert_eq!(codes(&found), ["resource.invalid"]);
+    assert_eq!(found["diagnostics"][0]["location"]["file"], "policy.json");
+    assert!(found["result"]["bundle"]["policy"]
+        .get("productionValidator")
+        .is_none());
+    assert_no_canary(&captured);
+
+    let (exit, captured) = run(&["validate", fixture.path()]);
+    assert_eq!(exit, Exit::Invalid);
+    assert!(captured
+        .stderr()
+        .starts_with("ggctl: error: resource.invalid: "));
+    assert_no_canary(&captured);
 }
 
 #[test]
@@ -297,9 +322,6 @@ fn a_production_policy_is_held_to_the_profile_invariants() {
             .as_array()
             .expect("diagnostics")
             .iter()
-            .filter(|diagnostic| {
-                diagnostic["code"].as_str() != Some("validate.production_validators_not_run")
-            })
             .map(|diagnostic| {
                 (
                     diagnostic["code"].as_str().expect("code").to_owned(),
@@ -354,13 +376,7 @@ fn warnings_pass_unless_strict_or_warnings_as_errors() {
     assert_eq!(exit, Exit::Success);
     let found = report(&captured);
     assert_eq!(found["result"]["valid"], true);
-    assert_eq!(
-        codes(&found),
-        [
-            "bundle.unreferenced_entry",
-            "validate.production_validators_not_run"
-        ]
-    );
+    assert_eq!(codes(&found), ["bundle.unreferenced_entry"]);
     assert_eq!(found["diagnostics"][0]["severity"], "warning");
     assert_eq!(
         found["diagnostics"][0]["location"],
@@ -379,7 +395,7 @@ fn warnings_pass_unless_strict_or_warnings_as_errors() {
     assert_eq!(found["outcome"], "invalid");
     assert_eq!(found["result"]["valid"], true);
     assert_eq!(
-        found["diagnostics"][2],
+        found["diagnostics"][1],
         json!({
             "code": "validate.warnings_as_errors",
             "severity": "error",
@@ -461,7 +477,6 @@ fn sarif_carries_the_diagnostics_alone_and_keeps_the_exit_code() {
         [
             ("bundle.digest_mismatch", "error", Some("tools.json")),
             ("bundle.unreferenced_entry", "warning", Some("notes.txt")),
-            ("validate.production_validators_not_run", "note", None),
         ]
     );
     assert!(!captured.stdout().contains(fixture.path()));
