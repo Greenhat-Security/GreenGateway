@@ -234,8 +234,22 @@ fn bundle_mappings_follow_the_rules_adr_0008_states() {
                 "{name}: host paths never enter a bundle"
             );
             assert_eq!(
-                path, None,
-                "{name}: the deployment schema defines no setting yet"
+                path.is_some(),
+                field.field_type != FieldType::Json,
+                "{name}: every deployment field but the JSON documents has a document path"
+            );
+            if let Some(path) = path {
+                assert!(
+                    path.starts_with("/spec/"),
+                    "{name}: {path} is beneath /spec"
+                );
+                assert_eq!(field.document_path(), Some(path), "{name}");
+            }
+        } else {
+            assert_eq!(
+                field.document_path(),
+                None,
+                "{name}: only deployment fields have a path"
             );
         }
     }

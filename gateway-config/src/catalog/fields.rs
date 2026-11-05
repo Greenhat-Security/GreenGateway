@@ -23,7 +23,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/listeners/public/address"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ContainerListener),
     },
     Field {
@@ -35,7 +37,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/listeners/admin/address"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::SingleContainerPort),
     },
     Field {
@@ -47,7 +51,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/listeners/grpc/address"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::NoGrpc),
     },
     Field {
@@ -63,7 +69,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/listeners/grpc/max_concurrent_streams"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::NoGrpc),
     },
     Field {
@@ -79,7 +87,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/listeners/grpc/max_metadata_bytes"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::NoGrpc),
     },
     Field {
@@ -139,7 +149,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/listeners/tls/min_version"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::EdgeTerminatesTls),
     },
     Field {
@@ -155,7 +167,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/listeners/tls/handshake_timeout_ms"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::EdgeTerminatesTls),
     },
     Field {
@@ -171,7 +185,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/listeners/tls/max_concurrent_handshakes"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::EdgeTerminatesTls),
     },
     Field {
@@ -183,7 +199,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/listeners/tls/client_certificate_identity"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::NoClientCertificates),
     },
     Field {
@@ -195,7 +213,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/listeners/public/client_certificates"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::NoClientCertificates),
     },
     Field {
@@ -207,7 +227,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/listeners/admin/client_certificates"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::NoClientCertificates),
     },
     Field {
@@ -267,7 +289,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/listeners/admin/prefix"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -279,7 +303,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/admin_login/provider"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -291,7 +317,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/admin_sessions/mode"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -307,7 +335,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/admin_sessions/ttl_secs"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     // Any integer parses. That it lies between 1 and the session's lifetime
@@ -326,7 +356,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/admin_sessions/idle_timeout_secs"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -342,7 +374,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/admin_sessions/max_entries"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -358,7 +392,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/admin_login/pending_ttl_secs"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -374,7 +410,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/admin_login/pending_max_entries"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -390,7 +428,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/admin_login/pending_max_per_ip"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -402,7 +442,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/public_url"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -438,7 +480,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/audit/successful_probes_metrics_only"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -454,7 +498,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/audit/sqlite_retention_days"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -470,7 +516,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/shutdown/drain_delay_ms"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -486,7 +534,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/shutdown/timeout_ms"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -502,7 +552,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/audit/drain_timeout_ms"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -514,7 +566,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/audit/durability"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -530,7 +584,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/audit/durability_timeout_ms"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -558,7 +614,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/discovery/endpoint_limit"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -574,7 +632,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/discovery/projector/lease_ttl_ms"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -590,7 +650,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/discovery/projector/poll_ms"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -606,7 +668,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/discovery/projector/batch"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -762,7 +826,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/discovery/payload_capture/enabled"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -783,7 +849,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/discovery/payload_capture/sample_rate"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -799,7 +867,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/discovery/signals/schema_mismatch_threshold"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -820,7 +890,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/discovery/signals/error_rate_spike_threshold"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -836,7 +908,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/discovery/signals/principal_new_to_endpoint_threshold"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -854,7 +928,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/discovery/signals/volume_outlier_threshold"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -870,7 +946,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/discovery/rule_suggestion_baseline_window_hours"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     // A host path that is neither one of ADR-0008's bootstrap inputs nor a
@@ -932,7 +1010,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/cors/allowed_origins"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -948,7 +1028,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/limits/max_body_bytes"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -964,7 +1046,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/limits/max_request_path_bytes"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -982,7 +1066,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/rate_limits/read/requests_per_second"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -998,7 +1084,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/rate_limits/read/burst"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1016,7 +1104,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/rate_limits/write/requests_per_second"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1032,7 +1122,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/rate_limits/write/burst"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1048,7 +1140,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/rate_limits/max_buckets"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1064,7 +1158,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/rate_limits/bucket_ttl_ms"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1076,7 +1172,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/trusted_proxies/trust_headers"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1088,7 +1186,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/trusted_proxies/cidrs"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1100,7 +1200,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::ClearsDefault,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/authorization/exempt_paths"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1112,7 +1214,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::ClearsDefault,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/limits/allowed_content_types"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1124,7 +1228,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/authentication/enabled"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1136,7 +1242,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/authentication/mode"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1148,7 +1256,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/authentication/cookie_name"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1160,7 +1270,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::ClearsDefault,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/authentication/exempt_paths"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1282,7 +1394,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/authentication/service_token_cache_ttl_ms"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1298,7 +1412,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/tool_runtime/queue_depth"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1314,7 +1430,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/tool_runtime/global_concurrency"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1330,7 +1448,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/tool_runtime/queue_timeout_ms"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1346,7 +1466,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/tool_runtime/lease_ttl_ms"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1362,7 +1484,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/cluster/heartbeat_ms"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     // Its floor of three heartbeats is the ClusterMemberStaleWindow rule.
@@ -1379,7 +1503,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/cluster/member_stale_ms"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -1395,7 +1521,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/cluster/maintenance_interval_ms"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -1411,7 +1539,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/cluster/maintenance_lease_ttl_ms"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -1427,7 +1557,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/cluster/readiness_probe_cache_ms"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     // Honoured in both modes. The Cloudflare wrapper excludes it because it
@@ -1441,7 +1573,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/cluster/status_expose_hostnames"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::NoClusterStatus),
     },
     Field {
@@ -1457,7 +1591,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/audit/postgres_retention_days"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -1473,7 +1609,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/tool_runtime/default_timeout_ms"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1497,7 +1635,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/csrf/enabled"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1509,7 +1649,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/csrf/cookie_name"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1521,7 +1663,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/csrf/header_name"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1533,7 +1677,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/csrf/cookie_domain"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1545,7 +1691,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::ClearsDefault,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/csrf/exempt_paths"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1557,7 +1705,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::MayCarrySecret,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/upstream/url"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1597,7 +1747,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/upstream/timeout_ms"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1613,7 +1765,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/upstream/response_idle_timeout_ms"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1629,7 +1783,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/upstream/connect_timeout_ms"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1641,7 +1797,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/egress/allowed_hosts"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1657,7 +1815,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/egress/timeout_ms"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1673,7 +1833,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/egress/response_idle_timeout_ms"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1689,7 +1851,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/egress/connect_timeout_ms"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1705,7 +1869,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/egress/max_response_bytes"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1721,7 +1887,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/egress/max_request_body_bytes"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1733,7 +1901,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/egress/nat64_prefixes"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1745,7 +1915,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/egress/deny_private_addresses"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1757,7 +1929,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/state/backend"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -1769,7 +1943,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/cluster/deployment_id"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -1796,7 +1972,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/state/postgres/tls_mode"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -1824,7 +2002,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/state/postgres/pool_max"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -1840,7 +2020,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/state/postgres/connect_timeout_ms"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -1856,7 +2038,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/state/postgres/acquire_timeout_ms"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -1872,7 +2056,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/state/postgres/statement_timeout_ms"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -1888,7 +2074,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/state/postgres/idle_in_transaction_timeout_ms"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -1904,7 +2092,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/state/postgres/lock_timeout_ms"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -1920,7 +2110,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/state/postgres/startup_retry_limit"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -1932,7 +2124,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/state/postgres/auto_migrate"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -1948,7 +2142,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/state/postgres/migration_statement_timeout_ms"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     // Read in both modes, unlike the authority-event settings after it.
@@ -1961,7 +2157,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Refused,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/authority_evidence/durability"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1973,7 +2171,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/authority_evidence/event_sink"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     // A host path, like AUDIT_LOG_FILE, that ADR-0008's bootstrap table does
@@ -1999,7 +2199,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/authority_evidence/pseudonym_key_alias"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -2011,7 +2213,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/authority_evidence/previous_pseudonym_key_alias"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -2027,7 +2231,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/authority_evidence/event_journal_capacity"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
     Field {
@@ -2043,7 +2249,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
         state_backends: StateBackends::Cluster,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/authority_evidence/event_retention_hours"),
+        },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
 ];
