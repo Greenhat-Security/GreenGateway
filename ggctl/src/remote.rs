@@ -135,20 +135,17 @@ pub(crate) type TrustAnchors = Vec<reqwest::Certificate>;
 
 /// Loads `--ca-file`: a regular file of at most 1 MiB holding at least one
 /// PEM certificate. These anchors decide which server receives the bearer
-/// token, so on Unix neither the file nor a directory holding it may be
-/// writable by another account ([`FilePermissions::NotWritableByOthers`]).
+/// token, so on Unix no other account may be able to change the file or
+/// what its path resolves to ([`FilePermissions::TrustAnchor`]).
 pub(crate) fn load_roots(path: &Path) -> Result<TrustAnchors, Code> {
-    let bytes = read_regular_file(
-        path,
-        MAX_CA_FILE_BYTES,
-        FilePermissions::NotWritableByOthers,
-    )
-    .map_err(|problem| match problem {
-        FileProblem::Unreadable => Code::CaFileUnreadable,
-        FileProblem::NotRegularFile => Code::CaFileNotRegularFile,
-        FileProblem::UnsafePermissions => Code::CaFileUnsafePermissions,
-        FileProblem::TooLarge => Code::CaFileTooLarge,
-    })?;
+    let bytes = read_regular_file(path, MAX_CA_FILE_BYTES, FilePermissions::TrustAnchor).map_err(
+        |problem| match problem {
+            FileProblem::Unreadable => Code::CaFileUnreadable,
+            FileProblem::NotRegularFile => Code::CaFileNotRegularFile,
+            FileProblem::UnsafePermissions => Code::CaFileUnsafePermissions,
+            FileProblem::TooLarge => Code::CaFileTooLarge,
+        },
+    )?;
     roots_from_pem(&bytes)
 }
 

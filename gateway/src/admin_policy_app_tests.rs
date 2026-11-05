@@ -312,6 +312,115 @@ async fn policy_put_rejects_egress_change_without_persisting_or_swapping() {
     assert!(live_after["egress"].is_null());
 }
 
+/// A policy document of small rules whose compact JSON -- the request body,
+/// and the form a draft is measured in -- is under the 1 MiB policy bound,
+/// and whose policy file, pretty-printed as a standalone commit writes it,
+/// is over it.
+fn policy_document_too_large_for_a_policy_file() -> Value {
+    let bound = usize::try_from(rbac::policy::MAX_POLICY_FILE_BYTES).expect("the bound fits");
+    let mut count = 2_000;
+    loop {
+        let rules = (0..count)
+            .map(|index| {
+                direct_rule_json(
+                    Some(&format!("rule-{index}")),
+                    &["GET"],
+                    &format!("/large/{index}"),
+                    "deny",
+                )
+            })
+            .collect::<Vec<_>>();
+        let document = policy_document_with_rules("large-policy", Value::Array(rules));
+        let policy =
+            rbac::Policy::validate_json_value(document.clone()).expect("the policy is valid");
+        let pretty = serde_json::to_vec_pretty(&policy).expect("the policy serializes");
+        if pretty.len() >= bound {
+            let compact = serde_json::to_vec(&policy).expect("the policy serializes");
+            assert!(
+                compact.len() < bound && document.to_string().len() < bound,
+                "{count} rules are {} bytes compact",
+                compact.len()
+            );
+            return document;
+        }
+        count += 500;
+    }
+}
+
+#[tokio::test]
+async fn policy_put_refuses_a_policy_file_too_large_to_read_back_without_writing_it() {
+    let initial_policy = policy_document_string("initial-policy", "test:old");
+    let policy = TempPolicyFile::new(&initial_policy);
+    let history_db = TempDb::new("policy-file-too-large");
+    let router = policy_admin_router_with_history(Some(&policy), &history_db);
+    let disk_before = fs::read(&policy.path).expect("policy file should read");
+    let (etag_before, live_before) = current_policy(&router).await;
+    let candidate = policy_document_too_large_for_a_policy_file().to_string();
+
+    // Validation reports what a write would refuse, as a refusal of
+    // publication only: the document itself is sound to simulate and test.
+    let validation = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_VALIDATE_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(candidate.clone()),
+            None,
+        ))
+        .await
+        .expect("policy validation should complete");
+    assert_eq!(validation.status(), StatusCode::BAD_REQUEST);
+    let validation = json_body(validation).await;
+    assert_eq!(validation["valid"], json!(false));
+    let diagnostics = validation["diagnostics"]
+        .as_array()
+        .expect("validation lists diagnostics");
+    let refusal = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == json!("policy_file_too_large"))
+        .unwrap_or_else(|| panic!("no policy_file_too_large diagnostic in {diagnostics:?}"));
+    assert_eq!(refusal["severity"], json!("error"));
+    assert_eq!(
+        refusal["blocks"],
+        json!({ "simulation": false, "tests": false, "publication": true, "evidence": false })
+    );
+
+    // Before the fix the commit wrote the file and then could not reload it:
+    // `500`, a POLICY_FILE the gateway refuses to read, and the old policy
+    // still enforced. Now nothing is written.
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(candidate),
+            Some(&etag_before),
+        ))
+        .await
+        .expect("oversized policy PUT should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["valid"], json!(false));
+    assert!(
+        body["errors"][0]
+            .as_str()
+            .is_some_and(|error| error.contains("more than the maximum size of 1048576 bytes")),
+        "unexpected refusal: {body}"
+    );
+    assert_eq!(
+        fs::read(&policy.path).expect("policy file should still read"),
+        disk_before
+    );
+    let (etag_after, live_after) = current_policy(&router).await;
+    assert_eq!(etag_after, etag_before);
+    assert_eq!(live_after, live_before);
+    assert!(policy_history_entries(&router, None).await.is_empty());
+    rbac::Policy::from_file(&policy.path).expect("the policy file still reads back");
+}
+
 #[tokio::test]
 async fn policy_history_records_every_policy_mutation_path_once() {
     let initial_policy = policy_document_with_rules_string(
@@ -3393,25 +3502,137 @@ async fn policy_rule_preview_scan_ceiling_reports_a_truncated_incomplete_count()
     // Three observations fall inside the window, newest first: match-new,
     // wrong-role, match-old. A two-row ceiling reads only the first two, so
     // the one match it saw is not the window's count.
-    let truncated = preview_rule_with_scan_limit(&store, request(), 2)
+    let truncated = preview_rule_within(&store, request(), preview_slot(), 2, preview_deadline())
         .await
         .expect("truncated preview should complete");
     assert_eq!(truncated.scanned_event_count, 2);
     assert_eq!(truncated.match_count, 1);
     assert!(truncated.scan_truncated);
+    assert!(!truncated.deadline_exceeded);
     assert!(!truncated.complete);
     assert_eq!(truncated.samples.len(), 1);
     assert_eq!(truncated.samples[0].event_id, "match-new");
 
     // A ceiling the window exactly fills is not a truncation: every row was
     // read and nothing was left behind.
-    let exact = preview_rule_with_scan_limit(&store, request(), 3)
+    let exact = preview_rule_within(&store, request(), preview_slot(), 3, preview_deadline())
         .await
         .expect("exact-ceiling preview should complete");
     assert_eq!(exact.scanned_event_count, 3);
     assert_eq!(exact.match_count, 2);
     assert!(!exact.scan_truncated);
     assert!(exact.complete);
+}
+
+/// A slot of a limiter no other preview shares, for a preview called
+/// directly rather than through the route.
+fn preview_slot() -> PolicyEvaluationSlot {
+    Arc::new(PolicyEvaluationLimiter::new(1))
+        .try_acquire("rule-preview-test".to_owned())
+        .expect("a fresh limiter admits one preview")
+}
+
+fn preview_deadline() -> Instant {
+    Instant::now() + POLICY_RULE_PREVIEW_DEADLINE
+}
+
+#[tokio::test]
+async fn policy_rule_preview_refuses_conditions_before_reading_any_observation() {
+    let db = TempDb::new("rule-preview-conditions");
+    create_audit_schema(&db.path);
+    seed_rule_preview_events(&db.path);
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let router = policy_admin_router_with_sqlite(Some(&policy), test_audit_log(), Some(&db.path));
+
+    // A wide tree no policy validation would accept -- every branch is an
+    // empty `any`, which is false, so evaluating it per observation visits
+    // every node -- and a valid leaf. The preview refuses both: a retained
+    // observation captures none of the facts a condition reads.
+    let empty_branches = vec![json!({ "any": [] }); 4_096];
+    for conditions in [
+        json!({ "any": empty_branches }),
+        json!({ "source_network": { "cidrs": ["10.0.0.0/8"] } }),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_RULE_PREVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["policy-audit-reader"])),
+                Some(
+                    json!({
+                        "rule": {
+                            "methods": ["GET"],
+                            "path": "/**",
+                            "action": "deny",
+                            "conditions": conditions
+                        }
+                    })
+                    .to_string(),
+                ),
+                None,
+            ))
+            .await
+            .expect("policy rule preview should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["errors"],
+            json!([
+                "rule preview does not support conditions: retained observations do not \
+                 capture the facts conditions read"
+            ])
+        );
+    }
+}
+
+#[tokio::test]
+async fn policy_rule_preview_stops_at_its_deadline_and_returns_its_slot() {
+    let db = TempDb::new("rule-preview-deadline");
+    create_audit_schema(&db.path);
+    seed_rule_preview_events(&db.path);
+    let store = storage::SqliteAuditEventStore::open(&db.path).expect("query store should open");
+    let request = || {
+        parse_rule_preview_body(&Bytes::from(
+            json!({
+                "rule": { "methods": ["GET"], "path": "/api/items/{id}", "action": "deny" },
+                "from": "2024-06-01T12:00:00Z",
+                "to": "2024-06-01T12:00:05Z"
+            })
+            .to_string(),
+        ))
+        .expect("preview request should parse")
+    };
+    let limiter = Arc::new(PolicyEvaluationLimiter::new(1));
+    let slot = || {
+        limiter
+            .try_acquire("rule-preview-deadline".to_owned())
+            .expect("the preview's slot should be free again")
+    };
+
+    // A deadline already passed stops the scan at its first row: nothing is
+    // counted, and the answer says the window was not read rather than that
+    // nothing in it matched.
+    let stopped = preview_rule_within(&store, request(), slot(), 100, Instant::now())
+        .await
+        .expect("a preview past its deadline still answers");
+    assert_eq!(stopped.scanned_event_count, 0);
+    assert_eq!(stopped.match_count, 0);
+    assert!(stopped.scan_truncated);
+    assert!(stopped.deadline_exceeded);
+    assert!(!stopped.complete);
+
+    // The slot came back with the answer, so the same caller is admitted
+    // again, and a scan within its deadline is complete.
+    let finished = preview_rule_within(&store, request(), slot(), 100, preview_deadline())
+        .await
+        .expect("a preview within its deadline completes");
+    assert_eq!(finished.scanned_event_count, 3);
+    assert!(!finished.scan_truncated);
+    assert!(!finished.deadline_exceeded);
+    assert!(finished.complete);
+    drop(slot());
 }
 
 #[tokio::test]
@@ -4326,7 +4547,7 @@ async fn policy_rule_preview_moderate_scale_completes_under_two_seconds() {
     };
 
     let started = Instant::now();
-    let response = preview_rule(&store, request)
+    let response = preview_rule(&store, request, preview_slot())
         .await
         .expect("preview should complete");
     let elapsed = started.elapsed();
