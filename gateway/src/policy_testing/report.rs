@@ -13,9 +13,11 @@ use serde_json::{json, Value};
 use super::{
     runner::{CaseResult, CaseStatus, MatchedView, RunOutcome, RunStatus, Summary},
     suite::SUITE_SCHEMA_VERSION,
+    synthetic::ResourceBinding,
     NOT_EVALUATED,
 };
 use crate::policy_eval::{
+    egress::{EGRESS_CONTEXT_VERSION, EGRESS_SEMANTICS_VERSION},
     tools::{TOOL_CONTEXT_VERSION, TOOL_SEMANTICS_VERSION},
     CONTEXT_VERSION, HTTP_SEMANTICS_VERSION,
 };
@@ -100,6 +102,8 @@ pub(crate) struct EvaluatorBinding {
     pub(crate) http_context_version: u16,
     pub(crate) tool_semantics_version: &'static str,
     pub(crate) tool_context_version: u16,
+    pub(crate) egress_semantics_version: &'static str,
+    pub(crate) egress_context_version: u16,
 }
 
 impl EvaluatorBinding {
@@ -109,6 +113,8 @@ impl EvaluatorBinding {
             http_context_version: CONTEXT_VERSION,
             tool_semantics_version: TOOL_SEMANTICS_VERSION,
             tool_context_version: TOOL_CONTEXT_VERSION,
+            egress_semantics_version: EGRESS_SEMANTICS_VERSION,
+            egress_context_version: EGRESS_CONTEXT_VERSION,
         }
     }
 }
@@ -122,6 +128,8 @@ pub(crate) struct RunReport {
     pub(crate) suite: SuiteBinding,
     pub(crate) policy: PolicyBinding,
     pub(crate) evaluator: EvaluatorBinding,
+    /// The configuration egress cases and rate sequences were decided by.
+    pub(crate) synthetic_resources: ResourceBinding,
     pub(crate) gateway_version: &'static str,
     /// The stages no case's verdict covers. A passing run is a statement about
     /// policy decisions only, never that a real request would succeed.
@@ -142,6 +150,7 @@ impl RunReport {
             },
             policy,
             evaluator: EvaluatorBinding::current(),
+            synthetic_resources: outcome.resources,
             gateway_version: env!("CARGO_PKG_VERSION"),
             not_evaluated: NOT_EVALUATED,
             summary: outcome.summary,
@@ -205,6 +214,10 @@ fn override_text(selected: Option<usize>) -> String {
     )
 }
 
+fn steps_text(steps: &[&str]) -> String {
+    format!("[{}]", steps.join(", "))
+}
+
 fn expected_text(case: &CaseResult, field: &str) -> String {
     let expected = &case.expected;
     let text = match field {
@@ -213,6 +226,7 @@ fn expected_text(case: &CaseResult, field: &str) -> String {
         "reason" => expected.reason.map(str::to_owned),
         "matched" => expected.matched.as_ref().map(matched_text),
         "rate_override" => expected.rate_override.map(override_text),
+        "steps" => expected.steps.as_deref().map(steps_text),
         _ => None,
     };
     text.unwrap_or_else(|| "-".to_owned())
@@ -228,6 +242,7 @@ fn actual_text(case: &CaseResult, field: &str) -> String {
         "reason" => actual.reason.map(str::to_owned),
         "matched" => actual.matched.as_ref().map(matched_text),
         "rate_override" => actual.rate_override.map(override_text),
+        "steps" => actual.steps.as_deref().map(steps_text),
         _ => None,
     };
     text.unwrap_or_else(|| "-".to_owned())
