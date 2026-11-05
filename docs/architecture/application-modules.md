@@ -15,7 +15,7 @@ an exit code. Implementation is grouped by responsibility:
 | `admin_connections`, `admin_tools`, `admin_tokens`, `admin_policy`, `admin_policy_drafts` | Domain-specific handlers and mutations; policy drafts, including a discovery suggestion opened in one, publish only through `admin_policy`'s mutation path |
 | `admin_observability`, `admin_events` | Audit, traffic, signals, suggestions and change telemetry |
 | `admin_responses`, `admin_ui` | Shared error mapping and embedded UI serving |
-| `admin_policy_test_runs`, `admin_policy_tests`, `policy_testing` | Policy test suites: the run endpoint, the stored suite's `GET`/`PUT` (its stores are `storage::policy_tests` and `storage::postgres_policy_tests`), and the state-free suite parser, evaluator-backed runner and JSON/SARIF/JUnit reports |
+| `admin_policy_test_runs`, `admin_policy_tests`, `admin_policy_test_gate`, `policy_testing` | Policy test suites: the run endpoint, the stored suite's `GET`/`PUT` (its stores are `storage::policy_tests` and `storage::postgres_policy_tests`), the `POLICY_TESTS_REQUIRED` gate every policy publication asks inside its commit precondition, and the state-free suite parser, evaluator-backed runner and JSON/SARIF/JUnit reports |
 | `admin_policy_simulations`, `policy_simulation` | Synthetic policy simulation: the simulation endpoint and its concurrency bound, and the state-free request parser, position-aware edits, shadow projections and evaluator-backed runner |
 | `admin_policy_analyses`, `policy_analysis` | Structural policy analysis: the analysis endpoint and its concurrency bound, and the state-free request parser, sound inclusion checks, evaluator-confirmed findings, advisory patches and JSON/SARIF reports |
 | `admin_policy_replays`, `policy_replay` | Historical policy replay: the replay job endpoints, their process-local job registry and quotas, and the state-free `replay-context.v1` record and parser, the legacy adapters that read one out of a stored audit event, their evaluator-backed replay, the `policy-replay.v1` request parser, the bounded job engine and the base-to-candidate and recorded-to-base impact comparison |
@@ -59,8 +59,9 @@ OpenAPI tool registration), `mcp_app_tests.rs` (the MCP endpoint),
 suggestions, principals and schema coverage), `cluster_app_tests.rs` (cluster
 status, readiness and the HA metric registry) and `routing_app_tests.rs`
 (listeners, routing, proxying and the middleware order), beside the
-per-feature `*_app_tests.rs`, `admin_policy_*_tests.rs` and
-`admin_suggestion_drafts_tests.rs` modules it already declared and the
+per-feature `*_app_tests.rs`, `admin_policy_*_tests.rs`,
+`admin_suggestion_drafts_tests.rs` and `admin_suggestion_acceptance_tests.rs`
+modules it already declared and the
 acceptance modules under `tests/`. `app_tests.rs` itself
 defines no tests; it owns the fixtures more than one of these modules uses.
 [The application test inventory](../testing/application-test-inventory.md)

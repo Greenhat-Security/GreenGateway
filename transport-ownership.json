@@ -6929,7 +6929,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "0e8c07209feac6e90a65a6d9ee789a4aeeb2e51a21f92751ed4c8c21d08d2633",
+      "sha256": "4b8dd97b514c4a67403d66db2519e08b2a178b8d3f89c3d9e029446063a182fe",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -7334,6 +7334,16 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_test_gate :: *#1",
+      "sha256": "88b5000e16712f3c60014eb72556124fe9cbcd69866f24b9868107a0b9bd0e0c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
       "file": "gateway/src/admin_policy_simulations.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -7359,6 +7369,16 @@
         "capability-import-or-glob"
       ],
       "scope": "gateway::admin_policy_evidence::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/admin_policy_test_gate.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_test_gate::use super :: *#1",
       "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
@@ -9101,7 +9121,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::record_catalog_change_evidence#1",
-      "sha256": "7703bb8317269a4a230827f47c4761d4f810735be51a5ca044ed1adb1db13c24",
+      "sha256": "abc43238557be529f6656cc1b01ebbb264cf8fa246026b68de4c9ba72f79f8e9",
       "owner": "GreenGateway maintainers",
       "purpose": "Appends one catalog change-evidence row through the caller's open PostgreSQL transaction (issue #425) and counts a refused insert on the in-process evidence-failure counter (issue #440); no new connection, endpoint or transport."
     },
@@ -11168,9 +11188,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::RbacPolicyState#1",
-      "sha256": "a30db022f49cba05f303e2135003bcd2a232174669c9d8d7d88468fce6a6b4eb",
+      "sha256": "2410eb116827f9fdee5881d98962cc01594fb3ebfba59b5d86a1e99b72251557",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #422 structural attribution: the pre-cutover permission engine (engine) and route vector (routes) join the direct-rule matcher as #[cfg(test)] fields kept only for the frozen differential oracles, so serving snapshots carry only the compiled policy, whose own routes, direct rules and permission engine every HTTP and tool-lane decision, audit attribution and management permission reads. cfg gating and doc comments only; no field, client, socket, TLS, DNS or header authority is added."
+      "purpose": "Issue #422 structural attribution: the pre-cutover permission engine (engine) and route vector (routes) join the direct-rule matcher as #[cfg(test)] fields kept only for the frozen differential oracles, so serving snapshots carry only the compiled policy, whose own routes, direct rules and permission engine every HTTP and tool-lane decision, audit attribution and management permission reads. cfg gating and doc comments only; no field, client, socket, TLS, DNS or header authority is added. Reviewed for #243 (decision facts): each snapshot also holds decision_identity, an Arc of the installed policy's ETag, semantic digest and element ids computed once at install; plain data that adds no client, socket, TLS, DNS or header authority."
     },
     {
       "file": "gateway/src/middleware/rbac.rs",
@@ -11188,9 +11208,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::middleware::rbac::impl  RbacState::evaluate_tool_authorization#1",
-      "sha256": "0370b17a9b5d0ac912b875882aa1620bf06ff6dbf790dab3b3f9e98f193de30b",
+      "sha256": "485f2075b7291f8b97da57a2c05c0a3d097abca795782422c859234d5c4c0a3a",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #243 tool lanes: tool admission now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact for source_network conditions; a pure data parameter that adds no network, process or transport capability."
+      "purpose": "Issue #243 tool lanes: tool admission now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact for source_network conditions; a pure data parameter that adds no network, process or transport capability. Reviewed for #243 (decision facts): the authorization handed to the runtime also carries the verdict's decision facts (codes, versions, digests and policy positions); a pure data value that adds no network, process or transport capability."
     },
     {
       "file": "gateway/src/middleware/rbac.rs",
@@ -11228,9 +11248,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::rbac_middleware#1",
-      "sha256": "67c5fb7a91f70ca6e31e5898fbc64b9611a43d5f5c1f20405a5c9db1b8231400",
+      "sha256": "4bcdcc906b161c70262d1faadfc5ef2ed17d70c77acbb30be8c3109ecac77cc7",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority. Reviewed for #243: the decision is now asked with the facts serving_facts takes from the authenticated principal (its verified organization in mapped-role mode), a pure data read that adds no transport, provider, resolver or process authority. Reviewed for #243 (request conditions): the facts now come from policy_facts::http_request_facts -- the canonical client address under the state's ClientIpPolicy, the referenced request headers, the strictly decoded query and an injected clock -- and a query that does not decode strictly is refused as policy_query_undecodable; pure reads of the admitted request that add no transport, provider, resolver or process authority."
+      "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority. Reviewed for #243: the decision is now asked with the facts serving_facts takes from the authenticated principal (its verified organization in mapped-role mode), a pure data read that adds no transport, provider, resolver or process authority. Reviewed for #243 (request conditions): the facts now come from policy_facts::http_request_facts -- the canonical client address under the state's ClientIpPolicy, the referenced request headers, the strictly decoded query and an injected clock -- and a query that does not decode strictly is refused as policy_query_undecodable; pure reads of the admitted request that add no transport, provider, resolver or process authority. Reviewed for #243 (decision facts): a complete verdict's PolicyDecision now carries PolicyDecisionFacts built from the evaluation context, the captured facts and the evaluation it already holds, for the request's observation; a pure data value that adds no transport, provider, resolver or process authority."
     },
     {
       "file": "gateway/src/middleware/validate.rs",
@@ -11418,9 +11438,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::policy_replay::file_attributes#1",
-      "sha256": "54a6a9a8dcff73aefeffeb33ec7c4e3e2a5c5e6cf7351496a4925f485491e960",
+      "sha256": "463a9839a7b1a94a28d2595154ef19b647c7ba5083ab600db2bdd16e92f160ac",
       "owner": "policy replay contexts (#243)",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module: the replay job engine (#243 slice 13) calls the adapters and evaluator and the impact comparison (#243 slice 14) reads the recorded result, while the serialized form and egress replay wait for a record that states them. The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability."
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module: the replay job engine (#243 slice 13) calls the adapters and evaluator and the impact comparison (#243 slice 14) reads the recorded result, while the serialized form and egress replay wait for a record that states them. The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability. Reviewed for #243 (decision facts): the module documentation now describes replay-context.v2 and the recorded decision facts; documentation only, the dead-code gating is unchanged."
     },
     {
       "file": "gateway/src/policy_testing/suite.rs",
@@ -15703,9 +15723,9 @@
         "capability-import-or-glob"
       ],
       "scope": "ggctl::credential::permissions_are_safe#1",
-      "sha256": "cf13be7114107383518f7daa780dffd53a5a9ba9ada3bc822696e54b4796ec47",
+      "sha256": "5edec6137620cfeaf7ffd3c7d7087fcacfc136a0b46dc37d8d4f21f0d986083d",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #242 (operator file safety): reads the Unix mode bits of --token-file, --ca-file, --answers and the bundle.yaml ggctl pin compares through PermissionsExt to refuse a credential group or other can access, or another file they can write. Read-only metadata; no network or process capability."
+      "purpose": "Reviewed for #242 (operator file safety) and #243 (ggctl policy and evidence documents): reads the Unix mode bits of --token-file, --ca-file, --answers and the bundle.yaml ggctl pin compares through PermissionsExt to refuse a credential group or other can access, or another file they can write; a policy or evidence document, which grants nothing, is accepted in any mode. Read-only metadata; no network or process capability."
     },
     {
       "file": "ggctl/src/credential.rs",
@@ -15893,10 +15913,10 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "ggctl::remote::impl  AdminClient::get_json#1",
-      "sha256": "919dd904f3f34d16bb35cc015270dc214805dba8228af411f13406150619572a",
+      "scope": "ggctl::remote::impl  AdminClient::exchange#1",
+      "sha256": "108bb344e1891fe91a3493f84aa99db01ca6f09f3e9c371ec1aa9f9e3cdaec88",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+      "purpose": "Reviewed for #243 (ggctl policy commands): the one request path of ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder. exchange sends one GET, POST or DELETE with an optional JSON body and the bearer token to a path below that base; redirects, 401 and 403 are refused, a body is read only when bounded and of the accepted media type, only visible-ASCII values of the headers a command names are returned, and only a GET whose connection was never established is sent again. The version handshake's get_json now calls it."
     },
     {
       "file": "ggctl/src/remote.rs",
@@ -15913,10 +15933,10 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "ggctl::remote::is_json#1",
-      "sha256": "0d43a2a52b437659c7e44cf99d58e59eac6e246a40e4765980a9b2f6d1f2871e",
+      "scope": "ggctl::remote::has_media_type#1",
+      "sha256": "21c0b77d407ef16f4560edfe1bf369f028da301473237fb902dbe302a510632f",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+      "purpose": "Reviewed for #243 (ggctl policy commands), replacing is_json: compares the Content-Type of an answer of ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder. with the one media type the request accepts (application/json, or application/xml for a JUnit report). Reads a header only; no connection."
     },
     {
       "file": "ggctl/src/remote.rs",

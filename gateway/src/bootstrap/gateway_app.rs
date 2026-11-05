@@ -1164,6 +1164,7 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
         history_store: policy_history_store,
         draft_store: policy_draft_store,
         test_suite_store: policy_test_suite_store,
+        policy_tests_required: config.policy_tests_required,
         #[cfg(feature = "postgres")]
         control_plane: policy_control_plane,
         #[cfg(feature = "postgres")]
@@ -1305,8 +1306,11 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
     let suggestions_admin_state = SuggestionsAdminState {
         suggestion_engine: rule_suggestion_engine,
         policy: policy_admin_state.clone(),
-        lifecycle_guard: Arc::new(tokio::sync::Mutex::new(())),
+        lifecycle_guard: Arc::default(),
     };
+    // Settles a standalone acceptance a previous process left pending
+    // (issue #243) without waiting for the first suggestion request.
+    spawn_suggestion_acceptance_reconciler(suggestions_admin_state.clone(), &app_state.lifecycle);
     let principal_admin_state = PrincipalAdminState {
         directory: principal_directory,
         audit_query_store: audit_query_store.clone(),
