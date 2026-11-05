@@ -2635,6 +2635,29 @@ mod database {
             .await,
             0
         );
+        // Each activation journaled its evidence row in its own transaction
+        // (migration 30), and nothing else the import wrote is journaled.
+        assert_eq!(
+            client_names(
+                &pool,
+                "SELECT j.source FROM greengateway.authority_event_journal j \
+                 JOIN greengateway.document_change_evidence e ON e.event_id = j.event_id \
+                 ORDER BY j.position",
+            )
+            .await,
+            vec![
+                "document_change_evidence".to_owned(),
+                "document_change_evidence".to_owned()
+            ]
+        );
+        assert_eq!(
+            count_of(
+                &pool,
+                "SELECT count(*) FROM greengateway.authority_event_journal"
+            )
+            .await,
+            2
+        );
 
         // No admin session is imported, so no session evidence is either: a
         // grant row would claim a sign-in this cluster never saw.

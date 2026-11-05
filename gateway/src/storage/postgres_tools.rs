@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    change_evidence::{ChangeActor, DocumentAction, DocumentChange},
+    change_evidence::{DocumentAction, DocumentChange},
     policy_history::{PolicyCommitError, PolicyCommitPrecondition},
     postgres_documents::{self, DocumentResource},
     RepositoryError, RepositoryErrorKind,
@@ -52,7 +52,7 @@ pub trait ToolControlPlane: Send + Sync {
         &self,
         precondition: PolicyCommitPrecondition,
         document: &Value,
-        change: DocumentChange<'_>,
+        change: DocumentChange,
         diff_summary: &Value,
     ) -> Result<ActiveToolDocument, PolicyCommitError>;
 }
@@ -114,7 +114,10 @@ impl PostgresToolStore {
     }
 
     /// Idempotently seed the empty tools document. Racing first boots
-    /// produce exactly one seeded document; later boots are no-ops.
+    /// produce exactly one seeded document; later boots are no-ops. The seed
+    /// is the system actor `bootstrap`'s commit: it records and journals its
+    /// evidence like any other, so a full journal refuses it (a later boot
+    /// retries), while a later boot's no-op writes and journals nothing.
     pub async fn seed_empty_document(&self) -> Result<(), PolicyCommitError> {
         let document = empty_tools_document();
         let etag = crate::tools_file_etag(&document).map_err(|_| {
@@ -130,10 +133,7 @@ impl PostgresToolStore {
             postgres_documents::DocumentCommit {
                 document_json: &document.to_string(),
                 document_etag: &etag,
-                change: DocumentChange {
-                    action: DocumentAction::ToolsPublish,
-                    actor: ChangeActor::System { label: SEED_ACTOR },
-                },
+                change: DocumentChange::system(DocumentAction::ToolsPublish, SEED_ACTOR),
                 diff_summary_json: r#"{"action":"tools_seeded"}"#,
                 tool_names: None,
             },
@@ -214,7 +214,7 @@ impl ToolControlPlane for PostgresToolStore {
         &self,
         precondition: PolicyCommitPrecondition,
         document: &Value,
-        change: DocumentChange<'_>,
+        change: DocumentChange,
         diff_summary: &Value,
     ) -> Result<ActiveToolDocument, PolicyCommitError> {
         let etag = crate::tools_file_etag(document).map_err(|_| {
