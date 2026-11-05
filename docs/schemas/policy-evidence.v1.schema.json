@@ -513,7 +513,12 @@
                 "limitations": {
                   "type": "array",
                   "items": {
-                    "enum": ["comparison_budget_exhausted", "deadline_exceeded", "findings_truncated"]
+                    "enum": [
+                      "comparison_budget_exhausted",
+                      "deadline_exceeded",
+                      "findings_truncated",
+                      "resources_unavailable"
+                    ]
                   }
                 },
                 "suppressions": {

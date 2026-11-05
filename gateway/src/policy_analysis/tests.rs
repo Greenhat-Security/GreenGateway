@@ -3409,14 +3409,14 @@ fn unavailable_suppressions_hide_nothing_and_are_reported_unavailable() {
 fn reports_mark_suppressed_expired_and_mismatched_findings_and_count_them() {
     let outcome = run(&policy(base(
         json!([
-            { "path": "/api/**", "action": "allow" },
-            { "path": "/api/admin", "action": "deny" },
-            { "path": "/ops/**", "action": "allow" },
-            { "path": "/ops/admin", "action": "deny" },
-            { "path": "/web/**", "action": "allow" },
-            { "path": "/web/admin", "action": "deny" },
-            { "path": "/docs/**", "action": "allow" },
-            { "path": "/docs/admin", "action": "deny" }
+            { "methods": ["GET"], "path": "/api/**", "action": "allow" },
+            { "methods": ["GET"], "path": "/api/admin", "action": "deny" },
+            { "methods": ["GET"], "path": "/ops/**", "action": "allow" },
+            { "methods": ["GET"], "path": "/ops/admin", "action": "deny" },
+            { "methods": ["GET"], "path": "/web/**", "action": "allow" },
+            { "methods": ["GET"], "path": "/web/admin", "action": "deny" },
+            { "methods": ["GET"], "path": "/docs/**", "action": "allow" },
+            { "methods": ["GET"], "path": "/docs/admin", "action": "deny" }
         ]),
         json!([]),
     )));

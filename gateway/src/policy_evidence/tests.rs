@@ -44,7 +44,10 @@ use crate::{
     },
     rbac::{
         policy_document::inspect_source,
-        policy_resources::{PolicyResourceSnapshot, PolicyResourceView},
+        policy_resources::{
+            AdminSurface, ConnectionInventory, PolicyResourceSnapshot, PolicyResourceView,
+            ToolInventory,
+        },
         Policy,
     },
 };
@@ -97,6 +100,40 @@ fn predecessor_document() -> Value {
 
 fn policy(document: Value) -> Policy {
     Policy::validate_json_value(document).expect("fixture policy validates")
+}
+
+/// Every resource an analysis reads, present and empty, so an analysis of the
+/// fixtures is complete: what a deployment with no tools, no Connections and
+/// a closed egress lane reads.
+fn analysis_resource_view() -> PolicyResourceView {
+    PolicyResourceView {
+        configuration: Some("sha256:configuration".to_owned()),
+        egress: Some(std::sync::Arc::new(
+            crate::policy_eval::egress::CompiledEgressPolicy::new(
+                crate::policy_eval::egress::EgressControls {
+                    allowed_hosts: std::collections::HashSet::new(),
+                    allowed_host_globs: Vec::new(),
+                    allowed_ports: std::collections::HashSet::new(),
+                    deny_private_ips: true,
+                    nat64_prefixes: Vec::new(),
+                    private_ip_allow_cidrs: Vec::new(),
+                },
+            ),
+        )),
+        tools: Some(ToolInventory {
+            names: std::collections::BTreeSet::new(),
+            digest: "sha256:tools".to_owned(),
+        }),
+        connections: Some(ConnectionInventory {
+            etag: "\"connections\"".to_owned(),
+            endpoints: Vec::new(),
+        }),
+        admin: Some(AdminSurface {
+            policy_route: "/v1/admin/policy".to_owned(),
+            policy_route_exempt: false,
+        }),
+        security_revision: None,
+    }
 }
 
 fn reader() -> Value {
@@ -599,7 +636,7 @@ fn suppression_of_duplicate(ended: bool) -> Suppression {
             // A publication is judged on its own, as the endpoint judges it.
             active: &publication,
             global_rate_lanes: None,
-            resource_view: &PolicyResourceView::default(),
+            resource_view: &analysis_resource_view(),
         },
         Instant::now() + Duration::from_secs(5),
     )
@@ -632,7 +669,7 @@ fn analysis_evidence(stored: &StoredCandidate, read: &SuppressionRead) -> Analys
             // A publication is judged on its own, as the endpoint judges it.
             active: &publication,
             global_rate_lanes: None,
-            resource_view: &PolicyResourceView::default(),
+            resource_view: &analysis_resource_view(),
         },
         Instant::now() + Duration::from_secs(5),
     )
