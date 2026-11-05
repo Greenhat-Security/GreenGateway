@@ -6893,7 +6893,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "4b8dd97b514c4a67403d66db2519e08b2a178b8d3f89c3d9e029446063a182fe",
+      "sha256": "2f80bbc7d1eea7f419d71501d8ad05c74e1ff28ca1294b08b49e6605be7da65d",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -9359,6 +9359,16 @@
       "sha256": "0a7475b75811083bc93e00a9edc25b3eb62fc2ffea5a8966a48c44ebb108973a",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): decodes one row of the ledger's local SQLite database through rusqlite's Row, whose name the PostgreSQL client also exports, which is why the guard's conservative global alias union flags it. It adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/mcp_client_configs.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::mcp_client_configs::host_is_loopback#1",
+      "sha256": "a852ed69d98f94c0fda4baaeb76c6a7762df1ea7ca25bb35443f7604fa0e0336",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (MCP client templates): classifies the parsed host of a gateway MCP URL as loopback (localhost or a loopback IPv4/IPv6 literal) so a template never names a plain-http non-loopback endpoint. url::Host is a value from an already-parsed URL; nothing is resolved or connected."
     },
     {
       "file": "gateway/src/connections/secret.rs",
@@ -15632,6 +15642,26 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/admin_mcp_clients.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_mcp_clients::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_mcp_clients :: *#1",
+      "sha256": "73464c2de231005b1d5da40dc33d6cbcf529baad3d886b1aa3b09d60f26a0a89",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
       "file": "gateway/src/storage/contraction.rs",
       "reasons": [
         "network-or-process-reference"
@@ -15877,10 +15907,10 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "ggctl::remote::impl  AdminClient::exchange#1",
-      "sha256": "108bb344e1891fe91a3493f84aa99db01ca6f09f3e9c371ec1aa9f9e3cdaec88",
+      "scope": "ggctl::remote::impl  AdminClient::send#1",
+      "sha256": "692a3e4a7b2a667d13dafd50802407a04b1d17b4597ee8ae2bfd19477c32d793",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #243 (ggctl policy commands): the one request path of ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder. exchange sends one GET, POST or DELETE with an optional JSON body and the bearer token to a path below that base; redirects, 401 and 403 are refused, a body is read only when bounded and of the accepted media type, only visible-ASCII values of the headers a command names are returned, and only a GET whose connection was never established is sent again. The version handshake's get_json now calls it."
+      "purpose": "Reviewed for #243 (ggctl policy commands): the one request path of ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder. send, which exchange calls, sends one GET, POST or DELETE with an optional JSON body and the bearer token to a path below that base; redirects, 401 and 403 are refused, a body is read only when bounded and of the accepted media type, only visible-ASCII values of the headers a command names are returned, and only a GET whose connection was never established is sent again. #242 MCP client templates moved this body from exchange into send unchanged, so that get_json can add the mcp-config route's form-encoded query to the same path below the base: exchange and get_json both call it, and the version handshake and mcp-config read through get_json."
     },
     {
       "file": "ggctl/src/remote.rs",
