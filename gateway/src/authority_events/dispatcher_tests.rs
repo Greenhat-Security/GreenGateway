@@ -212,14 +212,22 @@ impl Producers {
             .expect("the JWT revoke commits");
     }
 
-    async fn create_and_delete_connection(&self, actor: &ChangeActor) {
+    /// Create a Connection without credential authority, replace it with
+    /// one that configures some (a replace and a credential binding change
+    /// under one operation), and delete it: four journaled events.
+    async fn create_rebind_and_delete_connection(&self, actor: &ChangeActor) {
         let stored = self
             .connections
-            .create(candidate(), actor.subject(), None)
+            .create(candidate(), actor, None)
             .await
             .expect("a Connection creates");
+        let rebound = self
+            .connections
+            .replace(&stored.id, &stored.etag(), bound_candidate(), actor)
+            .await
+            .expect("the replace commits");
         self.connections
-            .delete(&stored.id, &stored.etag(), actor)
+            .delete(&rebound.id, &rebound.etag(), actor)
             .await
             .expect("the delete commits");
     }
@@ -239,6 +247,25 @@ fn candidate() -> ConnectionWrite {
         }
     }))
     .expect("the candidate deserializes")
+}
+
+/// The same Connection with a credential binding: replacing [`candidate`]
+/// with it advances the credential revision from 0 to 1.
+fn bound_candidate() -> ConnectionWrite {
+    serde_json::from_value(serde_json::json!({
+        "display_name": "Billing API",
+        "enabled": false,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://billing.example.test",
+            "base_path": "/v1"
+        },
+        "authentication": {
+            "type": "static_bearer",
+            "secret_id": "billing-token"
+        }
+    }))
+    .expect("the bound candidate deserializes")
 }
 
 async fn scalar(pool: &deadpool_postgres::Pool, sql: &str) -> i64 {
@@ -344,7 +371,7 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
         .await;
     producers.revoke_jwt("withdrawn-jti").await;
     producers
-        .create_and_delete_connection(&ChangeActor::for_test("deleting-admin"))
+        .create_rebind_and_delete_connection(&ChangeActor::for_test("deleting-admin"))
         .await;
 
     let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
@@ -357,7 +384,7 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
         term.deliver_until_caught_up(&stop)
             .await
             .expect("delivery succeeds"),
-        Some(6)
+        Some(9)
     );
 
     let delivered = sink.delivered();
@@ -372,9 +399,42 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
             ("3", "service_token.rotate"),
             ("4", "service_token.revoke"),
             ("5", "jwt.revoke"),
-            ("6", "connection.delete"),
+            ("6", "connection.create"),
+            ("7", "connection.replace"),
+            ("8", "credential.binding_change"),
+            ("9", "connection.delete"),
         ]
     );
+    // A Connection's create, replace and delete are on its connection axis,
+    // and the replace's binding change on its credential axis, from the 0
+    // of a Connection created without credential authority, under the
+    // replace's operation and shared revision.
+    assert_eq!(
+        delivered[5..]
+            .iter()
+            .map(|record| (
+                record.resource.kind.as_str(),
+                record.revision.axis.as_str(),
+                record.revision.before.as_deref(),
+                record.revision.after.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("connection", "connection", None, Some("1")),
+            ("connection", "connection", Some("1"), Some("2")),
+            ("connection", "credential", Some("0"), Some("1")),
+            ("connection", "connection", Some("2"), None),
+        ]
+    );
+    assert_eq!(delivered[6].operation_id, delivered[7].operation_id);
+    assert_eq!(
+        delivered[6].revision.security,
+        delivered[7].revision.security
+    );
+    assert_ne!(delivered[5].operation_id, delivered[6].operation_id);
+    assert!(delivered[5..]
+        .iter()
+        .all(|record| record.resource.reference == delivered[5].resource.reference));
     // An issue is the token's first revision on the token axis.
     assert_eq!(
         (
@@ -389,7 +449,9 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
     for table in [
         "service_token_change_evidence ORDER BY security_revision",
         "jwt_revocation_evidence",
-        "connection_change_evidence",
+        // The replace and its binding change share a revision; the replace
+        // row is written first, and sorts first.
+        "connection_change_evidence ORDER BY security_revision, action",
     ] {
         evidence_ids.extend(
             texts(
@@ -431,6 +493,9 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
             (Some("service_token"), Some("service_token"), None),
             (Some("system"), Some("system"), None),
             (Some("principal"), Some("bearer_token"), None),
+            (Some("principal"), Some("bearer_token"), None),
+            (Some("principal"), Some("bearer_token"), None),
+            (Some("principal"), Some("bearer_token"), None),
         ]
     );
     for record in &delivered {
@@ -445,6 +510,8 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
             "service-token:revoking-token",
             "deleting-admin",
             "operator:revoke-jwt",
+            "billing-token",
+            "billing.example.test",
             ISSUER,
             ACTOR_ISSUER,
         ] {
@@ -453,15 +520,15 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
     }
 
     let stats = store.stats().await.expect("stats read");
-    assert_eq!(stats.cursor, Some(6));
-    assert_eq!(stats.head, 6);
+    assert_eq!(stats.cursor, Some(9));
+    assert_eq!(stats.head, 9);
     assert_eq!(stats.undelivered(), 0);
     assert_eq!(stats.oldest_undelivered_age_secs, None);
 
     // A restart resumes from the committed cursor and delivers nothing again.
     drop(term);
     let mut restarted = begin(&store, &sink, &keyring, 100, 2).await;
-    assert_eq!(restarted.committed_position(), 6);
+    assert_eq!(restarted.committed_position(), 9);
     assert_eq!(
         restarted
             .deliver_until_caught_up(&stop)
@@ -776,21 +843,18 @@ async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing() {
         expires_at: None,
     };
     let issuing = ChangeActor::for_test("creating-admin");
-    // Two issues and a rotate fill the journal.
-    let first = producers.token().await;
+    // Two issues and a Connection create fill the journal.
+    producers.token().await;
     let refused = producers
         .tokens
         .create(request(), &issuing)
         .await
         .expect("the issue fits");
-    producers
-        .rotate(&first, &ChangeActor::for_test("rotating-admin"))
-        .await;
     let connection = producers
         .connections
-        .create(candidate(), "deleting-admin", None)
+        .create(candidate(), &issuing, None)
         .await
-        .expect("a create journals nothing and is not refused");
+        .expect("the create fits");
 
     let journal = || {
         texts(
@@ -855,6 +919,25 @@ async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing() {
             .await,
         Err(ConnectionStoreError::Unavailable { operation }) if operation == OPERATION_JOURNAL_APPEND
     ));
+    assert!(matches!(
+        producers
+            .connections
+            .create(candidate(), &issuing, None)
+            .await,
+        Err(ConnectionStoreError::Unavailable { operation }) if operation == OPERATION_JOURNAL_APPEND
+    ));
+    assert!(matches!(
+        producers
+            .connections
+            .replace(
+                &connection.id,
+                &connection.etag(),
+                bound_candidate(),
+                &ChangeActor::for_test("editing-admin")
+            )
+            .await,
+        Err(ConnectionStoreError::Unavailable { operation }) if operation == OPERATION_JOURNAL_APPEND
+    ));
 
     // Nothing the refused changes would have written exists -- no revision
     // spent, no outbox row, no evidence -- and nothing already accepted
@@ -901,7 +984,16 @@ async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing() {
         )
         .await,
         1,
-        "the refused delete left the Connection in place"
+        "the refused delete left the Connection in place, and the refused create made none"
+    );
+    assert_eq!(
+        producers
+            .connections
+            .get(&connection.id)
+            .await
+            .expect("the Connection reads"),
+        Some(connection.clone()),
+        "the refused replace changed nothing"
     );
 
     // Delivery and retention free the room; the refused change then commits
@@ -966,9 +1058,9 @@ async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() 
     let token = producers.token().await;
     let connection = producers
         .connections
-        .create(candidate(), "deleting-admin", None)
+        .create(candidate(), &ChangeActor::for_test("creating-admin"), None)
         .await
-        .expect("a create journals nothing and is not refused");
+        .expect("the create commits");
     let journal = || {
         scalar(
             &pool,
@@ -987,6 +1079,7 @@ async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() 
     let rotating = ChangeActor::for_test("rotating-admin");
     let revoking = ChangeActor::for_test("revoking-admin");
     let deleting = ChangeActor::for_test("deleting-admin");
+    let editing = ChangeActor::for_test("editing-admin");
     let command = ChangeActor::system("operator:revoke-jwt");
     let request = || CreateTokenRequest {
         scopes: vec!["admin:tokens:read".to_owned()],
@@ -1024,7 +1117,22 @@ async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() 
         .delete(&connection.id, &connection.etag(), &deleting)
         .await
         .is_err());
-    assert_eq!(evidence_failures(), 5);
+    assert!(producers
+        .connections
+        .create(candidate(), &issuing, None)
+        .await
+        .is_err());
+    assert!(producers
+        .connections
+        .replace(
+            &connection.id,
+            &connection.etag(),
+            bound_candidate(),
+            &editing
+        )
+        .await
+        .is_err());
+    assert_eq!(evidence_failures(), 7);
     accept_new_rows(&pool, "authority_event_journal").await;
 
     // An evidence table that refuses the insert refuses its own producer:
@@ -1050,14 +1158,31 @@ async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() 
         .await
         .expect_err("a refused evidence insert refuses the JWT revoke");
     accept_new_rows(&pool, "jwt_revocation_evidence").await;
+    // A credential-changing replace is refused at its first row, and counts
+    // once.
     refuse_new_rows(&pool, "connection_change_evidence").await;
     assert!(producers
         .connections
         .delete(&connection.id, &connection.etag(), &deleting)
         .await
         .is_err());
+    assert!(producers
+        .connections
+        .create(candidate(), &issuing, None)
+        .await
+        .is_err());
+    assert!(producers
+        .connections
+        .replace(
+            &connection.id,
+            &connection.etag(),
+            bound_candidate(),
+            &editing
+        )
+        .await
+        .is_err());
     accept_new_rows(&pool, "connection_change_evidence").await;
-    assert_eq!(evidence_failures(), 10);
+    assert_eq!(evidence_failures(), 14);
 
     // Nothing any refused change would have written exists.
     assert_eq!(journal().await, journal_before);
@@ -1087,20 +1212,39 @@ async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() 
         )
         .await,
         1,
-        "the refused delete left the Connection in place"
+        "the refused delete left the Connection in place, and no refused create made one"
+    );
+    assert_eq!(
+        producers
+            .connections
+            .get(&connection.id)
+            .await
+            .expect("the Connection reads"),
+        Some(connection.clone()),
+        "no refused replace changed it"
     );
 
     // The same changes commit once the tables accept rows again, and a
-    // success counts nothing.
+    // success counts nothing: the replace journals its binding change too.
     producers.rotate(&token, &rotating).await;
     producers.revoke_jwt("refused-jti").await;
+    let rebound = producers
+        .connections
+        .replace(
+            &connection.id,
+            &connection.etag(),
+            bound_candidate(),
+            &editing,
+        )
+        .await
+        .expect("the replace commits");
     producers
         .connections
-        .delete(&connection.id, &connection.etag(), &deleting)
+        .delete(&rebound.id, &rebound.etag(), &deleting)
         .await
         .expect("the delete commits");
-    assert_eq!(journal().await, journal_before + 3);
-    assert_eq!(evidence_failures(), 10);
+    assert_eq!(journal().await, journal_before + 5);
+    assert_eq!(evidence_failures(), 14);
     assert_eq!(
         recorder.count(crate::metrics::AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL, &[]),
         0,

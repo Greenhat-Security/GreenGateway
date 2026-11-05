@@ -3,7 +3,8 @@
 Part of [#425](https://github.com/Greenhat-Security/GreenGateway/issues/425), PR 1,
 the first three PR 2 slices (PostgreSQL Connection deletion evidence; service-token
 rotate/revoke and JWT revocation evidence; policy, tools and catalog publication
-evidence), the keyed safe-reference derivation
+evidence), PostgreSQL service-token issue and Connection create, replace and
+credential binding change evidence, the keyed safe-reference derivation
 ([Keyed safe references](#keyed-safe-references)), PR 3's durable delivery
 ([Durable delivery](#durable-delivery)), the journaled evidence's actor metadata
 ([Actor metadata](#actor-metadata)), the cluster admin session evidence in the
@@ -33,7 +34,10 @@ database gains the same columns. Migration 26 makes migration 19's
 capacity held for every session's withdrawal so that a full journal never refuses a
 logout. Migration 27 lets migration 18's token table record the issue of a
 service token too, written and journaled in the create's transaction, and the
-standalone token database rebuilds its own table once to admit it. The first PR 4
+standalone token database rebuilds its own table once to admit it. Migration 28 lets
+migration 16's Connection table record a create, a replace and, when a replace
+changes credential authority, a `credential.binding_change` on the credential
+revision axis, each written and journaled in the change's transaction. The first PR 4
 slice adds migration 12 of the
 standalone Connections database: Connection create/replace/delete and local-secret
 create/rotate/delete/re-encryption write its `connection_change_evidence` and
@@ -86,7 +90,7 @@ or unconfigured individual stores.
 | --- | --- | --- |
 | Policy publish, rollback, rule edits and suggestion acceptance | Immutable document/history, actor subject, action/diff, active pointer, shared revision and outbox, plus one non-cascading `document_change_evidence` row (operation code, event/operation UUIDs, actor kind, subject, issuer and auth mode, prior/new version, the outbox row's shared revision, database-clock time) in the same transaction; suggestion acceptance composes its own state, and so its evidence, in the same transaction | Caller-bound operation identity, safe-reference projection, durable delivery and retention |
 | Tools publication | Shared document transaction plus name reservations and the same `document_change_evidence` row; the first-boot seed and the import's activation are recorded as system actors | Same as policy |
-| Connection and credential binding changes | Record, bindings, immutable version, shared revision and outbox | Actor/history must survive Connection deletion; safe per-operation metadata and delivery. Standalone writes non-cascading create, replace and `credential.binding_change` evidence, with the whole actor, in the Connections database's own transaction ([Standalone evidence](#standalone-evidence)); PostgreSQL does not yet |
+| Connection and credential binding changes | Record, bindings, immutable version, shared revision and outbox, plus since migration 28 a non-cascading `connection_change_evidence` row per committed create (`connection.create`, no prior version and version 1) and replace (`connection.replace`, prior and new specification version), and a `credential.binding_change` row on the credential axis (prior and new credential revision) under the same operation ID and shared revision when a replace advances the credential revision: actor (subject, kind, auth mode, canonical issuer), event/operation UUIDs, the outbox row's shared revision, database-clock time, journaled and delivered in the change's transaction. An identical replace records nothing. No binding, secret ID or locator enters a row. Standalone writes the same rows, without a shared revision, in the Connections database's own transaction ([Standalone evidence](#standalone-evidence)) | A caller-bound operation identity and an issuer-scoped subject reference; Connections created or replaced before migration 28 keep only their cascading version history; standalone evidence is not delivered |
 | Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) and its journal row in the same transaction; delivered with keyed safe references since PR 3; since migration 24 the actor's kind, auth mode and canonical issuer too. Standalone writes the same deletion evidence, without a shared revision, in the Connections database's own transaction | A caller-bound operation identity and an issuer-scoped subject reference, without which the delivered record cannot be `authority_event.v1`; standalone evidence is not delivered |
 | Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox, plus one non-cascading `catalog_change_evidence` row (action derived from the write, event/operation UUIDs, actor subject, catalog revision transition, compiled overlay revision, shared revision, database-clock time) that outlives the replacement and the Connection's deletion | Issuer/auth mode, caller-bound operation identity, journaling for delivery |
 | Service-token issue | Token row with creator, row/shared revisions and outbox, plus since migration 27 a `service_token_change_evidence` row with action `service_token.issue` (actor, event/operation UUIDs, no prior revision and row revision 1, the create outbox row's shared revision, database-clock time) in the create's transaction, journaled and delivered. Standalone writes the same row in the token database's own create transaction. Neither store records the returned plaintext or its hash | A caller-bound operation identity and an issuer-scoped subject reference; tokens issued before the evidence existed keep only `created_by`; standalone evidence is not delivered |
@@ -499,7 +503,12 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
   JWT revocation's under its issuer and `jti` digest, an admin session's under its
   random session ID), and the v1 revision transition as decimal strings. A
   service-token issue (since migration 27) is the token's first revision: `null`
-  before and `1` after, beside its create's shared revision. An admin
+  before and `1` after, beside its create's shared revision. A Connection create
+  (since migration 28) is likewise `null` before and `1` after on the `connection`
+  axis, and a replace advances it; a `credential.binding_change` is on the
+  `credential` axis, where `0` before means the Connection had no credential
+  authority, and names the Connection as its resource, as every Connection change
+  does. An admin
   session record carries `null` for the shared security revision, which a session
   does not take. No identifier, token material, `jti`, issuer or secret reaches
   it.
@@ -567,8 +576,15 @@ Not covered by PR 3, and still open:
   `503` and mints nothing. The dispatcher delivers it on the token axis with no
   revision before it and revision `1` after it. Tokens created before migration 27
   have no issue row, and nothing is backfilled for them.
-- **Every other operation.** PostgreSQL Connection create/replace and credential
-  bindings have no evidence rows to journal yet.
+- **Connection create, replace and credential binding change (migration 28).** A
+  create writes its `connection.create` row, and a replace its `connection.replace`
+  row, after the outbox row and under its shared revision, and journals it in the
+  same transaction; a replace that advances the credential revision also writes and
+  journals a `credential.binding_change` row under the same operation ID and shared
+  revision. A full journal refuses the create or the replace with `503` and commits
+  nothing of it; an identical replace commits nothing and journals nothing.
+  Connections created or replaced before migration 28 have no such rows, and
+  nothing is backfilled for them.
 
 ### Admin session withdrawals and journal capacity
 
@@ -660,8 +676,9 @@ every row:
 
 The admin endpoints build the actor (`auth::change_actor::ChangeActor`) from the
 authenticated `Principal` and pass it to the store, which records it in the
-change's own transaction: Connection delete (`connection_delete_endpoint`), token
-rotate and revoke (`token_rotate_endpoint`, `token_revoke_endpoint`), and the
+change's own transaction: Connection create, replace and delete
+(`connection_create_endpoint`, `connection_put_endpoint`, `connection_delete_endpoint`;
+the PostgreSQL create and replace since migration 28), token issue, rotate and revoke (`token_rotate_endpoint`, `token_revoke_endpoint`), and the
 `revoke-jwt` command, which passes a `system` actor. Each field is bounded by
 exactly the bound authentication enforces (`MAX_PRINCIPAL_SUBJECT_BYTES` and
 `MAX_PRINCIPAL_ISSUER_BYTES`, 4,096 bytes each), so no principal a validator
@@ -678,7 +695,8 @@ that row as any other unprojectable row does.
 
 Tests: the shared service-token change-evidence contract and the JWT revocation
 evidence tests in `gateway/src/storage/contract_tests.rs` (both token stores), the
-Connection deletion evidence tests in `gateway/src/connections/pg_store_tests.rs`,
+Connection deletion, create and replace evidence tests in
+`gateway/src/connections/pg_store_tests.rs`,
 `migration_twenty_four_adds_actor_metadata_and_guesses_none_for_existing_evidence`,
 the standalone column upgrade in `gateway/src/auth/tokens.rs`, the delivery
 projection tests in `gateway/src/authority_events/delivery_tests.rs`, the
@@ -849,12 +867,11 @@ What required mode does not do:
 
 - It refuses no `admitted` row. Several of them are retained but not delivered: the
   policy, tools and catalog evidence rows are not journal sources (admin-session
-  evidence is, since migration 26),
-  cluster Connection create and replace have no evidence row of their own (their
-  immutable version names the actor), and the
+  evidence is, since migration 26), and the
   standalone token, Connection and local-secret evidence has no dispatcher. A
-  cluster Connection's version history still cascades with the Connection, whose
-  deletion has its own evidence row.
+  cluster Connection's version history still cascades with the Connection; its
+  create, replace, credential binding change (since migration 28) and deletion
+  evidence rows do not.
 - It does not refuse configuration activation, external provider rotation or
   anything outside the inventory's matrix (status observations, verification and
   last-use updates, cleanup).
@@ -890,8 +907,18 @@ reload and keep the active document; `config_tests.rs`, `config/stage_tests.rs` 
    evidence-insert failure and its rollback, and reconciling a lost response
    from the evidence row; CI runs them against its disposable loopback database,
    not verified TLS. Migration 24 adds the deleting actor's kind, auth mode and
-   canonical issuer ([Actor metadata](#actor-metadata)). Still open for this row: a
-   caller-bound operation identity at the store boundary.
+   canonical issuer ([Actor metadata](#actor-metadata)). Migration 28 extends the
+   table to Connection create and replace, and to the credential binding change a
+   replace records on the credential axis when it advances the credential revision,
+   each written and journaled in the change's own transaction with the whole actor;
+   PostgreSQL-gated store tests cover attribution, a stale ETag, a moved collection,
+   the capacity bound and an unrecordable actor writing nothing, racing writers
+   leaving only the winner's rows, forced evidence and journal failures rolling the
+   change back, a full journal refused with `503`, survival after delete and
+   restart, and the absence of specification, binding and secret material.
+   Connections created or replaced before migration 28 keep only their cascading
+   version history. Still open for this row: a caller-bound operation identity at
+   the store boundary.
 2. **Service-token and JWT metadata (landed).** `ServiceTokenStore` rotate and
    revoke now take the mutating actor, and both adapters write one evidence row
    per committed change in the change's own transaction: migration 18's

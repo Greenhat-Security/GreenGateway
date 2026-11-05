@@ -234,7 +234,11 @@ async fn records_create_replace_delete_with_cas_and_shared_state_bumps() {
     // one immutable document version, one outbox row identifying the
     // connection, and both revision counters advanced.
     let created = store
-        .create(http_candidate("Billing API"), "op-1", None)
+        .create(
+            http_candidate("Billing API"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await
         .expect("create should commit");
     assert_eq!(created.revisions.connection, 1);
@@ -298,7 +302,12 @@ async fn records_create_replace_delete_with_cas_and_shared_state_bumps() {
         .etag();
     let winner_candidate = http_candidate("Renamed API");
     let replaced = store
-        .replace(&created.id, &current_etag, winner_candidate, "op-3")
+        .replace(
+            &created.id,
+            &current_etag,
+            winner_candidate,
+            &ChangeActor::for_test("op-3"),
+        )
         .await
         .expect("replace should win");
     assert_eq!(replaced.revisions.connection, 2);
@@ -314,7 +323,7 @@ async fn records_create_replace_delete_with_cas_and_shared_state_bumps() {
             &created.id,
             &identical_etag,
             http_candidate("Renamed API"),
-            "op-4",
+            &ChangeActor::for_test("op-4"),
         )
         .await
         .expect("identical replace is a no-op");
@@ -326,7 +335,12 @@ async fn records_create_replace_delete_with_cas_and_shared_state_bumps() {
 
     // A stale etag loses with Conflict and writes nothing.
     let lost = store
-        .replace(&created.id, &stale_etag, http_candidate("Loser"), "op-5")
+        .replace(
+            &created.id,
+            &stale_etag,
+            http_candidate("Loser"),
+            &ChangeActor::for_test("op-5"),
+        )
         .await
         .expect_err("the stale etag must lose");
     assert!(
@@ -407,7 +421,7 @@ async fn additional_header_bindings_round_trip_and_advance_the_credential_axis()
     ]))
     .expect("additional headers should deserialize");
     let created = store
-        .create(write, "additional-create", None)
+        .create(write, &ChangeActor::for_test("additional-create"), None)
         .await
         .expect("Connection with additional headers should create");
     assert_eq!(created.revisions.credential, 1);
@@ -467,7 +481,7 @@ async fn additional_header_bindings_round_trip_and_advance_the_credential_axis()
             &created.id,
             &created.etag(),
             replacement,
-            "additional-replace",
+            &ChangeActor::for_test("additional-replace"),
         )
         .await
         .expect("Connection with additional headers should replace");
@@ -501,25 +515,33 @@ async fn concurrent_same_etag_replaces_produce_exactly_one_winner() {
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
     let created = store
-        .create(http_candidate("Race Base"), "op-1", None)
+        .create(
+            http_candidate("Race Base"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await
         .expect("create should commit");
     let etag = created.etag();
 
     let store_a = PostgresConnectionStore::new(pool.clone(), 64).expect("store a");
     let store_b = PostgresConnectionStore::new(pool.clone(), 64).expect("store b");
+    let (replica_a, replica_b) = (
+        ChangeActor::for_test("replica-a"),
+        ChangeActor::for_test("replica-b"),
+    );
     let (a, b) = tokio::join!(
         store_a.replace(
             &created.id,
             &etag,
             http_candidate("Replica A Wins"),
-            "replica-a"
+            &replica_a
         ),
         store_b.replace(
             &created.id,
             &etag,
             http_candidate("Replica B Wins"),
-            "replica-b"
+            &replica_b
         )
     );
     let winners = usize::from(a.is_ok()) + usize::from(b.is_ok());
@@ -545,11 +567,19 @@ async fn capacity_and_binding_tamper_fail_closed() {
     let (store, pool) = migrated_store(&database.dsn, 1).await;
 
     store
-        .create(http_candidate("Only One"), "op-1", None)
+        .create(
+            http_candidate("Only One"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await
         .expect("first create fits");
     let limited = store
-        .create(http_candidate("Second"), "op-2", None)
+        .create(
+            http_candidate("Second"),
+            &ChangeActor::for_test("op-2"),
+            None,
+        )
         .await
         .expect_err("the capacity limit must hold");
     assert!(
@@ -622,9 +652,13 @@ async fn concurrent_creates_at_capacity_produce_exactly_one_winner() {
     let (store_a, pool_a) = migrated_store(&database.dsn, 1).await;
     let (store_b, _pool_b) = migrated_store(&database.dsn, 1).await;
 
+    let (replica_a, replica_b) = (
+        ChangeActor::for_test("replica-a"),
+        ChangeActor::for_test("replica-b"),
+    );
     let (a, b) = tokio::join!(
-        store_a.create(http_candidate("Replica A"), "replica-a", None),
-        store_b.create(http_candidate("Replica B"), "replica-b", None)
+        store_a.create(http_candidate("Replica A"), &replica_a, None),
+        store_b.create(http_candidate("Replica B"), &replica_b, None)
     );
     let winners = usize::from(a.is_ok()) + usize::from(b.is_ok());
     assert_eq!(winners, 1, "the last free slot is taken exactly once");
@@ -681,7 +715,7 @@ async fn record_and_bindings_are_read_from_one_snapshot() {
     let created = reader
         .create(
             http_candidate_with_secret("Snapshot", "billing-token"),
-            "op-1",
+            &ChangeActor::for_test("op-1"),
             None,
         )
         .await
@@ -702,7 +736,7 @@ async fn record_and_bindings_are_read_from_one_snapshot() {
             &created.id,
             &stale.etag(),
             http_candidate_with_secret("Snapshot", "billing-token-v2"),
-            "op-2",
+            &ChangeActor::for_test("op-2"),
         )
         .await
         .expect("the concurrent replacement should commit");
@@ -731,7 +765,7 @@ async fn record_and_bindings_are_read_from_one_snapshot() {
             &created.id,
             &replaced.etag(),
             http_candidate_with_secret("Snapshot", "billing-token-v3"),
-            "op-3",
+            &ChangeActor::for_test("op-3"),
         )
         .await
         .expect("the second concurrent replacement should commit");
@@ -766,7 +800,11 @@ async fn dependency_counts_fail_closed_above_the_dependency_bound() {
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
     let created = store
-        .create(http_candidate("Counted"), "op-1", None)
+        .create(
+            http_candidate("Counted"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await
         .expect("create should commit");
 
@@ -858,7 +896,7 @@ async fn changing_the_catalog_kind_under_a_published_catalog_is_refused() {
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
     let created = store
-        .create(mcp_candidate(), "op-1", None)
+        .create(mcp_candidate(), &ChangeActor::for_test("op-1"), None)
         .await
         .expect("MCP connection should create");
     store
@@ -907,7 +945,12 @@ async fn changing_the_catalog_kind_under_a_published_catalog_is_refused() {
     .expect("OpenAPI candidate should deserialize");
 
     let refused = store
-        .replace(&created.id, &current.etag(), different_kind.clone(), "op-3")
+        .replace(
+            &created.id,
+            &current.etag(),
+            different_kind.clone(),
+            &ChangeActor::for_test("op-3"),
+        )
         .await
         .expect_err("the kind change must be refused while a catalog is published");
     assert!(
@@ -966,7 +1009,7 @@ async fn changing_the_catalog_kind_under_a_published_catalog_is_refused() {
             &created.id,
             &after_withdrawal.etag(),
             different_kind,
-            "op-5",
+            &ChangeActor::for_test("op-5"),
         )
         .await
         .expect("the kind change is allowed once no managed-tool rows remain");
@@ -994,7 +1037,7 @@ async fn mcp_catalog_replaces_with_cas_revisions_dependencies_and_outbox() {
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
     let created = store
-        .create(mcp_candidate(), "op-1", None)
+        .create(mcp_candidate(), &ChangeActor::for_test("op-1"), None)
         .await
         .expect("MCP connection should create");
     let etag = created.etag();
@@ -1072,7 +1115,7 @@ async fn mcp_catalog_replaces_with_cas_revisions_dependencies_and_outbox() {
     let mut renamed = mcp_candidate();
     renamed.display_name = "Renamed MCP".to_owned();
     let fresh_record_etag = store
-        .replace(&created.id, &etag, renamed, "op-3")
+        .replace(&created.id, &etag, renamed, &ChangeActor::for_test("op-3"))
         .await
         .expect("record replace should win")
         .etag();
@@ -1141,7 +1184,7 @@ async fn a_stale_catalog_revision_is_refused_even_under_a_fresh_connection_etag(
     let database = create_test_database(&admin_dsn).await;
     let (store, _pool) = migrated_store(&database.dsn, 64).await;
     let created = store
-        .create(mcp_candidate(), "op-1", None)
+        .create(mcp_candidate(), &ChangeActor::for_test("op-1"), None)
         .await
         .expect("MCP connection should create");
 
@@ -1245,7 +1288,7 @@ async fn concurrent_creates_under_one_collection_etag_produce_exactly_one_winner
             store
                 .create(
                     http_candidate(name),
-                    "op",
+                    &ChangeActor::for_test("op"),
                     Some(super::super::store::CollectionCheck {
                         expected_etag: "empty",
                         compute: &derive,
@@ -1288,7 +1331,7 @@ async fn retained_mcp_catalog_bytes_charge_entries_resources_and_templates() {
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
     let created = store
-        .create(mcp_candidate(), "op-1", None)
+        .create(mcp_candidate(), &ChangeActor::for_test("op-1"), None)
         .await
         .expect("MCP connection should create");
 
@@ -1419,7 +1462,11 @@ async fn openapi_overlay_catalog_cas_prune_and_restart_are_atomic() {
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
     let api = store
-        .create(http_candidate("Overlay API"), "overlay-op-1", None)
+        .create(
+            http_candidate("Overlay API"),
+            &ChangeActor::for_test("overlay-op-1"),
+            None,
+        )
         .await
         .expect("connection should create");
     let digest = reservation_spec_digest();
@@ -1876,7 +1923,11 @@ async fn enum_source_initial_cas_has_one_cross_replica_winner() {
     let (store_a, pool) = migrated_store(&database.dsn, 64).await;
     let store_b = PostgresConnectionStore::new(pool.clone(), 64).expect("second replica");
     let api = store_a
-        .create(http_candidate("Enum CAS API"), "enum-cas-create", None)
+        .create(
+            http_candidate("Enum CAS API"),
+            &ChangeActor::for_test("enum-cas-create"),
+            None,
+        )
         .await
         .expect("connection should create");
     let digest = reservation_spec_digest();
@@ -1977,7 +2028,11 @@ async fn policy_and_overlay_name_adoption_serialize_in_commit_order_across_repli
     // advisory waiters in queue order, so the overlay observes that
     // authoritative commit and must refuse adoption of its name.
     let policy_first_api = store
-        .create(http_candidate("Policy-first API"), "race-create-a", None)
+        .create(
+            http_candidate("Policy-first API"),
+            &ChangeActor::for_test("race-create-a"),
+            None,
+        )
         .await
         .expect("policy-first Connection should create");
     let blocker = pool.get().await.expect("blocker checkout");
@@ -2076,7 +2131,11 @@ async fn policy_and_overlay_name_adoption_serialize_in_commit_order_across_repli
     // the unclaimed name; the later policy is deliberately allowed to
     // grant that now-existing tool.
     let overlay_first_api = store
-        .create(http_candidate("Overlay-first API"), "race-create-b", None)
+        .create(
+            http_candidate("Overlay-first API"),
+            &ChangeActor::for_test("race-create-b"),
+            None,
+        )
         .await
         .expect("overlay-first Connection should create");
     blocker
@@ -2207,7 +2266,7 @@ fn mcp_resource(uri: &str) -> StoredMcpResource {
 
 async fn published_mcp_catalog(store: &PostgresConnectionStore) -> StoredConnection {
     let mcp = store
-        .create(mcp_candidate(), "op-1", None)
+        .create(mcp_candidate(), &ChangeActor::for_test("op-1"), None)
         .await
         .expect("create");
     store
@@ -2303,7 +2362,11 @@ async fn persisted_openapi_entry_edited_out_of_band_loads_as_corruption() {
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
     let api = store
-        .create(http_candidate("Billing API"), "op-3", None)
+        .create(
+            http_candidate("Billing API"),
+            &ChangeActor::for_test("op-3"),
+            None,
+        )
         .await
         .expect("create");
     store
@@ -2538,20 +2601,27 @@ async fn delete_flushes_queued_dependency_guards_before_it_is_judged() {
         .await
         .expect("an unreferenced Connection deletes");
 
-    // The actor the control plane is handed reaches the authority: the
-    // refused attempt left no evidence and the committed one names op-3.
-    let actors: Vec<String> = client
+    // The actor the control plane is handed reaches the authority: beside
+    // the create's row, the refused attempt left no evidence and the
+    // committed one names op-3.
+    let actors: Vec<(String, String)> = client
         .query(
-            "SELECT actor_user_id FROM greengateway.connection_change_evidence \
-             WHERE connection_id = $1::text::uuid",
+            "SELECT action, actor_user_id FROM greengateway.connection_change_evidence \
+             WHERE connection_id = $1::text::uuid ORDER BY security_revision",
             &[&record.id.as_str()],
         )
         .await
         .expect("evidence")
         .iter()
-        .map(|row| row.get(0))
+        .map(|row| (row.get(0), row.get(1)))
         .collect();
-    assert_eq!(actors, ["op-3"]);
+    assert_eq!(
+        actors,
+        [
+            ("connection.create".to_owned(), "op-1".to_owned()),
+            ("connection.delete".to_owned(), "op-3".to_owned())
+        ]
+    );
 }
 
 /// The authority itself refuses a tool name another lane holds, so two
@@ -2571,7 +2641,11 @@ async fn tool_names_are_reserved_across_lanes_at_the_authority() {
     tools.seed_empty_document().await.expect("seed");
     let digest = reservation_spec_digest();
     let api = store
-        .create(http_candidate("Billing API"), "op-1", None)
+        .create(
+            http_candidate("Billing API"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await
         .expect("create");
     store
@@ -2617,7 +2691,11 @@ async fn tool_names_are_reserved_across_lanes_at_the_authority() {
 
     // Nor can a second Connection.
     let other = store
-        .create(http_candidate("Other API"), "op-4", None)
+        .create(
+            http_candidate("Other API"),
+            &ChangeActor::for_test("op-4"),
+            None,
+        )
         .await
         .expect("create");
     let refused = store
@@ -2748,7 +2826,11 @@ async fn concurrent_cross_lane_publishes_of_one_tool_name_produce_exactly_one_wi
     for round in 0..4 {
         let name = format!("raced_{round}");
         let api = store
-            .create(http_candidate(&format!("API {round}")), "op-c", None)
+            .create(
+                http_candidate(&format!("API {round}")),
+                &ChangeActor::for_test("op-c"),
+                None,
+            )
             .await
             .expect("create");
         let active = tools.active_tools().await.expect("active").expect("seeded");
@@ -2819,7 +2901,11 @@ async fn openapi_catalog_triple_cas_and_status_append() {
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
     let created = store
-        .create(http_candidate("Billing API"), "op-1", None)
+        .create(
+            http_candidate("Billing API"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await
         .expect("OpenAPI connection should create");
 
@@ -3018,7 +3104,11 @@ async fn a_stale_dependency_flush_never_replaces_a_newer_documents_guards() {
     let database = create_test_database(&admin_dsn).await;
     let (store, _pool) = migrated_store(&database.dsn, 64).await;
     let created = store
-        .create(http_candidate("Billing API"), "op-1", None)
+        .create(
+            http_candidate("Billing API"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await
         .expect("connection should create");
     let manual_tools = |deps: Vec<ConnectionDependency>| {
@@ -3109,7 +3199,11 @@ async fn operation_ids_are_bounded_by_characters_not_bytes() {
     let database = create_test_database(&admin_dsn).await;
     let (store, _pool) = migrated_store(&database.dsn, 64).await;
     let api = store
-        .create(http_candidate("Billing API"), "op-1", None)
+        .create(
+            http_candidate("Billing API"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await
         .expect("connection should create");
     let mut entry = openapi_entry("billing.list");
@@ -3141,7 +3235,11 @@ async fn status_revisions_are_read_from_the_authority() {
     let database = create_test_database(&admin_dsn).await;
     let (store, _pool) = migrated_store(&database.dsn, 64).await;
     let created = store
-        .create(http_candidate("Billing API"), "op-1", None)
+        .create(
+            http_candidate("Billing API"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await
         .expect("connection should create");
     let before = store
@@ -3206,11 +3304,19 @@ async fn global_history_pruning_preserves_every_connections_current_status() {
     let seed_limit = i64::try_from(maximum).expect("history limit should fit PostgreSQL");
 
     let quiet = store
-        .create(http_candidate("Quiet API"), "op-1", None)
+        .create(
+            http_candidate("Quiet API"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await
         .expect("quiet connection should create");
     let noisy = store
-        .create(http_candidate("Noisy API"), "op-2", None)
+        .create(
+            http_candidate("Noisy API"),
+            &ChangeActor::for_test("op-2"),
+            None,
+        )
         .await
         .expect("noisy connection should create");
 
@@ -3401,7 +3507,7 @@ async fn global_history_pruning_preserves_every_connections_current_status() {
     );
 }
 
-// ==== Connection change evidence (issue #425, PR 2; migration 16) ====
+// ==== Connection change evidence (issue #425, PR 2; migrations 16 and 28) ====
 
 /// One `connection_change_evidence` row, every column, read as text where
 /// the column is a UUID or timestamp so no extra type support is needed.
@@ -3415,23 +3521,28 @@ struct EvidenceRow {
     actor_auth_mode: Option<String>,
     action: String,
     connection_id: String,
-    prior_version: i64,
+    revision_axis: String,
+    prior_version: Option<i64>,
+    new_version: Option<i64>,
     security_revision: i64,
     committed_at: String,
 }
 
-/// The whole evidence table in commit order.
+/// The whole evidence table in commit order: by shared revision, and within
+/// one transaction in the order its rows were journaled.
 async fn evidence_rows(pool: &deadpool_postgres::Pool) -> Vec<EvidenceRow> {
     pool.get()
         .await
         .expect("evidence checkout")
         .query(
             r#"
-            SELECT event_id::text, operation_id::text, actor_user_id, action,
-                   connection_id::text, prior_version, security_revision,
-                   committed_at::text, actor_issuer, actor_kind, actor_auth_mode
-            FROM greengateway.connection_change_evidence
-            ORDER BY security_revision, event_id
+            SELECT e.event_id::text, e.operation_id::text, e.actor_user_id, e.action,
+                   e.connection_id::text, e.prior_version, e.security_revision,
+                   e.committed_at::text, e.actor_issuer, e.actor_kind, e.actor_auth_mode,
+                   e.revision_axis, e.new_version
+            FROM greengateway.connection_change_evidence e
+            LEFT JOIN greengateway.authority_event_journal j ON j.event_id = e.event_id
+            ORDER BY e.security_revision, j.position, e.event_id
             "#,
             &[],
         )
@@ -3447,11 +3558,36 @@ async fn evidence_rows(pool: &deadpool_postgres::Pool) -> Vec<EvidenceRow> {
             actor_auth_mode: row.get(10),
             action: row.get(3),
             connection_id: row.get(4),
+            revision_axis: row.get(11),
             prior_version: row.get(5),
+            new_version: row.get(12),
             security_revision: row.get(6),
             committed_at: row.get(7),
         })
         .collect()
+}
+
+/// The rows of one action, in the order given.
+fn of_action(rows: &[EvidenceRow], action: &str) -> Vec<EvidenceRow> {
+    rows.iter()
+        .filter(|row| row.action == action)
+        .cloned()
+        .collect()
+}
+
+/// Every evidence row as JSON text, for material that must never be in it.
+async fn evidence_text(pool: &deadpool_postgres::Pool) -> String {
+    pool.get()
+        .await
+        .expect("evidence text checkout")
+        .query_one(
+            "SELECT coalesce(string_agg(row_to_json(e)::text, E'\\n'), '') \
+             FROM greengateway.connection_change_evidence e",
+            &[],
+        )
+        .await
+        .expect("evidence rows should encode")
+        .get::<_, String>(0)
 }
 
 async fn security_revision(pool: &deadpool_postgres::Pool) -> i64 {
@@ -3529,13 +3665,19 @@ async fn deletion_evidence_survives_cascade_and_restart_and_reconciles_a_lost_re
             "committed_at",
             "actor_kind",
             "actor_auth_mode",
-            "actor_issuer"
+            "actor_issuer",
+            "new_version",
+            "revision_axis"
         ],
         "evidence holds identifiers, revisions and the actor; a new column needs review"
     );
 
     let created = store
-        .create(http_candidate("Evidence API"), "creating-admin", None)
+        .create(
+            http_candidate("Evidence API"),
+            &ChangeActor::for_test("creating-admin"),
+            None,
+        )
         .await
         .expect("create should commit");
     let replaced = store
@@ -3543,13 +3685,13 @@ async fn deletion_evidence_survives_cascade_and_restart_and_reconciles_a_lost_re
             &created.id,
             &created.etag(),
             http_candidate("Evidence API v2"),
-            "editing-admin",
+            &ChangeActor::for_test("editing-admin"),
         )
         .await
         .expect("replace should commit");
     assert_eq!(replaced.revisions.connection, 2);
     assert!(
-        evidence_rows(&pool).await.is_empty(),
+        of_action(&evidence_rows(&pool).await, "connection.delete").is_empty(),
         "create and replace record no deletion evidence"
     );
 
@@ -3591,10 +3733,21 @@ async fn deletion_evidence_survives_cascade_and_restart_and_reconciles_a_lost_re
         (2, 0),
         "the tombstone keeps its prior version and the 0 deletion sentinel"
     );
-    // ...and the evidence names who did it, bound to that tombstone.
+    // ...and the evidence names who did it, bound to that tombstone, beside
+    // the create's and the replace's, which outlive the record too.
     let evidence = evidence_rows(&pool).await;
-    assert_eq!(evidence.len(), 1, "{evidence:?}");
-    let row = &evidence[0];
+    assert_eq!(
+        evidence
+            .iter()
+            .map(|row| row.action.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "connection.create",
+            "connection.replace",
+            "connection.delete"
+        ]
+    );
+    let row = &evidence[2];
     assert_eq!(row.action, "connection.delete");
     assert_eq!(row.actor_user_id, "deleting-admin");
     assert_eq!(
@@ -3611,7 +3764,15 @@ async fn deletion_evidence_survives_cascade_and_restart_and_reconciles_a_lost_re
         "the deleting principal's canonical issuer, kind and auth mode"
     );
     assert_eq!(row.connection_id, created.id.as_str());
-    assert_eq!(row.prior_version, 2);
+    assert_eq!(
+        (
+            row.revision_axis.as_str(),
+            row.prior_version,
+            row.new_version
+        ),
+        ("connection", Some(2), None),
+        "a deletion keeps its prior version and no successor"
+    );
     assert_eq!(row.security_revision, tombstone_revision);
     assert_eq!(security_revision(&pool).await, tombstone_revision);
     assert_ne!(row.event_id, row.operation_id);
@@ -3619,23 +3780,14 @@ async fn deletion_evidence_survives_cascade_and_restart_and_reconciles_a_lost_re
         count(
             &pool,
             "SELECT COUNT(*) FROM greengateway.connection_change_evidence \
-             WHERE committed_at <= now() AND committed_at > now() - interval '1 hour'",
+             WHERE action = 'connection.delete' \
+               AND committed_at <= now() AND committed_at > now() - interval '1 hour'",
         )
         .await,
         1,
         "committed_at is the database clock's"
     );
-    let stored = pool
-        .get()
-        .await
-        .expect("evidence text checkout")
-        .query_one(
-            "SELECT row_to_json(e)::text FROM greengateway.connection_change_evidence e",
-            &[],
-        )
-        .await
-        .expect("evidence row should encode")
-        .get::<_, String>(0);
+    let stored = evidence_text(&pool).await;
     for material in [
         "billing-token",
         "billing.example.test",
@@ -3695,10 +3847,15 @@ async fn refused_deletes_write_no_evidence() {
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
     let created = store
-        .create(http_candidate("Guarded API"), "op-1", None)
+        .create(
+            http_candidate("Guarded API"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await
         .expect("create should commit");
     let revision_before = security_revision(&pool).await;
+    let evidence_before = evidence_rows(&pool).await;
 
     let stale = store
         .delete(
@@ -3774,7 +3931,7 @@ async fn refused_deletes_write_no_evidence() {
         );
     }
 
-    assert!(evidence_rows(&pool).await.is_empty());
+    assert_eq!(evidence_rows(&pool).await, evidence_before);
     assert_eq!(
         security_revision(&pool).await,
         revision_before,
@@ -3799,7 +3956,7 @@ async fn refused_deletes_write_no_evidence() {
         )
         .await
         .expect("a maximal principal subject and issuer still delete");
-    let evidence = evidence_rows(&pool).await;
+    let evidence = of_action(&evidence_rows(&pool).await, "connection.delete");
     assert_eq!(evidence.len(), 1);
     assert_eq!(evidence[0].actor_user_id, maximal_actor);
     assert_eq!(
@@ -3821,7 +3978,11 @@ async fn concurrent_deletes_produce_one_winner_and_one_evidence_row() {
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
     let created = store
-        .create(http_candidate("Race Delete"), "op-1", None)
+        .create(
+            http_candidate("Race Delete"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await
         .expect("create should commit");
     let etag = created.etag();
@@ -3848,7 +4009,7 @@ async fn concurrent_deletes_produce_one_winner_and_one_evidence_row() {
         ),
         "{loser}"
     );
-    let evidence = evidence_rows(&pool).await;
+    let evidence = of_action(&evidence_rows(&pool).await, "connection.delete");
     assert_eq!(evidence.len(), 1, "{evidence:?}");
     assert_eq!(evidence[0].actor_user_id, winner);
     assert_eq!(deletion_tombstones(&pool, &created.id).await, 1);
@@ -3871,10 +4032,15 @@ async fn a_failed_evidence_insert_rolls_back_the_whole_delete() {
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
     let created = store
-        .create(http_candidate("Faulted API"), "op-1", None)
+        .create(
+            http_candidate("Faulted API"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await
         .expect("create should commit");
     let revision_before = security_revision(&pool).await;
+    let evidence_before = evidence_rows(&pool).await;
     let state_before = store.state_revision().await.expect("state revision");
     let outbox_before = count(&pool, "SELECT COUNT(*) FROM greengateway.security_outbox").await;
 
@@ -3959,7 +4125,7 @@ async fn a_failed_evidence_insert_rolls_back_the_whole_delete() {
         store.state_revision().await.expect("state revision"),
         state_before
     );
-    assert!(evidence_rows(&pool).await.is_empty());
+    assert_eq!(evidence_rows(&pool).await, evidence_before);
 
     store
         .delete(
@@ -3969,7 +4135,7 @@ async fn a_failed_evidence_insert_rolls_back_the_whole_delete() {
         )
         .await
         .expect("the unchanged ETag deletes once evidence can commit");
-    let evidence = evidence_rows(&pool).await;
+    let evidence = of_action(&evidence_rows(&pool).await, "connection.delete");
     assert_eq!(evidence.len(), 1, "{evidence:?}");
     assert_eq!(evidence[0].actor_user_id, "recovered-admin");
     assert_eq!(
@@ -3977,6 +4143,870 @@ async fn a_failed_evidence_insert_rolls_back_the_whole_delete() {
         revision_before + 1,
         "the aborted attempt consumed no revision"
     );
+}
+
+// ==== Create, replace and credential binding change evidence (migration 28) ====
+
+/// The shared revisions of one Connection's record changes (create,
+/// replace, delete), in commit order.
+async fn record_outbox_revisions(pool: &deadpool_postgres::Pool, id: &ConnectionId) -> Vec<i64> {
+    pool.get()
+        .await
+        .expect("outbox checkout")
+        .query(
+            "SELECT revision FROM greengateway.security_outbox \
+             WHERE resource_type = 'connection' AND resource_id = $1 ORDER BY revision",
+            &[&id.as_str()],
+        )
+        .await
+        .expect("outbox rows should read")
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+/// The journal's view of the evidence: each row's source and position, in
+/// position order.
+async fn journaled_evidence(pool: &deadpool_postgres::Pool) -> Vec<(String, String)> {
+    pool.get()
+        .await
+        .expect("journal checkout")
+        .query(
+            "SELECT j.event_id::text, j.source FROM greengateway.authority_event_journal j \
+             ORDER BY j.position",
+            &[],
+        )
+        .await
+        .expect("journal rows should read")
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect()
+}
+
+/// Everything a refused Connection change must leave alone, read at once.
+#[derive(Debug, PartialEq, Eq)]
+struct RecordState {
+    records: Vec<StoredConnection>,
+    versions: i64,
+    bindings: i64,
+    outbox: i64,
+    security_revision: i64,
+    evidence: Vec<EvidenceRow>,
+    journal: Vec<(String, String)>,
+}
+
+async fn record_state(
+    store: &PostgresConnectionStore,
+    pool: &deadpool_postgres::Pool,
+) -> RecordState {
+    RecordState {
+        records: store.list().await.expect("records should list"),
+        versions: count(
+            pool,
+            "SELECT COUNT(*) FROM greengateway.connection_documents",
+        )
+        .await,
+        bindings: count(
+            pool,
+            "SELECT COUNT(*) FROM greengateway.connection_credential_bindings",
+        )
+        .await,
+        outbox: count(pool, "SELECT COUNT(*) FROM greengateway.security_outbox").await,
+        security_revision: security_revision(pool).await,
+        evidence: evidence_rows(pool).await,
+        journal: journaled_evidence(pool).await,
+    }
+}
+
+/// Issue #425: every committed create and replace names who made it, after
+/// the Connection and its cascading history are gone and after a restart. A
+/// create records `connection.create` (no prior version, version 1); a
+/// replace records `connection.replace` on the connection axis and, when it
+/// changed credential authority, a `credential.binding_change` row on the
+/// credential axis under the same operation and shared revision. Each row
+/// carries the whole actor, the outbox row's shared revision and the
+/// database clock, and is journaled in commit order; an identical replace
+/// commits nothing and records nothing. No specification, endpoint, header
+/// name, binding or bound secret ID enters any row.
+#[tokio::test]
+async fn create_and_replace_evidence_names_the_actor_and_survives_delete_and_restart() {
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (store, pool) = migrated_store(&database.dsn, 64).await;
+    // A person signed in through a provider creates, as the admin endpoint
+    // would pass them; a service token edits the description; a person
+    // without an issuer rebinds the credentials.
+    let creating_admin = ChangeActor::from_principal(&crate::auth::Principal {
+        user_id: "creating-admin".to_owned(),
+        issuer: Some(" https://idp.example.test/ ".to_owned()),
+        email: Some("creating-admin@example.test".to_owned()),
+        org_id: None,
+        roles: vec!["connections-admin".to_owned()],
+        session_id: "session-creating-admin".to_owned(),
+        auth_method: crate::auth::AuthMethod::Cookie,
+    });
+    let editing_token = ChangeActor::service_token_for_test("service-token:token_editor");
+    let rebinding_admin = ChangeActor::for_test("rebinding-admin");
+
+    let created = store
+        .create(http_candidate("Evidence API"), &creating_admin, None)
+        .await
+        .expect("create should commit");
+    let described = store
+        .replace(
+            &created.id,
+            &created.etag(),
+            http_candidate("Evidence API, described"),
+            &editing_token,
+        )
+        .await
+        .expect("a description change should commit");
+    assert_eq!(
+        (
+            described.revisions.connection,
+            described.revisions.credential
+        ),
+        (2, 1),
+        "a description change leaves the credential axis"
+    );
+    let mut rebinding = http_candidate_with_secret("Evidence API, described", "rebound");
+    rebinding.additional_headers = serde_json::from_value(json!([
+        {"header_name": "CF-Access-Client-Id", "secret_id": "access-client-id"}
+    ]))
+    .expect("additional headers should deserialize");
+    let rebound = store
+        .replace(
+            &created.id,
+            &described.etag(),
+            rebinding.clone(),
+            &rebinding_admin,
+        )
+        .await
+        .expect("a credential change should commit");
+    assert_eq!(
+        (rebound.revisions.connection, rebound.revisions.credential),
+        (3, 2)
+    );
+    // An identical replacement is a committed no-op: no revision, no outbox
+    // row and no evidence.
+    let revision_before_no_op = security_revision(&pool).await;
+    let evidence_before_no_op = evidence_rows(&pool).await;
+    let unchanged = store
+        .replace(&created.id, &rebound.etag(), rebinding, &rebinding_admin)
+        .await
+        .expect("an identical replace commits");
+    assert_eq!(unchanged, rebound);
+    assert_eq!(security_revision(&pool).await, revision_before_no_op);
+    assert_eq!(evidence_rows(&pool).await, evidence_before_no_op);
+
+    let outbox = record_outbox_revisions(&pool, &created.id).await;
+    assert_eq!(outbox.len(), 3, "a create and two replacements");
+    let evidence = evidence_rows(&pool).await;
+    let owned = |value: &str| value.to_owned();
+    assert_eq!(
+        evidence
+            .iter()
+            .map(|row| (
+                row.action.clone(),
+                row.revision_axis.clone(),
+                row.prior_version,
+                row.new_version,
+                row.security_revision,
+                row.connection_id.clone(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("connection.create", "connection", None, Some(1), outbox[0]),
+            (
+                "connection.replace",
+                "connection",
+                Some(1),
+                Some(2),
+                outbox[1]
+            ),
+            (
+                "connection.replace",
+                "connection",
+                Some(2),
+                Some(3),
+                outbox[2]
+            ),
+            (
+                "credential.binding_change",
+                "credential",
+                Some(1),
+                Some(2),
+                outbox[2]
+            ),
+        ]
+        .map(|(action, axis, prior, new, revision)| (
+            owned(action),
+            owned(axis),
+            prior,
+            new,
+            revision,
+            owned(created.id.as_str()),
+        )),
+        "each change on its own axis, bound to its outbox row"
+    );
+    assert_eq!(
+        evidence
+            .iter()
+            .map(|row| (
+                row.actor_user_id.clone(),
+                row.actor_issuer.clone(),
+                row.actor_kind.clone(),
+                row.actor_auth_mode.clone(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                owned("creating-admin"),
+                Some(owned("https://idp.example.test")),
+                Some(owned("principal")),
+                Some(owned("session_cookie")),
+            ),
+            (
+                owned("service-token:token_editor"),
+                None,
+                Some(owned("service_token")),
+                Some(owned("service_token")),
+            ),
+            (
+                owned("rebinding-admin"),
+                None,
+                Some(owned("principal")),
+                Some(owned("bearer_token")),
+            ),
+            (
+                owned("rebinding-admin"),
+                None,
+                Some(owned("principal")),
+                Some(owned("bearer_token")),
+            ),
+        ],
+        "the whole actor of each change, its issuer canonical"
+    );
+    // One operation per store call: the rebinding's two rows share one, and
+    // every row has its own event ID.
+    assert_ne!(evidence[0].operation_id, evidence[1].operation_id);
+    assert_ne!(evidence[1].operation_id, evidence[2].operation_id);
+    assert_eq!(evidence[2].operation_id, evidence[3].operation_id);
+    let events: BTreeSet<&str> = evidence.iter().map(|row| row.event_id.as_str()).collect();
+    assert_eq!(events.len(), evidence.len());
+    assert!(evidence.iter().all(|row| row.event_id != row.operation_id));
+    // Every row is journaled, in the order it was written.
+    assert_eq!(
+        journaled_evidence(&pool).await,
+        evidence
+            .iter()
+            .map(|row| (row.event_id.clone(), owned("connection_change_evidence")))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM greengateway.connection_change_evidence \
+             WHERE committed_at <= now() AND committed_at > now() - interval '1 hour'",
+        )
+        .await,
+        4,
+        "committed_at is the database clock's"
+    );
+
+    // The rows outlive the Connection and its cascading history...
+    store
+        .delete(&created.id, &rebound.etag(), &rebinding_admin)
+        .await
+        .expect("delete should commit");
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM greengateway.connection_documents"
+        )
+        .await,
+        0,
+        "the version history cascaded with the record"
+    );
+    let evidence_after_delete = evidence_rows(&pool).await;
+    assert_eq!(&evidence_after_delete[..4], evidence.as_slice());
+    assert_eq!(evidence_after_delete[4].action, "connection.delete");
+    assert_eq!(evidence_after_delete[4].prior_version, Some(3));
+
+    // ...hold nothing of the specification, its bindings or the person...
+    let stored = evidence_text(&pool).await;
+    for material in [
+        "billing-token",
+        "rebound",
+        "access-client-id",
+        "CF-Access-Client-Id",
+        "cf-access-client-id",
+        "billing.example.test",
+        "/openapi.json",
+        "Evidence API",
+        "static_bearer",
+        "http_authentication",
+        "additional_header",
+        "creating-admin@example.test",
+        "connections-admin",
+        "session-creating-admin",
+    ] {
+        assert!(
+            !stored.contains(material),
+            "evidence must not carry specification, binding or secret material ({material}): {stored}"
+        );
+    }
+
+    // ...and survive a restart unchanged.
+    drop(store);
+    drop(pool);
+    let (restarted, restarted_pool) = migrated_store(&database.dsn, 64).await;
+    restarted
+        .validate_persisted_state()
+        .await
+        .expect("evidence does not disturb boot validation");
+    assert_eq!(evidence_rows(&restarted_pool).await, evidence_after_delete);
+}
+
+/// Only a committed create or replace is evidence. A stale ETag, a moved
+/// collection, a missing record, the capacity bound and an actor the
+/// evidence cannot record exactly are each refused with nothing written and
+/// no revision consumed; the actor bound is the principal bound, so a
+/// maximal subject and issuer still create.
+#[tokio::test]
+async fn refused_creates_and_replaces_write_no_evidence() {
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (store, pool) = migrated_store(&database.dsn, 64).await;
+    let created = store
+        .create(
+            http_candidate("Guarded API"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
+        .await
+        .expect("create should commit");
+    let before = record_state(&store, &pool).await;
+    assert_eq!(before.evidence.len(), 1);
+
+    let stale = store
+        .replace(
+            &created.id,
+            &fabricated_stale_etag(&created.id),
+            http_candidate_with_secret("Stale", "stale"),
+            &ChangeActor::for_test("stale-admin"),
+        )
+        .await
+        .expect_err("a stale ETag must not replace");
+    assert!(
+        matches!(stale, ConnectionStoreError::Conflict { .. }),
+        "{stale}"
+    );
+
+    let absent = ConnectionId::new_managed();
+    let missing = store
+        .replace(
+            &absent,
+            &fabricated_stale_etag(&absent),
+            http_candidate("Absent"),
+            &ChangeActor::for_test("absent-admin"),
+        )
+        .await
+        .expect_err("an absent Connection must not replace");
+    assert!(
+        matches!(missing, ConnectionStoreError::NotFound { .. }),
+        "{missing}"
+    );
+
+    // The cross-replica half of a collection If-Match: the collection moved
+    // since the caller read it.
+    fn derive(records: &BTreeMap<ConnectionId, StoredConnection>) -> String {
+        records.len().to_string()
+    }
+    let moved = store
+        .create(
+            http_candidate("Moved"),
+            &ChangeActor::for_test("moved-admin"),
+            Some(super::super::store::CollectionCheck {
+                expected_etag: "0",
+                compute: &derive,
+            }),
+        )
+        .await
+        .expect_err("a moved collection must not create");
+    assert!(
+        matches!(moved, ConnectionStoreError::CollectionConflict { .. }),
+        "{moved}"
+    );
+
+    let full = PostgresConnectionStore::new(pool.clone(), 1).expect("a store at capacity");
+    let over = full
+        .create(
+            http_candidate("Over"),
+            &ChangeActor::for_test("over-admin"),
+            None,
+        )
+        .await
+        .expect_err("a create past the maximum must not commit");
+    assert!(
+        matches!(over, ConnectionStoreError::LimitExceeded { .. }),
+        "{over}"
+    );
+
+    for actor in [
+        ChangeActor::for_test(""),
+        ChangeActor::for_test(&"a".repeat(EVIDENCE_ACTOR_MAX_BYTES + 1)),
+        ChangeActor::for_test_with_issuer("issuing-admin", ""),
+        ChangeActor::for_test_with_issuer(
+            "issuing-admin",
+            &"i".repeat(crate::auth::principal::MAX_PRINCIPAL_ISSUER_BYTES + 1),
+        ),
+        ChangeActor::service_token_with_issuer_for_test(
+            "service-token:token_1",
+            "https://idp.example.test",
+        ),
+    ] {
+        let create = store
+            .create(http_candidate("Unattributable"), &actor, None)
+            .await
+            .expect_err("an unrecordable create must not commit");
+        assert!(
+            matches!(create, ConnectionStoreError::Validation { .. }),
+            "{create}"
+        );
+        let replace = store
+            .replace(
+                &created.id,
+                &created.etag(),
+                http_candidate_with_secret("Unattributable", "nobody"),
+                &actor,
+            )
+            .await
+            .expect_err("an unrecordable replace must not commit");
+        assert!(
+            matches!(replace, ConnectionStoreError::Validation { .. }),
+            "{replace}"
+        );
+    }
+
+    assert_eq!(
+        record_state(&store, &pool).await,
+        before,
+        "no refused change wrote anything or consumed a revision"
+    );
+
+    let maximal_actor = "m".repeat(EVIDENCE_ACTOR_MAX_BYTES);
+    let maximal_issuer = "i".repeat(crate::auth::principal::MAX_PRINCIPAL_ISSUER_BYTES);
+    let maximal = store
+        .create(
+            http_candidate("Maximal"),
+            &ChangeActor::for_test_with_issuer(&maximal_actor, &maximal_issuer),
+            None,
+        )
+        .await
+        .expect("a maximal principal subject and issuer still create");
+    let evidence = of_action(&evidence_rows(&pool).await, "connection.create");
+    assert_eq!(evidence.len(), 2);
+    assert_eq!(evidence[1].connection_id, maximal.id.as_str());
+    assert_eq!(evidence[1].actor_user_id, maximal_actor);
+    assert_eq!(
+        evidence[1].actor_issuer.as_deref(),
+        Some(maximal_issuer.as_str())
+    );
+    assert_eq!(evidence[1].security_revision, before.security_revision + 1);
+}
+
+/// Two replicas race: two creates under one collection ETag, then two
+/// credential-changing replacements under one Connection ETag. The
+/// authority serializes each pair, exactly one of each commits, and the
+/// evidence names only the winners -- one create row, and one replace row
+/// with one binding change row under the winner's operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn racing_creates_and_replaces_record_only_the_winner() {
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (store, pool) = migrated_store(&database.dsn, 64).await;
+    let store_a = PostgresConnectionStore::new(pool.clone(), 64).expect("store a");
+    let store_b = PostgresConnectionStore::new(pool.clone(), 64).expect("store b");
+    let (replica_a, replica_b) = (
+        ChangeActor::for_test("replica-a"),
+        ChangeActor::for_test("replica-b"),
+    );
+    fn derive(records: &BTreeMap<ConnectionId, StoredConnection>) -> String {
+        records.len().to_string()
+    }
+    let collection = || {
+        Some(super::super::store::CollectionCheck {
+            expected_etag: "0",
+            compute: &derive,
+        })
+    };
+    let (a, b) = tokio::join!(
+        store_a.create(http_candidate("Replica A"), &replica_a, collection()),
+        store_b.create(http_candidate("Replica B"), &replica_b, collection())
+    );
+    let (created, winner) = match (a, b) {
+        (Ok(created), Err(loser)) | (Err(loser), Ok(created)) => {
+            assert!(
+                matches!(loser, ConnectionStoreError::CollectionConflict { .. }),
+                "{loser}"
+            );
+            let winner = if created.write.display_name == "Replica A" {
+                "replica-a"
+            } else {
+                "replica-b"
+            };
+            (created, winner)
+        }
+        outcome => panic!("exactly one racing creator commits: {outcome:?}"),
+    };
+    let evidence = evidence_rows(&pool).await;
+    assert_eq!(evidence.len(), 1, "{evidence:?}");
+    assert_eq!(
+        (
+            evidence[0].action.as_str(),
+            evidence[0].actor_user_id.as_str()
+        ),
+        ("connection.create", winner)
+    );
+
+    let etag = created.etag();
+    let (a, b) = tokio::join!(
+        store_a.replace(
+            &created.id,
+            &etag,
+            http_candidate_with_secret("Replica A", "a-token"),
+            &replica_a
+        ),
+        store_b.replace(
+            &created.id,
+            &etag,
+            http_candidate_with_secret("Replica B", "b-token"),
+            &replica_b
+        )
+    );
+    let winner = match (a, b) {
+        (Ok(_), Err(loser)) => ("replica-a", loser),
+        (Err(loser), Ok(_)) => ("replica-b", loser),
+        outcome => panic!("exactly one racing writer commits: {outcome:?}"),
+    };
+    assert!(
+        matches!(winner.1, ConnectionStoreError::Conflict { .. }),
+        "{}",
+        winner.1
+    );
+    let evidence = evidence_rows(&pool).await;
+    assert_eq!(
+        evidence[1..]
+            .iter()
+            .map(|row| (row.action.as_str(), row.actor_user_id.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("connection.replace", winner.0),
+            ("credential.binding_change", winner.0)
+        ]
+    );
+    assert_eq!(evidence[1].operation_id, evidence[2].operation_id);
+    assert_eq!(
+        evidence[2].security_revision,
+        security_revision(&pool).await
+    );
+    assert_eq!(store.count().await.expect("count"), 1);
+}
+
+/// The evidence is required, not best effort, for a create and a replace
+/// as for a delete: when an evidence insert or its journal append fails,
+/// the change reports failure and nothing of it commits -- record, version,
+/// bindings, outbox row, revisions -- and the aborted attempt consumes no
+/// revision. A credential-changing replace whose binding change row alone
+/// fails does not commit its replace row either. The same changes commit
+/// once evidence can be written again.
+#[tokio::test]
+async fn a_failed_evidence_or_journal_write_rolls_back_create_and_replace() {
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (store, pool) = migrated_store(&database.dsn, 64).await;
+    let created = store
+        .create(
+            http_candidate("Faulted API"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
+        .await
+        .expect("create should commit");
+    let before = record_state(&store, &pool).await;
+    let state_before = store.state_revision().await.expect("state revision");
+    let rebinding = || http_candidate_with_secret("Faulted API", "rebound");
+    let faulted = ChangeActor::for_test("faulted-admin");
+    let execute = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            pool.get()
+                .await
+                .expect("fault checkout")
+                .batch_execute(sql)
+                .await
+                .expect("fault statement");
+        }
+    };
+
+    // Every evidence insert fails; then only a binding change row's does.
+    for (install, remove) in [
+        (
+            r#"
+            CREATE FUNCTION greengateway.fail_connection_change_evidence()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'injected evidence failure';
+            END;
+            $$;
+            CREATE TRIGGER fail_connection_change_evidence
+            BEFORE INSERT ON greengateway.connection_change_evidence
+            FOR EACH ROW EXECUTE FUNCTION greengateway.fail_connection_change_evidence();
+            "#,
+            r#"
+            DROP TRIGGER fail_connection_change_evidence
+                ON greengateway.connection_change_evidence;
+            DROP FUNCTION greengateway.fail_connection_change_evidence();
+            "#,
+        ),
+        (
+            r#"
+            CREATE FUNCTION greengateway.fail_connection_change_evidence()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'injected binding change evidence failure';
+            END;
+            $$;
+            CREATE TRIGGER fail_connection_change_evidence
+            BEFORE INSERT ON greengateway.connection_change_evidence
+            FOR EACH ROW WHEN (NEW.action = 'credential.binding_change')
+            EXECUTE FUNCTION greengateway.fail_connection_change_evidence();
+            "#,
+            r#"
+            DROP TRIGGER fail_connection_change_evidence
+                ON greengateway.connection_change_evidence;
+            DROP FUNCTION greengateway.fail_connection_change_evidence();
+            "#,
+        ),
+    ] {
+        execute(install).await;
+        let failed = store
+            .replace(&created.id, &created.etag(), rebinding(), &faulted)
+            .await
+            .expect_err("a replace whose evidence cannot commit must fail");
+        assert!(
+            matches!(failed, ConnectionStoreError::Postgres { .. }),
+            "{failed}"
+        );
+        execute(remove).await;
+        assert_eq!(record_state(&store, &pool).await, before);
+    }
+    execute(
+        r#"
+        CREATE FUNCTION greengateway.fail_connection_change_evidence()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            RAISE EXCEPTION 'injected evidence failure';
+        END;
+        $$;
+        CREATE TRIGGER fail_connection_change_evidence
+        BEFORE INSERT ON greengateway.connection_change_evidence
+        FOR EACH ROW EXECUTE FUNCTION greengateway.fail_connection_change_evidence();
+        "#,
+    )
+    .await;
+    let failed = store
+        .create(http_candidate("Faulted create"), &faulted, None)
+        .await
+        .expect_err("a create whose evidence cannot commit must fail");
+    assert!(
+        matches!(failed, ConnectionStoreError::Postgres { .. }),
+        "{failed}"
+    );
+    execute(
+        r#"
+        DROP TRIGGER fail_connection_change_evidence
+            ON greengateway.connection_change_evidence;
+        DROP FUNCTION greengateway.fail_connection_change_evidence();
+        "#,
+    )
+    .await;
+    assert_eq!(record_state(&store, &pool).await, before);
+
+    // A journal that refuses the append refuses both as well.
+    execute(
+        "ALTER TABLE greengateway.authority_event_journal \
+         ADD CONSTRAINT refuse_new_rows CHECK (false) NOT VALID",
+    )
+    .await;
+    let failed = store
+        .create(http_candidate("Unjournaled create"), &faulted, None)
+        .await
+        .expect_err("a create whose journal row cannot commit must fail");
+    assert!(
+        matches!(failed, ConnectionStoreError::Postgres { .. }),
+        "{failed}"
+    );
+    let failed = store
+        .replace(&created.id, &created.etag(), rebinding(), &faulted)
+        .await
+        .expect_err("a replace whose journal row cannot commit must fail");
+    assert!(
+        matches!(failed, ConnectionStoreError::Postgres { .. }),
+        "{failed}"
+    );
+    execute("ALTER TABLE greengateway.authority_event_journal DROP CONSTRAINT refuse_new_rows")
+        .await;
+    assert_eq!(record_state(&store, &pool).await, before);
+    assert_eq!(
+        store.state_revision().await.expect("state revision"),
+        state_before
+    );
+
+    // The same ETag replaces once evidence can commit, at the next revision.
+    let recovered = store
+        .replace(
+            &created.id,
+            &created.etag(),
+            rebinding(),
+            &ChangeActor::for_test("recovered-admin"),
+        )
+        .await
+        .expect("the unchanged ETag replaces once evidence can commit");
+    assert_eq!(recovered.revisions.credential, 2);
+    let evidence = evidence_rows(&pool).await;
+    assert_eq!(
+        evidence[1..]
+            .iter()
+            .map(|row| (
+                row.action.as_str(),
+                row.actor_user_id.as_str(),
+                row.security_revision
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "connection.replace",
+                "recovered-admin",
+                before.security_revision + 1
+            ),
+            (
+                "credential.binding_change",
+                "recovered-admin",
+                before.security_revision + 1
+            ),
+        ],
+        "the aborted attempts consumed no revision"
+    );
+}
+
+/// A full authority-event journal refuses a create and a replace before
+/// anything commits, as unavailable rather than as a conflict or a
+/// validation problem, and the admin API answers that with `503`. Nothing
+/// accepted is evicted to admit them, and both commit once there is room.
+#[tokio::test]
+async fn a_full_journal_refuses_create_and_replace_with_503() {
+    use crate::storage::postgres_authority_events::{
+        PostgresAuthorityEventStore, OPERATION_JOURNAL_APPEND,
+    };
+
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (store, pool) = migrated_store(&database.dsn, 64).await;
+    let created = store
+        .create(
+            http_candidate("Journaled API"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
+        .await
+        .expect("create should commit");
+    // The create's event is the one retained; the journal holds no more.
+    let journal = PostgresAuthorityEventStore::new(pool.clone());
+    journal
+        .configure_capacity(1)
+        .await
+        .expect("capacity applies");
+    let before = record_state(&store, &pool).await;
+    assert_eq!(before.journal.len(), 1);
+
+    let refused_create = store
+        .create(
+            http_candidate("Refused API"),
+            &ChangeActor::for_test("op-2"),
+            None,
+        )
+        .await
+        .expect_err("a full journal refuses the create");
+    let refused_replace = store
+        .replace(
+            &created.id,
+            &created.etag(),
+            http_candidate_with_secret("Journaled API", "rebound"),
+            &ChangeActor::for_test("op-3"),
+        )
+        .await
+        .expect_err("a full journal refuses the replace");
+    for refused in [refused_create, refused_replace] {
+        assert!(
+            matches!(
+                refused,
+                ConnectionStoreError::Unavailable { operation } if operation == OPERATION_JOURNAL_APPEND
+            ),
+            "{refused}"
+        );
+        let response = crate::admin_connections::connection_mutation_error_response(
+            crate::connections::control_plane::ConnectionMutationError::Store(refused),
+        );
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+    assert_eq!(
+        record_state(&store, &pool).await,
+        before,
+        "nothing of the refused changes committed and nothing accepted was evicted"
+    );
+
+    journal
+        .configure_capacity(16)
+        .await
+        .expect("capacity applies");
+    store
+        .replace(
+            &created.id,
+            &created.etag(),
+            http_candidate_with_secret("Journaled API", "rebound"),
+            &ChangeActor::for_test("op-3"),
+        )
+        .await
+        .expect("the replace commits once there is room");
+    store
+        .create(
+            http_candidate("Admitted API"),
+            &ChangeActor::for_test("op-2"),
+            None,
+        )
+        .await
+        .expect("the create commits once there is room");
+    assert_eq!(journaled_evidence(&pool).await.len(), 4);
 }
 
 /// A disabled `delegated_issuer_token` Connection exchanging with
@@ -4039,11 +5069,19 @@ async fn a_token_exchange_client_secret_alias_is_never_bound_under_another_purpo
     let (store, pool) = migrated_store(&database.dsn, 64).await;
 
     let bearer = store
-        .create(bearer_candidate("shared-secret"), "op-1", None)
+        .create(
+            bearer_candidate("shared-secret"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await
         .expect("a bearer Connection should create");
     let refused = store
-        .create(delegated_candidate("shared-secret"), "op-1", None)
+        .create(
+            delegated_candidate("shared-secret"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await;
     assert!(
         is_secret_purpose_conflict(&refused, "authentication.client_secret_id"),
@@ -4051,11 +5089,19 @@ async fn a_token_exchange_client_secret_alias_is_never_bound_under_another_purpo
     );
 
     let delegated = store
-        .create(delegated_candidate("exchange-secret"), "op-1", None)
+        .create(
+            delegated_candidate("exchange-secret"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await
         .expect("a delegated Connection should create");
     let refused = store
-        .create(bearer_candidate("exchange-secret"), "op-1", None)
+        .create(
+            bearer_candidate("exchange-secret"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await;
     assert!(
         is_secret_purpose_conflict(&refused, "authentication.secret_id"),
@@ -4067,7 +5113,12 @@ async fn a_token_exchange_client_secret_alias_is_never_bound_under_another_purpo
     ]))
     .expect("additional headers should deserialize");
     let refused = store
-        .replace(&bearer.id, &bearer.etag(), with_header, "op-1")
+        .replace(
+            &bearer.id,
+            &bearer.etag(),
+            with_header,
+            &ChangeActor::for_test("op-1"),
+        )
         .await;
     assert!(
         is_secret_purpose_conflict(&refused, "additional_headers.secret_id"),
@@ -4085,13 +5136,22 @@ async fn a_token_exchange_client_secret_alias_is_never_bound_under_another_purpo
         2
     );
     store
-        .create(delegated_candidate("exchange-secret"), "op-1", None)
+        .create(
+            delegated_candidate("exchange-secret"),
+            &ChangeActor::for_test("op-1"),
+            None,
+        )
         .await
         .expect("delegated Connections may share a client secret");
     let mut renamed = delegated.write.clone();
     renamed.display_name = "Mailbox".to_owned();
     store
-        .replace(&delegated.id, &delegated.etag(), renamed, "op-1")
+        .replace(
+            &delegated.id,
+            &delegated.etag(),
+            renamed,
+            &ChangeActor::for_test("op-1"),
+        )
         .await
         .expect("a delegated Connection replaces itself");
 }
@@ -4108,9 +5168,13 @@ async fn concurrent_writes_cannot_both_bind_one_alias_under_two_purposes() {
     let (store_a, pool) = migrated_store(&database.dsn, 64).await;
     let (store_b, _pool_b) = migrated_store(&database.dsn, 64).await;
 
+    let (replica_a, replica_b) = (
+        ChangeActor::for_test("replica-a"),
+        ChangeActor::for_test("replica-b"),
+    );
     let (a, b) = tokio::join!(
-        store_a.create(delegated_candidate("contested-secret"), "replica-a", None),
-        store_b.create(bearer_candidate("contested-secret"), "replica-b", None)
+        store_a.create(delegated_candidate("contested-secret"), &replica_a, None),
+        store_b.create(bearer_candidate("contested-secret"), &replica_b, None)
     );
     let winners = usize::from(a.is_ok()) + usize::from(b.is_ok());
     assert_eq!(winners, 1, "exactly one purpose wins the alias");
@@ -4236,7 +5300,7 @@ async fn catalog_evidence_survives_replacement_cascade_and_restart() {
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
     let created = store
-        .create(mcp_candidate(), "creator", None)
+        .create(mcp_candidate(), &ChangeActor::for_test("creator"), None)
         .await
         .expect("MCP connection should create");
     store
@@ -4404,7 +5468,7 @@ async fn catalog_evidence_on_the_expanded_schema_records_no_actor_metadata_yet()
         "the store runs on the expanded schema"
     );
     let created = store
-        .create(mcp_candidate(), "creator", None)
+        .create(mcp_candidate(), &ChangeActor::for_test("creator"), None)
         .await
         .expect("MCP connection should create");
     store
@@ -4498,7 +5562,11 @@ async fn openapi_publication_evidence_names_the_overlay_change() {
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
     let api = store
-        .create(http_candidate("Evidence API"), "creator", None)
+        .create(
+            http_candidate("Evidence API"),
+            &ChangeActor::for_test("creator"),
+            None,
+        )
         .await
         .expect("connection should create");
     let digest = reservation_spec_digest();
@@ -4653,7 +5721,7 @@ async fn a_failed_catalog_evidence_insert_rolls_back_the_publication() {
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
     let created = store
-        .create(mcp_candidate(), "creator", None)
+        .create(mcp_candidate(), &ChangeActor::for_test("creator"), None)
         .await
         .expect("MCP connection should create");
     let revision_before = security_revision(&pool).await;
