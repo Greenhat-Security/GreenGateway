@@ -1073,7 +1073,7 @@ async fn e2e_08_barrier_race_rejects_stale_openapi_and_mcp_publications() {
                 ACCEPTANCE_OPENAPI_SPEC,
                 &["ping".to_owned()],
                 &[],
-                ACCEPTANCE_ACTOR,
+                &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
             )
             .await
     });
@@ -1087,7 +1087,11 @@ async fn e2e_08_barrier_race_rejects_stale_openapi_and_mcp_publications() {
         refresh_start.wait().await;
         refresh_visible.wait().await;
         refresh_service
-            .refresh(&refresh_id, &refresh_etag, ACCEPTANCE_ACTOR)
+            .refresh(
+                &refresh_id,
+                &refresh_etag,
+                &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
+            )
             .await
     });
 
@@ -1170,7 +1174,7 @@ async fn e2e_08_barrier_race_rejects_stale_openapi_and_mcp_publications() {
             ACCEPTANCE_OPENAPI_SPEC,
             &selected,
             &confirmations,
-            ACCEPTANCE_ACTOR,
+            &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
         )
         .await
         .expect("a fresh post-race registration should publish");
@@ -1329,7 +1333,7 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
             ACCEPTANCE_OPENAPI_SPEC,
             &selected,
             &confirmations,
-            ACCEPTANCE_ACTOR,
+            &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
         )
         .await
         .expect("managed OpenAPI capability should publish");
@@ -1344,7 +1348,7 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
         .refresh(
             mcp_connection.id.as_str(),
             mcp_connection.etag().as_str(),
-            ACCEPTANCE_ACTOR,
+            &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
         )
         .await
         .expect("managed MCP capability should publish");

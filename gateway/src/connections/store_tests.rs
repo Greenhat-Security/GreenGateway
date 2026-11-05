@@ -42,7 +42,7 @@ fn exact_overlay_schema_version_survives_restart_and_future_replay_fails_closed(
                 expected_overlay_revision: 0,
             }),
             1,
-            "operator",
+            &ChangeActor::for_test("operator"),
             &[],
         )
         .expect("the exact supported overlay should publish");
@@ -1807,7 +1807,7 @@ fn openapi_overlay_catalog_reports_and_enum_prune_are_one_atomic_revision() {
                 expected_overlay_revision: 0,
             }),
             1,
-            "operator-a",
+            &ChangeActor::for_test("operator-a"),
             &[],
         )
         .expect("overlay and catalog should publish together");
@@ -1876,7 +1876,7 @@ fn openapi_overlay_catalog_reports_and_enum_prune_are_one_atomic_revision() {
                 expected_overlay_revision: 0,
             }),
             1,
-            "operator-b",
+            &ChangeActor::for_test("operator-b"),
             &[],
         )
         .expect_err("stale overlay CAS must reject the whole catalog write");
@@ -1929,7 +1929,7 @@ fn openapi_overlay_catalog_reports_and_enum_prune_are_one_atomic_revision() {
                 expected_overlay_revision: 1,
             }),
             2,
-            "operator-injected-failure",
+            &ChangeActor::for_test("operator-injected-failure"),
             &[],
         )
         .expect_err("a failure after catalog and enum work must roll back everything");
@@ -1977,7 +1977,7 @@ fn openapi_overlay_catalog_reports_and_enum_prune_are_one_atomic_revision() {
                 expected_overlay_revision: 1,
             }),
             2,
-            "operator-b",
+            &ChangeActor::for_test("operator-b"),
             &[],
         )
         .expect("second overlay should publish");
@@ -2043,7 +2043,7 @@ fn openapi_overlay_catalog_reports_and_enum_prune_are_one_atomic_revision() {
                 expected_overlay_revision: 2,
             }),
             2,
-            "resolver",
+            &ChangeActor::for_test("resolver"),
             &[],
         )
         .expect("report-only CAS should commit");
@@ -2099,7 +2099,7 @@ fn openapi_overlay_catalog_reports_and_enum_prune_are_one_atomic_revision() {
             &[openapi_catalog_entry("beta")],
             None,
             2,
-            "operator-refresh",
+            &ChangeActor::for_test("operator-refresh"),
             &[],
         )
         .expect("refresh-style publish should preserve the exact overlay");
@@ -2124,7 +2124,7 @@ fn openapi_overlay_catalog_reports_and_enum_prune_are_one_atomic_revision() {
                 expected_overlay_revision: 2,
             }),
             0,
-            "operator-c",
+            &ChangeActor::for_test("operator-c"),
             &[],
         )
         .expect("overlay delete and bare catalog should commit together");
@@ -2188,7 +2188,7 @@ fn enum_source_values_publish_atomically_and_use_exact_generation_cas() {
             &[openapi_catalog_entry("enum_tool")],
             Some(&overlay),
             1,
-            "enum-resolver",
+            &ChangeActor::for_test("enum-resolver"),
             &[],
             std::slice::from_ref(&first_write),
         )
