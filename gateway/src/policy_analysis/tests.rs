@@ -3,7 +3,7 @@
 //! evaluator over small policy universes.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
@@ -50,7 +50,7 @@ use crate::{
     policy_testing::suite::Diagnostics,
     rbac::{
         matcher::path_pattern_matches,
-        policy_document::parse_v1_with_typed_matchers,
+        policy_document::parse_v1,
         policy_resources::{
             AdminSurface, ConnectionInventory, PolicyResourceSnapshot, PolicyResourceView,
             ToolInventory,
@@ -63,11 +63,10 @@ fn policy(value: Value) -> Policy {
     Policy::validate_json_value(value).expect("test policy validates")
 }
 
-/// A policy v1 document with typed matchers, which this build validates but
-/// does not yet accept for enforcement: parsed as the typed-matcher tests
-/// parse one, so the analyzer's handling of them is pinned before they are.
+/// A policy v1 document with typed matchers, parsed as the typed-matcher
+/// tests parse one.
 fn typed_matcher_policy(value: Value) -> Policy {
-    parse_v1_with_typed_matchers(&value).unwrap_or_else(|issues| panic!("validates: {issues:?}"))
+    parse_v1(&value).unwrap_or_else(|issues| panic!("validates: {issues:?}"))
 }
 
 fn far_deadline() -> Instant {
@@ -110,6 +109,7 @@ fn resource_view_for(policy: &Policy) -> PolicyResourceView {
         }))),
         tools: Some(ToolInventory {
             names,
+            definitions: BTreeMap::new(),
             digest: "sha256:tools".to_owned(),
         }),
         connections: Some(ConnectionInventory {
@@ -1471,6 +1471,7 @@ fn unknown_references_and_case_collisions_are_reported_as_heuristics() {
     let mut view = resource_view_for(&analyzed);
     view.tools = Some(ToolInventory {
         names: BTreeSet::new(),
+        definitions: BTreeMap::new(),
         digest: "sha256:tools".to_owned(),
     });
     view.connections = Some(ConnectionInventory {

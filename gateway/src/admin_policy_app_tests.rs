@@ -6352,8 +6352,8 @@ mod cluster_policy_tests {
             "a refused write commits nothing"
         );
 
-        // A tool_argument condition is refused for what this build does
-        // not enforce, before any roster is asked.
+        // A document with a tool_argument condition, which this build
+        // serves, is held by the same gate as any other v1 document.
         let typed = json!({
             "schema_version": "1.0.0",
             "id": "v1-typed",
@@ -6379,12 +6379,8 @@ mod cluster_policy_tests {
                 .expect("PUT should complete"),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        let refusal = body["errors"].to_string();
-        assert!(
-            refusal.contains("does not yet enforce") && !refusal.contains("cluster mode"),
-            "{body}"
-        );
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "capability_not_advertised");
         assert_eq!(policy_version_count(&pool).await, before);
 
         // The older member's row goes stale: the same write is admitted and
@@ -6496,7 +6492,9 @@ mod cluster_policy_tests {
         assert_eq!(body["reason"], "capability_not_advertised");
         assert_eq!(policy_version_count(&pool).await, before + 2);
 
-        // Three refused writes, three audit events, none naming a member.
+        // Four refused writes -- the conditioned document among them, held
+        // like any other v1 document -- four audit events, none naming a
+        // member.
         let started = std::time::Instant::now();
         let refusals = || {
             capture
@@ -6505,13 +6503,13 @@ mod cluster_policy_tests {
                 .filter(|event| event.event_type == "cluster.operation_refused")
                 .collect::<Vec<_>>()
         };
-        while refusals().len() < 3 && started.elapsed() < Duration::from_secs(5) {
+        while refusals().len() < 4 && started.elapsed() < Duration::from_secs(5) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let refused = refusals();
         assert_eq!(
             refused.len(),
-            3,
+            4,
             "validation audits nothing; each write once"
         );
         for event in &refused {
@@ -6671,6 +6669,198 @@ mod cluster_policy_tests {
         assert_eq!(refusals().len(), 1, "the admitted write is not refused");
     }
 
+    /// A live replica of the build that enforces every rule condition but
+    /// the `tool_argument` leaf: this schema, document formats `0..=1` and
+    /// every capability that build had, but not
+    /// `policy_tool_argument_conditions`.
+    async fn insert_pre_tool_argument_member(
+        pool: &deadpool_postgres::Pool,
+        deployment: &str,
+    ) -> uuid::Uuid {
+        let member = uuid::Uuid::new_v4();
+        let (schema_min, schema_max) = migrations::schema_version_range();
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint,
+                      capabilities)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, 'pre-tool-arguments', $4, $5, 0, 1,
+                         repeat('c', 64),
+                         'delegated_token_purges,openapi_discovery_catalogs,'
+                         || 'openapi_swagger2_catalogs,operation_requirements,'
+                         || 'policy_document_v1,policy_role_descriptions,'
+                         || 'policy_rule_conditions')",
+                &[
+                    &deployment,
+                    &member.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    &schema_min,
+                    &schema_max,
+                ],
+            )
+            .await
+            .expect("a pre-tool-argument member row inserts");
+        member
+    }
+
+    fn cluster_tool_argument_policy_json(id: &str) -> String {
+        json!({
+            "schema_version": "1.0.0",
+            "id": id,
+            "default_action": "deny",
+            "roles": { "admin": { "permissions": ["admin:policy:read", "admin:policy:write"] } },
+            "rules": [{
+                "id": "eu-exports",
+                "tool_name": "reports.export",
+                "action": "deny",
+                "conditions": { "tool_argument": { "pointer": "/region", "in": ["eu"] } }
+            }]
+        })
+        .to_string()
+    }
+
+    /// Issue #243's tool-argument conditions through the policy API in
+    /// cluster mode. A replica of the build that enforces every other rule
+    /// condition admits a document with those, so one with a source-network
+    /// condition is committed while it is live; one whose conditions read a
+    /// tool argument is the registered operation
+    /// `policy.tool_argument_conditions` as well, refused with
+    /// `409 capability_not_advertised`, writing no version, audited once and
+    /// naming no member. Once that replica has left, the same `PUT` commits
+    /// the document and its condition is served back.
+    #[tokio::test]
+    async fn cluster_policy_tool_argument_conditions_wait_for_every_live_member() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let seeded = initialize(&store, "tool-arguments-gate-init").await;
+        let deployment = "deploy-cluster-policy-tool-arguments";
+        let membership = registered_replica(&pool, deployment).await;
+        let older = insert_pre_tool_argument_member(&pool, deployment).await;
+        let capture = audit::sink::tests::CaptureSink::new();
+        let (router, rbac_state) = cluster_policy_router_with(
+            store.clone(),
+            Some(membership),
+            audit::AuditLog::new(Arc::new(capture.clone())),
+        );
+        rbac_state
+            .install_revision_snapshot(seeded.policy.clone(), seeded.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let before = policy_version_count(&pool).await;
+
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((
+                        &seeded.etag,
+                        &cluster_tool_argument_policy_json("tool-arguments-held"),
+                    )),
+                ))
+                .await
+                .expect("PUT should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "capability_not_advertised");
+        assert!(
+            !body.to_string().contains(&older.to_string()),
+            "a refusal names no member: {body}"
+        );
+        assert_eq!(
+            policy_version_count(&pool).await,
+            before,
+            "a refused write commits nothing"
+        );
+
+        // The same replica enforces the other conditions.
+        let conditioned = router
+            .clone()
+            .oneshot(admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some((
+                    &seeded.etag,
+                    &cluster_conditioned_policy_json("source-network-conditioned"),
+                )),
+            ))
+            .await
+            .expect("PUT should complete");
+        assert_eq!(conditioned.status(), StatusCode::OK);
+        let conditioned_etag = conditioned
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("ETag header")
+            .to_owned();
+        assert_eq!(policy_version_count(&pool).await, before + 1);
+
+        let started = std::time::Instant::now();
+        let refusals = || {
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.event_type == "cluster.operation_refused")
+                .collect::<Vec<_>>()
+        };
+        while refusals().is_empty() && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let refused = refusals();
+        assert_eq!(refused.len(), 1, "one refused write, one audit event");
+        assert_eq!(
+            refused[0].payload["operation"],
+            "policy.tool_argument_conditions"
+        );
+        assert_eq!(
+            refused[0].payload["capability"],
+            "policy_tool_argument_conditions"
+        );
+        assert_eq!(refused[0].payload["document_format"], 1);
+        assert_eq!(refused[0].payload["lacking_members"], 1);
+        assert!(!refused[0].payload.to_string().contains(&older.to_string()));
+
+        // The older replica's row goes stale: the condition is committed and
+        // served back exactly.
+        backdate_member(&pool, older).await;
+        let admitted = router
+            .clone()
+            .oneshot(admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some((
+                    &conditioned_etag,
+                    &cluster_tool_argument_policy_json("tool-arguments-admitted"),
+                )),
+            ))
+            .await
+            .expect("PUT should complete");
+        assert_eq!(admitted.status(), StatusCode::OK);
+        let (_, served) = refusal_of(admitted).await;
+        assert_eq!(
+            served["rules"][0]["conditions"]["tool_argument"]["pointer"], "/region",
+            "{served}"
+        );
+        assert_eq!(policy_version_count(&pool).await, before + 2);
+        let active = store
+            .active()
+            .await
+            .expect("active read")
+            .expect("the deployment is initialized");
+        assert!(active.policy.uses_tool_argument_conditions());
+        assert_eq!(refusals().len(), 1, "the admitted write is not refused");
+    }
+
     const MAPPED_ISSUER: &str = "https://idp.example.test";
 
     /// A policy v1 document in mapped-role mode: `admin` reads and writes
@@ -6746,10 +6936,9 @@ mod cluster_policy_tests {
     /// standalone mode judges them, request for request, from the same
     /// 0.x policy: validation and `PUT` refuse a move to mapped-role mode
     /// that leaves the publisher no mapping granting it the policy write
-    /// (`publisher_policy_write_lost` at `/identity_mappings`), refuse a
-    /// `tool_argument` condition (`typed_matchers_not_enforced`), and commit
-    /// a mapped
-    /// document that keeps the publisher's write -- in cluster mode once the
+    /// (`publisher_policy_write_lost` at `/identity_mappings`), find nothing
+    /// wrong with rule conditions, which both modes serve, and commit a
+    /// mapped document that keeps the publisher's write -- in cluster mode once the
     /// operation gate admits format 1 -- and serve it with its mappings.
     /// From then on the management lane judges every principal by the
     /// internal roles its mappings grant from the organization its issuer
@@ -6811,10 +7000,6 @@ mod cluster_policy_tests {
             "publisher_policy_write_lost".to_owned(),
             "/identity_mappings".to_owned(),
         )];
-        let typed = vec![(
-            "typed_matchers_not_enforced".to_owned(),
-            "/rules/0/conditions".to_owned(),
-        )];
         let mut answers = Vec::new();
 
         for (mode, router, etag) in [
@@ -6867,32 +7052,10 @@ mod cluster_policy_tests {
             )
             .await;
             assert_eq!(
-                (typed_validated.0, &typed_validated.1),
-                (StatusCode::BAD_REQUEST, &typed),
+                (typed_validated.0, typed_validated.1.is_empty()),
+                (StatusCode::OK, true),
                 "{mode}: {}",
                 typed_validated.2
-            );
-            let refused = judged(
-                router,
-                policy_admin_request(
-                    Method::PUT,
-                    POLICY_ADMIN_ROUTE,
-                    Some(publisher()),
-                    Some(conditioned.clone()),
-                    Some(etag),
-                ),
-            )
-            .await;
-            assert_eq!(refused.0, StatusCode::BAD_REQUEST, "{mode}");
-            assert!(
-                refused.2.contains("does not yet enforce") && !refused.2.contains("cluster mode"),
-                "{mode}: {}",
-                refused.2
-            );
-            assert_eq!(
-                current_policy(router).await.0,
-                etag,
-                "{mode}: nothing was written"
             );
 
             let validated = judged(
@@ -6983,7 +7146,7 @@ mod cluster_policy_tests {
             }
             answers.push((
                 (validated.0, replaced.0, replaced.1),
-                (typed_validated.0, typed_validated.1, refused.0),
+                (typed_validated.0, typed_validated.1),
                 statuses,
             ));
         }
