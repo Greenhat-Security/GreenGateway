@@ -4126,6 +4126,118 @@ async fn bound_shadow_disable_applies_and_the_next_change_needs_a_fresh_review()
     assert_eq!(promoted.status(), StatusCode::OK);
 }
 
+/// A promotion bound to a shadow review is a publication like any other:
+/// with `POLICY_TESTS_REQUIRED` on it must pass the stored suite, after the
+/// binding is verified, and a refused one writes nothing. Off, the same
+/// promotion goes ahead.
+#[tokio::test]
+async fn a_bound_shadow_promotion_must_pass_the_required_policy_tests() {
+    // The suite holds the reports rule to observing, so promoting it fails;
+    // disabling the exports rule changes nothing the suite asserts.
+    let suite = json!({
+        "schema_version": "policy-tests.v1",
+        "cases": [
+            {
+                "id": "reports-are-observed",
+                "kind": "http",
+                "request": { "method": "GET", "path": "/reports/1" },
+                "principal": {
+                    "subject": "synthetic-analyst",
+                    "roles": ["analyst"],
+                    "auth_method": "bearer_token"
+                },
+                "expect": { "logical": "deny", "effect": "observe", "matched": { "rule": "shadow-reports" } }
+            },
+            {
+                "id": "allow-is-public",
+                "kind": "http",
+                "request": { "method": "GET", "path": "/allow/1" },
+                "principal": "anonymous",
+                "expect": { "logical": "allow", "matched": { "rule": "allow-reports" } }
+            }
+        ]
+    });
+    for required in [true, false] {
+        let db = TempDb::new("shadow-promotion-required-tests");
+        create_audit_schema(&db.path);
+        seed_shadow_reports_would_deny_events(&db.path);
+        let policy = TempPolicyFile::new(&shadow_review_policy_document());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let mut config = policy_admin_config_with_sqlite(Some(&policy), Some(&db.path));
+        config.policy_tests_required = required;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+        let mut store = policy_admin_request(
+            Method::PUT,
+            POLICY_TESTS_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(suite.to_string()),
+            None,
+        );
+        store
+            .headers_mut()
+            .insert(header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        let stored = router
+            .clone()
+            .oneshot(store)
+            .await
+            .expect("suite PUT should complete");
+        assert_eq!(stored.status(), StatusCode::CREATED);
+
+        let reports_binding = shadow_review_binding(&router, "shadow-reports").await;
+        let exports_binding = shadow_review_binding(&router, "shadow-exports").await;
+        let reviewed_etag = binding_policy_etag(&reports_binding);
+        let promoted = router
+            .clone()
+            .oneshot(bound_shadow_patch(
+                "shadow-reports",
+                json!({ "action": "deny" }),
+                &reports_binding,
+                Some(&reviewed_etag),
+            ))
+            .await
+            .expect("bound promotion should complete");
+        if !required {
+            assert_eq!(promoted.status(), StatusCode::OK);
+            continue;
+        }
+        assert_eq!(promoted.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let refused = json_body(promoted).await;
+        assert_eq!(refused["reason"], json!("policy_tests_required_failed"));
+        assert_eq!(refused["required_tests"]["status"], json!("failed"));
+        assert_eq!(
+            refused["required_tests"]["summary"],
+            json!({ "total": 2, "passed": 1, "failed": 1, "incomplete": 0, "errors": 0 })
+        );
+        assert_shadow_rule_unchanged(&router, "shadow-reports", &reviewed_etag).await;
+
+        let disabled = router
+            .clone()
+            .oneshot(bound_shadow_patch(
+                "shadow-exports",
+                json!({ "enabled": false }),
+                &exports_binding,
+                Some(&reviewed_etag),
+            ))
+            .await
+            .expect("bound disable should complete");
+        assert_eq!(disabled.status(), StatusCode::OK);
+        let event = captured_policy_change(&capture, "rule_updated");
+        assert_eq!(event.payload["required_tests"]["total"], json!(2));
+        assert_eq!(event.payload["required_tests"]["passed"], json!(2));
+        // The binding held both times; only the suite refused the promotion.
+        assert!(shadow_transition_refusals(&capture).is_empty());
+    }
+}
+
 #[tokio::test]
 async fn bound_shadow_promotion_refuses_a_stale_revision() {
     let db = TempDb::new("shadow-promotion-stale-revision");
@@ -5602,6 +5714,17 @@ mod cluster_policy_tests {
         membership: Option<Arc<cluster_membership::ClusterMembership>>,
         audit: audit::AuditLog,
     ) -> (Router, middleware::rbac::RbacState) {
+        cluster_policy_router_configured(store, membership, audit, false)
+    }
+
+    /// [`cluster_policy_router_with`], with `POLICY_TESTS_REQUIRED` on or
+    /// off.
+    pub(super) fn cluster_policy_router_configured(
+        store: Arc<PostgresPolicyStore>,
+        membership: Option<Arc<cluster_membership::ClusterMembership>>,
+        audit: audit::AuditLog,
+        policy_tests_required: bool,
+    ) -> (Router, middleware::rbac::RbacState) {
         let rbac_state = middleware::rbac::RbacState::new(
             cluster_policy("router-seed"),
             Vec::new(),
@@ -5663,6 +5786,7 @@ mod cluster_policy_tests {
                 test_suite_store: Some(
                     Arc::new(store.test_suite_store()) as Arc<dyn storage::PolicyTestSuiteStore>
                 ),
+                policy_tests_required,
                 control_plane: Some(store as Arc<dyn storage::PolicyControlPlane>),
                 membership,
                 event_store: None,
@@ -7816,6 +7940,201 @@ mod cluster_policy_tests {
                     admin_principal().user_id
                 ),
             ]
+        );
+    }
+
+    /// `POLICY_TESTS_REQUIRED` in cluster mode (issue #243): the gate reads
+    /// the cluster's stored suite and runs it inside the commit
+    /// precondition, so a refused publication commits no version, revision,
+    /// outbox or evidence row, and an admitted one records the suite that
+    /// admitted it.
+    #[tokio::test]
+    async fn cluster_publication_must_pass_the_required_suite() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let document = |id: &str, rules: Value| {
+            json!({
+                "schema_version": "0.1.0",
+                "id": id,
+                "default_action": "deny",
+                "roles": {
+                    "admin": {
+                        "permissions": [
+                            "admin:policy:read",
+                            "admin:policy:write",
+                            "admin:policy:simulate"
+                        ]
+                    }
+                },
+                "rules": rules
+            })
+        };
+        let public_health = json!([
+            { "id": "public-health", "methods": ["GET"], "path": "/health", "action": "allow" }
+        ]);
+        let seed = parse_policy_body(&Bytes::from(
+            document("gate-seed", public_health.clone()).to_string(),
+        ))
+        .expect("the seed policy parses");
+        let active = PolicyControlPlane::commit(
+            store.as_ref(),
+            PolicyCommitRequest {
+                precondition: PolicyCommitPrecondition::Initialize,
+                candidate: &seed,
+                change: crate::storage::DocumentChange::test_policy("seed"),
+                diff_summary: &DIFF,
+            },
+        )
+        .await
+        .expect("deployment should initialize");
+        let capture = audit::sink::tests::CaptureSink::new();
+        let (router, rbac_state) = cluster_policy_router_configured(
+            store.clone(),
+            None,
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>),
+            true,
+        );
+        rbac_state
+            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let put = |uri: &str, headers: &[(&str, &str)], body: String| {
+            let mut builder = Request::builder().method(Method::PUT).uri(uri);
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            let mut request = builder
+                .body(Body::from(body))
+                .expect("request should build");
+            request.extensions_mut().insert(admin_principal());
+            request
+        };
+        let outbox_rows = || async {
+            let client = pool.get().await.expect("checkout");
+            client
+                .query_one(
+                    "SELECT count(*)::bigint FROM greengateway.security_outbox",
+                    &[],
+                )
+                .await
+                .expect("outbox count")
+                .get::<_, i64>(0)
+        };
+
+        // No suite is stored: nothing can be published.
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(put(
+                    POLICY_ADMIN_ROUTE,
+                    &[("if-match", &active.etag)],
+                    document("gate-renamed", public_health.clone()).to_string(),
+                ))
+                .await
+                .expect("publication should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["reason"], "policy_tests_required_failed");
+        assert_eq!(body["required_tests"]["status"], "suite_missing");
+
+        let stored = router
+            .clone()
+            .oneshot(put(
+                POLICY_TESTS_ADMIN_ROUTE,
+                &[("if-none-match", "*")],
+                json!({
+                    "schema_version": "policy-tests.v1",
+                    "cases": [{
+                        "id": "health-is-public",
+                        "kind": "http",
+                        "request": { "method": "GET", "path": "/health" },
+                        "principal": "anonymous",
+                        "expect": { "logical": "allow", "matched": { "rule": "public-health" } }
+                    }]
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("suite PUT should complete");
+        assert_eq!(stored.status(), StatusCode::CREATED);
+        assert_eq!(
+            stored
+                .headers()
+                .get(POLICY_TESTS_ACTIVE_STATUS_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("passed")
+        );
+        let suite_etag = stored
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("ETag")
+            .to_owned();
+        let rows_before = outbox_rows().await;
+
+        // A candidate the suite fails commits nothing at all.
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(put(
+                    POLICY_ADMIN_ROUTE,
+                    &[("if-match", &active.etag)],
+                    document("gate-closed", json!([])).to_string(),
+                ))
+                .await
+                .expect("publication should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(
+            body["required_tests"],
+            json!({
+                "status": "failed",
+                "suite_version": 1,
+                "suite_etag": suite_etag,
+                "summary": { "total": 1, "passed": 0, "failed": 1, "incomplete": 0, "errors": 0 }
+            })
+        );
+        let still = PolicyControlPlane::active(store.as_ref())
+            .await
+            .expect("active reads")
+            .expect("a policy is active");
+        assert_eq!(still.etag, active.etag);
+        assert_eq!(outbox_rows().await, rows_before);
+
+        // One it passes is committed, and its record names the suite.
+        let published = router
+            .clone()
+            .oneshot(put(
+                POLICY_ADMIN_ROUTE,
+                &[("if-match", &active.etag)],
+                document("gate-renamed", public_health).to_string(),
+            ))
+            .await
+            .expect("publication should complete");
+        assert_eq!(published.status(), StatusCode::OK);
+        assert_eq!(outbox_rows().await, rows_before + 1);
+        let changed = || -> Vec<Value> {
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.event_type == audit::event::POLICY_CHANGED)
+                .map(|event| event.payload)
+                .collect()
+        };
+        assert_eventually(Duration::from_secs(5), || !changed().is_empty());
+        let changed = changed();
+        let [changed] = changed.as_slice() else {
+            panic!("one change is audited, not {changed:?}");
+        };
+        assert_eq!(
+            changed["required_tests"],
+            json!({ "suite_version": 1, "suite_etag": suite_etag, "total": 1, "passed": 1 })
         );
     }
 

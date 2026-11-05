@@ -7298,6 +7298,16 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_test_gate :: *#1",
+      "sha256": "88b5000e16712f3c60014eb72556124fe9cbcd69866f24b9868107a0b9bd0e0c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
       "file": "gateway/src/admin_policy_simulations.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -7323,6 +7333,16 @@
         "capability-import-or-glob"
       ],
       "scope": "gateway::admin_policy_evidence::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/admin_policy_test_gate.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_test_gate::use super :: *#1",
       "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."

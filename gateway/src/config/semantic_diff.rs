@@ -677,6 +677,13 @@ static POLICY_HISTORY_SQLITE_PATH: Field = setting(
     RiskCode::StorageChanged,
     Rule::AnyChange,
 );
+// Off, a policy change is activated whether or not the stored suite passes.
+static POLICY_TESTS_REQUIRED: Field = setting(
+    "POLICY_TESTS_REQUIRED",
+    Section::Policy,
+    RiskCode::PolicyTestsNotRequired,
+    Rule::LooserWhen(false),
+);
 static TOOL_LEASE_TTL_MS: Field = neutral("TOOL_LEASE_TTL_MS", Section::Cluster);
 static CLUSTER_HEARTBEAT_MS: Field = neutral("CLUSTER_HEARTBEAT_MS", Section::Cluster);
 static CLUSTER_MEMBER_STALE_MS: Field = neutral("CLUSTER_MEMBER_STALE_MS", Section::Cluster);
@@ -824,6 +831,7 @@ pub(crate) static SETTINGS: &[&Field] = &[
     &POLICY_FILE,
     &TOOLS_FILE,
     &POLICY_HISTORY_SQLITE_PATH,
+    &POLICY_TESTS_REQUIRED,
     &CORS_ALLOW_ORIGINS,
     &MAX_BODY_SIZE,
     &MAX_REQUEST_PATH_BYTES,
@@ -1538,6 +1546,7 @@ fn compare_storage(c: &mut Comparison, base: &StoragePlan, candidate: &StoragePl
         policy_file,
         tools_file,
         policy_history_sqlite_path,
+        policy_tests_required,
         tool_lease_ttl_ms,
         cluster_heartbeat_ms,
         cluster_member_stale_ms,
@@ -1668,6 +1677,11 @@ fn compare_storage(c: &mut Comparison, base: &StoragePlan, candidate: &StoragePl
         ),
         (before, after) => c.value(&POLICY_FILE, before.as_ref(), after.as_ref()),
     }
+    c.flag(
+        &POLICY_TESTS_REQUIRED,
+        *policy_tests_required,
+        candidate.policy_tests_required,
+    );
     c.flag(
         &CLUSTER_STATUS_EXPOSE_HOSTNAMES,
         *cluster_status_expose_hostnames,

@@ -11,7 +11,9 @@ cases in slice 12). A deployment can also keep one suite beside its policy, as
 a versioned resource with a strong ETag (`GET`/`PUT
 /v1{ADMIN_PREFIX}/policy/tests`), and a run or an
 [evidence package](policy-evidence.md) can name that stored suite instead of
-carrying one.
+carrying one. With `POLICY_TESTS_REQUIRED=true` no policy change is activated
+unless the stored suite passes against it
+([below](#requiring-the-stored-suite-before-activation)).
 
 Every case is decided by the same compiled policy evaluator the gateway uses
 for live traffic (`gateway/src/policy_eval`): the runner builds the same typed
@@ -198,8 +200,9 @@ schema gives them no identifiers; a reordered policy changes them.
 `/v1{ADMIN_PREFIX}/policy/tests` holds at most one suite: the stored suite, an
 exact-version `policy-tests.v1` document kept with the policy authority. Every
 write is a new immutable version; nothing is edited in place and nothing is
-deleted. Storing a suite changes no enforcement and activates nothing:
-requiring a passing suite before a policy change is a later slice.
+deleted. Storing a suite changes no enforcement and activates nothing; with
+`POLICY_TESTS_REQUIRED=true` it is the suite every later policy change must
+pass.
 
 ```http
 PUT /v1/admin/policy/tests
@@ -267,6 +270,88 @@ If-Match: "sha256:..."            (replacing the stored one)
 | `422` | `policy_tests_invalid` | The suite is invalid; `diagnostics` as for a run. |
 | `428` | `policy_tests_precondition_required` | Neither `If-Match` nor `If-None-Match` was sent. |
 | `503` | `policy_tests_unavailable` | No suite store is configured or it could not be read or written. |
+
+With `POLICY_TESTS_REQUIRED=true` a successful `PUT` also reports what the
+[activation gate](#requiring-the-stored-suite-before-activation) would answer
+for the active policy under the suite just stored, in
+`X-GreenGateway-Policy-Tests-Active-Status`: `passed`, or the refusal's
+`status`. The suite is stored either way, so storing the suite the next
+policy must pass never needs the current policy to pass it first.
+
+## Requiring the stored suite before activation
+
+`POLICY_TESTS_REQUIRED=true` ([configuration](configuration.md#policy_tests_required))
+makes the stored suite a precondition of every policy change the admin API
+activates: `PUT /v1{ADMIN_PREFIX}/policy`, rollback, rule create, update (a
+promotion or disable bound to a shadow review included), delete and reorder,
+a draft publication, and a discovery suggestion's acceptance, standalone or
+in cluster mode (where the rule and the suggestion's transition commit in one
+transaction). Each runs the stored suite against its candidate inside the
+commit precondition: under the policy write lock, after the cross-resource
+checks, before any authority is asked to write. The run is the one
+`POST .../policy/tests/runs` makes for a candidate -- the same runner, the
+same egress controls and rate lanes, the same five-second deadline on a
+blocking thread -- and the write lock serializes it with every other
+publication on the replica.
+
+The change is committed only when every case of the suite passed. Anything
+else refuses it and writes nothing:
+
+| `required_tests.status` | Meaning |
+| --- | --- |
+| `suite_missing` | No suite is stored. |
+| `suite_invalid` | The stored suite no longer verifies against its ETag (a row edited out of band) or this build no longer accepts it. |
+| `suite_unavailable` | No suite store is configured, or it could not be read (`503`). |
+| `failed` | At least one case's expectation did not hold. |
+| `incomplete` | At least one case could not be decided, or the run decided fewer cases than the suite holds. |
+| `error` | The evaluator refused at least one case. |
+| `deadline_exceeded` | The run did not finish within five seconds. |
+| `evaluation_failed` | The candidate did not compile or the evaluation did not complete. |
+
+An evaluator error is never a pass, and neither is an undecided or
+incomplete case, whatever the case expected.
+
+```json
+{
+  "error": "the stored policy test suite this deployment requires did not pass against this policy; nothing was written",
+  "reason": "policy_tests_required_failed",
+  "required_tests": {
+    "status": "failed",
+    "suite_version": 3,
+    "suite_etag": "\"sha256:...\"",
+    "summary": { "total": 4, "passed": 3, "failed": 1, "incomplete": 0, "errors": 0 }
+  }
+}
+```
+
+The answer is `422 policy_tests_required_failed`, or `503
+policy_tests_unavailable` for `suite_unavailable`. `suite_version` and
+`suite_etag` are `null` when no suite was read, and `summary` is `null` unless
+the run completed. The answer carries counts only: run the stored suite
+(`{"suite": {"source": "stored"}}`) against the same candidate to see which
+cases did not pass. A draft publication that is refused this way is also
+audited as `policy.draft_publish_refused` with the same reason.
+
+Each refusal is audited as `policy.publication_refused` with the code
+(`policy_tests_required_failed` or `policy_tests_unavailable`), the policy ETag
+the change would have replaced, the resource snapshot digest and
+`required_tests` as in the answer. A change the suite admitted records
+`required_tests` (`suite_version`, `suite_etag`, `total` and `passed`) in its
+`policy.changed` event. Neither ever carries a case id, a fixture value or a
+matched element.
+
+What the gate does not cover:
+
+- It reads the suite once per publication. In cluster mode another replica
+  can store a new suite between that read and the policy commit; the
+  `policy.changed` record names the suite version that admitted the change.
+- A watched or `SIGHUP` reload of `POLICY_FILE`, a restart, and
+  `gateway import-standalone` are not publications through the API and are
+  not gated: whoever can write the policy file or run the import is trusted
+  with the policy.
+- Bundle activation (#242) has no runtime path in this build: nothing opens a
+  revision ledger or selects a bundle at startup, so there is no activation
+  there to gate yet.
 
 ## Running a suite
 
@@ -478,8 +563,11 @@ acting principal and the request envelope, `action` (`created` or
 `replaced`), the new `version`, `suite_digest`, `previous_suite_digest` (`null`
 for the first suite), `case_count`, `case_kinds` (the number of `http`, `tool`,
 `tool_http`, `rate` and `egress` cases) and, in cluster mode, the `security_revision` the
-write committed at. It never carries a case, a case id or a fixture value, and
-a refused write emits none. Cluster mode additionally records the write in
+write committed at. With `POLICY_TESTS_REQUIRED=true` it also carries
+`active_policy`: the activation gate's answer for the active policy under the
+new suite (`status`, `suite_version`, `suite_etag` and `summary`, as in a
+[refusal](#requiring-the-stored-suite-before-activation)). It never carries a
+case, a case id or a fixture value, and a refused write emits none. Cluster mode additionally records the write in
 `greengateway.document_change_evidence` (action `policy_tests.publish`), in the
 same transaction.
 
@@ -495,8 +583,8 @@ ends, even when the client disconnects first.
 
 Not part of this slice, and not to be inferred from it:
 
-- Requiring a passing suite before a policy change is activated. A suite can be
-  stored beside the policy and run by reference, but nothing is gated on it.
+- Gating bundle activation or a policy file reload on the stored suite (see
+  [what the gate does not cover](#requiring-the-stored-suite-before-activation)).
 - Typed claim, header, query, tool-argument and time-window matchers, and
   stable route and rate-override identifiers (policy v1).
 - `ggctl policy test` (#242). The runner holds no application state, so that

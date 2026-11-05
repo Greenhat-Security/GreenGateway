@@ -711,14 +711,16 @@ pub(super) async fn accept_suggestion_in_cluster(
             Err(response) => return *response,
         };
     // The acceptance publishes the whole document, so it is checked against
-    // the other resources exactly as every other policy write is.
-    let review = match admit_policy_resources(
-        PublicationRequest {
-            state: &state.policy,
-            rbac_state,
-            parts,
-            principal,
-        },
+    // the other resources exactly as every other policy write is, and, when
+    // policy tests are required, must pass the stored suite (issue #243).
+    let publication = PublicationRequest {
+        state: &state.policy,
+        rbac_state,
+        parts,
+        principal,
+    };
+    let mut review = match admit_policy_resources(
+        publication,
         &prepared.before_policy,
         &prepared.current_etag,
         &prepared.candidate,
@@ -726,6 +728,18 @@ pub(super) async fn accept_suggestion_in_cluster(
     ) {
         Ok(review) => review,
         Err(response) => return *response,
+    };
+    review.required_tests = match admit_required_policy_tests(
+        publication,
+        &prepared.current_etag,
+        &prepared.candidate,
+        &prepared.diff_summary,
+        review.resource_snapshot_digest.as_deref(),
+    )
+    .await
+    {
+        Ok(required_tests) => required_tests,
+        Err(refused) => return *refused.into_response(),
     };
     // The acceptance commits the whole document, so a role description
     // already in it is written again and the gate is asked again.
