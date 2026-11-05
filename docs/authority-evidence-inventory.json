@@ -48,7 +48,7 @@
       ]
     },
     "journaled_dispatch": {
-      "description": "Cluster mode (migration 21): the evidence row is journaled in authority_event_journal in its own transaction under its own event_id, reserving one unit of bounded capacity; a full journal refuses the mutation and evicts nothing. Since migration 26 an admin session grant takes two units, one held for its withdrawal, and a withdrawal spends that unit and is never refused for capacity. With AUTHORITY_EVENT_SINK=log or file, one leased dispatcher reads the journal after a fenced, persisted cursor in bounded batches, delivers authority_event_delivery.v1 records whose actor and resource are keyed safe references, and advances the cursor only after the sink accepted: at least once, deduplicated on (authority_id, event_id). Retention prunes only delivered rows past AUTHORITY_EVENT_RETENTION_HOURS and never an evidence row. With AUTHORITY_EVENT_SINK=none nothing is delivered, and AUTHORITY_EVIDENCE_DURABILITY=required refuses to start such a replica. Since migration 24 the record also carries the actor's kind and auth mode and a keyed reference to a principal's issuer, each null where the evidence row recorded none. It is still not the proposed authority_event.v1: the subject reference is not issuer-scoped, actors without an issuer and rows committed before migration 24 cannot name one, and the operation identity is not caller-bound.",
+      "description": "Cluster mode (migration 21): the evidence row is journaled in authority_event_journal in its own transaction under its own event_id, reserving one unit of bounded capacity; a full journal refuses the mutation and evicts nothing. Since migration 32 the policy, tools and catalog evidence rows (document_change_evidence, catalog_change_evidence) are journaled the same way, and the document rows' actor reads in migration 24's vocabulary. Since migration 26 an admin session grant takes two units, one held for its withdrawal, and a withdrawal spends that unit and is never refused for capacity. With AUTHORITY_EVENT_SINK=log or file, one leased dispatcher reads the journal after a fenced, persisted cursor in bounded batches, delivers authority_event_delivery.v1 records whose actor and resource are keyed safe references, and advances the cursor only after the sink accepted: at least once, deduplicated on (authority_id, event_id). Retention prunes only delivered rows past AUTHORITY_EVENT_RETENTION_HOURS and never an evidence row. With AUTHORITY_EVENT_SINK=none nothing is delivered, and AUTHORITY_EVIDENCE_DURABILITY=required refuses to start such a replica. Since migration 24 the record also carries the actor's kind and auth mode and a keyed reference to a principal's issuer, each null where the evidence row recorded none. It is still not the proposed authority_event.v1: the subject reference is not issuer-scoped, actors without an issuer and rows committed before migration 24 cannot name one, and the operation identity is not caller-bound.",
       "sources": [
         {
           "path": "gateway/src/storage/postgres_authority_events.rs",
@@ -65,6 +65,10 @@
         {
           "path": "gateway/src/cluster_maintenance.rs",
           "anchor": "pub(crate) struct AuthorityEventRetention"
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents.rs",
+          "anchor": "JournalSource::DocumentChange"
         }
       ]
     }
@@ -114,16 +118,15 @@
           "anchor": "async fn policy_draft_publish_endpoint("
         }
       ],
-      "boundary": "persist_policy_mutation -> PolicyControlPlane::commit -> commit_policy_in / postgres_documents::commit_in; active row lock and expected ETag guard; document/history, shared revision, active pointer, security_outbox and one document_change_evidence row commit together. Discovery acceptance invokes commit_policy_in inside its suggestion transaction, so its evidence row shares that transaction. An empty or oversized actor, or an action that cannot describe the resource, is refused before anything is written; an evidence insert failure rolls the whole commit (and an acceptance's transition) back.",
+      "boundary": "persist_policy_mutation -> PolicyControlPlane::commit -> commit_policy_in / postgres_documents::commit_in; active row lock and expected ETag guard; document/history, shared revision, active pointer, security_outbox, one document_change_evidence row and its authority_event_journal row commit together. Discovery acceptance invokes commit_policy_in inside its suggestion transaction, so its evidence row shares that transaction. An empty or oversized actor, or an action that cannot describe the resource, is refused before anything is written; an evidence insert or journal append failure rolls the whole commit (and an acceptance's transition) back and is reported as a store failure (503); a full journal refuses the commit with 503 and is counted.",
       "record": "Immutable policy_documents retain actor subject, diff/action, document ETag and version; security_outbox retains committed revision/from/to. document_change_evidence (migration 23) has no foreign key and holds one row per committed change: operation code, event/operation UUIDs, actor kind/subject/issuer/auth mode, prior/new version, the outbox row's shared revision and database-clock committed_at. Stale ETag, lost initialize race and refused acceptance write none.",
-      "actor": "The handler names the operation and passes the authenticated principal: subject (1 to 4096 bytes), issuer (1 to 4096 bytes, or none) and auth mode (session_cookie, bearer_token, service_token, client_certificate), the principal bounds. The import's activation is the system actor import-standalone with auth mode system. No keyed safe actor reference yet. The kind vocabulary is migration 23's own, not migration 24's: a service-token caller is actor_kind principal with auth mode service_token (migration 24 records actor_kind service_token), and the issuer is stored as the principal carried it, not in canonical form.",
+      "actor": "The handler names the operation and passes the authenticated principal, which the store records as auth::change_actor::ChangeActor::from_principal builds it, as every other evidence table does: subject (1 to 4096 bytes), kind (principal, or service_token for a service-token caller), auth mode (session_cookie, bearer_token, service_token, client_certificate) and the canonical issuer of a principal that has one (1 to 4096 bytes), within the bounds authentication enforces; migration 32's CHECK pairs each new row's kind with its auth mode as migration 24's does. The import's activation is the system actor import-standalone with auth mode system. Rows committed before migration 32 keep migration 23's vocabulary (a service-token caller as kind principal, the issuer as the principal carried it) and are delivered as kind service_token with the issuer canonicalized; nothing is rewritten. A keyed safe actor reference exists only in what is delivered.",
       "identity": "Generated event_id and operation_id UUIDs; operation code policy.publish, policy.rollback, policy.rule.create/update/delete/reorder or policy.suggestion.accept (configuration.import for the import); prior/new version and shared security revision equal to the outbox row's; exactly one row per activated version. operation_id is minted per commit, not bound to a client idempotency key; a lost response is reconciled from the version's evidence row.",
-      "delivery": "post_commit_telemetry",
+      "delivery": "journaled_dispatch",
       "disposition": [
-        "missing_metadata",
-        "missing_delivery"
+        "missing_metadata"
       ],
-      "follow_up": "PR2 follow-up: caller-bound operation identity at the commit boundary and keyed safe actor references, and the actor columns aligned with migration 24's (service_token kind, canonical issuer) before the rows are journaled. Journal document_change_evidence (it is not a migration 21 journal source yet) so the dispatcher delivers it, with the journal's capacity reservation in the same transaction.",
+      "follow_up": "PR2 follow-up: caller-bound operation identity at the commit boundary and an issuer-scoped subject reference, so the delivered record can become authority_event.v1. Since migration 32 each row is journaled in the commit's transaction and dispatched as authority_event_delivery.v1 on the policy axis, with the singleton policy document as its resource; AUTHORITY_EVIDENCE_DURABILITY=required admits this row and nothing qualifies it yet.",
       "sources": [
         {
           "path": "gateway/src/admin_policy.rs",
@@ -144,6 +147,22 @@
         {
           "path": "gateway/src/storage/migrations/0023_document_and_catalog_change_evidence.sql",
           "anchor": "CREATE TABLE greengateway.document_change_evidence ("
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents.rs",
+          "anchor": "JournalSource::DocumentChange"
+        },
+        {
+          "path": "gateway/src/storage/migrations/0032_document_and_catalog_evidence_journal.sql",
+          "anchor": "ADD CONSTRAINT document_change_evidence_actor_metadata CHECK ("
+        },
+        {
+          "path": "gateway/src/authority_events/delivery.rs",
+          "anchor": "fn document_shape("
+        },
+        {
+          "path": "gateway/src/authority_events/delivery.rs",
+          "anchor": "fn document_actor("
         }
       ],
       "tests": [
@@ -170,11 +189,31 @@
         {
           "path": "gateway/src/storage/contract_tests.rs",
           "anchor": "async fn an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn a_full_journal_refuses_policy_and_catalog_publications_and_commits_nothing("
+        },
+        {
+          "path": "gateway/src/authority_events/delivery_tests.rs",
+          "anchor": "fn document_changes_project_on_the_axis_of_their_document("
+        },
+        {
+          "path": "gateway/src/authority_events/delivery_tests.rs",
+          "anchor": "fn legacy_document_actors_are_read_in_migration_24s_vocabulary("
+        },
+        {
+          "path": "gateway/src/storage/migrations.rs",
+          "anchor": "async fn migration_thirty_two_journals_document_and_catalog_evidence_and_aligns_the_actor("
         }
       ],
       "required_durability_supported": false,
       "required_mode": "admitted",
-      "test_claim": "PostgreSQL-gated regression anchors for the transactional document evidence. They do not certify the proposed authority-event contract, delivery or retention."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional document evidence and its journaled delivery: attribution in migration 24's vocabulary, refusals writing and journaling nothing, rollback on a failed evidence insert, a full journal refusing a publication with nothing committed, commit-order delivery under the evidence IDs, legacy rows read in the new vocabulary and migration 32's backfill. They do not certify the proposed authority_event.v1 contract."
     },
     {
       "id": "policy_standalone",
@@ -347,16 +386,15 @@
           "anchor": "async fn tools_openapi_register_endpoint("
         }
       ],
-      "boundary": "register_tools_via_control_plane -> commit_tools -> shared document transaction with CAS, name reservations, immutable version, pointer, revision, outbox and one document_change_evidence row. The first-boot seed and the import's activation use the same transaction.",
+      "boundary": "register_tools_via_control_plane -> commit_tools -> shared document transaction with CAS, name reservations, immutable version, pointer, revision, outbox, one document_change_evidence row and its authority_event_journal row; a full journal refuses the commit with 503, and the first-boot seed with a failed start. The first-boot seed and the import's activation use the same transaction.",
       "record": "tool_documents retain actor subject and action/diff with version and ETag; the outbox row and the non-cascading document_change_evidence row (migration 23) commit with them. A later failed local install does not undo that commit, and its evidence row keeps describing the committed version. A tool name another lane holds writes none.",
-      "actor": "Authenticated principal kind/subject/issuer/auth mode for registration; the system actors bootstrap (first-boot seed) and import-standalone (import), auth mode system. No keyed safe actor reference yet. Same migration 23 vocabulary as policy: a service-token caller is actor_kind principal, and the issuer is not canonicalized.",
+      "actor": "Authenticated principal recorded as ChangeActor::from_principal builds it for registration (a service token as kind service_token, the canonical issuer); the system actors bootstrap (first-boot seed) and import-standalone (import), auth mode system. Same vocabulary and legacy reading as policy since migration 32. A keyed safe actor reference exists only in what is delivered.",
       "identity": "Generated event/operation UUIDs, tools.publish (configuration.import for the import), prior/new tools version and the outbox row's shared security revision; operation_id minted per commit, no client-bound operation ID.",
-      "delivery": "post_commit_telemetry",
+      "delivery": "journaled_dispatch",
       "disposition": [
-        "missing_metadata",
-        "missing_delivery"
+        "missing_metadata"
       ],
-      "follow_up": "PR2 follow-up: caller-bound operation identity and keyed safe actor references, shared with policy; preserve tool-name locks and committed-but-not-locally-installed semantics. Journal the rows for dispatch, as for policy.",
+      "follow_up": "PR2 follow-up: caller-bound operation identity and an issuer-scoped subject reference, shared with policy; preserve tool-name locks and committed-but-not-locally-installed semantics. Since migration 32 each row is journaled and dispatched on the tools axis.",
       "sources": [
         {
           "path": "gateway/src/admin_tools.rs",
@@ -373,6 +411,14 @@
         {
           "path": "gateway/src/storage/postgres_documents.rs",
           "anchor": "async fn record_document_change("
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents.rs",
+          "anchor": "JournalSource::DocumentChange"
+        },
+        {
+          "path": "gateway/src/authority_events/delivery.rs",
+          "anchor": "fn document_shape("
         }
       ],
       "tests": [
@@ -391,11 +437,23 @@
         {
           "path": "gateway/src/storage/postgres_documents_tests.rs",
           "anchor": "async fn a_failed_document_evidence_insert_rolls_back_the_whole_commit("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn a_full_journal_refuses_policy_and_catalog_publications_and_commits_nothing("
+        },
+        {
+          "path": "gateway/src/authority_events/delivery_tests.rs",
+          "anchor": "fn document_changes_project_on_the_axis_of_their_document("
         }
       ],
       "required_durability_supported": false,
       "required_mode": "admitted",
-      "test_claim": "PostgreSQL-gated regression anchors for the transactional document evidence. They do not certify the proposed authority-event contract, delivery or retention."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional document evidence and its journaled delivery, the first-boot seed included. They do not certify the proposed authority_event.v1 contract."
     },
     {
       "id": "tools_standalone",
@@ -458,16 +516,15 @@
           "anchor": "async fn policy_tests_put_endpoint("
         }
       ],
-      "boundary": "policy_tests_put_endpoint -> PostgresPolicyTestSuiteStore::commit -> postgres_documents::commit_in over migration 29's policy_test_suite_versions and policy_test_suite_active; active row lock and expected ETag (If-Match, or Initialize for If-None-Match: *) guard; immutable version, shared revision, active pointer, security_outbox (resource_type policy_tests) and one document_change_evidence row commit together. An empty or oversized actor is refused before anything is written; an evidence insert failure rolls the whole commit back.",
+      "boundary": "policy_tests_put_endpoint -> PostgresPolicyTestSuiteStore::commit -> postgres_documents::commit_in over migration 29's policy_test_suite_versions and policy_test_suite_active; active row lock and expected ETag (If-Match, or Initialize for If-None-Match: *) guard; immutable version, shared revision, active pointer, security_outbox (resource_type policy_tests), one document_change_evidence row and its authority_event_journal row commit together; a full journal refuses the write with 503. An empty or oversized actor is refused before anything is written; an evidence insert failure rolls the whole commit back.",
       "record": "Immutable policy_test_suite_versions retain actor subject, a counts-only diff summary, the suite and its ETag (the suite's semantic digest); security_outbox retains the revision and from/to versions. document_change_evidence (widened by migration 29) holds one row per committed write with action policy_tests.publish and resource_type policy_tests, event/operation UUIDs, actor kind/subject/issuer/auth mode, prior/new version and the outbox row's shared revision. A stale ETag, an existing suite under If-None-Match: * and a lost initialize race write none.",
-      "actor": "The handler passes the authenticated principal: subject, issuer (or none) and auth mode, in migration 23's actor vocabulary, as for policy. No keyed safe actor reference yet.",
+      "actor": "The handler passes the authenticated principal, recorded in migration 24's vocabulary as for policy since migration 32. A keyed safe actor reference exists only in what is delivered.",
       "identity": "Generated event_id and operation_id UUIDs; operation code policy_tests.publish; prior/new suite version and the outbox row's shared security revision; exactly one row per stored version. The proposed event names the suite as a policy resource on its own policy_tests revision axis, since its versions are not policy versions.",
-      "delivery": "post_commit_telemetry",
+      "delivery": "journaled_dispatch",
       "disposition": [
-        "missing_metadata",
-        "missing_delivery"
+        "missing_metadata"
       ],
-      "follow_up": "Shared with policy: caller-bound operation identity and keyed safe actor references, and journaling document_change_evidence for dispatch.",
+      "follow_up": "Shared with policy: caller-bound operation identity and an issuer-scoped subject reference. Since migration 32 each row is journaled and dispatched as a policy resource of its own on the policy_tests axis.",
       "sources": [
         {
           "path": "gateway/src/storage/postgres_policy_tests.rs",
@@ -494,6 +551,10 @@
         {
           "path": "gateway/src/admin_policy_app_tests.rs",
           "anchor": "async fn cluster_policy_tests_commit_through_the_document_transaction("
+        },
+        {
+          "path": "gateway/src/authority_events/delivery_tests.rs",
+          "anchor": "fn document_changes_project_on_the_axis_of_their_document("
         }
       ],
       "required_durability_supported": false,
@@ -966,16 +1027,15 @@
           "anchor": "async fn connection_openapi_overlay_delete_endpoint("
         }
       ],
-      "boundary": "MCP/OpenAPI replacements and overlay updates share the Connection-state transaction and revision/CAS checks; entries, reservations, dependencies, outbox and one catalog_change_evidence row commit together. Registration, refresh and overlay put/delete all reach the OpenAPI replacement. An actor evidence cannot record exactly (an empty or oversized subject or issuer, or an issuer on a service token) is refused before the transaction opens; an evidence insert failure rolls the publication back.",
+      "boundary": "MCP/OpenAPI replacements and overlay updates share the Connection-state transaction and revision/CAS checks; entries, reservations, dependencies, outbox, one catalog_change_evidence row and its authority_event_journal row commit together. Registration, refresh and overlay put/delete all reach the OpenAPI replacement. An actor evidence cannot record exactly (an empty or oversized subject or issuer, or an issuer on a service token) is refused before the transaction opens; an evidence insert or journal append failure rolls the publication back; a full journal refuses it with 503 and is counted.",
       "record": "Current catalog/overlay rows keep their actor's subject and are still replaced or cascaded. catalog_change_evidence (migration 23, with migration 25's actor columns) has no foreign key and keeps one row per publication: action, event/operation UUIDs, the whole actor, Connection ID, prior/new catalog revision, the overlay revision the catalog was compiled from, the outbox row's shared revision and committed_at. A stale catalog or overlay revision, a conflict or a limit writes none.",
-      "actor": "Every catalog writer is an admin endpoint, which builds the ChangeActor from the authenticated Principal; the store records it whole, as Connection deletion does: actor_user_id (the subject, 1 to 4096 bytes, the principal bound), actor_kind, actor_auth_mode and, for a principal that has one, the canonical actor_issuer, in migration 25's columns under migration 24's pairing CHECK. They survive replacement and Connection deletion. Rows committed before this build record none of the three new columns, and nothing is backfilled. A keyed safe actor reference is still absent.",
+      "actor": "Every catalog writer is an admin endpoint, which builds the ChangeActor from the authenticated Principal; the store records it whole, as Connection deletion does: actor_user_id (the subject, 1 to 4096 bytes, the principal bound), actor_kind, actor_auth_mode and, for a principal that has one, the canonical actor_issuer, in migration 25's columns under migration 24's pairing CHECK. They survive replacement and Connection deletion. Rows committed before this build record none of the three new columns, and nothing is backfilled. A keyed safe actor reference exists only in what is delivered.",
       "identity": "Generated event/operation UUIDs; catalog.mcp.publish, catalog.openapi.publish, catalog.overlay.replace or catalog.overlay.delete, derived from the write; the catalog revision transition of the connection_catalog outbox row (its 0 stored as NULL), overlay revision and shared revision. Catalog revisions restart when a Connection re-enters a managed kind, so evidence is ordered by security revision. No client-bound operation ID.",
-      "delivery": "post_commit_telemetry",
+      "delivery": "journaled_dispatch",
       "disposition": [
-        "missing_metadata",
-        "missing_delivery"
+        "missing_metadata"
       ],
-      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the Connection store's catalog writers; a scheduled refresh, if one is added, records a system actor, which the table can now express. Catalogs removed by a Connection kind change are connection.replace evidence. Journal catalog_change_evidence (not a migration 21 journal source yet) so the dispatcher delivers it.",
+      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the Connection store's catalog writers and derive an issuer-scoped subject reference; a scheduled refresh, if one is added, records a system actor, which the table can now express. Catalogs removed by a Connection kind change are connection.replace evidence. Since migration 32 each row is journaled in the publication's transaction and dispatched as a catalog resource referenced by its Connection on the catalog axis; the overlay revision stays in the row.",
       "sources": [
         {
           "path": "gateway/src/connections/pg_store.rs",
@@ -1004,6 +1064,18 @@
         {
           "path": "gateway/src/storage/migrations/0025_catalog_change_evidence_actor_metadata.sql",
           "anchor": "ADD CONSTRAINT catalog_change_evidence_actor_metadata CHECK ("
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "JournalSource::CatalogChange"
+        },
+        {
+          "path": "gateway/src/storage/migrations/0032_document_and_catalog_evidence_journal.sql",
+          "anchor": "'catalog_change_evidence'"
+        },
+        {
+          "path": "gateway/src/authority_events/delivery.rs",
+          "anchor": "const ACTION_CATALOG_OVERLAY_DELETE: &str = \"catalog.overlay.delete\";"
         }
       ],
       "tests": [
@@ -1034,11 +1106,27 @@
         {
           "path": "gateway/src/connections/pg_store_tests.rs",
           "anchor": "async fn a_failed_catalog_evidence_insert_rolls_back_the_publication("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn a_full_journal_refuses_policy_and_catalog_publications_and_commits_nothing("
+        },
+        {
+          "path": "gateway/src/authority_events/delivery_tests.rs",
+          "anchor": "fn catalog_publications_project_on_the_catalog_axis("
+        },
+        {
+          "path": "gateway/src/storage/migrations.rs",
+          "anchor": "async fn migration_thirty_two_journals_document_and_catalog_evidence_and_aligns_the_actor("
         }
       ],
       "required_durability_supported": false,
       "required_mode": "admitted",
-      "test_claim": "PostgreSQL-gated regression anchors for the transactional catalog evidence. They do not certify the proposed authority-event contract, delivery or retention."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional catalog evidence and its journaled delivery: a full journal refusing a publication with nothing committed, commit-order delivery and migration 32's backfill. They do not certify the proposed authority_event.v1 contract."
     },
     {
       "id": "catalog_standalone",
@@ -2235,15 +2323,14 @@
       ],
       "entrypoints": [],
       "boundary": "import-standalone apply is offline and commits each section separately. Policy/tools activation reuse document transactions; Connection/token imports preserve state and intentionally do not replay old outbox entries.",
-      "record": "Imported durable state and policy/tools activation records; each activation also writes one configuration.import document_change_evidence row (migration 23), which the import's validation counts. JSON stdout report carries section counts/checksums. The entire import/report has no single transaction or immutable operator-operation ledger.",
+      "record": "Imported durable state and policy/tools activation records; each activation also writes one configuration.import document_change_evidence row (migration 23) and, since migration 32, journals it in the activation's transaction, which the import's validation counts. The other sections write imported state and no evidence. JSON stdout report carries section counts/checksums. The entire import/report has no single transaction or immutable operator-operation ledger.",
       "actor": "IMPORT_ACTOR marks migration provenance, recorded as a system actor (auth mode system) on the activation evidence; historic actors retained for imported policy history. It is not authenticated human attribution.",
       "identity": "Natural-key idempotence per section and canonical checksums support resume; report has no persisted whole-import operation ID.",
-      "delivery": "operator_output",
+      "delivery": "journaled_dispatch",
       "disposition": [
-        "missing_metadata",
-        "missing_delivery"
+        "missing_metadata"
       ],
-      "follow_up": "Treat import as multiple section operations: persist resumable section evidence with each owning transaction and a final verified manifest. Retain existing no-replay outbox semantics; do not publish sensitive canonical export bodies as evidence.",
+      "follow_up": "Treat import as multiple section operations: persist resumable section evidence with each owning transaction and a final verified manifest. The two activations are journaled and dispatched (configuration.import on the axis of the document each activated) since migration 32, and a full journal refuses the section; the other sections are not. Retain existing no-replay outbox semantics; do not publish sensitive canonical export bodies as evidence.",
       "sources": [
         {
           "path": "gateway/src/import/sections.rs",
@@ -2256,6 +2343,10 @@
         {
           "path": "gateway/src/storage/postgres_service_tokens.rs",
           "anchor": "pub(crate) async fn import_service_tokens_in("
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents.rs",
+          "anchor": "JournalSource::DocumentChange"
         }
       ],
       "tests": [
