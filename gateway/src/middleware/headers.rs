@@ -17,6 +17,14 @@
 use axum::{extract::Request, middleware::Next, response::Response};
 use http::HeaderMap;
 
+/// The baseline `permissions-policy`. It denies the asynchronous clipboard
+/// API (`clipboard-read`, `clipboard-write`) along with the device and
+/// payment features, and the admin UI serves this same value explicitly
+/// (issue #242): nothing in the console reads or writes the clipboard, so a
+/// token, a template or any other value leaves the page only when the
+/// operator selects it and copies it with the keyboard or a context menu.
+pub(crate) const PERMISSIONS_POLICY: &str = "accelerometer=(), autoplay=(), camera=(), clipboard-read=(), clipboard-write=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()";
+
 /// Request headers that must never be trusted from untrusted clients.
 ///
 /// These are stripped to prevent privilege escalation via header spoofing,
@@ -146,7 +154,7 @@ pub async fn header_hardening_middleware(mut req: Request, next: Next) -> Respon
             .expect("static header value should parse"),
     );
     headers.entry("permissions-policy").or_insert(
-        "accelerometer=(), autoplay=(), camera=(), clipboard-read=(), clipboard-write=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+        PERMISSIONS_POLICY
             .parse()
             .expect("static header value should parse"),
     );

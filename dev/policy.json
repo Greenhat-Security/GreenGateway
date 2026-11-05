@@ -38,6 +38,11 @@
     },
     {
       "methods": ["GET"],
+      "path_prefix": "/v1/admin/mcp",
+      "permission": "admin:mcp:clients:read"
+    },
+    {
+      "methods": ["GET"],
       "path_prefix": "/v1/admin/connections",
       "permission": "admin:connections:read"
     },

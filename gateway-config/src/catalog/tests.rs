@@ -1,7 +1,7 @@
 //! The catalog's own rules, and the committed rendering of it.
 //!
-//! What the catalog says about the compiler is proved by the gateway's
-//! `config::catalog_tests`, which can run the compiler. These tests hold what
+//! What the catalog says about the compiler is proved by
+//! `compiler::catalog_tests`, which run the compiler. These tests hold what
 //! needs no compiler: that each entry is internally consistent and follows the
 //! rules ADR-0008 states for whole groups of fields, and that
 //! `docs/configuration-catalog.json` is exactly what [`render_json`] produces.

@@ -83,18 +83,17 @@ impl EgressInputs {
 
 /// The validated egress settings.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct EgressPlan {
-    pub(crate) egress_allowed_hosts: Vec<String>,
-    pub(crate) egress_timeout_ms: u64,
-    pub(crate) egress_response_idle_timeout_ms: u64,
-    pub(crate) egress_connect_timeout_ms: u64,
-    pub(crate) egress_max_response_bytes: usize,
-    pub(crate) egress_max_request_body_bytes: usize,
-    pub(crate) egress_nat64_prefixes: Vec<IpNet>,
-    pub(crate) egress_deny_private_ips: bool,
+pub struct EgressPlan {
+    pub egress_allowed_hosts: Vec<String>,
+    pub egress_timeout_ms: u64,
+    pub egress_response_idle_timeout_ms: u64,
+    pub egress_connect_timeout_ms: u64,
+    pub egress_max_response_bytes: usize,
+    pub egress_max_request_body_bytes: usize,
+    pub egress_nat64_prefixes: Vec<IpNet>,
+    pub egress_deny_private_ips: bool,
     /// Where each of the block's inputs came from, in the order they are read.
-    #[allow(dead_code)] // Read by the stage tests; startup builds from the values alone.
-    pub(crate) provenance: Vec<Provenance>,
+    pub provenance: Vec<Provenance>,
 }
 
 /// Parses the egress block. Every input here is checked on its own.

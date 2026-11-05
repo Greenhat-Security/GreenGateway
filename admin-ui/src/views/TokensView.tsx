@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { FormEvent, type RefObject, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
@@ -36,7 +36,8 @@ export function TokensView() {
   const [mutationError, setMutationError] =
     useState<TokensViewError | null>(null);
   const [oneTimeToken, setOneTimeToken] = useState<CreatedToken | null>(null);
-  const [copyStatus, setCopyStatus] = useState<string | null>(null);
+  const [selectionStatus, setSelectionStatus] = useState<string | null>(null);
+  const plaintextTokenRef = useRef<HTMLInputElement | null>(null);
   const capabilities = useAdminCapabilities();
   const [writeRejected, setWriteRejected] = useState(false);
   const canWriteTokens = !writeRejected && hasAdminPermission(capabilities, TOKEN_WRITE_PERMISSION);
@@ -156,7 +157,7 @@ export function TokensView() {
 
     setIsCreating(true);
     setMutationError(null);
-    setCopyStatus(null);
+    setSelectionStatus(null);
 
     try {
       const created = await createToken(scopes, expiresAt);
@@ -196,7 +197,7 @@ export function TokensView() {
 
     setMutatingTokenId(token.id);
     setMutationError(null);
-    setCopyStatus(null);
+    setSelectionStatus(null);
 
     try {
       const rotated = await rotateToken(token.id);
@@ -214,24 +215,21 @@ export function TokensView() {
       upsertToken(oneTimeToken.token);
     }
     setOneTimeToken(null);
-    setCopyStatus(null);
+    setSelectionStatus(null);
   }
 
-  async function copyPlaintextToken() {
-    if (!oneTimeToken) {
+  // The console never writes to the clipboard: the admin UI's
+  // Permissions-Policy denies the asynchronous clipboard API (issue #242).
+  // Selecting the token lets the operator copy it with the keyboard or the
+  // context menu, so the plaintext leaves the page only by their own action.
+  function selectPlaintextToken() {
+    const input = plaintextTokenRef.current;
+    if (!oneTimeToken || !input) {
       return;
     }
-    if (!navigator.clipboard) {
-      setCopyStatus('Copy unavailable');
-      return;
-    }
-
-    try {
-      await navigator.clipboard.writeText(oneTimeToken.plaintext_token);
-      setCopyStatus('Copied');
-    } catch {
-      setCopyStatus('Copy failed');
-    }
+    input.focus();
+    input.select();
+    setSelectionStatus('Token selected. Press Ctrl+C (or Cmd+C) to copy it.');
   }
 
   function upsertToken(nextToken: TokenRecord) {
@@ -274,10 +272,9 @@ export function TokensView() {
         {oneTimeToken ? (
           <OneTimeTokenPanel
             created={oneTimeToken}
-            copyStatus={copyStatus}
-            onCopy={() => {
-              void copyPlaintextToken();
-            }}
+            inputRef={plaintextTokenRef}
+            selectionStatus={selectionStatus}
+            onSelect={selectPlaintextToken}
             onDismiss={dismissOneTimeToken}
           />
         ) : null}
@@ -443,13 +440,15 @@ export function TokensView() {
 
 function OneTimeTokenPanel({
   created,
-  copyStatus,
-  onCopy,
+  inputRef,
+  selectionStatus,
+  onSelect,
   onDismiss,
 }: {
   created: CreatedToken;
-  copyStatus: string | null;
-  onCopy: () => void;
+  inputRef: RefObject<HTMLInputElement | null>;
+  selectionStatus: string | null;
+  onSelect: () => void;
   onDismiss: () => void;
 }) {
   return (
@@ -462,16 +461,21 @@ function OneTimeTokenPanel({
           className="endpoint-template"
           readOnly
           spellCheck={false}
+          ref={inputRef}
           value={created.plaintext_token}
           onFocus={(event) => event.currentTarget.select()}
         />
-        <button type="button" className="secondary-button" onClick={onCopy}>
-          {copyStatus ?? 'Copy'}
+        <button type="button" className="secondary-button" onClick={onSelect}>
+          Select token
         </button>
         <button type="button" className="primary-button" onClick={onDismiss}>
           I've saved this
         </button>
       </div>
+      <p>
+        {selectionStatus ??
+          'Select the token and copy it with the keyboard or the context menu.'}
+      </p>
     </div>
   );
 }

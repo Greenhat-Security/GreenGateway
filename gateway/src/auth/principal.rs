@@ -28,7 +28,7 @@ impl AuthMethod {
 // Issuer canonicalization and the issuer bound, which the configuration
 // compiler shares with `ggctl` (issue #242).
 pub(crate) use gateway_config::auth::{
-    canonical_issuer, provider_issuer, MAX_PRINCIPAL_ISSUER_BYTES, PROVIDER_ISSUER_PREFIX,
+    canonical_issuer, provider_issuer, MAX_PRINCIPAL_ISSUER_BYTES,
 };
 
 /// Authenticated caller identity used for authorization and audit attribution.

@@ -12,6 +12,7 @@ an exit code. Implementation is grouped by responsibility:
 | `probes` | Health/readiness, metrics and proxy fallback |
 | `admin_identity`, `admin_authorization` | Admin login, capabilities and final permission checks |
 | `admin_config` | The configuration admin API: the `config/capabilities` version handshake `ggctl` reads |
+| `admin_mcp_clients` | The credential-free MCP client configuration templates (`mcp/client-configs`) the admin UI and `ggctl mcp-config` read, rendered by `gateway-config` |
 | `admin_connections`, `admin_tools`, `admin_tokens`, `admin_policy`, `admin_policy_drafts` | Domain-specific handlers and mutations; policy drafts, including a discovery suggestion opened in one, publish only through `admin_policy`'s mutation path |
 | `admin_observability`, `admin_events` | Audit, traffic, signals, suggestions and change telemetry |
 | `admin_responses`, `admin_ui` | Shared error mapping and embedded UI serving |
@@ -100,14 +101,15 @@ the server remains authoritative for permissions and secret binding validity.
 
 `gateway-config` is the library the gateway and `ggctl` both link (issue #242,
 ADR-0008). Besides the bundle reader, catalog, ledger and digests its own
-documentation lists, it holds the I/O-free leaves of the configuration
-compiler, which is moving into it from `gateway/src/config`: the types and
-validators a setting is parsed into, with no file, socket, clock or provider
-behind them. The gateway re-exports each one from the module it used to live
-in, so call sites did not change:
+documentation lists, it holds the environment configuration compiler, moved
+into it from `gateway/src/config`, and the I/O-free leaves the compiler calls:
+the types and validators a setting is parsed into, with no file, socket, clock
+or provider behind them. The gateway re-exports each one from the module it
+used to live in, so call sites did not change:
 
 | `gateway-config` module | Holds | Re-exported by |
 |---|---|---|
+| `compiler` | The configuration compiler ([contract](configuration-compiler.md)): `compile`, the input inventory, the parse and validate stages and the `ConfigPlan` they build, `ConfigError` and its value-free diagnostics, every setting's name, default and bound, the JSON setting types (`AuthProviderConfig`, `UpstreamRouteConfig`, `McpUpstreamServerConfig`, `InboundClientAuthConfig` and the rest), and the semantic diff of two plans | `config` (a glob re-export) |
 | `connections` | Connections limits (`MAX_CREDENTIALS`, display name, Connection and secret ID bounds) and the Connection ID grammar | `connections::model` |
 | `connections::secret` | The operator alias document, the secrets root, and the alias, environment-key and file-key grammars | `connections::secret` |
 | `connections::{aws,azure,gcp,vault,kubernetes}_secret` | Each secret provider's configuration document and validator | the gateway module of the same name |
@@ -124,6 +126,11 @@ except `path_match`'s: the tests `security-mutations.json` selects and the
 property tests stay in the gateway's `path_match` module, because the mutation
 campaign builds and runs only the gateway's test binary. Tests that exercise a
 provider, a listener or a store, rather than the document, stay in the gateway.
+The compiler's parity goldens, stage tests and catalog tests moved with it and
+hold its plans to the values the gateway's `Config` always had; the gateway's
+`config_tests` still hold `Config::from_env_vars` to every setting.
 What touches files, the network or a clock (provider construction, key and
-secrets-root reads, listener binding) stays in the gateway, and the compiler's
-zero-I/O scan (`config::stage_tests`) reads these modules too.
+secrets-root reads, listener binding) stays in the gateway, and so do
+`Config`, its conversion from a plan (`config::into_config`) and the
+process-environment reader. The compiler's zero-I/O scan
+(`compiler::stage_tests`) reads the whole compiler module and these leaves.

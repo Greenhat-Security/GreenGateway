@@ -3649,3 +3649,68 @@ textarea:focus-visible {
     justify-content: stretch;
   }
 }
+
+.mcp-clients-body,
+.mcp-template {
+  display: grid;
+  gap: var(--gh-ref-space-3);
+  min-width: 0;
+}
+
+.mcp-clients-facts {
+  display: grid;
+  gap: var(--gh-ref-space-2);
+  margin: 0;
+}
+
+.mcp-clients-facts dt {
+  color: var(--gh-sys-fg-subtle);
+  font-size: var(--gh-type-caption);
+  font-weight: 600;
+}
+
+.mcp-clients-facts dd {
+  margin: 0;
+}
+
+.mcp-template-locations {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.mcp-template-label {
+  font-weight: 600;
+}
+
+.mcp-template-text {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--gh-sys-border);
+  border-radius: var(--gh-comp-input-radius);
+  padding: 10px 12px;
+  color: var(--gh-sys-fg);
+  background: var(--gh-sys-bg-canvas);
+  font-size: var(--gh-type-body-sm);
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+  resize: vertical;
+}
+
+.mcp-template-text:focus {
+  outline: none;
+  border-color: var(--gh-sys-primary);
+  box-shadow: 0 0 0 2px
+    color-mix(in srgb, var(--gh-sys-primary) 25%, transparent);
+}
+
+.mcp-template .token-row {
+  grid-template-columns: auto;
+  justify-content: start;
+}
+
+@media (max-width: 760px) {
+  .mcp-clients-page .rule-check-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
