@@ -5,9 +5,9 @@
 //! validation, doctor and diff as a bundle. The file is read like the other
 //! local files `ggctl` reads (`credential::read_regular_file`): a regular
 //! file, a symbolic link to one followed, of at most
-//! [`MAX_ENV_FILE_BYTES`], opened without blocking and, on Unix, neither it
-//! nor a directory holding it writable by group or other without the sticky
-//! bit, as the bundle reader requires of a bundle. It must be UTF-8. It is
+//! [`MAX_ENV_FILE_BYTES`], opened without blocking and, on Unix, not
+//! writable by group or other, as the bundle reader requires of a bundle
+//! file. It must be UTF-8. It is
 //! then parsed with the grammar `gateway import-standalone` reads
 //! (`gateway_config::env_file`) and compiled by the gateway's own compiler
 //! through a reader that answers from the file alone: `ggctl` never reads

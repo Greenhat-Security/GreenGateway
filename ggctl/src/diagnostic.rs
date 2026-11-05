@@ -559,7 +559,7 @@ impl Code {
             ),
             Self::EnvUnsafePermissions => (
                 "env.unsafe_permissions",
-                "the environment file, or a directory holding it, is writable by group or other",
+                "the environment file is writable by group or other",
                 Invalid,
             ),
             Self::EnvTooLarge => ("env.too_large", "the environment file is larger than 1 MiB", Invalid),
