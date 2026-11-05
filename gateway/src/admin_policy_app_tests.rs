@@ -6322,7 +6322,9 @@ mod cluster_policy_tests {
         assert_eq!(body["reason"], "capability_not_advertised");
         assert_eq!(policy_version_count(&pool).await, before + 2);
 
-        // Three refused writes, three audit events, none naming a member.
+        // Four refused writes -- the conditioned document among them, held
+        // like any other v1 document -- four audit events, none naming a
+        // member.
         let started = std::time::Instant::now();
         let refusals = || {
             capture
@@ -6331,13 +6333,13 @@ mod cluster_policy_tests {
                 .filter(|event| event.event_type == "cluster.operation_refused")
                 .collect::<Vec<_>>()
         };
-        while refusals().len() < 3 && started.elapsed() < Duration::from_secs(5) {
+        while refusals().len() < 4 && started.elapsed() < Duration::from_secs(5) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let refused = refusals();
         assert_eq!(
             refused.len(),
-            3,
+            4,
             "validation audits nothing; each write once"
         );
         for event in &refused {
@@ -6636,7 +6638,7 @@ mod cluster_policy_tests {
             }
             answers.push((
                 (validated.0, replaced.0, replaced.1),
-                (typed_validated.0, typed_validated.1, refused.0),
+                (typed_validated.0, typed_validated.1),
                 statuses,
             ));
         }
