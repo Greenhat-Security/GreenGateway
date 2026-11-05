@@ -5643,12 +5643,25 @@ mod cluster_policy_tests {
                     PolicyEvaluationLimiter::new(MAX_CONCURRENT_POLICY_SIMULATIONS),
                 ))),
             )
+            .route(
+                POLICY_TESTS_ADMIN_ROUTE,
+                get(policy_tests_get_endpoint).put(policy_tests_put_endpoint),
+            )
+            .route(
+                POLICY_TEST_RUNS_ADMIN_ROUTE,
+                post(policy_test_runs_endpoint).layer(Extension(Arc::new(
+                    PolicyEvaluationLimiter::new(MAX_CONCURRENT_POLICY_TEST_RUNS),
+                ))),
+            )
             .with_state(PolicyAdminState {
                 policy_file: None,
                 rbac_state: Some(rbac_state.clone().with_revision_gate(gate.clone())),
                 history_store: Some(store.clone() as Arc<dyn storage::PolicyHistory>),
                 draft_store: Some(
                     Arc::new(store.draft_store()) as Arc<dyn storage::PolicyDraftStore>
+                ),
+                test_suite_store: Some(
+                    Arc::new(store.test_suite_store()) as Arc<dyn storage::PolicyTestSuiteStore>
                 ),
                 control_plane: Some(store as Arc<dyn storage::PolicyControlPlane>),
                 membership,
@@ -7803,6 +7816,223 @@ mod cluster_policy_tests {
                     admin_principal().user_id
                 ),
             ]
+        );
+    }
+
+    /// The stored policy test suite in cluster mode (issue #243): a write is
+    /// one versioned-document commit of its own resource -- a version row,
+    /// the next shared security revision, an outbox row and an evidence row
+    /// naming the writer -- and every replica reads and replaces the same
+    /// suite under the same strong ETag. A stale ETag is `412` and writes
+    /// nothing, the policy itself is untouched, and a run of the stored
+    /// suite reads it from the authority.
+    #[tokio::test]
+    async fn cluster_policy_tests_commit_through_the_document_transaction() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let tester_policy = parse_policy_body(&Bytes::from(
+            json!({
+                "schema_version": "0.1.0",
+                "id": "suite-init",
+                "default_action": "deny",
+                "roles": {
+                    "admin": {
+                        "permissions": [
+                            "admin:policy:read",
+                            "admin:policy:write",
+                            "admin:policy:simulate"
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .expect("the tester policy parses");
+        let active = PolicyControlPlane::commit(
+            store.as_ref(),
+            PolicyCommitRequest {
+                precondition: PolicyCommitPrecondition::Initialize,
+                candidate: &tester_policy,
+                change: crate::storage::DocumentChange::test_policy("seed"),
+                diff_summary: &DIFF,
+            },
+        )
+        .await
+        .expect("deployment should initialize");
+        let mut replicas = Vec::new();
+        for _ in 0..2 {
+            let (router, rbac_state) = cluster_policy_router(store.clone());
+            rbac_state
+                .install_revision_snapshot(active.policy.clone(), active.security_revision)
+                .await
+                .expect("the authority's revision should install");
+            replicas.push(router);
+        }
+        let suite_request = |method: Method, headers: &[(&str, &str)], body: String| {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(POLICY_TESTS_ADMIN_ROUTE);
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            let mut request = builder
+                .body(Body::from(body))
+                .expect("suite request should build");
+            request.extensions_mut().insert(admin_principal());
+            request
+        };
+        let suite = |description: &str| {
+            json!({
+                "schema_version": "policy-tests.v1",
+                "description": description,
+                "cases": [{
+                    "id": "unrouted-is-denied",
+                    "kind": "http",
+                    "request": { "method": "GET", "path": "/unrouted" },
+                    "principal": "anonymous",
+                    "expect": { "logical": "deny" }
+                }]
+            })
+        };
+
+        let created = replicas[0]
+            .clone()
+            .oneshot(suite_request(
+                Method::PUT,
+                &[("if-none-match", "*")],
+                suite("first").to_string(),
+            ))
+            .await
+            .expect("create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let first_etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("ETag")
+            .to_owned();
+
+        // The other replica reads the same suite, and replaces it.
+        let read = replicas[1]
+            .clone()
+            .oneshot(suite_request(Method::GET, &[], String::new()))
+            .await
+            .expect("read should complete");
+        assert_eq!(etag_of(read).await, first_etag);
+        let replaced = replicas[1]
+            .clone()
+            .oneshot(suite_request(
+                Method::PUT,
+                &[("if-match", &first_etag)],
+                suite("second").to_string(),
+            ))
+            .await
+            .expect("replace should complete");
+        let second_etag = etag_of(replaced).await;
+        assert_ne!(second_etag, first_etag);
+        let (status, body) = refusal_of(
+            replicas[0]
+                .clone()
+                .oneshot(suite_request(
+                    Method::PUT,
+                    &[("if-match", &first_etag)],
+                    suite("stale").to_string(),
+                ))
+                .await
+                .expect("stale write should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+        assert_eq!(body["reason"], "policy_tests_etag_mismatch");
+
+        // A run of the stored suite, through the first replica.
+        let run = replicas[0]
+            .clone()
+            .oneshot({
+                let mut request = Request::builder()
+                    .method(Method::POST)
+                    .uri(POLICY_TEST_RUNS_ADMIN_ROUTE)
+                    .body(Body::from(
+                        json!({ "suite": { "source": "stored", "etag": second_etag } }).to_string(),
+                    ))
+                    .expect("run request should build");
+                request.extensions_mut().insert(admin_principal());
+                request
+            })
+            .await
+            .expect("run should complete");
+        let (status, report) = refusal_of(run).await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["suite"]["stored"]["etag"], json!(second_etag));
+        assert_eq!(
+            report["policy"]["security_revision"],
+            json!(active.security_revision)
+        );
+
+        // Two suite commits, each with its revision, outbox row and evidence;
+        // the stale write recorded nothing, and the policy is unchanged.
+        let client = pool.get().await.expect("checkout");
+        let outbox: Vec<(i64, String, Option<i64>, i64)> = client
+            .query(
+                "SELECT revision, resource_type, from_version, to_version \
+                 FROM greengateway.security_outbox WHERE revision > $1 ORDER BY revision",
+                &[&active.security_revision],
+            )
+            .await
+            .expect("outbox rows")
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        assert_eq!(outbox.len(), 2, "{outbox:?}");
+        assert!(outbox
+            .iter()
+            .all(|(_, resource, _, _)| resource == "policy_tests"));
+        assert_eq!(outbox[0].2, None);
+        assert_eq!(outbox[1].2, Some(outbox[0].3));
+        let evidence: Vec<(String, String, String, i64)> = client
+            .query(
+                "SELECT action, resource_type, actor_user_id, security_revision \
+                 FROM greengateway.document_change_evidence \
+                 WHERE resource_type = 'policy_tests' ORDER BY security_revision",
+                &[],
+            )
+            .await
+            .expect("evidence rows")
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        let writer = admin_principal().user_id;
+        assert_eq!(
+            evidence,
+            vec![
+                (
+                    "policy_tests.publish".to_owned(),
+                    "policy_tests".to_owned(),
+                    writer.clone(),
+                    outbox[0].0
+                ),
+                (
+                    "policy_tests.publish".to_owned(),
+                    "policy_tests".to_owned(),
+                    writer,
+                    outbox[1].0
+                ),
+            ]
+        );
+        let still = store
+            .active()
+            .await
+            .expect("active read")
+            .expect("active document");
+        assert_eq!(
+            (still.version, still.etag),
+            (active.version, active.etag),
+            "storing a suite changes no policy"
         );
     }
 

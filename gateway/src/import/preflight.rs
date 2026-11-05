@@ -118,6 +118,11 @@ const AUTHORITATIVE_TABLES: &[&str] = &[
     // by publications, never by the import.
     "document_change_evidence",
     "catalog_change_evidence",
+    // 0029: the stored policy test suite. The import never writes it (a
+    // standalone suite stays behind), so a row means an operator already
+    // stored one in this namespace.
+    "policy_test_suite_versions",
+    "policy_test_suite_active",
 ];
 
 /// The authoritative singleton counters and the column that carries them.
