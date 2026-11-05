@@ -62,12 +62,26 @@ fn positional_choices(command: &CommandSpec) -> &'static [&'static str] {
 }
 
 /// Whether the command's positional argument is a path, which completes
-/// directory names: every such argument today is a bundle directory.
+/// directory names: every such argument is a bundle directory.
 fn takes_a_directory(command: &CommandSpec) -> bool {
     command
         .arguments
         .first()
         .is_some_and(|argument| argument.kind == ValueKind::Path)
+}
+
+/// Whether the command's positional argument is a document file, which
+/// completes file names.
+fn takes_a_file(command: &CommandSpec) -> bool {
+    command
+        .arguments
+        .first()
+        .is_some_and(|argument| argument.kind == ValueKind::File)
+}
+
+/// Whether an option's value completes file names.
+fn is_file_name(kind: ValueKind) -> bool {
+    matches!(kind, ValueKind::Path | ValueKind::File)
 }
 
 /// Single-quotes text for a POSIX shell, zsh or fish.
@@ -111,7 +125,7 @@ fn bash() -> String {
         let _ = writeln!(script, "            case \"$prev\" in");
         for option in command.options {
             match option.value.map(|(_, kind)| kind) {
-                Some(ValueKind::Path) => {
+                Some(kind) if is_file_name(kind) => {
                     let _ = writeln!(
                         script,
                         "                {}) COMPREPLY=($(compgen -f -- \"$cur\")); return 0 ;;",
@@ -143,6 +157,8 @@ fn bash() -> String {
             .collect();
         let directories = if takes_a_directory(command) {
             "$(compgen -d -- \"$cur\") "
+        } else if takes_a_file(command) {
+            "$(compgen -f -- \"$cur\") "
         } else {
             ""
         };
@@ -170,7 +186,7 @@ fn zsh_option(option: &OptionSpec) -> String {
     let description = zsh_spec(option.help);
     let spec = match option.value {
         None => format!("{}[{description}]", option.name),
-        Some((placeholder, ValueKind::Path)) => {
+        Some((placeholder, kind)) if is_file_name(kind) => {
             format!("{}[{description}]:{placeholder}:_files", option.name)
         }
         Some((placeholder, ValueKind::Choice(choices))) => {
@@ -245,6 +261,8 @@ fn zsh() -> String {
         if let Some(argument) = command.arguments.first() {
             let action = if takes_a_directory(command) {
                 "_files -/".to_owned()
+            } else if takes_a_file(command) {
+                "_files".to_owned()
             } else {
                 format!("({})", positional_choices(command).join(" "))
             };
@@ -318,7 +336,7 @@ fn fish() -> String {
             let long = &option.name[2..];
             let line = match option.value.map(|(_, kind)| kind) {
                 None => format!("complete -c ggctl -n {condition} -l {long}"),
-                Some(ValueKind::Path) => {
+                Some(kind) if is_file_name(kind) => {
                     format!("complete -c ggctl -n {condition} -l {long} -r -F")
                 }
                 Some(ValueKind::Choice(choices)) => format!(
@@ -342,6 +360,9 @@ fn fish() -> String {
                 script,
                 "complete -c ggctl -n {condition} -a '(__fish_complete_directories)'"
             );
+        }
+        if takes_a_file(command) {
+            let _ = writeln!(script, "complete -c ggctl -n {condition} -F");
         }
         let _ = writeln!(
             script,
@@ -397,7 +418,7 @@ fn powershell() -> String {
                 }
                 // A path option completes file names: returning nothing
                 // leaves PowerShell's own path completion in place.
-                Some(ValueKind::Path) => {}
+                Some(kind) if is_file_name(kind) => {}
                 Some(_) => {
                     let _ = writeln!(
                         script,
@@ -429,14 +450,15 @@ fn powershell() -> String {
     let mut path_options: Vec<_> = COMMANDS
         .iter()
         .flat_map(|command| command.options)
-        .filter(|option| matches!(option.value, Some((_, ValueKind::Path))))
+        .filter(|option| option.value.is_some_and(|(_, kind)| is_file_name(kind)))
         .map(|option| option.name)
         .collect();
     path_options.sort_unstable();
     path_options.dedup();
+    // A bundle directory or a document: PowerShell completes either path.
     let directory_commands: Vec<_> = COMMANDS
         .iter()
-        .filter(|command| takes_a_directory(command))
+        .filter(|command| takes_a_directory(command) || takes_a_file(command))
         .map(|command| command.name)
         .collect();
     let _ = write!(
@@ -544,7 +566,7 @@ mod tests {
             powershell.matches(')').count()
         );
         assert!(powershell.contains(
-            "$previous -in @('--against', '--answers', '--ca-file', '--output', '--state-dir', '--token-file')"
+            "$previous -in @('--against', '--answers', '--ca-file', '--candidate', '--output', '--state-dir', '--token-file')"
         ));
         // A bundle directory completes directory names.
         assert!(bash
@@ -553,8 +575,15 @@ mod tests {
         assert!(fish.contains(
             "complete -c ggctl -n '__fish_seen_subcommand_from doctor' -a '(__fish_complete_directories)'\n"
         ));
+        // A document completes file names.
+        assert!(bash
+            .contains("            COMPREPLY=($(compgen -f -- \"$cur\") $(compgen -W '--server"));
+        assert!(zsh.contains("'1:PACKAGE:_files' \\\n"));
+        assert!(fish.contains(
+            "complete -c ggctl -n '__fish_seen_subcommand_from policy; and __fish_seen_subcommand_from lint' -F\n"
+        ));
         assert!(powershell.contains(
-            "$command -in @('validate', 'pin', 'convert', 'doctor', 'diff', 'ledger seed')"
+            "$command -in @('validate', 'pin', 'convert', 'doctor', 'diff', 'ledger seed', 'policy lint', 'policy test', 'policy explain', 'evidence verify')"
         ));
         for script in [&bash, &zsh, &fish] {
             // Single quotes pair up once escaped quotes are removed.
@@ -567,29 +596,53 @@ mod tests {
     fn a_family_completes_its_commands_then_each_commands_options() {
         let [bash, zsh, fish, powershell] = scripts().map(|(_, script)| script);
         // The family's name is offered first; its commands after it.
-        assert!(bash.contains("compgen -W 'version schema init validate pin convert doctor diff ledger completion help'"));
+        assert!(bash.contains("compgen -W 'version schema init validate pin convert doctor diff ledger policy evidence completion help'"));
         assert!(bash.contains(
             "        ledger)\n            if [ \"$COMP_CWORD\" -eq 2 ]; then\n                COMPREPLY=($(compgen -W 'seed verify rollback --help -h' -- \"$cur\"))"
         ));
+        assert!(bash.contains(
+            "        policy)\n            if [ \"$COMP_CWORD\" -eq 2 ]; then\n                COMPREPLY=($(compgen -W 'lint test explain replay --help -h' -- \"$cur\"))"
+        ));
         assert!(bash.contains("            command=\"$command ${COMP_WORDS[2]}\"\n"));
         assert!(bash.contains("        'ledger rollback')\n"));
+        assert!(bash.contains("        'policy test')\n"));
         assert!(bash.contains("                --acknowledge) COMPREPLY=($(compgen -W 'risk.admin_access_path_removed "));
+        assert!(bash.contains(
+            "                --format) COMPREPLY=($(compgen -W 'human json junit' -- \"$cur\")); return 0 ;;"
+        ));
+        assert!(bash.contains(
+            "                --candidate) COMPREPLY=($(compgen -f -- \"$cur\")); return 0 ;;"
+        ));
         assert!(zsh.contains("    'ledger:Seed, verify or roll back"));
         assert!(zsh.contains("        'seed:Create a state directory"));
+        assert!(zsh.contains("    'policy:Lint, test, explain and replay policy"));
+        assert!(zsh.contains("        'verify:Verify a policy evidence package"));
         assert!(zsh.contains("      command=\"$command ${words[2]}\"\n"));
         assert!(zsh.contains("    'ledger verify')\n      _arguments \\\n        '--state-dir["));
+        assert!(zsh.contains("    'policy replay')\n      _arguments \\\n        '--server["));
         assert!(fish.contains(
             "complete -c ggctl -n '__fish_seen_subcommand_from ledger; and not __fish_seen_subcommand_from seed verify rollback' -a rollback -d "
         ));
         assert!(fish.contains(
             "complete -c ggctl -n '__fish_seen_subcommand_from ledger; and __fish_seen_subcommand_from rollback' -l acknowledge -x -a "
         ));
+        assert!(fish.contains(
+            "complete -c ggctl -n '__fish_seen_subcommand_from policy; and not __fish_seen_subcommand_from lint test explain replay' -a replay -d "
+        ));
+        assert!(fish.contains(
+            "complete -c ggctl -n '__fish_seen_subcommand_from policy; and __fish_seen_subcommand_from test' -l candidate -r -F -d "
+        ));
         assert!(powershell
             .contains("        'ledger' = @('seed', 'verify', 'rollback', '--help', '-h')\n"));
         assert!(powershell.contains("        'ledger rollback' = @('--state-dir', '--acknowledge', '--format', '--help', '-h')\n"));
+        assert!(powershell.contains(
+            "        'policy' = @('lint', 'test', 'explain', 'replay', '--help', '-h')\n"
+        ));
+        assert!(powershell.contains("        'evidence verify' = @('--format', '--help', '-h')\n"));
         // No family command is offered as a first word.
         assert!(!bash.contains(
             "compgen -W 'version schema init validate pin convert doctor diff ledger seed"
         ));
+        assert!(!bash.contains("policy evidence completion help policy lint"));
     }
 }

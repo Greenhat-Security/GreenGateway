@@ -15,7 +15,7 @@
       "const": "GgctlReport"
     },
     "command": {
-      "enum": ["version", "schema", "init", "validate", "pin", "convert", "doctor", "diff", "ledger seed", "ledger verify", "ledger rollback"]
+      "enum": ["version", "schema", "init", "validate", "pin", "convert", "doctor", "diff", "ledger seed", "ledger verify", "ledger rollback", "policy lint", "policy test", "policy explain", "policy replay", "evidence verify"]
     },
     "exitCode": {
       "type": "integer",
@@ -123,6 +123,46 @@
       "then": {
         "properties": {"result": {"$ref": "#/$defs/ledgerRollbackResult"}}
       }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "policy lint"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/policyLintResult"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "policy test"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/policyTestResult"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "policy explain"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/policyExplainResult"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "policy replay"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/policyReplayResult"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "evidence verify"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/evidenceVerifyResult"}}
+      }
     }
   ],
   "$defs": {
@@ -134,7 +174,7 @@
         "code": {
           "description": "The stable family.reason code. docs/ggctl.md lists every ggctl code by family, and docs/configuration-bundles.md every bundle reader code.",
           "type": "string",
-          "pattern": "^(usage|credential|trust|remote|compat|schema|validate|doctor|diff|init|convert|pin|state_dir|ledger|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile)\\.[a-z][a-z0-9_]*$"
+          "pattern": "^(usage|credential|trust|remote|input|policy|evidence|compat|schema|validate|doctor|diff|init|convert|pin|state_dir|ledger|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile)\\.[a-z][a-z0-9_]*$"
         },
         "severity": {
           "enum": ["error", "warning", "info"]
@@ -883,6 +923,210 @@
     "shownValue": {
       "description": "A boolean, a fixed word, a number, or the word unbounded.",
       "type": ["boolean", "string", "number"]
+    },
+    "digest": {
+      "description": "An ADR-0004 digest: sha256: and 64 lowercase hexadecimal digits.",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "code": {
+      "description": "A stable code a gateway reported, in lowercase snake segments.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    },
+    "refusal": {
+      "description": "A request the gateway refused: its HTTP status, its stable reason and its structured request diagnostics (a stable code, a JSON Pointer into the request and the gateway's fixed message). The free-text error and errors members of the answer are never repeated.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {"type": "integer", "minimum": 100, "maximum": 599},
+        "reason": {"$ref": "#/$defs/code"},
+        "diagnostics": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "pointer"],
+            "properties": {
+              "code": {"$ref": "#/$defs/code"},
+              "pointer": {"type": "string", "pattern": "^(/([^/~]|~[01])*)*$"},
+              "message": {"type": "string"}
+            }
+          }
+        },
+        "diagnosticsTruncated": {"const": true}
+      }
+    },
+    "policyLintResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "valid": {
+          "description": "Present once the gateway judged the document: the gateway's policy validator found no error, its cross-resource checks included.",
+          "type": "boolean"
+        },
+        "schemaVersion": {"type": "string"},
+        "sourceDigest": {"$ref": "#/$defs/digest"},
+        "semanticDigest": {"$ref": "#/$defs/digest"},
+        "diagnostics": {
+          "description": "The validator's diagnostics, as POST /policy/validate reported them.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "severity", "pointer", "message", "remediation", "blocks"],
+            "properties": {
+              "code": {"$ref": "#/$defs/code"},
+              "severity": {"enum": ["error", "warning", "risk"]},
+              "pointer": {"type": "string", "pattern": "^(/([^/~]|~[01])*)*$"},
+              "elementId": {"type": "string"},
+              "message": {"type": "string"},
+              "remediation": {"type": "string"},
+              "blocks": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["simulation", "tests", "publication", "evidence"],
+                "properties": {
+                  "simulation": {"type": "boolean"},
+                  "tests": {"type": "boolean"},
+                  "publication": {"type": "boolean"},
+                  "evidence": {"type": "boolean"}
+                }
+              }
+            }
+          }
+        },
+        "resourceSnapshot": {
+          "description": "The resources the cross-resource checks read.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["complete"],
+          "properties": {
+            "digest": {"$ref": "#/$defs/digest"},
+            "complete": {"type": "boolean"},
+            "unavailable": {"type": "array", "items": {"$ref": "#/$defs/code"}}
+          }
+        },
+        "refusal": {"$ref": "#/$defs/refusal"}
+      }
+    },
+    "policyTestResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "The run's status, once it completed. Only passed exits 0.",
+          "enum": ["passed", "failed", "incomplete", "error"]
+        },
+        "results": {
+          "description": "The gateway's policy-test-results.v1 report, as it answered it (docs/policy-tests.md).",
+          "type": "object",
+          "required": ["schema_version", "status"],
+          "properties": {
+            "schema_version": {"const": "policy-test-results.v1"}
+          }
+        },
+        "refusal": {"$ref": "#/$defs/refusal"}
+      }
+    },
+    "policyExplainResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "results": {
+          "description": "The gateway's policy-simulation-results.v1 document, as it answered it (docs/policy-simulation.md).",
+          "type": "object",
+          "required": ["schema_version"],
+          "properties": {
+            "schema_version": {"const": "policy-simulation-results.v1"}
+          }
+        },
+        "refusal": {"$ref": "#/$defs/refusal"}
+      }
+    },
+    "policyReplayResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action"],
+      "properties": {
+        "action": {"enum": ["start", "read", "cancel"]},
+        "job": {
+          "description": "The gateway's policy-replay-job.v1 job, as it last answered it (docs/policy-replay.md).",
+          "type": "object",
+          "required": ["schema_version", "job_id", "state"],
+          "properties": {
+            "schema_version": {"const": "policy-replay-job.v1"},
+            "job_id": {"type": "string", "pattern": "^rpl_[0-9a-f]{32}$"},
+            "state": {"enum": ["queued", "running", "completed", "completed_incomplete", "failed", "cancelled", "expired"]}
+          }
+        },
+        "discarded": {
+          "description": "For a cancellation: true when the job had finished and was discarded.",
+          "type": "boolean"
+        },
+        "refusal": {"$ref": "#/$defs/refusal"}
+      }
+    },
+    "evidenceVerifyResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "signature", "trusted"],
+      "properties": {
+        "verdict": {
+          "description": "integrity_valid when the package is exactly its RFC 8785 bytes and every artifact its manifest names is present, of its defined media type and schema version, and of the stated size and ADR-0004 digest; not_verified for a version, artifact or signature claim this ggctl does not verify.",
+          "enum": ["integrity_valid", "integrity_invalid", "not_verified"]
+        },
+        "signature": {
+          "description": "No signature is verified: packages are unsigned.",
+          "const": "unsigned"
+        },
+        "trusted": {
+          "description": "Integrity shows the package is unchanged since its manifest was computed, not who computed it.",
+          "const": false
+        },
+        "package": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "generatedAt", "size", "sourceDigest"],
+          "properties": {
+            "schemaVersion": {"const": "policy-evidence.v1"},
+            "generatedAt": {"type": "string"},
+            "size": {"type": "integer", "minimum": 0, "maximum": 4194304},
+            "sourceDigest": {
+              "description": "The ADR-0004 source digest of the file's bytes (application/vnd.greengateway.policy-evidence+json, policy-evidence.v1).",
+              "$ref": "#/$defs/digest"
+            }
+          }
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "mediaType", "schemaVersion", "digest", "size", "verified"],
+            "properties": {
+              "name": {"enum": ["report", "analysis", "report_markdown"]},
+              "mediaType": {"type": "string"},
+              "schemaVersion": {"type": "string"},
+              "digest": {"$ref": "#/$defs/digest"},
+              "size": {"type": "integer", "minimum": 0},
+              "verified": {"type": "boolean"}
+            }
+          }
+        },
+        "report": {
+          "description": "The report's own completeness statement, for a package whose integrity verified.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["completeness", "limitations"],
+          "properties": {
+            "completeness": {"enum": ["complete", "incomplete"]},
+            "limitations": {"type": "array", "items": {"$ref": "#/$defs/code"}}
+          }
+        }
+      }
     }
   }
 }

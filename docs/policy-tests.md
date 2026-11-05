@@ -499,8 +499,9 @@ Not part of this slice, and not to be inferred from it:
   stored beside the policy and run by reference, but nothing is gated on it.
 - Typed claim, header, query, tool-argument and time-window matchers, and
   stable route and rate-override identifiers (policy v1).
-- `ggctl policy test` (#242). The runner holds no application state, so that
-  command can link it rather than reimplement it.
+- Running a suite offline. `ggctl policy test` (docs/ggctl.md) sends a suite
+  to this endpoint and reports the gateway's run, as JSON or the gateway's
+  own JUnit report; it does not run cases itself.
 
 The admin UI's Policy Studio has a Test view over this API (#243 slice 18).
 It keeps the suite in page memory only, runs it against the live policy under
