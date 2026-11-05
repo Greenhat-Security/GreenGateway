@@ -15303,6 +15303,26 @@
       "reasons": [
         "capability-import-or-glob"
       ],
+      "scope": "ggctl::output::is_reparse_point#1",
+      "sha256": "6d1fa81e6bfd8253541831ad0154e2fe7be3b4eace213f4a4eca1635436cfa3e",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (ggctl pin): imports the Windows MetadataExt to read the file attributes of the bundle.yaml entry, not followed, so a reparse point is refused like a link before the manifest is replaced, as the bundle reader refuses one. Read-only metadata; no network or process capability."
+    },
+    {
+      "file": "ggctl/src/output.rs",
+      "reasons": [
+        "capability-in-macro-input"
+      ],
+      "scope": "ggctl::output::impl  Replacement::create#1",
+      "sha256": "090b5c4f9d03d0196dbc22a32aafae1d1045ba3dbac1c050e5f2b3ff74141067",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (ggctl pin): names the hidden replacement manifest beside bundle.yaml from the fixed manifest name, this process's own ID (std::process::id, read only, inside format!) and an attempt counter, creates it exclusively with create_new (mode 0600 on Unix), and writes and flushes it before it is renamed over bundle.yaml. Local filesystem only; no process is spawned or signalled and no network capability."
+    },
+    {
+      "file": "ggctl/src/output.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
       "scope": "ggctl::output::is_owner_only#1",
       "sha256": "a4872bdbd542b847b24ed2891eeb1a7ffeb0953e934926070bc3bce7898f7546",
       "owner": "GreenGateway maintainers: operator CLI (#242)",

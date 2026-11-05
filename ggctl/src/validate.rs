@@ -15,8 +15,8 @@ use std::{
 };
 
 use gateway_config::bundle::{
-    self, BundleReport, BundledResource, Profile, PublishedSchemasOnly, ReadOptions,
-    ResourceDeclaration,
+    self, Bundle, BundleReport, BundledResource, ManifestSummary, Profile, PublishedSchemasOnly,
+    ReadOptions, ResourceDeclaration,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -100,8 +100,17 @@ impl BundleRecord {
     /// `None` when the manifest itself could not be read.
     pub(crate) fn of(read: &BundleRead) -> Option<Self> {
         let manifest = read.manifest.as_ref()?;
-        let bundle = read.bundle.as_ref();
-        Some(Self {
+        Some(Self::from_parts(manifest, read.bundle.as_ref()))
+    }
+
+    /// What the manifest declares, without digests or the profile: for a
+    /// bundle no reader has accepted as it is.
+    pub(crate) fn declared(manifest: &ManifestSummary) -> Self {
+        Self::from_parts(manifest, None)
+    }
+
+    fn from_parts(manifest: &ManifestSummary, bundle: Option<&Bundle<Value, Value>>) -> Self {
+        Self {
             api_version: manifest.api_version.as_str(),
             name: manifest.name.clone(),
             source_digest: bundle.map(|bundle| bundle.source_digest.clone()),
@@ -120,7 +129,12 @@ impl BundleRecord {
                 ResourceRecord::of(declaration, bundle.and_then(|bundle| bundle.tools.as_ref()))
             }),
             connections: manifest.connections_from_server.then_some("server"),
-        })
+        }
+    }
+
+    /// The bundle's source digest, once every stage passed.
+    pub(crate) fn source_digest(&self) -> Option<&str> {
+        self.source_digest.as_deref()
     }
 
     /// The headline: the bundle's name and document version.
@@ -190,12 +204,17 @@ impl ResourceRecord {
 
 /// Whether the manifest has the bundle supply a policy or tools document.
 pub(crate) fn supplies_a_resource(read: &BundleRead) -> bool {
-    read.manifest.as_ref().is_some_and(|manifest| {
-        [&manifest.policy, &manifest.tools]
-            .into_iter()
-            .flatten()
-            .any(|declaration| matches!(declaration, ResourceDeclaration::Bundle { .. }))
-    })
+    read.manifest
+        .as_ref()
+        .is_some_and(declares_a_bundled_resource)
+}
+
+/// Whether `manifest` has the bundle supply a policy or tools document.
+pub(crate) fn declares_a_bundled_resource(manifest: &ManifestSummary) -> bool {
+    [&manifest.policy, &manifest.tools]
+        .into_iter()
+        .flatten()
+        .any(|declaration| matches!(declaration, ResourceDeclaration::Bundle { .. }))
 }
 
 /// The `validate` result.

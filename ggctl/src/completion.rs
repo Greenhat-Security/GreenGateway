@@ -449,7 +449,9 @@ mod tests {
         assert!(fish.contains(
             "complete -c ggctl -n '__fish_seen_subcommand_from doctor' -a '(__fish_complete_directories)'\n"
         ));
-        assert!(powershell.contains("$command -in @('validate', 'convert', 'doctor', 'diff')"));
+        assert!(
+            powershell.contains("$command -in @('validate', 'pin', 'convert', 'doctor', 'diff')")
+        );
         for script in [&bash, &zsh, &fish] {
             // Single quotes pair up once escaped quotes are removed.
             assert_eq!(script.replace(r"'\''", "").matches('\'').count() % 2, 0);
