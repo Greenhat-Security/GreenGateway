@@ -1108,13 +1108,18 @@
           "cap-fs-ext@4.0.3|registry+https://github.com/rust-lang/crates.io-index",
           "cap-std@4.0.3|registry+https://github.com/rust-lang/crates.io-index",
           "hex@0.4.3|registry+https://github.com/rust-lang/crates.io-index",
+          "http@1.5.0|registry+https://github.com/rust-lang/crates.io-index",
+          "ipnet@2.12.2|registry+https://github.com/rust-lang/crates.io-index",
           "jsonschema@0.60.2|registry+https://github.com/rust-lang/crates.io-index",
+          "percent-encoding@2.3.2|registry+https://github.com/rust-lang/crates.io-index",
           "proptest@1.11.0|registry+https://github.com/rust-lang/crates.io-index",
           "rusqlite@0.40.2|registry+https://github.com/rust-lang/crates.io-index",
           "rustix@1.1.5|registry+https://github.com/rust-lang/crates.io-index",
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
           "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index",
           "sha2@0.11.1|registry+https://github.com/rust-lang/crates.io-index",
+          "time@0.3.55|registry+https://github.com/rust-lang/crates.io-index",
+          "tracing@0.1.44|registry+https://github.com/rust-lang/crates.io-index",
           "url@2.5.8|registry+https://github.com/rust-lang/crates.io-index",
           "uuid@1.26.1|registry+https://github.com/rust-lang/crates.io-index"
         ]
@@ -6258,6 +6263,20 @@
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           {
+            "name": "time",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^0.3.53",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "formatting",
+              "parsing"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
             "name": "rustix",
             "rename": null,
             "kind": null,
@@ -6328,11 +6347,55 @@
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           {
+            "name": "http",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^1.4.2",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "ipnet",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^2.11.0",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "percent-encoding",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^2.3.2",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
             "name": "sha2",
             "rename": null,
             "kind": null,
             "target": null,
             "req": "^0.11.0",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "tracing",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^0.1.44",
             "optional": false,
             "uses_default_features": true,
             "features": [],
@@ -6893,7 +6956,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "4b8dd97b514c4a67403d66db2519e08b2a178b8d3f89c3d9e029446063a182fe",
+      "sha256": "d7416445936b1349702b358c5dec48ce7c52b8c8646e02d226c1d4753ad73187",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -7258,6 +7321,16 @@
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
     {
+      "file": "gateway/src/audit/event.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::audit::event::POLICY_REPLAY_INTERRUPTED#1",
+      "sha256": "b4a586094188f2d52f5671213fa11bd6c55ca0fdd4d6f7c4562991865a583355",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Narrow cfg_attr(not(feature = \"postgres\"), allow(dead_code)) on the policy.replay_interrupted event name, which only cluster replay jobs record. An audit vocabulary entry; dead-code gating only, no transport or process capability."
+    },
+    {
       "file": "gateway/src/admin_policy_test_runs.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -7298,6 +7371,16 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_test_gate :: *#1",
+      "sha256": "88b5000e16712f3c60014eb72556124fe9cbcd69866f24b9868107a0b9bd0e0c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
       "file": "gateway/src/admin_policy_simulations.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -7318,11 +7401,91 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/admin_policy_replays_cluster.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_replays::cluster::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Glob import of the parent admin_policy_replays module (and through it the application composition root) for the cluster replay job routes and worker, the same boundary the sibling admin modules use; it brings in no transport, socket or process capability of its own."
+    },
+    {
+      "file": "gateway/src/admin_policy_replays_cluster.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::admin_policy_replays::cluster::ClusterPolicyReplays#1",
+      "sha256": "cb5b7eaae2b966e54f312e26e4f62ff471d5c098cf639f831a02efbcaf7469d8",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Holds the deployment's shared PostgreSQL pool and database settings for the cluster replay job store and the audit stream reader; no connection constructor, socket or caller-selected authority."
+    },
+    {
+      "file": "gateway/src/admin_policy_replays_cluster.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::admin_policy_replays::cluster::impl  ClusterPolicyReplays::new#1",
+      "sha256": "41fccd90c14d00e2cae68c160c107c911d72f5e29aa436d674c119c3652da287",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Builds the cluster replay job store over the deployment's existing shared PostgreSQL pool; no connection constructor, socket or caller-selected authority."
+    },
+    {
+      "file": "gateway/src/admin_policy_replays_cluster.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::admin_policy_replays::cluster::impl  ClusterPolicyReplays::with_store#1",
+      "sha256": "79587302fb31988c044bdd002933f531f0dc43b3b6dd4afafc3fbe7c9518d8b4",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Keeps the existing shared PostgreSQL pool beside the replay job store so the audit stream reader can be built per run; no connection constructor, socket or caller-selected authority."
+    },
+    {
+      "file": "gateway/src/admin_policy_replays_cluster.rs",
+      "reasons": [
+        "capability-in-macro-input"
+      ],
+      "scope": "gateway::admin_policy_replays::cluster::impl  ClusterPolicyReplays::work#1",
+      "sha256": "a2200ae041829f66d7da1615908dd6264fe88ad3ff1fb35f6deffb688f7070a8",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "tokio::select! in the replay worker's idle wait: shutdown, a local admission's wake-up, or the poll timer. Local task coordination only; no network, socket or process capability."
+    },
+    {
+      "file": "gateway/src/admin_policy_replays.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::admin_policy_replays::ReplayJobState#1",
+      "sha256": "25fdca6b32d077304ade6ca860ce9d5a17cb272eed18eee89f13acb6ceb23ba1",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Narrow cfg_attr(not(feature = \"postgres\"), allow(dead_code)) on the interrupted job state, which only cluster replay jobs reach. Dead-code gating only; no transport or process capability."
+    },
+    {
+      "file": "gateway/src/admin_policy_replays.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::admin_policy_replays::ReplayJobEvidenceRefusal#1",
+      "sha256": "020aad7f73cd33d64b93c493e35538798a3661d6b587464840f9b985a08de036",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Narrow cfg_attr(not(feature = \"postgres\"), allow(dead_code)) on the evidence refusal for an unreadable cluster replay job store. Dead-code gating only; no transport or process capability."
+    },
+    {
       "file": "gateway/src/admin_policy_evidence.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
       "scope": "gateway::admin_policy_evidence::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/admin_policy_test_gate.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_test_gate::use super :: *#1",
       "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
@@ -7378,12 +7541,32 @@
       "purpose": "Import the IpAddr and SocketAddr value types so the pure policy analyzer can hand the static egress lane a witness address and resolution facts when it confirms an egress CIDR finding. Value types only: the analyzer resolves no name, opens no socket and builds no client; every DNS lookup and transport stays in crate::egress."
     },
     {
+      "file": "gateway/src/admin_policy_analysis_suppressions.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_analysis_suppressions::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
       "file": "gateway/src/main.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
       "scope": "gateway::use admin_policy_analyses :: *#1",
       "sha256": "e22b2a94fcb1f5fbbc6dcc3fd0f5e6bd12adbf2945a80b8671fcc2f213a78869",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_analysis_suppressions :: *#1",
+      "sha256": "464e054f68672e86843462bd6b9a4a42b5173592d86fdc607d22b9f01f30ce02",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -8083,8 +8266,28 @@
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway::config::use std :: { collections :: { HashMap , HashSet } , env :: { self , VarError } , error :: Error , fmt , net :: SocketAddr , path :: PathBuf , str :: FromStr , sync :: LazyLock , }#1",
-      "sha256": "a82115cd7f23df27472f360ce15ca064c567ff292a12bb255a02f1337f5f4ec2",
+      "scope": "gateway::config::use std :: { env :: { self , VarError } , net :: SocketAddr , path :: PathBuf , }#1",
+      "sha256": "f9068c4ba6cc254e97df1e01cc99e226c7a145f252d6b5f451d18388ad71a019",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/config.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::config::use gateway_config :: compiler :: *#1",
+      "sha256": "f1f9d1777e876e66af73068fce198f503825dc5adc01ec60df2f1c08461c35b4",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Glob re-export of the configuration compiler (gateway_config::compiler, issue #242) at the paths the gateway has always named its settings by; the compiler names no transport, file, process or environment API, which its zero-I/O source scan holds."
+    },
+    {
+      "file": "gateway-config/src/compiler.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::compiler::use std :: { collections :: { HashMap , HashSet } , env :: VarError , error :: Error , fmt , net :: SocketAddr , path :: PathBuf , str :: FromStr , sync :: LazyLock , }#1",
+      "sha256": "3658d7829c4639413132de512131545d84b54304c94a3e51bbaafa1745faeb86",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -8149,16 +8352,6 @@
       "purpose": "Reviewed for #242 PR 4: the configuration bundle reader's contained, read-only filesystem access (canonicalized root opened as a cap-std directory, no-follow opens, link count, reparse attribute and Unix mode read from the opened handle). It adds no network or process capability; constructor bodies require separate scope review."
     },
     {
-      "file": "gateway-config/src/bundle/value.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway_config::bundle::value::file_attributes#1",
-      "sha256": "f35344af05310ce62d71cb4418df23165a4f4b7fe61773cdaa9b146fec815541",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the bundle reader's secret-reference, placeholder and decimal value forms, which the field catalog (#242 PR 3) will call; pure parsing of an in-memory tree with no I/O and no transport or process capability."
-    },
-    {
       "file": "gateway-config/src/inbound_tls.rs",
       "reasons": [
         "unexpanded-attribute"
@@ -8169,41 +8362,41 @@
       "purpose": "Moved unchanged from gateway::inbound_tls for #242: the listener client-certificate mode the configuration compiler parses. Its only unexpanded input is the `#[default]` variant marker of a standard `Default` derive; a plain enum with no transport, file or process capability."
     },
     {
-      "file": "gateway/src/config.rs",
+      "file": "gateway-config/src/compiler.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::StateBackend#1",
+      "scope": "gateway_config::compiler::StateBackend#1",
       "sha256": "5b01127d64e2cd12fe7fe2a565ecdca8c1ee988a78b41ad2ea6a885bbf05665c",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
-      "file": "gateway/src/config.rs",
+      "file": "gateway-config/src/compiler.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::DatabaseTlsMode#1",
+      "scope": "gateway_config::compiler::DatabaseTlsMode#1",
       "sha256": "ad2ac35857d530f78b48d111ec5c77f7824cd76194ad1916d4af7d87a65de8ef",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
-      "file": "gateway/src/config.rs",
+      "file": "gateway-config/src/compiler.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::UpstreamLoadBalancingStrategy#1",
+      "scope": "gateway_config::compiler::UpstreamLoadBalancingStrategy#1",
       "sha256": "0031658aa35b4a616c8259f3ff0140c864aaf8acd49026ab38085314e386c36f",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
-      "file": "gateway/src/config.rs",
+      "file": "gateway-config/src/compiler.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::UpstreamRequestBodyMode#1",
+      "scope": "gateway_config::compiler::UpstreamRequestBodyMode#1",
       "sha256": "6784b1ca2fbb5aecac05d65ef310aab6aba6d2d3ba0ab9018e45d7b9bf497fc1",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
@@ -8299,21 +8492,11 @@
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
-      "file": "gateway/src/config.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::config::impl  ConfigError::problems#1",
-      "sha256": "73ec1cd52e14bd0b84a851b33f115fbba88fc1f38ae27efa9abca263a4f9adef",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
-    },
-    {
-      "file": "gateway/src/config.rs",
+      "file": "gateway-config/src/compiler.rs",
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "gateway::config::url_host_is_loopback#1",
+      "scope": "gateway_config::compiler::url_host_is_loopback#1",
       "sha256": "ef51ec667a217d2d76d791c03eecc2efea01487c8c2ca36450eae01d85634e64",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
@@ -8584,7 +8767,7 @@
         "capability-in-macro-input"
       ],
       "scope": "gateway::connections::mcp::refresh_store_error#1",
-      "sha256": "e6c7783aaeba3d4ac8f7aa9defa2e818f23f6f9c85cba18f4d29e40e831b9580",
+      "sha256": "d7fed9341b4062ba45a7b73c835c4ae3aad8aa0d1c9da80c982ee38c30f2e414",
       "owner": "GreenGateway maintainers",
       "purpose": "Connection configuration, shared storage or checked provider/MCP protocol handling in this exact scope."
     },
@@ -9055,7 +9238,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::record_catalog_change_evidence#1",
-      "sha256": "042dcfad5ecd4b07d82089066f150e16b1a481f8db5a2796e210f0f59e7b244d",
+      "sha256": "d124602990cc81f89f1f8ea406e388a8c2ed0e3fff6575c85ccf19bcee6e8f46",
       "owner": "GreenGateway maintainers",
       "purpose": "Appends one catalog change-evidence row through the caller's open PostgreSQL transaction (issue #425) and counts a refused insert on the in-process evidence-failure counter (issue #440); no new connection, endpoint or transport."
     },
@@ -9230,6 +9413,16 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway-config/src/rbac/policy.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway_config::rbac::policy::EnforcementMode#1",
+      "sha256": "99db9307f073e50f7c0486a22599850b7a3795dffa048be6e43d37823b7029c3",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
       "file": "gateway-config/src/ledger/location.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -9248,6 +9441,36 @@
       "sha256": "b614645a054675446906c5e5bd9cd95dfc6bdbcdab6ca5c8d79e8f422cbd3882",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed for #242 (standalone state directory; moved here from the revision ledger's location checks): reads the Windows reparse-point attribute of state-directory, lock-file and ledger-file metadata through std::os::windows::fs::MetadataExt to refuse links and junctions. Read-only metadata; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/tools/codecs.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway_config::tools::codecs::DecimalWireEncoding#1",
+      "sha256": "215b8fe68ca05606491df97cb2586bcd3ef52fff87e1490030fbdb1574853a06",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway-config/src/tools/definitions.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway_config::tools::definitions::ToolVisibility#1",
+      "sha256": "e19ec6ff716d7c13539b9d63347470b8011a5ea6721ab0334ba3221d82588a6e",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway-config/src/tools/definitions.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway_config::tools::definitions::ToolSource#1",
+      "sha256": "ce61dcadbae9a900a488a74aa9e877c0dc1d0192bf94e2e8b16eba72d11d3bea",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
       "file": "gateway-config/src/state_dir.rs",
@@ -9339,6 +9562,16 @@
       "sha256": "0a7475b75811083bc93e00a9edc25b3eb62fc2ffea5a8966a48c44ebb108973a",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): decodes one row of the ledger's local SQLite database through rusqlite's Row, whose name the PostgreSQL client also exports, which is why the guard's conservative global alias union flags it. It adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/mcp_client_configs.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::mcp_client_configs::host_is_loopback#1",
+      "sha256": "a852ed69d98f94c0fda4baaeb76c6a7762df1ea7ca25bb35443f7604fa0e0336",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (MCP client templates): classifies the parsed host of a gateway MCP URL as loopback (localhost or a loopback IPv4/IPv6 literal) so a template never names a plain-http non-loopback endpoint. url::Host is a value from an already-parsed URL; nothing is resolved or connected."
     },
     {
       "file": "gateway/src/connections/secret.rs",
@@ -11122,9 +11355,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::RbacPolicyState#1",
-      "sha256": "a30db022f49cba05f303e2135003bcd2a232174669c9d8d7d88468fce6a6b4eb",
+      "sha256": "2410eb116827f9fdee5881d98962cc01594fb3ebfba59b5d86a1e99b72251557",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #422 structural attribution: the pre-cutover permission engine (engine) and route vector (routes) join the direct-rule matcher as #[cfg(test)] fields kept only for the frozen differential oracles, so serving snapshots carry only the compiled policy, whose own routes, direct rules and permission engine every HTTP and tool-lane decision, audit attribution and management permission reads. cfg gating and doc comments only; no field, client, socket, TLS, DNS or header authority is added."
+      "purpose": "Issue #422 structural attribution: the pre-cutover permission engine (engine) and route vector (routes) join the direct-rule matcher as #[cfg(test)] fields kept only for the frozen differential oracles, so serving snapshots carry only the compiled policy, whose own routes, direct rules and permission engine every HTTP and tool-lane decision, audit attribution and management permission reads. cfg gating and doc comments only; no field, client, socket, TLS, DNS or header authority is added. Reviewed for #243 (decision facts): each snapshot also holds decision_identity, an Arc of the installed policy's ETag, semantic digest and element ids computed once at install; plain data that adds no client, socket, TLS, DNS or header authority."
     },
     {
       "file": "gateway/src/middleware/rbac.rs",
@@ -11142,9 +11375,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::middleware::rbac::impl  RbacState::evaluate_tool_authorization#1",
-      "sha256": "0370b17a9b5d0ac912b875882aa1620bf06ff6dbf790dab3b3f9e98f193de30b",
+      "sha256": "ad8f61d6150c392f0bf228d5478faa91ea21f04182c00e0771cc181e3b453208",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #243 tool lanes: tool admission now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact for source_network conditions; a pure data parameter that adds no network, process or transport capability."
+      "purpose": "Issue #243 tool lanes: tool admission now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact for source_network conditions; a pure data parameter that adds no network, process or transport capability. Reviewed for #243 (decision facts): the authorization handed to the runtime also carries the verdict's decision facts (codes, versions, digests and policy positions); a pure data value that adds no network, process or transport capability. Reviewed for #243 (tool-argument conditions): the item also takes the argument stage of admission, a callback the tool runtime supplies that validates the call's arguments against the tool's input schema and returns the eligible argument scalars as a typed policy fact (Fact<serde_json::Value>) or the runtime's own refusal; a pure data callback that adds no network, process or transport capability."
     },
     {
       "file": "gateway/src/middleware/rbac.rs",
@@ -11182,9 +11415,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::rbac_middleware#1",
-      "sha256": "67c5fb7a91f70ca6e31e5898fbc64b9611a43d5f5c1f20405a5c9db1b8231400",
+      "sha256": "4bcdcc906b161c70262d1faadfc5ef2ed17d70c77acbb30be8c3109ecac77cc7",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority. Reviewed for #243: the decision is now asked with the facts serving_facts takes from the authenticated principal (its verified organization in mapped-role mode), a pure data read that adds no transport, provider, resolver or process authority. Reviewed for #243 (request conditions): the facts now come from policy_facts::http_request_facts -- the canonical client address under the state's ClientIpPolicy, the referenced request headers, the strictly decoded query and an injected clock -- and a query that does not decode strictly is refused as policy_query_undecodable; pure reads of the admitted request that add no transport, provider, resolver or process authority."
+      "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority. Reviewed for #243: the decision is now asked with the facts serving_facts takes from the authenticated principal (its verified organization in mapped-role mode), a pure data read that adds no transport, provider, resolver or process authority. Reviewed for #243 (request conditions): the facts now come from policy_facts::http_request_facts -- the canonical client address under the state's ClientIpPolicy, the referenced request headers, the strictly decoded query and an injected clock -- and a query that does not decode strictly is refused as policy_query_undecodable; pure reads of the admitted request that add no transport, provider, resolver or process authority. Reviewed for #243 (decision facts): a complete verdict's PolicyDecision now carries PolicyDecisionFacts built from the evaluation context, the captured facts and the evaluation it already holds, for the request's observation; a pure data value that adds no transport, provider, resolver or process authority."
     },
     {
       "file": "gateway/src/middleware/validate.rs",
@@ -11372,9 +11605,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::policy_replay::file_attributes#1",
-      "sha256": "54a6a9a8dcff73aefeffeb33ec7c4e3e2a5c5e6cf7351496a4925f485491e960",
+      "sha256": "463a9839a7b1a94a28d2595154ef19b647c7ba5083ab600db2bdd16e92f160ac",
       "owner": "policy replay contexts (#243)",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module: the replay job engine (#243 slice 13) calls the adapters and evaluator and the impact comparison (#243 slice 14) reads the recorded result, while the serialized form and egress replay wait for a record that states them. The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability."
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module: the replay job engine (#243 slice 13) calls the adapters and evaluator and the impact comparison (#243 slice 14) reads the recorded result, while the serialized form and egress replay wait for a record that states them. The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability. Reviewed for #243 (decision facts): the module documentation now describes replay-context.v2 and the recorded decision facts; documentation only, the dead-code gating is unchanged."
     },
     {
       "file": "gateway/src/policy_testing/suite.rs",
@@ -11923,14 +12156,24 @@
       "purpose": "The IpAddr value type for the canonical client address a source_network rule condition compares against policy CIDRs (issue #243, item 16). The address is a fact the caller supplies after trusted-proxy processing; the module only compares it with ipnet networks. No socket, resolver, connection or other network or process capability is introduced."
     },
     {
-      "file": "gateway/src/rbac/policy.rs",
+      "file": "gateway/src/rbac/conditions.rs",
       "reasons": [
-        "unexpanded-attribute"
+        "capability-import-or-glob"
       ],
-      "scope": "gateway::rbac::policy::EnforcementMode#1",
-      "sha256": "99db9307f073e50f7c0486a22599850b7a3795dffa048be6e43d37823b7029c3",
+      "scope": "gateway::rbac::conditions::use gateway_config :: rbac :: conditions :: *#1",
+      "sha256": "28a11715f95d5419897909bf450ffd8416a0f5f59a000652162e7790f4f37341",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/rbac/identity_mappings.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::rbac::identity_mappings::use gateway_config :: rbac :: identity_mappings :: *#1",
+      "sha256": "29a5b722705aa7df66fd87058fd6ca74d3c27d851ea977dfaf77e881665fe19d",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
       "file": "gateway/src/rbac/policy.rs",
@@ -11941,6 +12184,26 @@
       "sha256": "bb080ff83476544ea8ef58c08ac706237cbec29ecc0f7312f1a933df6f0dbcf9",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+    },
+    {
+      "file": "gateway/src/rbac/policy_document.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::rbac::policy_document::use gateway_config :: rbac :: policy_document :: *#1",
+      "sha256": "2e538b3c5444995354d1dc9e306255d2602f4f038c0bc85c7eb9da64eac42738",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/rbac/policy.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::rbac::policy::use gateway_config :: rbac :: policy :: *#1",
+      "sha256": "eb8809b6874c7daeb2317374db1eef53354165ab08f48297503a3d322e711654",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
       "file": "gateway/src/rbac/policy_history.rs",
@@ -11971,6 +12234,16 @@
       "sha256": "563ec54565e1acf88c0af65ef2f343103630ff2285ee28b48da1b7e03103a374",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+    },
+    {
+      "file": "gateway/src/rbac/rule.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::rbac::rule::use gateway_config :: rbac :: rule :: *#1",
+      "sha256": "173d13dffa353f17c5edcb011b1fa7e6bdad4c45f1273f3457168b7abdb45116",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
       "file": "gateway/src/security_cluster.rs",
@@ -12161,6 +12434,26 @@
       "sha256": "9cd89ca573aa9bae93b82c4efe1852be2090e407d60cf70deafa8359fec5255d",
       "owner": "GreenGateway maintainers",
       "purpose": "Decodes one standalone policy draft SQLite row; no network, process or HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/analysis_suppressions.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::storage::analysis_suppressions::impl  SqliteAnalysisSuppressionStore::connection_guard#1",
+      "sha256": "645c25e9e14401ed9f98b947192e8a9f90825d8214475f7bfe15c2df71851655",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Lock-poison recovery counter for the standalone policy analysis suppression SQLite connection; metrics instrumentation only, no network, process or HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/analysis_suppressions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::analysis_suppressions::record_from_row#1",
+      "sha256": "4ac91a6be28ebd4b4915393cb1f37312fa34404982f71782626b49ef718089d3",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Decodes one standalone policy analysis suppression SQLite row; no network, process or HTTP authority."
     },
     {
       "file": "gateway/src/storage/policy_tests.rs",
@@ -12381,16 +12674,6 @@
       "sha256": "8975db9aa710482a9a74daaea9b083859bd92bb754fc5ad346160e1eb9cebf95",
       "owner": "GreenGateway maintainers",
       "purpose": "Operator-configured PostgreSQL foundation: verified connector, bounded shared pool and connection lifecycle."
-    },
-    {
-      "file": "gateway/src/storage/postgres.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::storage::postgres::CheckoutClass#1",
-      "sha256": "532b97bf248ee8a1a4904beaee15d0689000aa766a5bdc1b2d23c7693568a469",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) on the PolicyReplay checkout-class variant, which only the cluster replay reader constructs until cluster replay routes run jobs (#243). A metric label vocabulary entry; dead-code gating only, no transport or process capability."
     },
     {
       "file": "gateway/src/storage/postgres.rs",
@@ -12703,16 +12986,6 @@
       "sha256": "a3ae50a4c225309e969e2992b81a42ffc30aa9b18ade0e67684a1f44b7243573",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
-    },
-    {
-      "file": "gateway/src/storage/postgres_audit_replay.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::storage::postgres_audit_replay::file_attributes#1",
-      "sha256": "d1ee2ab112c8deac63271147fa247f89152e1c59017006284f9afdaec760ff93",
-      "owner": "policy replay contexts (#243)",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the cluster audit stream replay reader: cluster replay routes answer 503 until jobs run under #241's durable leases, so only tests call it. Dead-code gating only; the module reads the audit tables through the shared pool and adds no transport or process capability."
     },
     {
       "file": "gateway/src/storage/postgres_audit_replay.rs",
@@ -13421,7 +13694,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_documents::record_document_change#1",
-      "sha256": "593e2b9c718c0a9541e59752a69866b0647d03520a9e4d72e417ff3bf84f829c",
+      "sha256": "0abb564c585e3bbf25920f065ee9d1fb8d95bb717fec68a1d6bcdfaa8326366a",
       "owner": "GreenGateway maintainers",
       "purpose": "Appends one document change-evidence row through the caller's open PostgreSQL transaction (issue #425) and counts a refused insert on the in-process evidence-failure counter (issue #440); no new connection, endpoint or transport."
     },
@@ -13896,6 +14169,136 @@
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
     {
+      "file": "gateway/src/storage/postgres_analysis_suppressions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_analysis_suppressions::PostgresAnalysisSuppressionStore#1",
+      "sha256": "b5d00730121ac7fa2c7924c5a23299a78979c0624e8a64f6786744e26dd61905",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_analysis_suppressions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_analysis_suppressions::impl  PostgresAnalysisSuppressionStore::new#1",
+      "sha256": "76706a9ebf24dafecc2c91280de5259437049d9ea0442f16e466bfd5183d82d8",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_analysis_suppressions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_analysis_suppressions::record_from_row#1",
+      "sha256": "c02e12a71c47f1b93318377775d0d8ee2edd8804d67a621cb67c5c25ad7f4dbd",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_analysis_suppressions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_analysis_suppressions::classify_query#1",
+      "sha256": "b9618bf4127da4a3c48146f04769b3bf1026ac7481910dafc4f502dbfdacaf3b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::use tokio_postgres :: Row#1",
+      "sha256": "94c30df958d8d1ce64631e157a5f68d87dd645fc38b9694e548a6b7ab5c3521f",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Imports the PostgreSQL driver's row type to decode replay job rows read through the shared pool; no connection constructor, socket or caller-selected authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::PostgresPolicyReplayStore#1",
+      "sha256": "c594c6951c2f6ea015b7ef1483d57846183cb3aa105541e67e27923d335d83d3",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::impl  PostgresPolicyReplayStore::new#1",
+      "sha256": "3614e7c9abc4c6483bd0be66790c6b48ceb977cbc2f83bb50f132c519af9cb1e",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::impl  PostgresPolicyReplayStore::refusal#1",
+      "sha256": "f38bbfe1ef33c9b8f4412e728afeeeaa08a6658967383ab19dc8eb8efb817531",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::prune_with#1",
+      "sha256": "161ac09bf146318f9db44511a65e1aa4b8e976abee3529e700b9129b50bf1541",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::lease_status#1",
+      "sha256": "ab743f47899d83ee3536e5df3114fe621792651bf46d8523260e8adfccc0d54f",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::record_from_row#1",
+      "sha256": "a103ac321f72f345db773ab9e696a8f46201d013d93a27029a76d520aaf8f971",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::column#1",
+      "sha256": "d6746ed1403271704187641e982eff6a1a2d55cebb35f2a40c3c03609ea3c448",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::classify#1",
+      "sha256": "1682e99e0827031e77a705d0b8b98340d13d0bf12392b3db0d18e31018d91e33",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
       "file": "gateway/src/storage/postgres_policy_tests.rs",
       "reasons": [
         "network-or-process-reference"
@@ -14278,12 +14681,22 @@
     {
       "file": "gateway/src/tools/codecs/mod.rs",
       "reasons": [
-        "unexpanded-attribute"
+        "capability-import-or-glob"
       ],
-      "scope": "gateway::tools::codecs::DecimalWireEncoding#1",
-      "sha256": "215b8fe68ca05606491df97cb2586bcd3ef52fff87e1490030fbdb1574853a06",
+      "scope": "gateway::tools::codecs::use gateway_config :: tools :: codecs :: *#1",
+      "sha256": "3cc2233441d4529c9b2d65598a435a04cd493fdb6d722efabc0b302e6f41b6e8",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/tools/composite.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::tools::composite::use gateway_config :: tools :: composite :: *#1",
+      "sha256": "2a5ed4095e27595d9a737bc41c4a83d2bb1e2263e8b5b568e8f22d21f6059d8b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
       "file": "gateway/src/tools/definitions.rs",
@@ -14294,66 +14707,6 @@
       "sha256": "5776bb64c7038f66adb12c32dcd2326a96856c3bdfcaf16011d1957aa9fa1c52",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
-    },
-    {
-      "file": "gateway/src/tools/definitions.rs",
-      "reasons": [
-        "network-or-process-reference"
-      ],
-      "scope": "gateway::tools::definitions::impl From < McpToolAnnotations > ToolAnnotations::header#1",
-      "sha256": "9e8ffe87f2b11e49018b454278981cfc8c73eddca277873d4931577f86b3b470",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
-    },
-    {
-      "file": "gateway/src/tools/definitions.rs",
-      "reasons": [
-        "network-or-process-reference"
-      ],
-      "scope": "gateway::tools::definitions::impl From < McpToolAnnotations > ToolAnnotations::from#1",
-      "sha256": "2bb74040b786e0fac6efc3e5597b23c6a24212399c1168359863c4258063fa85",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
-    },
-    {
-      "file": "gateway/src/tools/definitions.rs",
-      "reasons": [
-        "network-or-process-reference"
-      ],
-      "scope": "gateway::tools::definitions::impl From < ToolAnnotations > McpToolAnnotations::header#1",
-      "sha256": "63f315e7654a97278c29ccb171e794b660df31100b3ec948b9cae96a4f3311c3",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
-    },
-    {
-      "file": "gateway/src/tools/definitions.rs",
-      "reasons": [
-        "network-or-process-reference"
-      ],
-      "scope": "gateway::tools::definitions::impl From < ToolAnnotations > McpToolAnnotations::from#1",
-      "sha256": "7620de996c728cda5da71cc863ddf437cabe47e9204fed4d4807249a1f67c270",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
-    },
-    {
-      "file": "gateway/src/tools/definitions.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::tools::definitions::ToolVisibility#1",
-      "sha256": "e19ec6ff716d7c13539b9d63347470b8011a5ea6721ab0334ba3221d82588a6e",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
-    },
-    {
-      "file": "gateway/src/tools/definitions.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::tools::definitions::ToolSource#1",
-      "sha256": "ce61dcadbae9a900a488a74aa9e877c0dc1d0192bf94e2e8b16eba72d11d3bea",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
       "file": "gateway/src/tools/definitions.rs",
@@ -14414,6 +14767,36 @@
       "sha256": "05d742e7a9bb701ef58372e3a22e98fbe2a412abdcaa26b33e7c3e26d6920a13",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/tools/definitions.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::tools::definitions::use gateway_config :: tools :: definitions :: *#1",
+      "sha256": "c7d38bab7551aabd061963d97769b11ba7e68a316672d41e895174ce4b3a2291",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/tools/definitions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::tools::definitions::tool_annotations_from_mcp#1",
+      "sha256": "f80459cc6a43df923fcd608ee4cab0db1cffbfcf5eccc38d9ab70424c9fc482a",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+    },
+    {
+      "file": "gateway/src/tools/definitions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::tools::definitions::mcp_tool_annotations#1",
+      "sha256": "775802573b1f1fe3d92c441ae0dcf91071da7fc5ed1889c83bb492b800f5142b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
     {
       "file": "gateway/src/tools/enum_source.rs",
@@ -15191,6 +15574,26 @@
       "purpose": "Issue #243 tool invocation context: carries the canonical client address the call entered with (Option<std::net::IpAddr>, a value set by the MCP and admin playground entry points) as the policy fact a source_network condition reads; a data field that adds no network, process or transport capability."
     },
     {
+      "file": "gateway/src/tools/selector.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::tools::selector::use gateway_config :: tools :: selector :: *#1",
+      "sha256": "b8c7c2a233bec4dd203b5e4afc25778c6b5477388092f3ec0b23bafdf1c3b4ae",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/tools/transforms.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::tools::transforms::use gateway_config :: tools :: transforms :: *#1",
+      "sha256": "276375f24027964db8096450ea558d0e02d261a83598a1f2da66288d5dfb7937",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
       "file": "gateway/src/upstream_route.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -15392,54 +15795,24 @@
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
     {
-      "file": "gateway/src/config/authority_events.rs",
+      "file": "gateway-config/src/compiler/authority_events.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::authority_events::AuthorityEventSinkSetting#1",
+      "scope": "gateway_config::compiler::authority_events::AuthorityEventSinkSetting#1",
       "sha256": "f5ef9e35e4d2ca02be18a568f1c64792fbd79433ae4191195d3ca705e1ef31f4",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
-      "file": "gateway/src/config/authority_events.rs",
+      "file": "gateway-config/src/compiler/authority_events.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::authority_events::impl  AuthorityEventSettings::retention#1",
-      "sha256": "e5f0f85f57447269aa7d76fd7187872f459993214341bfa959539733fc4d0fbc",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
-    },
-    {
-      "file": "gateway/src/config/authority_events.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::config::authority_events::AuthorityEvidenceDurability#1",
+      "scope": "gateway_config::compiler::authority_events::AuthorityEvidenceDurability#1",
       "sha256": "4504d9d256f82b5d0e1bccb9bd5a65f603360b6cd1e057d858a651494a1816c8",
       "owner": "GreenGateway maintainers",
       "purpose": "Clone/Copy/Debug/Default/PartialEq/Eq derives and #[default] on the two-value AUTHORITY_EVIDENCE_DURABILITY setting; no transport, file or process capability (issue #425)."
-    },
-    {
-      "file": "gateway/src/config/bundle.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::config::bundle::file_attributes#1",
-      "sha256": "6651893f61abaf3a3a584a1a4bf787888b6316908097bba4afe06cbd13196060",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the gateway's production validators passed to the shared bundle reader, which bundle mode (a later #242 slice) will call; it only calls the existing policy and tools validators and has no transport or process capability."
-    },
-    {
-      "file": "gateway/src/config/revisions.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::config::revisions::file_attributes#1",
-      "sha256": "fcfb2792059c7e0101f8eeebf037c18bedf13bbf7dc634eced0a54abb31f3244",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the production plan compiler the standalone ledger's plan, apply and rollback service (#242 PR 11) takes, which ledger startup and the admin routes (later #242 slices) will hold; it only hands that service the existing production policy and tools validators and their JSON forms, and has no transport or process capability."
     },
     {
       "file": "gateway/src/connections/control_plane.rs",
@@ -15608,6 +15981,26 @@
       ],
       "scope": "gateway::use admin_config :: *#1",
       "sha256": "f7ea42fbe0a39befb09e21a9a49ab5caef8ef939b0a749d731b79a43836992a0",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/admin_mcp_clients.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_mcp_clients::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_mcp_clients :: *#1",
+      "sha256": "73464c2de231005b1d5da40dc33d6cbcf529baad3d886b1aa3b09d60f26a0a89",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -15857,10 +16250,10 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "ggctl::remote::impl  AdminClient::exchange#1",
-      "sha256": "108bb344e1891fe91a3493f84aa99db01ca6f09f3e9c371ec1aa9f9e3cdaec88",
+      "scope": "ggctl::remote::impl  AdminClient::send#1",
+      "sha256": "692a3e4a7b2a667d13dafd50802407a04b1d17b4597ee8ae2bfd19477c32d793",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #243 (ggctl policy commands): the one request path of ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder. exchange sends one GET, POST or DELETE with an optional JSON body and the bearer token to a path below that base; redirects, 401 and 403 are refused, a body is read only when bounded and of the accepted media type, only visible-ASCII values of the headers a command names are returned, and only a GET whose connection was never established is sent again. The version handshake's get_json now calls it."
+      "purpose": "Reviewed for #243 (ggctl policy commands): the one request path of ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder. send, which exchange calls, sends one GET, POST or DELETE with an optional JSON body and the bearer token to a path below that base; redirects, 401 and 403 are refused, a body is read only when bounded and of the accepted media type, only visible-ASCII values of the headers a command names are returned, and only a GET whose connection was never established is sent again. #242 MCP client templates moved this body from exchange into send unchanged, so that get_json can add the mcp-config route's form-encoded query to the same path below the base: exchange and get_json both call it, and the version handshake and mcp-config read through get_json."
     },
     {
       "file": "ggctl/src/remote.rs",

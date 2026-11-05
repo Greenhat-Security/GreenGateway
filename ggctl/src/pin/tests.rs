@@ -74,9 +74,7 @@ fn editing_the_policy_then_pinning_makes_validate_pass() {
              tools          tools.json (pin unchanged)\n"
         )
     );
-    assert!(captured
-        .stderr()
-        .starts_with("ggctl: info: validate.production_validators_not_run: "));
+    assert!(captured.stderr().is_empty(), "{}", captured.stderr());
 
     let (exit, captured) = run(&["validate", fixture.path(), "--strict", "--format", "json"]);
     assert_eq!(exit, Exit::Success);
@@ -94,7 +92,7 @@ fn editing_the_policy_then_pinning_makes_validate_pass() {
     let found = report(&captured);
     assert_eq!(found["command"], "pin");
     assert_eq!(found["outcome"], "success");
-    assert_eq!(codes(&found), ["validate.production_validators_not_run"]);
+    assert!(codes(&found).is_empty());
     let result = &found["result"];
     assert_eq!(result["valid"], true);
     assert_eq!(result["changed"], false);
@@ -248,13 +246,7 @@ fn an_invalid_file_leaves_the_manifest_unchanged() {
     assert_eq!(exit, Exit::Invalid);
     let found = report(&captured);
     assert_eq!(found["outcome"], "invalid");
-    assert_eq!(
-        codes(&found),
-        [
-            "profile.policy_default_allow",
-            "validate.production_validators_not_run"
-        ]
-    );
+    assert_eq!(codes(&found), ["profile.policy_default_allow"]);
     let result = &found["result"];
     assert_eq!(result["valid"], false);
     assert_eq!(result["files"], json!([]));
@@ -316,7 +308,7 @@ fn interrupted(from: &Path, to: &Path) -> io::Result<()> {
     let read = gateway_config::bundle::read_bundle(
         root,
         gateway_config::bundle::ReadOptions { strict: true },
-        &gateway_config::bundle::PublishedSchemasOnly,
+        &gateway_config::bundle::ProductionValidators,
     );
     let found: Vec<_> = read.diagnostics.iter().map(|d| d.code.as_str()).collect();
     assert_eq!(found, ["bundle.digest_mismatch"]);
@@ -331,10 +323,7 @@ fn an_interrupted_write_leaves_no_partial_manifest() {
     let (exit, captured) = run_with(&["pin", fixture.path(), "--format", "json"], interrupted);
     assert_eq!(exit, Exit::Failure);
     let found = report(&captured);
-    assert_eq!(
-        codes(&found),
-        ["validate.production_validators_not_run", "pin.write_failed"]
-    );
+    assert_eq!(codes(&found), ["pin.write_failed"]);
     assert_eq!(found["result"]["valid"], true);
     assert_eq!(found["result"]["changed"], true);
     assert_eq!(found["result"]["written"], false);

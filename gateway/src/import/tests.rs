@@ -843,6 +843,7 @@ mod database {
                 &[mcp_entry("alpha"), mcp_entry("beta")],
                 &[],
                 &[],
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .expect("the MCP catalog should publish");
         let openapi = store
@@ -2579,6 +2580,8 @@ mod database {
             "admin_sessions",
             "jwt_revocations",
             "policy_drafts",
+            "policy_replay_jobs",
+            "policy_analysis_suppressions",
         ] {
             assert_eq!(
                 count_of(&pool, &format!("SELECT count(*) FROM greengateway.{table}")).await,
@@ -2636,7 +2639,7 @@ mod database {
             0
         );
         // Each activation journaled its evidence row in its own transaction
-        // (migration 30), and nothing else the import wrote is journaled.
+        // (migration 32), and nothing else the import wrote is journaled.
         assert_eq!(
             client_names(
                 &pool,

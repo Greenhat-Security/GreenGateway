@@ -177,6 +177,7 @@ async fn adds_baseline_security_headers() {
             headers["permissions-policy"],
             "accelerometer=(), autoplay=(), camera=(), clipboard-read=(), clipboard-write=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
         );
+    assert_eq!(headers["permissions-policy"], PERMISSIONS_POLICY);
     assert_eq!(headers["cross-origin-resource-policy"], "same-site");
     assert_eq!(
         headers["content-security-policy"],

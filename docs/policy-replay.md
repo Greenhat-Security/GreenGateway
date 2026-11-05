@@ -5,15 +5,20 @@ would have decided for traffic the gateway already served. Before any
 replay can run, each retained record has to be turned into the facts the
 policy evaluator reads, with every fact the record does not carry stated as
 missing rather than guessed. A **replay context** is that record, and this
-page describes its format, `replay-context.v1`, and how the gateway reads one
-out of the audit events it writes today (issue #243, slice 12), the
-bounded [replay jobs](#replay-jobs) that decide a window of them again under
+page describes its format, `replay-context.v2`, and how the gateway reads one
+out of the audit events it writes (issue #243, slice 12), the
+[decision facts](#decision-facts) the request path records beside each
+verdict so a replay can tell what decided it, the bounded
+[replay jobs](#replay-jobs) that decide a window of them again under
 a candidate policy (slice 13), and the [impact comparison](#impact-comparison)
 that compares those answers with the active policy the candidate was written
 against and with what was recorded (slice 14).
 
 Nothing on the request path writes a replay context: every context comes from
 the legacy adapters described below, is built in memory, and is never stored.
+What the request path does write, beside each verdict, is its decision facts:
+codes, versions and digests that say which policy and evaluator decided, and
+nothing a request carried.
 
 ## What a replay context is, and what it is not
 
@@ -24,9 +29,13 @@ A replay context carries, for one HTTP request or one tool invocation:
   the MCP identity, the tool name, and the egress destination -- each stated
   as recorded, absent or `not_recorded`;
 - the **recorded result**: what the gateway's policy stage recorded at the
-  time, under the evaluator and resources it ran then. It is a comparison
+  time, under the evaluator and resources it ran then, and -- for a record
+  written since the gateway records them -- the
+  [decision facts](#decision-facts) it was decided with. It is a comparison
   aid, never an input to a replayed decision; the
-  [impact comparison](#recorded-against-base) is what compares it.
+  [impact comparison](#recorded-against-base) is what compares it. (One
+  decision fact, the routing classification, also settles the MCP identity an
+  observation leaves unstated; see [What the records establish](#what-the-records-establish).)
 
 It does not carry anything the evaluator does not read. Source address, user
 agent, request id, email, organization, session, headers, query values,
@@ -52,13 +61,21 @@ replayed, and a replay never reconstructs facts that were not recorded.
 ## The record
 
 The published schema is
-[`docs/schemas/replay-context.v1.schema.json`](schemas/replay-context.v1.schema.json).
+[`docs/schemas/replay-context.v2.schema.json`](schemas/replay-context.v2.schema.json).
 The gateway's parser is authoritative: it dispatches the version exactly,
 refuses unknown and repeated members everywhere, refuses a credential-shaped
 member (`token`, `authorization`, `cookie`, `headers`, `email` and similar) by
 name, and checks what JSON Schema cannot state -- byte lengths, the exact-path
-and bare-host predicates, principal shape bounds, reason-code syntax and the
-dispatch origin form. A serialized context is at most 128 KiB.
+and bare-host predicates, principal shape bounds, reason-code syntax, the
+dispatch origin form, the `facts_available` bits each lane may set, and that
+`recorded.decision` describes its own record. A serialized context is at most
+128 KiB.
+
+`replay-context.v2` is `replay-context.v1`
+([schema](schemas/replay-context.v1.schema.json)) with one optional member,
+`recorded.decision`. The parser still reads v1 exactly as it was published --
+a v1 context with `recorded.decision` is refused, since v1 has no member for
+it -- and writes v2.
 
 ```json
 {
@@ -88,7 +105,19 @@ dispatch origin form. A serialized context is at most 128 KiB.
     "policy": "allowed",
     "reason": "matched_rule",
     "permission": "items:write",
-    "path_prefix": "/api"
+    "path_prefix": "/api",
+    "decision": {
+      "schema_version": "policy-decision.v1",
+      "lane": "http",
+      "policy_etag": "\"sha256:...\"",
+      "policy_semantic_digest": "sha256:...",
+      "semantics_version": "gg-http-alias-v1",
+      "context_version": 3,
+      "facts_available": 31,
+      "routing": "proxy_dispatch",
+      "reason": "matched_rule",
+      "element": { "kind": "route", "position": 0, "id": "payments" }
+    }
   }
 }
 ```
@@ -131,17 +160,125 @@ resolution evidence: `resolution` is always `not_recorded`.
 | `reason` | The policy stage's stable reason code, when recorded |
 | `matched_rule_id`, `permission`, `path_prefix` | The element that decided, as recorded |
 | `attribution_omitted` | Present, and `true`, when the record named a rule id or permission over 256 bytes: it is dropped and flagged, never cut |
+| `decision` | The record's [decision facts](#decision-facts), exactly as written, when it carries them; absent for a record from before them and for a request the policy stage refused to answer |
 
 A recorded `denied` with a reason such as `policy_evaluation_incomplete` or a
 revision-check code is what the gateway recorded for a request its policy
 stage refused to answer, not a policy denial; the reason says which.
 
-v1 does not say which policy revision or evaluator version produced the
-recorded result, because no audit record the adapters read carries either.
-A replay can therefore compare a recorded result with a replayed one, but it
-cannot attribute a difference to a policy change rather than an evaluator
-change. Binding a record to a revision needs a record the gateway does not
-write yet.
+A record without `decision` does not say which policy or evaluator produced
+its result, so a replay can compare it with a replayed answer but cannot
+attribute a difference to a policy change rather than an evaluator change.
+One with `decision` names both, and the
+[impact comparison](#recorded-against-base) labels such a difference
+accordingly.
+
+## Decision facts
+
+Beside each policy verdict, the gateway records the facts it was decided with:
+a `policy_decision_facts` member, in the `policy-decision.v1` format, on
+
+- `http.request_observed`, for a request the HTTP policy stage answered;
+- `tool.invoke_start`, and the `tool.invoke_rejected` written at admission --
+  an entry's refusal, a tool-name rule's denial, or a capacity or lease
+  refusal after policy admitted the call;
+- a tool-name rule's `authz.allowed`, `authz.would_deny` and `authz.denied`.
+
+```json
+"policy_decision_facts": {
+  "schema_version": "policy-decision.v1",
+  "lane": "tool",
+  "policy_etag": "\"sha256:...\"",
+  "semantics_version": "gg-tool-policy-v1",
+  "context_version": 1,
+  "facts_available": 36,
+  "reason": "matched_rule",
+  "element": { "kind": "rule", "position": 4, "id": "deny-exports" }
+}
+```
+
+| Member | Meaning |
+| --- | --- |
+| `schema_version` | Exactly `policy-decision.v1`. A reader dispatches on it; any change to what the member states is a new version |
+| `lane` | `http` or `tool` |
+| `policy_etag` | The ETag the admin API reports for the installed policy that decided: the one `GET .../policy` sends and a replay's `base_etag` names |
+| `policy_semantic_digest` | That policy's ADR-0004 semantic digest, the one `POST .../policy/validate` reports. Absent for a 0.x policy, which has no normative normalization and so no semantic digest |
+| `semantics_version`, `context_version` | The evaluator's semantics version (`gg-http-alias-v1` for the HTTP lane, `gg-tool-policy-v1` for the tool lane) and the version of the evaluation context it was given |
+| `facts_available` | Which of the evaluator's inputs it had, as the bits below |
+| `routing` | HTTP only: `unclassified`, `contextless`, `mcp_alias` (an MCP route alias, decided under the canonical `/mcp` identity as well) or `proxy_dispatch` |
+| `reason` | The verdict's stable reason code: the observation's `policy_reason`, or the invocation's |
+| `element` | The deciding element: `rule` or `route` with its `position` in that policy and its authored `id` (`id_omitted: true` instead, for one over 256 bytes), or `default`, `host_binding`, `tool_entry` (the invoked tool's entry, which the record names) or `no_tool_entry` |
+
+`facts_available` sets one bit per input the evaluator was given, whatever its
+value -- an anonymous principal and an absent `Host` are available -- and
+leaves clear one it decided without. The positions are part of the version
+and never reused:
+
+| Bit | Value | Input |
+| --- | --- | --- |
+| 0 | 1 | method |
+| 1 | 2 | path |
+| 2 | 4 | principal |
+| 3 | 8 | routing classification |
+| 4 | 16 | request host |
+| 5 | 32 | tool name |
+| 6 | 64 | organization |
+| 7 | 128 | client address |
+| 8 | 256 | headers |
+| 9 | 512 | query |
+| 10 | 1024 | tool arguments |
+| 11 | 2048 | clock |
+
+An HTTP verdict sets method, path, principal, request host and, for a
+classified request, routing (`31`); a tool invocation sets tool name and
+principal (`36`). A lane captures a typed-matcher fact only when the policy
+reads it, and the bits say which it captured: the organization (`64`) under
+a policy whose roles come from identity mappings, which read the
+organization the principal's issuer verified; and the client address, the
+referenced headers, the referenced query parameters and the clock (`128`,
+`256`, `512`, `2048`) when a v1 rule condition reads them. The client
+address bit is clear when the request or call had no address to capture,
+and a tool call never has headers or a query. Tool invocation admission
+captures the tool arguments (`1024`) only when a `tool_argument` condition
+of a rule for the invoked tool reads them, every earlier stage left the
+call to the rules, and the arguments passed the tool's input schema; the
+HTTP lane never does. The bits never carry the values: an address, header,
+query value, argument or instant the evaluator read is not in the facts.
+
+A request the policy stage refused to answer -- an unsafe path, an
+incomplete or failed evaluation, a failed revision check, an audit outage --
+carries no decision facts, nor does a request that never reached the stage.
+Neither does a decision made outside it, such as an admin endpoint's own
+permission refusal. If an installed policy's identity cannot be computed,
+which a validated policy always allows, its verdicts are recorded without
+facts and an error is logged: never under a guessed identity.
+
+**Cost on the request path.** A snapshot's identity -- ETag, semantic digest
+and element ids -- is computed once, when the snapshot is installed, from the
+policy its compiled instance holds, and shared by every verdict. A verdict
+adds one reference count and a fixed-size value of codes, versions and
+positions, and allocates nothing for them; the member is serialized where the
+observation or tool record is written. The kernel calls the `http_policy`
+and `tool_policy` microbenchmarks measure are unchanged.
+
+**Storage.** The member is part of the stored payload JSON -- SQLite's
+`payload_json` column and PostgreSQL's `payload_json` `jsonb` column -- so no
+table, column, index or migration changed, and the audit envelope stays at
+`0.2.0`. The member carries its own version instead. Readers that do not know
+it ignore it, as they ignore every payload member they do not read.
+
+### Privacy
+
+Decision facts add no personal data to a record. They hold the policy's own
+identity (ETag, semantic digest, element positions and authored ids), the
+evaluator's versions, a bit set and closed codes. They hold no source
+address, request id, user agent, email, subject, issuer, role, organization,
+header, query value, body, tool argument, path, host, route, upstream or
+error: the bit set says whether an input was present, never what it was.
+Whatever personal data a record already carries stays in the members it
+always had, under the same retention and access. A replay context keeps the
+facts as recorded; a [replay result](#privacy-projection) never repeats them,
+and counts records by what their facts establish instead.
 
 ## Reading the audit records the gateway writes today
 
@@ -155,9 +292,10 @@ window can always say how many records it could not use and why:
 | `duplicate_tool_observation`, `duplicate_http_decision`, `duplicate_tool_rule_decision`, `duplicate_tool_rejection`, `duplicate_tool_outcome` | Another record of the same request or invocation is the replayable one |
 | `not_policy_evaluated` | The request never reached the policy stage (`policy_decision: not_evaluated`): refused by authentication, exempt from policy, or a probe |
 | `unsupported_envelope_version` | An audit envelope version the adapter was not written for |
+| `unsupported_decision_facts_version` | Decision facts of a version the adapter was not written for |
 | `unsupported_rendered_tool_request` | A rendered tool request's decision record: its path carries tool arguments and is not adapted |
 | `unsupported_tool_rejection` | A `tool.invoke_rejected` reason the adapter does not know, so it cannot say which record is the invocation's replayable one |
-| `malformed_payload`, `malformed_method`, `malformed_path`, `malformed_principal`, `malformed_request_host`, `malformed_routing`, `malformed_tool_name`, `malformed_policy_decision`, `malformed_recorded_result` | A request record this gateway would not have written |
+| `malformed_payload`, `malformed_method`, `malformed_path`, `malformed_principal`, `malformed_request_host`, `malformed_routing`, `malformed_tool_name`, `malformed_policy_decision`, `malformed_recorded_result`, `malformed_decision_facts` | A request record this gateway would not have written |
 | `not_request_record` | Not a request or invocation record |
 
 ### One record per request and per invocation
@@ -197,10 +335,22 @@ An operational probe whose observation was suppressed
   neither, so its host is `not_recorded`, not absent. A dispatch recorded
   without a route id predates route ids, which every dispatch now carries, so
   its routing is `not_recorded`.
-- **MCP identity.** Never recorded. An MCP route alias is always the public
-  URL's path with `/mcp` appended, so a locally classified path that does not
-  end in `/mcp` is its own identity under every configuration. One that does
-  (other than `/mcp` itself) is `not_recorded`.
+- **MCP identity.** Not recorded by an observation's own members. An MCP
+  route alias is always the public URL's path with `/mcp` appended, so a
+  locally classified path that does not end in `/mcp` is its own identity
+  under every configuration. One that does (other than `/mcp` itself) is
+  `not_recorded` -- unless the record's decision facts state the routing
+  classification: `contextless` is its own identity, and `mcp_alias` an alias
+  of `/mcp`, the canonical identity every alias is decided under.
+- **Decision facts.** Read into the recorded result exactly, when present.
+  They must describe the record they sit on: its lane; its recorded reason
+  (an invocation policy admitted records none, and its facts name `allowed`
+  or `matched_rule`); and, for an observation, its routing -- `unclassified`
+  for an unclassified request, `contextless` or `mcp_alias` for a local one,
+  `proxy_dispatch` for a dispatch with a route id. Anything else is
+  `malformed_decision_facts`, and another version
+  `unsupported_decision_facts_version`. A record without them is read as
+  before.
 - **Egress.** Never recorded. No record names the destination a request
   connected to or what it resolved to.
 - **Tool callers.** A tool-rule decision record names the actor the tool
@@ -221,11 +371,11 @@ an allow.
 | request host `not_recorded`, `absent`, `present` | missing, absent, the host |
 | routing `not_recorded` | an unclassified request: `missing_dispatch_fact` |
 | routing `local`, identity `canonical` or `alias` | a contextless request, or an MCP alias decided under both identities |
-| routing `local`, identity `not_recorded` | both readings; see below |
+| routing `local`, identity `not_recorded` | both readings; see below. Only a record without decision facts has this state |
 | routing `proxy_dispatch` | the classified dispatch with the recorded facts |
 | egress `destination` | the destination with no resolution facts |
 | organization (never recorded) | not recorded: an identity mapping that tests `organizations` is `missing_matcher_fact` |
-| source address, headers, query values, clock (never recorded as condition facts) | not recorded: a rule condition that reads one is `missing_matcher_fact` |
+| source address, headers, query values, clock, tool arguments (never recorded as condition facts) | not recorded: a rule condition that reads one is `missing_matcher_fact` |
 
 **MCP identity.** A record that does not say whether its path was an MCP
 alias is decided under both readings, contextless and alias, and answers
@@ -245,7 +395,11 @@ are served.
 
 **Rule conditions.** Replay captures no condition fact: not the
 organization, the source address a record carries for audit, the headers,
-the query values or the instant of the original decision. A condition that
+the query values, the tool arguments or the instant of the original
+decision. A tool call whose arguments failed the input schema at admission,
+before an argument rule decided it, is recorded as a `tool.invoke_rejected`
+whose reason (`invalid_params` and the like) is no policy result, and is
+counted as `unsupported_tool_rejection`. A condition that
 reads one is unknown, so a decision that turns on it is `indeterminate` with
 `missing_matcher_fact`, never a guessed match or no-match; a condition
 decided without one (an `organization` leaf bound to another issuer, say)
@@ -271,7 +425,8 @@ refused it. No replay performs a lookup.
 ## Replay jobs
 
 `POST /v1{ADMIN_PREFIX}/policy/replays` starts a bounded job that decides one
-window of the standalone audit log again under a candidate policy and under
+window of retained audit records -- the standalone audit log, or in cluster
+mode the cluster audit stream -- again under a candidate policy and under
 the active policy it was written against, through the same evaluator the live
 adapters call, and reports what each decided and how they differ as counts.
 `GET /v1{ADMIN_PREFIX}/policy/replays/{id}` reads the job, its progress and,
@@ -342,9 +497,7 @@ simply holds fewer rows; the cutoff's count says how many.
 In cluster mode the audit authority is PostgreSQL's `audit_events` and its
 commit-ordered `audit_stream`, and the reader over them
 (`storage::postgres_audit_replay`) answers the job engine exactly as the
-standalone reader does. Cluster mode still answers every replay route `503`
-(see [below](#standalone-only-and-process-local)); the reader is what a cluster
-job will read.
+standalone reader does. [Cluster jobs](#cluster-jobs) read through it.
 
 - **Cutoff.** `high_water` is the highest stream position assigned when the
   job is created, read in the same statement as the window's rows at or below
@@ -399,9 +552,12 @@ job will read.
 | One page | 500 rows, and 4 MiB of their JSON past the first row | The next page continues |
 | One row | 256 KiB of actor and payload JSON | Counted as `oversized_record`; its JSON is never read |
 | Running jobs | 1 per replica, on a blocking thread | Further jobs are `queued` |
-| Queued or running jobs | 4 per replica, 1 per principal | `429 policy_replay_busy` |
+| Queued or running jobs | 4 per replica, 1 per principal; in cluster mode 4 per deployment, 1 per principal | `429 policy_replay_busy` |
 | Request body arrival | 5 seconds | `408 policy_replay_request_timeout` |
-| Unexpired jobs held | 32 per replica, 8 per principal | `429 policy_replay_quota_exhausted` |
+| Unexpired jobs held | 32 per replica, 8 per principal; in cluster mode 32 per deployment, 8 per principal | `429 policy_replay_quota_exhausted` |
+| Cluster lease | 30 seconds, renewed every 10 seconds and by every checkpoint | Another replica takes the job over and resumes it |
+| Cluster claims | 3 per job, not counting one given back at shutdown | `interrupted` with `takeover_limit` |
+| Cluster checkpoint | 4 MiB rendered | `failed` with `checkpoint_too_large` |
 | Finished job kept | 15 minutes after it finishes | The job reads `expired`, with no result |
 | Expired job remembered | 1 hour after that | `404` |
 | Request body | 2 MiB, or `MAX_BODY_SIZE` if lower | `413` |
@@ -420,7 +576,10 @@ long as its evaluation lasts. The job holds its slot while it is queued and
 hands it to the blocking thread that runs it, so the slot comes back only
 when that work has ended -- neither a dropped request nor a cancellation
 frees it early -- and before the job reads as finished. A retry naming a job
-already admitted is answered before a slot is asked for.
+already admitted is answered before a slot is asked for. A cluster job may
+run on any replica, so there the slot bounds the replica's admissions in
+flight and comes back when the request ends; the deployment's pending jobs
+are counted by the job store ([cluster jobs](#cluster-jobs)).
 
 ### Lifecycle
 
@@ -430,8 +589,9 @@ already admitted is answered before a slot is asked for.
 | --- | --- |
 | `completed` | Every record the cutoff selected was read and classified, the window was unchanged at the end, and at least one record was replayed |
 | `completed_incomplete` | A result whose `limitations` say what it does not cover: `scan_truncated`, `deadline_exceeded`, `source_changed`, `source_pruned` (cluster audit stream only: rows the window may have held are gone), or `no_data` when nothing in the window was replayable. It satisfies no gate |
-| `failed` | No result, with a stable `failure.reason`: `source_unavailable`, `compile_failed`, `evaluator_failed` (the evaluator broke its own contract; nothing it counted is an answer), `result_too_large`, `audit_unavailable` or `internal` |
+| `failed` | No result, with a stable `failure.reason`: `source_unavailable`, `compile_failed`, `evaluator_failed` (the evaluator broke its own contract; nothing it counted is an answer), `result_too_large`, `checkpoint_too_large` (cluster only), `audit_unavailable` or `internal` |
 | `cancelled` | No result. A queued job stops at once; a running one before its next record |
+| `interrupted` | Cluster only. No result: a replica took the job over and could not continue it, with `failure.reason` `pins_unreadable` (a pinned policy no longer validates or reproduces its ETag), `engine_version_changed` (the job was admitted under another evaluator, replay-context, checkpoint or result version), `checkpoint_unreadable` or `takeover_limit` ([cluster jobs](#cluster-jobs)) |
 | `expired` | 15 minutes have passed since the job finished: its result, if it had one, is gone, and it no longer counts against any quota |
 
 `completed` does not mean every record was decided: records the candidate
@@ -440,7 +600,8 @@ evaluator refused are all counted, by code.
 
 Every job leaves exactly its own lifecycle records: `policy.replay_started`
 when it is admitted, and one of `policy.replay_completed`,
-`policy.replay_cancelled` or `policy.replay_failed` when it ends. They carry
+`policy.replay_cancelled`, `policy.replay_failed` or (cluster only)
+`policy.replay_interrupted` when it ends. They carry
 the job id, the base and candidate ETags, the request digest, the projections,
 the window and cutoff (the start also names a stored candidate by its
 `candidate_draft_id` and `candidate_draft_revision`, or its
@@ -473,7 +634,7 @@ is what `AUDIT_DURABILITY` makes it: committed to the audit store under
 | `413` | The body is over its bound |
 | `422` | An invalid request, window, edit or candidate, or a history version this build does not accept now (`policy_revision_incompatible`) |
 | `429` | `policy_replay_busy` or `policy_replay_quota_exhausted` |
-| `503` | `audit_evidence_unavailable` (no standalone audit log, or it could not be read), `policy_replay_audit_unavailable` (the start was not recorded), `policy_replay_unsupported_in_cluster`, or a drafts store or policy history that could not be read (`policy_drafts_unavailable`, `policy_history_unavailable`) |
+| `503` | `audit_evidence_unavailable` (no standalone audit log or cluster job store, or the audit records could not be read), `policy_replay_audit_unavailable` (the start was not recorded), `policy_replay_store_unavailable` (cluster mode: the job store could not be read or written), or a drafts store or policy history that could not be read (`policy_drafts_unavailable`, `policy_history_unavailable`) |
 
 A job's representation is always sent with `Cache-Control: no-store`.
 
@@ -578,18 +739,96 @@ cutoff, base, candidate, projections and evaluator produce byte-identical
 results, however the log was paged. A job stopped by its deadline is the one
 exception, and says so. No replay result says a policy is safe.
 
-### Standalone only, and process-local
+### Standalone jobs are process-local
 
-Jobs live in the memory of the replica that admitted them, and run there.
-Shutting the gateway down cancels every job, and a running one stops before
-its next record. A restart forgets every job: its id is `404` afterwards,
-never resumed and never a partial result. Cluster mode answers every replay
-route `503 policy_replay_unsupported_in_cluster`, after the permission checks
-and before a body is read, a cutoff fixed or a job admitted: a replicated job
-needs the durable leases of #241. The [cluster reader](#the-cluster-reader)
-over PostgreSQL's audit stream exists, but no route uses it yet. Without a
-standalone audit log (`AUDIT_SQLITE_PATH` unset) the start route is
+A standalone job lives in the memory of the replica that admitted it, and
+runs there. Shutting the gateway down cancels every job, and a running one
+stops before its next record. A restart forgets every job: its id is `404`
+afterwards, never resumed and never a partial result. Without a standalone
+audit log (`AUDIT_SQLITE_PATH` unset) the start route is
 `503 audit_evidence_unavailable`, never an empty result.
+
+### Cluster jobs
+
+In cluster mode a job is a row of `greengateway.policy_replay_jobs`
+(migration 30), so every replica answers `GET` and `DELETE` for every job and
+any replica may run it. It reads the cluster audit stream through
+[the cluster reader](#the-cluster-reader), under the bounds above, and its
+result is the same `policy-replay-results.v1` document, with `source.kind`
+`cluster_audit_stream`. The routes, permissions, request, representation and
+status codes are the standalone ones.
+
+- **Admission.** The request is validated and pinned exactly as a standalone
+  one. The job store then looks up the idempotency key and counts the pending
+  jobs (4 per deployment, 1 per principal) and the unexpired ones (32 per
+  deployment, 8 per principal) in the transaction that inserts the job, under
+  a transaction-scoped advisory lock, so two replicas can neither both take
+  the last slot nor both admit one key. No job is ever evicted or ended to
+  make room. The row pins both policy documents as the gateway serialized
+  them (and, for a draft or history candidate, the draft revision or history
+  version it was read as), the cutoff, and the versions of the evaluator,
+  replay context, checkpoint and result the job was admitted under. The job becomes `queued`
+  only once its `policy.replay_started` event is accepted; until then no
+  replica runs it.
+- **Workers and leases.** Every cluster replica runs one replay worker, so
+  each runs at most one job at a time, on a blocking thread. While the
+  cluster membership gate admits the replica, the worker claims the oldest
+  job that is queued or whose holder's lease has expired by the database
+  clock. A lease lasts 30 seconds and is renewed every 10 seconds and by every
+  checkpoint. Every claim draws a fence from one sequence, so a takeover always
+  holds a larger fence than the lease it replaced, and every write a holder
+  makes names its holder and fence, so it matches nothing once another replica
+  holds the job.
+- **Checkpoints and takeover.** After every page the worker stores, in one
+  statement under its fence, the stream position it has read through and its
+  whole partial aggregate: a lossless `policy-replay-checkpoint.v1` document
+  of every count the run keeps, without a result's row caps. A replica that
+  takes a job over -- its holder crashed, stalled past its lease or lost the
+  database -- resumes from that checkpoint and reads the page after it. A page
+  whose checkpoint was not stored is read again whole, and one whose
+  checkpoint was is never read again, so every record is counted exactly once
+  and a resumed job's result is the one an uninterrupted job would have
+  produced. The 60-second run deadline is fixed by the job's first claim and
+  kept across takeovers: a resumed run gets what is left of it.
+- **Interrupted.** A replica that claims a job re-validates both pinned
+  documents and requires each to reproduce its ETag, and requires the job's
+  engine versions to be its own. A job that fails either, whose checkpoint
+  cannot be read back, or that has been claimed more than three times (a claim
+  given back at shutdown does not count) ends `interrupted`, with
+  `policy.replay_interrupted` carrying the job id, the reason and the records
+  it had read. It is never resumed under another evaluator and never
+  publishes a partial result.
+- **Cancellation.** `DELETE` ends a queued job at once (recording
+  `policy.replay_cancelled` with the admitting request's envelope) and asks a
+  running one to stop: its holder learns of it at its next checkpoint or lease
+  renewal and stops before its next record, and a replica that takes the job
+  over ends it without reading anything.
+- **Completion.** The worker records `policy.replay_completed` and only then
+  stores the result under its fence. If the lease is lost between the two, the
+  replica that takes the job over runs it from the last checkpoint and records
+  its own completion, so the audit trail can then hold two completion records
+  for one job -- with the same result digest, unless a deadline cut one of the
+  runs short. Only one result is ever stored.
+- **Draining and shutdown.** A draining replica's worker stops claiming. A run
+  in progress stops before its next record and gives its job back: its lease
+  expires at once, so another replica resumes it from its last checkpoint
+  without counting a takeover. Readiness never depends on the worker.
+- **Retention.** Every admission and every idle turn of a worker run one
+  bounded retention pass of at most 64 rows: finished jobs past their
+  retention are deleted, expired results cleared, and an admission whose start
+  was never recorded is removed 60 seconds after it began. A pending job is
+  never pruned. Every time is database time.
+
+The job table is analysis state, not authority: nothing about a job advances
+the security revision, writes the outbox or changes what any replica
+enforces. A row holds the admitting request's audit envelope (the actor,
+request id and client address its `policy.replay_started` event already
+holds) and both pinned policy documents for as long as the job is retained,
+at most 75 minutes after it finishes. Store failures are classified and
+logged where they happen, and a route that cannot read or write the store
+answers `503 policy_replay_store_unavailable`. [Policy evidence](policy-evidence.md)
+binds a cluster job through the same store, so a package can include a job
+that ran on any replica.
 
 ### In the admin UI
 
@@ -630,9 +869,11 @@ A replay job decides every replayable record three ways, and the result's
 Base against candidate is the impact of the change, reported per projection.
 Recorded against base says how far the base, decided today, is from what was
 recorded. The two are never folded into one answer: a difference between
-recorded and base says nothing about the candidate, and because a v1 record
-does not say which revision or evaluator recorded it, it cannot say whether
-the policy, the configuration or the evaluator changed since.
+recorded and base says nothing about the candidate, and is never counted as a
+candidate change. A record with [decision facts](#decision-facts) says which
+policy and evaluator decided it, and such a difference is labelled for what
+they name; one without them cannot say whether the policy, the configuration
+or the evaluator changed since.
 
 When the candidate is `active`, the base is the candidate: one compiled
 policy answers both, every transition is unchanged, and
@@ -757,8 +998,10 @@ result with the base's answer as authored, the policy the gateway serves:
 
 | Comparison | Meaning |
 | --- | --- |
-| `outcome_differs` | The base decides differently from what was recorded: `allowed`, `denied` or `would_deny` for a request, `admitted` or `denied` for an invocation |
-| `attribution_differs` | The same outcome, for a different reason or by a different element than the record names |
+| `outcome_differs` | The base decides differently from what was recorded -- `allowed`, `denied` or `would_deny` for a request, `admitted` or `denied` for an invocation -- and nothing the record states explains it |
+| `attribution_differs` | The same outcome, for a different reason or by a different element than the record names, and nothing the record states explains it |
+| `evaluator_changed` | A difference, of outcome or attribution, in a record whose decision facts name the base policy decided by another evaluator: a `semantics_version` or `context_version` that is not this build's |
+| `recorded_under_other_policy` | A difference in a record whose decision facts name another policy than the base (by ETag). What changed is the policy the record was decided under, not anything the candidate does |
 | `agrees` | The same outcome and, when the record states a reason, the same reason and element |
 | `recorded_not_policy_verdict` | The recorded reason is not a policy verdict -- `policy_evaluation_incomplete`, a revision-check code -- because the policy stage did not answer the request |
 | `base_indeterminate`, `base_refused` | The base could not answer, or the evaluator refused the record's facts |
@@ -770,6 +1013,25 @@ record that dropped an over-long attribution (`attribution_omitted`) is
 compared without it, and a record that states no reason -- a tool invocation
 policy admitted -- by outcome only. `matrix` counts the compared records by
 recorded policy and reason against the base's.
+
+A difference is labelled `recorded_under_other_policy` before
+`evaluator_changed`: a record decided under another policy names that
+policy's elements, so the evaluator is not what the comparison could isolate.
+Only `outcome_differs` and `attribution_differs` remain unexplained -- a
+record without decision facts, or one the base itself decided under this
+evaluator and that still differs, which points at a configuration the policy
+does not hold (MCP route paths, an identity provider's organizations) or at
+the record.
+
+Each lane's `provenance` counts every record by what its decision facts
+establish, every code listed, zeros included:
+
+| `provenance` | The record's decision facts name |
+| --- | --- |
+| `base_policy` | the base policy, decided by this build's evaluator |
+| `other_policy` | another policy than the base |
+| `other_evaluator` | the base policy, decided by another evaluator semantics or context version |
+| `not_recorded` | nothing: the record carries no decision facts |
 
 A difference here is a reason to look before reading the base-to-candidate
 transitions as a forecast: the base, decided today, is not what served those
@@ -785,7 +1047,10 @@ only a record carries. A recorded rule id, permission or path prefix is
 compared and never copied; a recorded reason is rendered only as the code it
 matched in the closed set of verdict reasons; and a tool a record names that
 the policy does not list is `no_tool_entry`, never its name. Paths, hosts,
-principals, roles, route permissions and dispatch facts never appear.
+principals, roles, route permissions and dispatch facts never appear. A
+record's decision facts are compared and never copied either: the result
+counts records by provenance code, and repeats no recorded ETag, digest,
+evaluator version or element id.
 
 ## How this is verified
 
@@ -800,7 +1065,24 @@ principals, roles, route permissions and dispatch facts never appear.
   one record of each is replayable, and its replayed admission is the live
   one.
 - Canary values in every member the evaluator does not read never appear in
-  a serialized context or its formatting.
+  a serialized context or its formatting, with or without decision facts.
+- Real requests through the live RBAC and observation middleware, and real
+  invocations through the tool runtime, record decision facts on every
+  verdict and none on a refusal; the observation's member is the verdict's
+  own; the adapters read it back exactly, naming the installed policy's ETag
+  and this build's evaluator; and the same records with the member removed
+  are read and replayed as before. A record whose facts state an MCP alias is
+  decided where the same record without them is `indeterminate`.
+- The facts name the snapshot that decided: a v1 policy's semantic digest and
+  a 0.x policy's none, a rule or route by position and id, an id-less rule by
+  position, an over-long id as `id_omitted`; two verdicts share one identity,
+  a reinstall makes a new one, and the per-verdict part is a fixed-size
+  `Copy` value.
+- Decision facts out of bounds, of another version, or describing another
+  record -- its lane, its reason, its routing -- are refused by the parser and,
+  where JSON Schema can state it, by the published schema; the adapter counts
+  them as `malformed_decision_facts` or `unsupported_decision_facts_version`.
+  A v1 context is read exactly as published.
 - Every context round-trips through the parser, matches the published
   schema, and the parser and the schema refuse the same malformed contexts.
 - A replay job's engine is run over in-memory and SQLite audit logs: a window
@@ -830,9 +1112,28 @@ principals, roles, route permissions and dispatch facts never appear.
   invalid window, edit or candidate creates no job; an idempotent retry starts
   nothing; queued jobs are cancelled, quotas refuse rather than evict, and
   results expire; a stalled upload holds no admission slot and is refused at
-  its deadline, and a job holds its slot until its evaluation ends; in cluster mode every route answers `503` without reading a
-  body, admitting a job, recording a lifecycle event or consulting the
-  cluster authority; and the side-effect test above holds.
+  its deadline, and a job holds its slot until its evaluation ends; in cluster
+  mode without a job store every route answers `503` without reading a body,
+  admitting a job, recording a lifecycle event or consulting the cluster
+  authority; and the side-effect test above holds.
+- Cluster jobs are run against a real PostgreSQL. The job store keeps one job
+  per owner and idempotency key across replicas, refuses at its per-owner and
+  per-deployment pending and unexpired bounds without evicting a job, never
+  lets a worker claim a job whose start is not recorded, hands a lapsed lease
+  to the next claim with a larger fence and the last checkpoint while the old
+  holder's checkpoint, renewal, ending and release match nothing, does not
+  count a claim given back at shutdown, ends a queued job's cancellation at
+  once and reports a running one's at its next checkpoint and renewal, serves
+  a result until its TTL and then `expired` with none, and prunes only
+  finished jobs and abandoned admissions. A job that loses its lease after one
+  checkpointed page is taken over by another replica, which resumes from the
+  checkpoint and publishes a result byte-identical to an uninterrupted run's,
+  every record counted once. A job admitted under another engine, one whose
+  pinned base no longer reproduces its ETag and one past its takeover limit
+  are interrupted with their reasons; a cancellation requested while a job's
+  holder was gone ends it at the takeover; and a takeover keeps the job's
+  deadline. The engine's checkpoint is read back strictly, and a run resumed
+  from any page's checkpoint produces the uninterrupted run's result.
 - The `policy-replay.v1` parser and its published schema accept and refuse
   the same requests, projections included.
 - The impact comparison is run over a window that touches every transition,
@@ -848,6 +1149,14 @@ principals, roles, route permissions and dispatch facts never appear.
   record value -- subject, request id, address, user agent, path, recorded
   rule id, unlisted tool name, issuer, permission or non-verdict reason --
   appears in a result or completion record.
+- A window whose records were decided under the base, under another policy,
+  under another evaluator semantics or context version, or before decision
+  facts, labels each difference `outcome_differs`,
+  `recorded_under_other_policy` or `evaluator_changed` accordingly, counts
+  every record's provenance, and -- with the candidate its own base -- leaves
+  every transition unchanged and the statement's count whole: no recorded
+  difference is a candidate change. No recorded ETag, evaluator version or
+  element id appears in the result.
 - Real requests through the live RBAC middleware, and real invocations
   through the tool runtime, are compared with the policy that decided them:
   every recorded verdict `agrees` -- including a rule without an id, which the

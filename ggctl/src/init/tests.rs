@@ -3,7 +3,7 @@ use std::fs;
 use gateway_config::bundle::{
     self,
     init::{self, read_answers, scaffold, Answers, AnswersSyntax, GITATTRIBUTES},
-    Profile, PublishedSchemasOnly, ReadOptions,
+    ProductionValidators, Profile, ReadOptions,
 };
 use serde_json::{json, Value};
 
@@ -83,9 +83,7 @@ fn init_writes_the_profile_bundle_and_says_what_it_wrote() {
         assert!(stdout.ends_with(
             "next: review the files, then run `ggctl validate --strict` on the --output directory\n"
         ));
-        assert!(captured
-            .stderr()
-            .contains("validate.production_validators_not_run"));
+        assert!(captured.stderr().is_empty(), "{}", captured.stderr());
         assert_path_not_echoed(&captured, &output);
 
         // What init wrote, validate accepts strictly.
@@ -114,7 +112,7 @@ fn the_json_report_describes_the_bundle_read_back() {
     assert_eq!(exit, Exit::Success);
     let found = report(&captured);
     assert_eq!(found["command"], "init");
-    assert_eq!(codes(&found), ["validate.production_validators_not_run"]);
+    assert!(codes(&found).is_empty());
     let result = &found["result"];
     assert_eq!(result["created"], true);
     assert_eq!(result["profile"], "production");
@@ -122,7 +120,7 @@ fn the_json_report_describes_the_bundle_read_back() {
     assert_eq!(result["operator"], true);
     assert_eq!(result["bundle"]["name"], "payments");
     assert_eq!(result["bundle"]["deployment"]["profile"], "production");
-    assert_eq!(result["bundle"]["policy"]["productionValidator"], "not_run");
+    assert_eq!(result["bundle"]["policy"]["productionValidator"], "passed");
     let policy: Value = serde_json::from_slice(
         &fs::read(parent.root.join("bundle").join("policy.json")).expect("policy"),
     )
@@ -158,12 +156,11 @@ fn a_cluster_bundle_leaves_policy_tools_and_connections_to_the_server() {
         .stdout()
         .starts_with("created bundle fleet (greengateway.dev/v1alpha1), cluster topology\n"));
     assert!(captured.stdout().contains("  policy         server\n"));
-    // Nothing is bundled, so no production validator was skipped.
     assert!(captured.stderr().is_empty(), "{}", captured.stderr());
     let read = bundle::read_bundle(
         &parent.root.join("bundle"),
         ReadOptions { strict: true },
-        &PublishedSchemasOnly,
+        &ProductionValidators,
     );
     let read = read.bundle.expect("a valid bundle");
     assert_eq!(read.source_files().len(), 2);

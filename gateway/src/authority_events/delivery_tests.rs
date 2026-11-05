@@ -1009,7 +1009,7 @@ fn admin_session_rows_project_without_actor_metadata_or_a_shared_revision() {
 }
 
 /// Policy, tools and stored policy test suite commits (journaled since
-/// migration 30) are delivered on the axis of the document their row names,
+/// migration 32) are delivered on the axis of the document their row names,
 /// and only in a pairing migration 29's CHECK admits: a policy operation on
 /// the policy, `tools.publish` on the tools document, `policy_tests.publish`
 /// on the suite, which is a `policy` resource of its own, and the import's
@@ -1192,7 +1192,7 @@ fn document_changes_project_on_the_axis_of_their_document() {
     }
 }
 
-/// Catalog publications (journaled since migration 30) are delivered as a
+/// Catalog publications (journaled since migration 32) are delivered as a
 /// `catalog` resource referenced by its Connection, under the catalog domain,
 /// on the `catalog` axis: the catalog revision before (none for a
 /// Connection's first catalog of its kind) and after. The overlay revision is
@@ -1278,7 +1278,7 @@ fn catalog_publications_project_on_the_catalog_axis() {
     }
 }
 
-/// A document row committed before migration 30 recorded a service-token
+/// A document row committed before migration 32 recorded a service-token
 /// caller as kind `principal` with auth mode `service_token`, and the issuer
 /// as the principal carried it. It is delivered in migration 24's
 /// vocabulary: kind `service_token`, and the issuer canonicalized as
@@ -1297,7 +1297,7 @@ fn legacy_document_actors_are_read_in_migration_24s_vocabulary() {
         .expect("an issuer reference derives");
     let as_recorded = format!(" {ACTOR_ISSUER_MARKER}/// ");
     for (kind, auth_mode, issuer, expected) in [
-        // A service-token caller in migration 23's vocabulary, and in 30's.
+        // A service-token caller in migration 23's vocabulary, and in 32's.
         (
             "principal",
             "service_token",

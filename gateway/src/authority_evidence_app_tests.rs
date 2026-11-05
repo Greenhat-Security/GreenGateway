@@ -370,35 +370,176 @@ async fn required_evidence_refuses_a_standalone_tools_registration_and_keeps_the
     assert_eq!(refused_operations(&capture, 1), ["tools.publish"]);
 }
 
+/// The standalone Connections database records managed catalog and overlay
+/// publication in the publication's own transaction (its migration 13), so
+/// required mode admits each of them: an OpenAPI registration, a refresh
+/// from the stored document, an overlay put and an overlay delete commit with
+/// one `catalog_change_evidence` row naming the authenticated principal, and
+/// a stale overlay write is refused by its own precondition and records
+/// nothing. Nothing is refused for its evidence.
 #[tokio::test]
-async fn required_evidence_refuses_standalone_catalog_changes_and_admits_evidenced_connection_changes(
-) {
-    let connection_db = TempDb::new("authority-evidence-connections");
+async fn required_evidence_admits_standalone_catalog_publication_and_records_it() {
+    let connection_db = TempDb::new("authority-evidence-catalogs");
     let policy = TempPolicyFile::new(&connection_policy_document_string());
-    // A best-effort gateway creates the managed OpenAPI Connection the
-    // catalog requests name.
-    let best_effort = connection_admin_router(&connection_db, &policy, test_audit_log());
-    let collection_etag = connection_collection_etag(&best_effort).await;
-    let created = best_effort
+    let (audit_log, capture) = captured_audit();
+    let mut config = required(connection_admin_config(
+        &connection_db,
+        &policy,
+        config::DEFAULT_ADMIN_PREFIX,
+    ));
+    config.rate_limit_write_burst = 1_000;
+    let router = router_with(config, audit_log);
+    let (connection_id, connection_etag) =
+        create_managed_openapi_connection(&router, "Evidence target").await;
+    let connection_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}");
+    let overlay_uri = format!("{connection_uri}/overlay");
+
+    let registered = preview_and_register_managed_openapi(
+        &router,
+        &connection_id,
+        &connection_etag,
+        widget_openapi_spec(),
+        &["createWidget"],
+    )
+    .await;
+    assert_eq!(registered.status(), StatusCode::CREATED);
+    // The Connection has no discovery path, so a refresh recompiles the
+    // stored document and reaches no upstream.
+    let refreshed = router
         .clone()
         .oneshot(connection_admin_request(
             Method::POST,
-            CONNECTIONS_ADMIN_ROUTE,
-            Some(test_principal(&["connections-editor"])),
-            Some(managed_openapi_connection_body("Evidence target")),
-            Some(&collection_etag),
+            &format!("{connection_uri}/refresh"),
+            Some(test_principal(&["connections-refresher"])),
+            None,
+            Some(&connection_etag),
             true,
         ))
         .await
-        .expect("best-effort connection create should complete");
-    assert_eq!(created.status(), StatusCode::CREATED);
-    let connection_etag = response_etag(&created);
-    let connection_id = json_body(created).await["id"]
-        .as_str()
-        .expect("created connection should include ID")
-        .to_owned();
-    drop(best_effort);
+        .expect("catalog refresh should complete");
+    assert_eq!(refreshed.status(), StatusCode::OK);
 
+    let current = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::GET,
+            &overlay_uri,
+            Some(test_principal(&["connections-reader"])),
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("overlay read should complete");
+    assert_eq!(current.status(), StatusCode::OK);
+    let initial_overlay_etag = response_etag(&current);
+    let document = json!({
+        "schema_version": "0.1.0",
+        "tools": {
+            "createWidget": {
+                "rename": "overlay_widget",
+                "description": "Widget operation compiled from the overlay.",
+                "visibility": "listed"
+            }
+        }
+    });
+    let stored = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::PUT,
+            &overlay_uri,
+            Some(test_principal(&["connections-editor"])),
+            Some(document.to_string()),
+            Some(&initial_overlay_etag),
+            true,
+        ))
+        .await
+        .expect("overlay put should complete");
+    assert_eq!(stored.status(), StatusCode::OK);
+    let stored_overlay_etag = response_etag(&stored);
+    let stale = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::PUT,
+            &overlay_uri,
+            Some(test_principal(&["connections-editor"])),
+            Some(document.to_string()),
+            Some(&initial_overlay_etag),
+            true,
+        ))
+        .await
+        .expect("stale overlay put should complete");
+    assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+    let removed = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::DELETE,
+            &overlay_uri,
+            Some(test_principal(&["connections-editor"])),
+            None,
+            Some(&stored_overlay_etag),
+            true,
+        ))
+        .await
+        .expect("overlay delete should complete");
+    assert_eq!(removed.status(), StatusCode::OK);
+
+    let (changes, stored_evidence) =
+        standalone_change_evidence(&connection_db.path, "catalog_change_evidence");
+    assert_eq!(
+        changes
+            .iter()
+            .map(|change| change.action.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "catalog.openapi.publish",
+            "catalog.openapi.publish",
+            "catalog.overlay.replace",
+            "catalog.overlay.delete",
+        ]
+    );
+    assert!(
+        changes.iter().all(|change| change.subject == "user-123"
+            && change.metadata() == (None, "principal".to_owned(), "bearer_token".to_owned())),
+        "{changes:?}"
+    );
+    for material in [
+        "createWidget",
+        "overlay_widget",
+        "Widget",
+        "openapi.example.test",
+        "user@example.com",
+        "org-456",
+        "session-789",
+    ] {
+        assert!(
+            !stored_evidence.contains(material),
+            "{material} reached the evidence"
+        );
+    }
+
+    // The audit writer delivers in order: once the overlay delete's own
+    // event (the fourth catalog revision) has arrived, a refusal of any
+    // change before it would have too.
+    assert_eventually(Duration::from_secs(5), || {
+        capture.events().iter().any(|event| {
+            event.event_type == audit::event::TOOL_REGISTRY_CHANGED
+                && event.payload["connection_id"] == json!(connection_id)
+                && event.payload["catalog_revision"] == json!(4)
+        })
+    });
+    assert!(capture
+        .events()
+        .iter()
+        .all(|event| event.event_type != audit::event::AUTHORITY_EVIDENCE_OPERATION_REFUSED));
+}
+
+/// The Connections database records who changes a Connection or a local
+/// secret in the change's own transaction, so required mode admits them.
+#[tokio::test]
+async fn required_evidence_admits_standalone_connection_and_secret_changes() {
+    let connection_db = TempDb::new("authority-evidence-connections");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
     let (audit_log, capture) = captured_audit();
     let mut config = required(connection_admin_config(
         &connection_db,
@@ -408,73 +549,6 @@ async fn required_evidence_refuses_standalone_catalog_changes_and_admits_evidenc
     config.rate_limit_write_burst = 1_000;
     let router = router_with(config, audit_log);
     let superadmin = || Some(test_principal(&["connections-superadmin"]));
-    let connection_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}");
-    let requests = [
-        (
-            Method::POST,
-            format!("{connection_uri}/refresh"),
-            None,
-            connection_etag.clone(),
-            "catalog.openapi.publish",
-        ),
-        (
-            Method::POST,
-            format!("{connection_uri}/openapi/register"),
-            Some(json!({ "spec": widget_openapi_spec() }).to_string()),
-            connection_etag.clone(),
-            "catalog.openapi.publish",
-        ),
-        (
-            Method::PUT,
-            format!("{connection_uri}/overlay"),
-            Some(json!({}).to_string()),
-            "\"overlay-etag\"".to_owned(),
-            "catalog.overlay.replace",
-        ),
-        (
-            Method::DELETE,
-            format!("{connection_uri}/overlay"),
-            None,
-            "\"overlay-etag\"".to_owned(),
-            "catalog.overlay.delete",
-        ),
-    ];
-    let mut expected = Vec::new();
-    for (method, uri, body, if_match, operation) in requests {
-        let response = router
-            .clone()
-            .oneshot(connection_admin_request(
-                method,
-                &uri,
-                superadmin(),
-                body,
-                Some(&if_match),
-                true,
-            ))
-            .await
-            .expect("refused catalog request should complete");
-        assert_refused(response, operation).await;
-        expected.push(operation.to_owned());
-    }
-
-    // The Connection is still at the revision it was created at.
-    let detail = router
-        .clone()
-        .oneshot(connection_admin_request(
-            Method::GET,
-            &connection_uri,
-            Some(test_principal(&["connections-reader"])),
-            None,
-            None,
-            false,
-        ))
-        .await
-        .expect("connection detail should complete");
-    assert_eq!(detail.status(), StatusCode::OK);
-    assert_eq!(response_etag(&detail), connection_etag);
-
-    // The Connections database records who changes a Connection or a local
-    // secret in the change's own transaction, so required mode admits them.
     let (evidence_before, _) =
         standalone_change_evidence(&connection_db.path, "connection_change_evidence");
     let collection_etag = connection_collection_etag(&router).await;
@@ -573,7 +647,10 @@ async fn required_evidence_refuses_standalone_catalog_changes_and_admits_evidenc
             .iter()
             .any(|event| event.event_type == audit::event::CONNECTION_SECRET_CHANGED)
     });
-    assert_eq!(refused_operations(&capture, expected.len()), expected);
+    assert!(capture
+        .events()
+        .iter()
+        .all(|event| event.event_type != audit::event::AUTHORITY_EVIDENCE_OPERATION_REFUSED));
 }
 
 async fn connection_collection_etag(router: &Router) -> String {

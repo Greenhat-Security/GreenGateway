@@ -5,17 +5,36 @@
 //! and digest code into one library that both binaries link, so neither can
 //! approximate the other. This crate is that library. Today it holds:
 //!
+//! - [`compiler`]: the environment configuration compiler (issue #433, moved
+//!   here by #242), which reads every setting through the reader its caller
+//!   passes, never the process environment, and returns a validated plan or
+//!   every problem with a value-free diagnostic. The gateway turns the plan
+//!   into the `Config` it starts from; `ggctl` runs the same compiler;
+//! - [`env_file`]: the `KEY=VALUE` environment file grammar that
+//!   `gateway import-standalone --from` and `ggctl --env` both read, and the
+//!   compilation of the variables a file sets;
 //! - [`catalog`]: the configuration field catalog, which describes every
-//!   setting the gateway's configuration compiler reads and is held to that
-//!   compiler, the configuration reference, `.env.example` and the Cloudflare
-//!   wrapper by parity tests;
+//!   setting the compiler reads and is held to the compiler, the
+//!   configuration reference, `.env.example` and the Cloudflare wrapper by
+//!   parity tests;
 //! - [`documents`]: the versioned documents GreenGateway publishes schemas
 //!   for, and those schemas;
 //! - [`capabilities`]: the `GatewayCapabilities` document a gateway serves at
 //!   `GET /v1{ADMIN_PREFIX}/config/capabilities`, which `ggctl` reads before
 //!   any configuration operation and refuses to proceed without;
+//! - [`mcp_client_configs`]: the credential-free MCP client configuration
+//!   templates a gateway serves at `GET /v1{ADMIN_PREFIX}/mcp/client-configs`
+//!   and `ggctl mcp-config` prints, rendered and read here so the two cannot
+//!   disagree about a template;
 //! - [`bundle`]: the configuration bundle reader, which `ggctl validate` and
-//!   `ggctl doctor` run and the gateway will start from in bundle mode;
+//!   `ggctl doctor` run and the gateway will start from in bundle mode, with
+//!   the [`bundle::ProductionValidators`] both pass it;
+//! - [`rbac`] and [`tools`]: the policy and tools documents (policy v0 and
+//!   v1, tools 0.1.0), their models and their validating parses
+//!   ([`rbac::Policy::validate_json_value`] and
+//!   [`tools::definitions::definitions_from_json_value`]), which the
+//!   gateway's policy and tools loaders run and which are the production
+//!   validators a bundle's documents are held to;
 //! - [`canonical_json`]: RFC 8785 canonical JSON and ADR-0004's digest frame;
 //! - [`opaque_id`] and [`permissions`]: the opaque ID grammar and the
 //!   projected-volume permission rule the reader shares with the gateway's
@@ -47,27 +66,39 @@
 //! - [`semantic_diff`]: the semantic diff between two compiled
 //!   configurations and its risk classification, which `ggctl diff` reports
 //!   for two bundles and the ledger's plans gate applies on;
-//! - the leaves of the environment configuration compiler, which is moving
-//!   here: [`connections`] (the secret alias, keyring and provider documents
-//!   and their validators, and the Connection ID grammar), [`auth`] (issuer
-//!   canonicalization, the JWKS key age bounds, the cookie-name grammar, the
-//!   client-certificate identity source and the admin session settings),
-//!   [`inbound_tls`], [`path_match`], [`request_bounds`], [`upstream_route`]
-//!   (the stable route ID grammar) and [`discovery`] (the signal and
-//!   suggestion defaults). The gateway re-exports each from the module it
-//!   moved out of.
+//! - the leaves the compiler calls: [`connections`] (the secret alias,
+//!   keyring and provider documents and their validators, the Connection
+//!   ID grammar and the origin-relative path grammar), [`auth`] (issuer
+//!   canonicalization, the principal identity bounds, the JWKS key age bounds,
+//!   the cookie-name grammar, the client-certificate identity source and the
+//!   admin session settings), [`inbound_tls`], [`path_match`],
+//!   [`request_bounds`], [`upstream_route`] (the stable route ID grammar) and
+//!   [`discovery`] (the signal and suggestion defaults).
 //!
-//! Still in the gateway crate: the environment configuration compiler
-//! (`config::compile`, extracted by #433 and described in
-//! `docs/architecture/configuration-compiler.md`) and the production policy
-//! and tools validators. The bundle reader takes those validators as a
-//! [`bundle::ResourceValidators`] argument, so the gateway runs them and
-//! `ggctl`, which cannot link the gateway crate, reports that it did not.
+//! The gateway re-exports the compiler, the policy and tools models and each
+//! leaf from the module it moved out of, so its call sites keep their paths.
+//! An inherent method that needs the gateway -- a file, an authenticated
+//! principal, the cluster roster -- is a method of a gateway-side trait of
+//! the same name there. With the bundle reader and the
+//! compiler both here, `ggctl` can link ADR-0008's pipeline stages 1 to 5:
+//! bounded reading and document validation, normalization, the typing of
+//! secret locators, and cross-field validation. The compiler's contract is
+//! `docs/architecture/configuration-compiler.md`.
+//!
+//! Still in the gateway crate: `Config` and the startup stages that act on a
+//! compiled plan, and everything that acts on a policy or tools document --
+//! loading and watching its file, its history, the tool registry, and
+//! evaluating policy and executing tools. The bundle reader takes its
+//! validators as a [`bundle::ResourceValidators`] argument; the gateway and
+//! `ggctl` both pass the production ones.
 //!
 //! Nothing here touches the environment, a clock or the network, and the
-//! compiler's leaves touch nothing at all. The bundle
-//! reader reads files only beneath the bundle root it is given, and never
-//! writes. The archive guard reads and writes only the readers and writers
+//! compiler, the policy and tools parses and the leaves touch nothing at all:
+//! the compiler's one side effect is a log line naming a setting, and the
+//! policy 0.x reader's is one naming the unknown top-level members it drops.
+//! The environment file grammar parses text its caller has read. The bundle
+//! reader reads files only
+//! beneath the bundle root it is given, and never writes. The archive guard reads and writes only the readers and writers
 //! it is handed. The ledger is the one store: it reads and writes only its own
 //! database and journal files beneath the state directory it is given, and
 //! the revision service reads and writes only through it. The state
@@ -90,16 +121,21 @@ pub mod bundle;
 pub mod canonical_json;
 pub mod capabilities;
 pub mod catalog;
+pub mod compiler;
 pub mod connections;
 pub mod discovery;
 pub mod documents;
+pub mod env_file;
 pub mod inbound_tls;
 pub mod ledger;
+pub mod mcp_client_configs;
 pub mod opaque_id;
 pub mod path_match;
 pub mod permissions;
+pub mod rbac;
 pub mod request_bounds;
 pub mod revisions;
 pub mod semantic_diff;
 pub mod state_dir;
+pub mod tools;
 pub mod upstream_route;

@@ -4,8 +4,8 @@ import type { PolicyDocument } from './policy';
 
 // The draft ETag a publication presents. `If-Match` on that request names
 // the live policy it is published over, so the draft's own strong ETag
-// travels in this header.
-const POLICY_DRAFT_ETAG_HEADER = 'X-GreenGateway-Policy-Draft-ETag';
+// travels in this header (as it does when a suggestion is added to a draft).
+export const POLICY_DRAFT_ETAG_HEADER = 'X-GreenGateway-Policy-Draft-ETag';
 const POLICY_DRAFT_WARNING_HEADER = 'X-GreenGateway-Policy-Draft-Warning';
 const POLICY_DRAFT_STATE_NOT_RECORDED_WARNING = 'policy_draft_state_not_recorded';
 const POLICY_HISTORY_WARNING_HEADER = 'X-GreenGateway-Policy-History-Warning';
@@ -71,6 +71,14 @@ export type PolicyDraftLimits = Readonly<{
 export type PolicyDraftList = Readonly<{
   drafts: readonly PolicyDraftSummary[];
   limits: PolicyDraftLimits;
+}>;
+
+// The discovery suggestion a publication also accepts: its id and the
+// revision it was read at. The gateway accepts it in the same commit, or
+// refuses the publication and writes nothing.
+export type PolicyDraftSuggestionBinding = Readonly<{
+  id: string;
+  revision: number;
 }>;
 
 export type PolicyDraftPublication = Readonly<{
@@ -224,13 +232,23 @@ export async function deletePolicyDraft(
 // Make the draft's candidate the live policy. Every precondition is one
 // the operator reviewed: the draft revision on screen, the live policy
 // revision its changes were compared with, and, when validation reported
-// one, the resource snapshot its diagnostics were read from.
+// one, the resource snapshot its diagnostics were read from. A suggestion
+// binding makes the publication that suggestion's acceptance as well.
 export async function publishPolicyDraft(
   draftId: string,
   draftEtag: string,
   policyEtag: string,
   resourceSnapshotDigest: string | null = null,
+  suggestion: PolicyDraftSuggestionBinding | null = null,
 ): Promise<PolicyDraftPublication> {
+  if (
+    suggestion !== null &&
+    (suggestion.id.trim().length === 0 ||
+      !Number.isSafeInteger(suggestion.revision) ||
+      suggestion.revision < 1)
+  ) {
+    throw new Error('Invalid suggestion binding.');
+  }
   const response = await adminFetchJsonResponse<unknown>(
     `${draftUrl(draftId)}/publish`,
     {
@@ -244,6 +262,13 @@ export async function publishPolicyDraft(
           ? {}
           : { [RESOURCE_SNAPSHOT_HEADER]: resourceSnapshotDigest }),
       },
+      ...(suggestion === null
+        ? {}
+        : {
+            body: JSON.stringify({
+              suggestion: { id: suggestion.id, revision: suggestion.revision },
+            }),
+          }),
     },
   );
   if (!isJsonObject(response.body)) {
@@ -408,6 +433,12 @@ function projectDraftList(body: unknown): PolicyDraftList {
       max_candidate_bytes: limits.max_candidate_bytes,
     },
   };
+}
+
+// A draft as a response carries it: the draft view in `body` and its
+// strong ETag in the response's `ETag` header. Anything else is refused.
+export function projectPolicyDraft(body: unknown, etag: string | null): PolicyDraft {
+  return projectDraft(body, etag);
 }
 
 function projectDraft(body: unknown, etag: string | null): PolicyDraft {

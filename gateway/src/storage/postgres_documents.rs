@@ -30,7 +30,7 @@
 //!    the actor's kind, subject, issuer and auth mode, the action, fresh
 //!    event and operation IDs, the prior and new versions and the shared
 //!    revision the outbox row took. The evidence row has no foreign key and
-//!    is never rewritten. Since migration 30 the row is also journaled for
+//!    is never rewritten. Since migration 32 the row is also journaled for
 //!    delivery (`postgres_authority_events::append_to_journal`) under its own
 //!    event ID, reserving one unit of the journal's capacity; a full journal
 //!    refuses the commit as unavailable. The actor is recorded in migration
@@ -134,7 +134,7 @@ const _: () =
 /// oversized subject or issuer, or an issuer on an actor that is not a
 /// principal), or an action that cannot describe this resource. An
 /// authenticated principal and every shipped call site satisfy it; the
-/// CHECKs of migrations 23 and 30 are the backstop.
+/// CHECKs of migrations 23 and 32 are the backstop.
 fn validate_change(
     resource: DocumentResource,
     change: &DocumentChange,
@@ -154,7 +154,7 @@ fn validate_change(
 }
 
 /// Append the commit's evidence row inside the caller's transaction, and
-/// journal it for delivery (migration 30). Its `event_id` and
+/// journal it for delivery (migration 32). Its `event_id` and
 /// `operation_id` are minted here, once, and the journal carries the same
 /// event ID; `committed_at` is the database clock's. The actor is recorded
 /// whole, in migration 24's vocabulary: its subject, canonical issuer, kind

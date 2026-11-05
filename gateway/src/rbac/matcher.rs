@@ -1,7 +1,9 @@
 use crate::auth::Principal;
 
 use super::conditions::{CompiledCondition, PolicyFacts, Truth, UNCAPTURED_FACTS};
-use super::rule::{PrincipalMatcher, Rule, RuleAction, RuleDispatchKind, RuleDispatchMatcher};
+use super::rule::{
+    PrincipalMatch, PrincipalMatcher, Rule, RuleAction, RuleDispatchKind, RuleDispatchMatcher,
+};
 use url::Url;
 
 /// Precompiled first-match-wins evaluator for direct firewall rules.
@@ -445,26 +447,6 @@ pub(crate) fn methods_cover(covering: &[String], covered: &[String]) -> bool {
     }
 }
 
-/// Returns the first path segment that looks like a capture (contains `{`
-/// or `}`) but does not parse as a valid one, if any. `PathSegment::new`
-/// silently compiles such a segment to `PathSegment::Never`, which never
-/// matches any request - reused here so policy validation can reject a
-/// malformed pattern up front instead of persisting a rule that can never
-/// fire.
-pub(crate) fn find_malformed_capture_segment(pattern: &str) -> Option<&str> {
-    let tail = pattern.strip_prefix('/')?;
-    if tail.is_empty() {
-        return None;
-    }
-
-    tail.split('/').find(|segment| {
-        *segment != "*"
-            && *segment != "**"
-            && has_capture_delimiter(segment)
-            && !is_capture_segment(segment)
-    })
-}
-
 #[derive(Debug, Clone)]
 struct CompiledRule {
     rule_index: usize,
@@ -787,6 +769,8 @@ mod tests {
     use proptest::prelude::*;
     use proptest::strategy::ValueTree;
     use proptest::test_runner::{Config as ProptestConfig, TestRunner};
+
+    use gateway_config::rbac::find_malformed_capture_segment;
 
     use super::*;
     use crate::auth::{AuthMethod, Principal};
@@ -1166,6 +1150,26 @@ mod tests {
                 find_malformed_capture_segment(pattern),
                 None,
                 "expected {pattern:?} to be accepted"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Policy validation (`gateway_config::rbac`, issue #242) keeps its
+        /// own copy of the capture grammar, because the pure-path benchmark
+        /// pins this file's. It must refuse exactly the segments this matcher
+        /// compiles to a segment that never matches.
+        #[test]
+        fn validation_refuses_exactly_the_segments_the_matcher_never_matches(
+            segment in "[a-zA-Z0-9_*{}-]{0,8}",
+        ) {
+            prop_assert_eq!(
+                find_malformed_capture_segment(&format!("/{segment}")).is_some(),
+                PathSegment::new(&segment) == PathSegment::Never,
+                "segment={:?}",
+                segment
             );
         }
     }

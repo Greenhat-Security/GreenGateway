@@ -49,7 +49,7 @@
 //! the closed record has no field for it.
 //!
 //! Policy, tools and stored policy test suite commits and managed catalog
-//! publications (journaled since migration 30) are delivered under their
+//! publications (journaled since migration 32) are delivered under their
 //! evidence's own operation codes. A document is a singleton, so its resource
 //! is referenced by the document it is: a `policy` resource on the `policy`
 //! axis, a `tools` resource on the `tools` axis, and the stored policy test
@@ -63,7 +63,7 @@
 //! a strictly greater one after it. Document versions are identity values,
 //! so the first is not always `1`.
 //!
-//! A document row committed before migration 30 recorded its actor in
+//! A document row committed before migration 32 recorded its actor in
 //! migration 23's vocabulary: kind `principal` for a service-token caller,
 //! told apart only by its `service_token` auth mode, and the issuer as the
 //! principal carried it. The record reads it in migration 24's: that pairing
@@ -112,7 +112,7 @@ const ACTION_JWT_REVOKE: &str = "jwt.revoke";
 const ACTION_ADMIN_SESSION_GRANT: &str = "admin_session.grant";
 const ACTION_ADMIN_SESSION_WITHDRAW: &str = "admin_session.withdraw";
 // Migration 23's document vocabulary (widened by migration 29) and catalog
-// vocabulary, journaled since migration 30.
+// vocabulary, journaled since migration 32.
 const ACTION_POLICY_PUBLISH: &str = "policy.publish";
 const ACTION_POLICY_ROLLBACK: &str = "policy.rollback";
 const ACTION_POLICY_RULE_CREATE: &str = "policy.rule.create";
@@ -146,7 +146,7 @@ const DOCUMENT_TOOLS: &str = "tools";
 const DOCUMENT_POLICY_TESTS: &str = "policy_tests";
 
 /// The actor kind every authenticated caller's document row recorded
-/// before migration 30, a service token's included.
+/// before migration 32, a service token's included.
 const LEGACY_DOCUMENT_PRINCIPAL_KIND: &str = "principal";
 
 /// The revision a created resource starts at: a service token's row revision
@@ -634,7 +634,7 @@ fn project_actor(
 }
 
 /// A document row's actor kind and issuer in migration 24's vocabulary. A
-/// row committed before migration 30 named a service-token caller kind
+/// row committed before migration 32 named a service-token caller kind
 /// `principal`, with auth mode `service_token`: that is kind `service_token`
 /// here. Its issuer is canonicalized as authentication canonicalizes a
 /// principal's (`ChangeActor::from_principal`), which leaves the canonical

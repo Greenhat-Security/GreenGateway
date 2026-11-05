@@ -9,7 +9,7 @@
 //! handler that knows which operation it performed names it explicitly rather
 //! than having it inferred from a diff summary. The actor is the one every
 //! other authority-evidence writer records, `auth::change_actor::ChangeActor`:
-//! since migration 30 a document row names a service token by its own kind and
+//! since migration 32 a document row names a service token by its own kind and
 //! a principal's issuer in canonical form, as migration 24's tables do.
 
 /// The operation a policy or tools document commit performed, in the proposed

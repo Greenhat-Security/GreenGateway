@@ -1,7 +1,7 @@
 //! The catalog's own rules, and the committed rendering of it.
 //!
-//! What the catalog says about the compiler is proved by the gateway's
-//! `config::catalog_tests`, which can run the compiler. These tests hold what
+//! What the catalog says about the compiler is proved by
+//! `compiler::catalog_tests`, which run the compiler. These tests hold what
 //! needs no compiler: that each entry is internally consistent and follows the
 //! rules ADR-0008 states for whole groups of fields, and that
 //! `docs/configuration-catalog.json` is exactly what [`render_json`] produces.
@@ -208,11 +208,12 @@ fn bundle_mappings_follow_the_rules_adr_0008_states() {
             resource,
             "{name}: POLICY_FILE, TOOLS_FILE and every *_SQLITE_PATH are replaced by bundle resources"
         );
-        let legacy_provider = name.starts_with("JWT_") || name == "ROLES_CLAIM";
+        let not_representable =
+            name.starts_with("JWT_") || name == "ROLES_CLAIM" || name == "OPENAPI_SPEC_PATH";
         assert_eq!(
             field.bundle == BundleMapping::NotRepresentable,
-            legacy_provider,
-            "{name}: the single-provider JWT fallback is what a bundle cannot represent"
+            not_representable,
+            "{name}: the single-provider JWT fallback and OPENAPI_SPEC_PATH are what a bundle cannot represent"
         );
         if let BundleMapping::Bootstrap(category) = field.bundle {
             assert_eq!(field.reload(), ReloadClass::Bootstrap, "{name}");
@@ -233,9 +234,22 @@ fn bundle_mappings_follow_the_rules_adr_0008_states() {
                 field.sensitivity != Sensitivity::HostPath,
                 "{name}: host paths never enter a bundle"
             );
+            assert!(
+                path.is_some(),
+                "{name}: every deployment field has a document path"
+            );
+            if let Some(path) = path {
+                assert!(
+                    path.starts_with("/spec/"),
+                    "{name}: {path} is beneath /spec"
+                );
+                assert_eq!(field.document_path(), Some(path), "{name}");
+            }
+        } else {
             assert_eq!(
-                path, None,
-                "{name}: the deployment schema defines no setting yet"
+                field.document_path(),
+                None,
+                "{name}: only deployment fields have a path"
             );
         }
     }

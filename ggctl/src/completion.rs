@@ -567,7 +567,7 @@ mod tests {
             powershell.matches(')').count()
         );
         assert!(powershell.contains(
-            "$previous -in @('--against', '--answers', '--ca-file', '--candidate', '--output', '--state-dir', '--token-file')"
+            "$previous -in @('--against', '--against-env', '--answers', '--ca-file', '--candidate', '--env', '--output', '--state-dir', '--token-file')"
         ));
         // A bundle directory completes directory names.
         assert!(bash
@@ -597,7 +597,7 @@ mod tests {
     fn a_family_completes_its_commands_then_each_commands_options() {
         let [bash, zsh, fish, powershell] = scripts().map(|(_, script)| script);
         // The family's name is offered first; its commands after it.
-        assert!(bash.contains("compgen -W 'version schema init validate pin convert doctor diff ledger backup policy evidence completion help'"));
+        assert!(bash.contains("compgen -W 'version schema init validate pin convert doctor diff ledger backup policy evidence mcp-config completion help'"));
         assert!(bash.contains(
             "        ledger)\n            if [ \"$COMP_CWORD\" -eq 2 ]; then\n                COMPREPLY=($(compgen -W 'seed verify rollback --help -h' -- \"$cur\"))"
         ));
@@ -650,7 +650,7 @@ mod tests {
     #[test]
     fn a_second_family_completes_its_commands_too() {
         let [bash, zsh, fish, powershell] = scripts().map(|(_, script)| script);
-        assert!(bash.contains("compgen -W 'version schema init validate pin convert doctor diff ledger backup policy evidence completion help'"));
+        assert!(bash.contains("compgen -W 'version schema init validate pin convert doctor diff ledger backup policy evidence mcp-config completion help'"));
         assert!(bash.contains(
             "        backup)\n            if [ \"$COMP_CWORD\" -eq 2 ]; then\n                COMPREPLY=($(compgen -W 'create verify restore --help -h' -- \"$cur\"))"
         ));

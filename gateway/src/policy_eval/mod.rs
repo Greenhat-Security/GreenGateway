@@ -81,8 +81,8 @@
 //! client address, named headers and query parameters, validated tool
 //! arguments, an injected clock -- which every lane takes beside its context.
 //!
-//! Identity mappings and every condition leaf but `tool_argument` are served.
-//! Every serving adapter evaluates with the facts the compiled policy reads
+//! Identity mappings and every condition leaf are served. Every serving
+//! adapter evaluates with the facts the compiled policy reads
 //! ([`CompiledPolicy::fact_needs`]) and no others: the organization
 //! authentication verified for the principal ([`CompiledPolicy::serving_facts`],
 //! `Principal::org_id`, never a request header), and on the lanes that have
@@ -91,11 +91,14 @@
 //! The HTTP lane, the tool lanes, rate-lane selection and the management lane
 //! all resolve roles from the same organization. A policy that reads no fact
 //! is evaluated with none captured, exactly as before facts were served.
-//! Validation still refuses a `tool_argument` leaf
-//! (`TypedMatchersNotEnforced`), since admission decides before a call's
-//! arguments are validated. A mapping or condition that reads an uncaptured
-//! fact makes the answer [`Limitation::MissingMatcherFact`], never a guessed
-//! match, and every live lane refuses an indeterminate answer.
+//! Tool invocation admission is the one lane that asks twice: a call whose
+//! tool-name rules reach a `tool_argument` leaf is decided again, after its
+//! arguments have passed the tool's input schema and before any capacity is
+//! taken, with only the eligible scalars those leaves read
+//! (`middleware::policy_facts::tool_argument_facts`); no other lane ever
+//! captures arguments. A mapping or condition that reads an uncaptured fact
+//! makes the answer [`Limitation::MissingMatcherFact`], never a guessed match,
+//! and every live lane refuses an indeterminate answer.
 //!
 //! In mapped-role mode each lane resolves the principal's internal roles once,
 //! on entry, and judges every role constraint -- route permissions, rule
@@ -131,6 +134,7 @@ use crate::{
         identity_mappings::CompiledIdentityMappings,
         matcher::{method_matches, path_pattern_matches, RuleDispatchContext, RuleScan},
         policy::{RouteRule, KNOWN_TOP_LEVEL_KEYS},
+        rule::PrincipalMatch,
         DefaultAction, EnforcementMode, Policy, PolicyEngine, RateLimitRule, RuleAction,
         RuleMatcher,
     },
@@ -148,11 +152,13 @@ use stages::{
 
 pub(crate) use crate::rbac::conditions::{Fact, FactNeeds, PolicyFacts, UNCAPTURED_FACTS};
 
-/// Most header or query entries one evaluation's facts may carry.
+/// Most header or query entries, or tool-argument scalars, one evaluation's
+/// facts may carry.
 pub(crate) const MAX_FACT_ENTRIES: usize = 128;
 /// Longest header or query name a fact may carry, in bytes.
 pub(crate) const MAX_FACT_NAME_BYTES: usize = 256;
-/// Longest header or query value, or organization, a fact may carry, in bytes.
+/// Longest header or query value, organization, or tool-argument string a
+/// fact may carry, in bytes.
 pub(crate) const MAX_FACT_VALUE_BYTES: usize = 8192;
 
 /// Each lane that adds a required fact bumps this, so a context built for an
@@ -405,8 +411,8 @@ impl CompiledPolicy {
     ///
     /// The request facts -- client address, headers, query, clock -- are
     /// added by the lane that has them (`middleware::policy_facts`), and only
-    /// those [`Self::fact_needs`] names. Tool arguments stay uncaptured on
-    /// every lane: validation refuses the leaf that reads them.
+    /// those [`Self::fact_needs`] names. Tool arguments are added only by tool
+    /// invocation admission, once the call's arguments are validated.
     pub(crate) fn serving_facts(&self, principal: Option<&Principal>) -> PolicyFacts {
         let mut facts = PolicyFacts::uncaptured();
         if self.fact_needs.organization {
@@ -760,11 +766,11 @@ impl CompiledPolicy {
         self.decide(context, facts, &mut NoStages)
     }
 
-    fn decide<S: StageSink>(
+    fn decide(
         &self,
         context: &PolicyEvaluationContext,
         facts: &PolicyFacts,
-        stages: &mut S,
+        stages: &mut impl StageSink,
     ) -> Result<Evaluation, EvaluationError> {
         context.validate(self.snapshot)?;
         validate_facts(facts)?;
@@ -1384,8 +1390,10 @@ impl FactsUse {
 
 /// Refuses facts past the work bounds every lane states for itself, as it
 /// does for the context. The organization is held to the bound a subject is,
-/// and header and query entries to bounds no request the gateway admits
-/// exceeds.
+/// header and query entries to bounds no request the gateway admits exceeds,
+/// and tool arguments -- already reduced to the scalars conditions read -- to
+/// the same entry and value bounds, nested no deeper than a condition's
+/// pointer reaches.
 pub(crate) fn validate_facts(facts: &PolicyFacts) -> Result<(), EvaluationError> {
     use crate::rbac::conditions::Fact;
 
@@ -1405,7 +1413,36 @@ pub(crate) fn validate_facts(facts: &PolicyFacts) -> Result<(), EvaluationError>
             }
         }
     }
+    if let Fact::Captured(arguments) = &facts.tool_arguments {
+        let mut scalars = 0;
+        if !arguments_within_bounds(arguments, 0, &mut scalars) {
+            return Err(EvaluationError::ContextTooLarge);
+        }
+    }
     Ok(())
+}
+
+/// Whether `value`, `depth` objects below the argument root, stays within
+/// the tool-argument fact bounds, counting its scalars into `scalars`.
+fn arguments_within_bounds(value: &Value, depth: usize, scalars: &mut usize) -> bool {
+    match value {
+        Value::Object(members) => {
+            depth < crate::rbac::conditions::MAX_TOOL_ARGUMENT_POINTER_TOKENS
+                && members.iter().all(|(name, member)| {
+                    name.len() <= MAX_FACT_NAME_BYTES
+                        && arguments_within_bounds(member, depth + 1, scalars)
+                })
+        }
+        Value::Array(_) => false,
+        Value::String(text) => {
+            *scalars += 1;
+            text.len() <= MAX_FACT_VALUE_BYTES && *scalars <= MAX_FACT_ENTRIES
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {
+            *scalars += 1;
+            *scalars <= MAX_FACT_ENTRIES
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

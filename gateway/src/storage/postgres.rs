@@ -658,15 +658,6 @@ fn validated_dsn_config(dsn: &str) -> Result<PgConfig, PostgresFoundationError> 
     Ok(config)
 }
 
-impl DatabaseTlsMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Verify => "verify",
-            Self::LoopbackDev => "loopback-dev",
-        }
-    }
-}
-
 /// The `loopback-dev` exception may only point at loopback: a development
 /// convenience that could quietly become a production plaintext connection is
 /// not a development convenience. The failure names the setting, never the
@@ -1133,17 +1124,13 @@ pub(crate) enum CheckoutClass {
     /// Singleton maintenance sessions, cleanup sweeps and operator
     /// commands.
     Maintenance,
-    /// Historical policy replay's reads of the cluster audit stream
-    /// (issue #243): a job's cutoff, its pages and its closing check, each
-    /// one short read-only transaction under the replay's own statement
-    /// and lock bounds (`storage::postgres_audit_replay`).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "cluster replay routes answer 503 until jobs run under #241's durable leases (#243)"
-        )
-    )]
+    /// Historical policy replay (issue #243): the reads of the cluster audit
+    /// stream -- a job's cutoff, its pages and its closing check, each one
+    /// short read-only transaction under the replay's own statement and lock
+    /// bounds (`storage::postgres_audit_replay`) -- and the replay job
+    /// records: admission, reads, cancellation, the workers' claims, lease
+    /// renewals, checkpoints and endings, and their retention
+    /// (`storage::postgres_policy_replays`).
     PolicyReplay,
 }
 

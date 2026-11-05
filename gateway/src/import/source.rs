@@ -36,6 +36,7 @@ use std::{
     sync::Arc,
 };
 
+use gateway_config::env_file::EnvFile;
 use serde_json::Value;
 
 use crate::{
@@ -52,6 +53,7 @@ use crate::{
         suggestions::{RuleSuggestion, RuleSuggestionConfig, RuleSuggestionEngine},
     },
     rbac::{
+        policy::{ClusterDocumentFormat, PolicyFile},
         policy_history::{PolicyHistoryListFilters, PolicyHistoryStore, PolicyVersion},
         Policy,
     },
@@ -215,6 +217,22 @@ impl StandaloneSource {
     pub(crate) fn writes_policy_rule_conditions(&self) -> bool {
         let conditioned =
             |policy: &Policy| policy.is_document_format_v1() && policy.uses_rule_conditions();
+        conditioned(&self.policy)
+            || self
+                .history
+                .iter()
+                .filter_map(|version| version.policy.as_ref())
+                .any(conditioned)
+    }
+
+    /// Whether the import writes a policy v1 document whose conditions
+    /// contain a `tool_argument` leaf to the cluster, active or in history:
+    /// the gated operation `policy.tool_argument_conditions`, which preflight
+    /// asks the target's live roster for as well.
+    pub(crate) fn writes_policy_tool_argument_conditions(&self) -> bool {
+        let conditioned = |policy: &Policy| {
+            policy.is_document_format_v1() && policy.uses_tool_argument_conditions()
+        };
         conditioned(&self.policy)
             || self
                 .history
@@ -411,39 +429,27 @@ pub(crate) fn tool_count(document: &Value) -> i64 {
         .unwrap_or(0)
 }
 
-/// Parse a `KEY=VALUE` environment file in the shape `.env.example`
-/// ships and `docker compose env_file` / systemd `EnvironmentFile` read:
-/// blank lines and `#` comments ignored, the value taken verbatim after
-/// the first `=` (so a value containing `=` survives), later assignments
+/// Parse a `KEY=VALUE` environment file with the grammar `ggctl --env`
+/// reads too (`gateway_config::env_file`): the shape `.env.example` ships
+/// and `docker compose env_file` / systemd `EnvironmentFile` read, with
+/// blank lines and `#` comments ignored, the value taken verbatim after the
+/// first `=` (so a value containing `=` survives), and later assignments
 /// winning over earlier ones.
 ///
-/// A malformed line is reported by NUMBER only. The text of a line in a
-/// standalone deployment's environment file may be a keyring key or a
-/// client secret, and an error message is the last place either belongs.
+/// A malformed line is reported by NUMBER only, the first one the file
+/// has. The text of a line in a standalone deployment's environment file
+/// may be a keyring key or a client secret, and an error message is the
+/// last place either belongs.
 pub(super) fn read_env_file(path: &Path) -> Result<BTreeMap<String, String>, ImportError> {
     let contents =
         fs::read_to_string(path).map_err(|_| ImportError::StandaloneEnvFileUnreadable {
             path: path.to_path_buf(),
         })?;
-    let mut variables = BTreeMap::new();
-    for (index, line) in contents.lines().enumerate() {
-        let trimmed_end = line.trim_end();
-        let trimmed = trimmed_end.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        // `export KEY=VALUE` is the other shape operators write.
-        let assignment = trimmed.strip_prefix("export ").unwrap_or(trimmed);
-        let Some((key, value)) = assignment.split_once('=') else {
-            return Err(ImportError::StandaloneEnvFileMalformed { line: index + 1 });
-        };
-        let key = key.trim();
-        if key.is_empty() {
-            return Err(ImportError::StandaloneEnvFileMalformed { line: index + 1 });
-        }
-        variables.insert(key.to_owned(), value.to_owned());
+    let file = EnvFile::parse(&contents);
+    if let Some(line) = file.malformed_lines().first() {
+        return Err(ImportError::StandaloneEnvFileMalformed { line: *line });
     }
-    Ok(variables)
+    Ok(file.into_variables())
 }
 
 /// The leading setting name of each validation problem, deduplicated.

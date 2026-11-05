@@ -372,11 +372,25 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         .with_pinned_checksum("668b382f85e96c9d29de4ed1bfb0f76b9bb7527be0fdabff877ff08d73ee5a8f"),
         Migration::new(
             30,
-            "document_and_catalog_evidence_journal",
-            include_str!("migrations/0030_document_and_catalog_evidence_journal.sql"),
+            "policy_replay_jobs",
+            include_str!("migrations/0030_policy_replay_jobs.sql"),
         )
         .finalize()
-        .with_pinned_checksum("c1c96c75aaa0aceb6bbc4f7d88840cac8ae32737ac80460f034e5adf09f5f268"),
+        .with_pinned_checksum("738505980f1ff1a51e0845b10064f1c6f4005ff7100acce8b15dd8633a4c113c"),
+        Migration::new(
+            31,
+            "policy_analysis_suppressions",
+            include_str!("migrations/0031_policy_analysis_suppressions.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("21a4635ecdbb9ff352c29531ba454f03575e32c9f37ed673f7f95eec480d441d"),
+        Migration::new(
+            32,
+            "document_and_catalog_evidence_journal",
+            include_str!("migrations/0032_document_and_catalog_evidence_journal.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("d0d858a1951e685832d0047b4963d1c4278f5603da9eeb680380e37343777b47"),
     ]
 });
 
@@ -409,20 +423,31 @@ impl SchemaCompatibility {
     }
 }
 
-// This build's manifest ends at 30, and it serves exactly schema 30: it
-// approves no migration above its manifest, and it does not serve schema 29.
-// The move from 29 to 30 (policy, tools and catalog change evidence in the
+// This build's manifest ends at 32, and it serves exactly schema 32: it
+// approves no migration above its manifest, and it does not serve schema 31.
+// The move from 31 to 32 (policy, tools and catalog change evidence in the
 // authority-event journal, and the document actor in migration 24's
-// vocabulary, #425) is coordinated, without an overlap: a schema-29 binary
-// left serving after migration 30 would commit policy, tools and catalog
+// vocabulary, #425) is coordinated, without an overlap: a schema-31 binary
+// left serving after migration 32 would commit policy, tools and catalog
 // changes whose evidence is never journaled, so the dispatcher would never
 // deliver them, and would keep writing service-token callers' document rows
-// in the old vocabulary, which migration 30's CHECK refuses for new rows.
+// in the old vocabulary, which migration 32's CHECK refuses for new rows.
 //
-// The move from 28 to 29 (the stored policy test suite, #243) was
-// coordinated too: a schema-28 binary left serving after migration 29 would
-// serve no suite routes and run no stored suite, so replicas behind one load
-// balancer would answer the same request differently.
+// The move from 30 to 31 (policy analysis suppressions, #243 slice 15) was
+// coordinated too: a schema-30 binary left serving after migration 31 would
+// analyze policies without the suppressions other replicas record, so one
+// finding would read as suppressed through one replica and as open through
+// another.
+//
+// The move from 29 to 30 (durable policy replay jobs, #243) was coordinated
+// too: a schema-29 binary left serving after migration 30 would still answer
+// every cluster replay route `503` while the new fleet admits jobs into the
+// shared table, so one deployment would give two answers for the same job.
+//
+// The move from 28 to 29 (the stored policy test suite, #243) was coordinated
+// too: a schema-28 binary left serving after migration 29 would serve no
+// suite routes and run no stored suite, so replicas behind one load balancer
+// would answer the same request differently.
 //
 // The move from 27 to 28 (Connection create, replace and credential binding
 // change evidence, #425) was coordinated too: a schema-27 binary left serving
@@ -440,7 +465,7 @@ impl SchemaCompatibility {
 // the same explicit column list (`connections::pg_store::
 // record_catalog_change_evidence`). This build is not that successor: it
 // carries migration 25 byte for byte, so its migrator records the approved
-// checksum, but it serves only schema 30, so from a prepared fleet it is a
+// checksum, but it serves only schema 32, so from a prepared fleet it is a
 // coordinated drain/migrate/restart like every other step.
 // That shared column list left out the three columns; this build's catalog
 // writer records all three.
@@ -459,19 +484,20 @@ impl SchemaCompatibility {
 // journaled authority evidence, #425), from 25 to 26 (admin session evidence
 // in the authority-event journal, with capacity held for every session's
 // withdrawal, #425), from 26 to 27 (service-token issue evidence, #425),
-// from 27 to 28, from 28 to 29 and from 29 to 30. A schema-26 binary left
-// serving after migration 27 would issue tokens without their evidence, and a schema-25
-// binary left serving after migration 26 would grant and withdraw admin
-// sessions without journaling their evidence. A schema-23 binary
-// must not keep writing evidence after migration 24: its Connection,
-// service-token and JWT revocation rows would record no actor kind, auth mode
-// or issuer. A schema-22 binary would also commit policy, tools and catalog
-// changes without their evidence, and a schema-20 one would write evidence
-// that is never journaled. The fence keeps covering every binary that can
-// serve this database: none that predates it accepts this ledger either.
+// from 27 to 28, from 28 to 29, from 29 to 30, from 30 to 31 and from 31 to
+// 32. A schema-26 binary left serving after migration 27 would issue tokens
+// without their evidence, and a schema-25 binary left serving after
+// migration 26 would grant and withdraw admin sessions without journaling
+// their evidence. A schema-23 binary must not keep writing evidence after
+// migration 24: its Connection, service-token and JWT revocation rows would
+// record no actor kind, auth mode or issuer. A schema-22 binary would also
+// commit policy, tools and catalog changes without their evidence, and a
+// schema-20 one would write evidence that is never journaled. The fence keeps
+// covering every binary that can serve this database: none that predates it
+// accepts this ledger either.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (30, 30),
-    write: (30, 30),
+    read: (32, 32),
+    write: (32, 32),
     approved_extensions: &[],
 };
 
@@ -506,7 +532,7 @@ const APPROVED_EXTENSION_SOURCES: &[ExtensionSource] = &[];
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 30.
+/// contract the schema. The shipped contract accepts only schema 32.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1426,18 +1452,18 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            30,
+            32,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (30, 30));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (30, 30));
-        assert_eq!(schema_version_range(), (30, 30));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (32, 32));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (32, 32));
+        assert_eq!(schema_version_range(), (32, 32));
         assert!(
             BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty(),
             "this build approves no migration above its manifest"
         );
         // Readiness samples the manifest and one row more.
-        assert_eq!(runtime_ledger_row_limit(), 31);
+        assert_eq!(runtime_ledger_row_limit(), 33);
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
             Ok(SchemaStatus::Current)
@@ -1445,19 +1471,19 @@ mod tests {
         // The next migration is refused whatever it is: nothing prepared this
         // build for one.
         let mut beyond = ledger_for(&MANIFEST, MANIFEST.len(), "");
-        beyond.push((31, hex_checksum("-- migration 31")));
+        beyond.push((33, hex_checksum("-- migration 33")));
         assert_eq!(
             validate_runtime_ledger(&beyond),
             Err(LedgerProblem::UnknownVersion)
         );
 
-        // The previous releases' schemas are not served: schemas 29, 28, 27, 26
-        // and 25 are left by coordinated upgrades, and so are the prepared
-        // release's schema 24 and every earlier point. The overlap of the
-        // rolling step from 24 to 25 belonged to the prepared release and the
-        // schema-25 successor, both of which serve 25; this build serves none of
-        // 24 through 29.
-        for behind in 1..=14 {
+        // The previous releases' schemas are not served: schemas 31, 30, 29, 28,
+        // 27, 26 and 25 are left by coordinated upgrades, and so are the
+        // prepared release's schema 24 and every earlier point. The overlap of
+        // the rolling step from 24 to 25 belonged to the prepared release and
+        // the schema-25 successor, both of which serve 25; this build serves
+        // none of 24 through 31.
+        for behind in 1..=16 {
             assert_eq!(
                 validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - behind, "")),
                 Ok(SchemaStatus::NeedsUpgrade {
@@ -2627,6 +2653,9 @@ mod tests {
                  DROP TABLE greengateway.catalog_change_evidence; \
                  DROP TABLE greengateway.policy_test_suite_active; \
                  DROP TABLE greengateway.policy_test_suite_versions; \
+                 DROP TABLE greengateway.policy_replay_jobs; \
+                 DROP SEQUENCE greengateway.policy_replay_job_fence; \
+                 DROP TABLE greengateway.policy_analysis_suppressions; \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await
@@ -4734,8 +4763,8 @@ mod tests {
         clean_database(foundation.pool()).await;
     }
 
-    /// Migration 30 makes the document and catalog evidence tables journal
-    /// sources and journals the evidence a schema-29 deployment committed:
+    /// Migration 32 makes the document and catalog evidence tables journal
+    /// sources and journals the evidence a schema-31 deployment committed:
     /// after every row already journaled, both tables together in their own
     /// commit order (committed_at, then event ID), each at its own commit time,
     /// one retained unit each, with the capacity unchanged. Every evidence row
@@ -4745,7 +4774,7 @@ mod tests {
     /// 24's tables do, a service token is its own kind, and the pairing CHECK
     /// is not validated over the old rows.
     #[tokio::test]
-    async fn migration_thirty_journals_document_and_catalog_evidence_and_aligns_the_actor() {
+    async fn migration_thirty_two_journals_document_and_catalog_evidence_and_aligns_the_actor() {
         let Some(dsn) = real_dsn() else {
             eprintln!("skipping: no test database locator; CI runs this test");
             return;
@@ -4759,17 +4788,17 @@ mod tests {
         bootstrap_ledger(&client)
             .await
             .expect("migration ledger should bootstrap");
-        let through_v29 = MANIFEST
+        let through_v31 = MANIFEST
             .iter()
-            .take_while(|migration| migration.version <= 29)
+            .take_while(|migration| migration.version <= 31)
             .count();
-        for migration in &MANIFEST[..through_v29] {
+        for migration in &MANIFEST[..through_v31] {
             apply_one(&client, migration, &test_settings())
                 .await
-                .expect("migrations through 29 should apply");
+                .expect("migrations through 31 should apply");
         }
 
-        // What a schema-29 deployment holds: one journaled JWT revocation,
+        // What a schema-31 deployment holds: one journaled JWT revocation,
         // committed after everything below, and document and catalog evidence
         // that is not journaled, committed out of table order, two rows of it
         // in the same instant.
@@ -4785,7 +4814,7 @@ mod tests {
                 &[&jwt_event],
             )
             .await
-            .expect("a schema-29 JWT revocation");
+            .expect("a schema-31 JWT revocation");
         client
             .execute(
                 "WITH reserved AS ( \
@@ -4861,7 +4890,7 @@ mod tests {
                     ],
                 )
                 .await
-                .expect("schema-29 document evidence");
+                .expect("schema-31 document evidence");
             evidence.push((committed_at, event_id, "document_change_evidence"));
         }
         const CATALOG: &str = "INSERT INTO greengateway.catalog_change_evidence \
@@ -4904,7 +4933,7 @@ mod tests {
                     ],
                 )
                 .await
-                .expect("schema-29 catalog evidence");
+                .expect("schema-31 catalog evidence");
             evidence.push((committed_at, event_id, "catalog_change_evidence"));
         }
         let snapshot = || {
@@ -4932,9 +4961,9 @@ mod tests {
         };
         let evidence_before = snapshot().await;
 
-        apply_one(&client, &MANIFEST[through_v29], &test_settings())
+        apply_one(&client, &MANIFEST[through_v31], &test_settings())
             .await
-            .expect("migration 30 should apply");
+            .expect("migration 32 should apply");
         assert_eq!(
             snapshot().await,
             evidence_before,
@@ -5092,7 +5121,7 @@ mod tests {
     /// refuses naming the missing migrations and readiness reports the schema
     /// incompatible, so a replica of it started before the migration stalls
     /// the rollout rather than serving. Its `migrate check` reports exactly
-    /// migrations 25 through 30 unapplied, and its `migrate up` applies them
+    /// migrations 25 through 32 unapplied, and its `migrate up` applies them
     /// and nothing else, recording for migration 25 exactly the checksum the
     /// prepared release approved. From then on it serves, with and without
     /// development auto-migration, and its migrator has nothing left to do.
@@ -5149,7 +5178,7 @@ mod tests {
 
         // The prepared release's schema: not served here.
         let missing = MANIFEST.len() - through_v24;
-        assert_eq!(missing, 6, "migrations 25 through 30");
+        assert_eq!(missing, 8, "migrations 25 through 32");
         let authority = PostgresReadinessAuthority::new(pool.clone());
         assert_eq!(
             read_and_validate_runtime(pool).await,
@@ -5164,7 +5193,7 @@ mod tests {
                 error,
                 PostgresFoundationError::SchemaNotReady {
                     applied: 24,
-                    missing: 6,
+                    missing: 8,
                     auto_migrate: false
                 }
             ),
@@ -5182,7 +5211,7 @@ mod tests {
             })
         );
 
-        // The migration role's `migrate up`: migrations 25 through 30 and
+        // The migration role's `migrate up`: migrations 25 through 32 and
         // nothing else, migration 25 under the approved checksum.
         assert_eq!(
             execute(&strict, false).await,
@@ -5212,7 +5241,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 30 }
+            AuthorityObservation::Writable { schema_version: 32 }
         );
         assert_eq!(
             execute(&strict, true).await,
@@ -5252,7 +5281,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 30 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 32 }
         );
         drop(client);
         clean_database(pool).await;

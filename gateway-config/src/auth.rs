@@ -1,7 +1,8 @@
 //! The authentication settings the configuration compiler reads and the
-//! shapes it holds them to (issue #242): issuer canonicalization, the JWKS key
-//! age bounds, cookie names, the client-certificate identity source and the
-//! admin session settings.
+//! shapes it holds them to (issue #242): issuer canonicalization, the
+//! principal identity bounds a policy's identity mappings are held to, the
+//! JWKS key age bounds, cookie names, the client-certificate identity source
+//! and the admin session settings.
 //!
 //! The gateway's validators and stores act on these; it re-exports each from
 //! the module that uses it (`auth::principal`, `auth::jwt`,
@@ -15,6 +16,10 @@ pub const PROVIDER_ISSUER_PREFIX: &str = "provider:";
 
 /// Longest issuer, in bytes.
 pub const MAX_PRINCIPAL_ISSUER_BYTES: usize = 4096;
+/// Longest role name, in bytes.
+pub const MAX_PRINCIPAL_ROLE_BYTES: usize = 256;
+/// Longest subject (`user_id`), in bytes.
+pub const MAX_PRINCIPAL_SUBJECT_BYTES: usize = 4096;
 
 /// Canonical issuer form used by authentication, policy, audit, and discovery.
 pub fn canonical_issuer(issuer: &str) -> Option<String> {

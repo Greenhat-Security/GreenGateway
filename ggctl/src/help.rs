@@ -10,11 +10,35 @@ use crate::{
 
 const WIDTH: usize = 80;
 
-/// `ggctl help [COMMAND [SUBCOMMAND]]`. The parser answers it as a help
-/// request; this is the same answer for a caller that runs the invocation
-/// directly.
+/// What the overview says ggctl is, after its name and version.
+pub(crate) const TAGLINE: &str = "the GreenGateway operator CLI";
+
+/// The overview's usage lines.
+pub(crate) const OVERVIEW_USAGE: &[&str] = &[
+    "ggctl <COMMAND> [OPTIONS]",
+    "ggctl help [COMMAND [SUBCOMMAND]]",
+];
+
+/// The overview's closing paragraphs.
+pub(crate) const OVERVIEW_NOTES: &[&str] = &[
+    "ggctl reads no configuration file of its own and no environment variable, reads only \
+     the files its arguments name, and makes no network request unless a command is given \
+     --server. It never accepts a secret as an argument: \
+     pass an admin bearer token with --token-stdin or --token-file.",
+    "Reference: docs/ggctl.md",
+];
+
+/// The spellings and help of the option every command takes, listed last.
+pub(crate) const HELP_OPTION: (&[&str], &str) = (&["-h", "--help"], "print this help");
+
+/// `ggctl help [--man] [COMMAND [SUBCOMMAND]]`. The parser answers it as a
+/// help or manual page request; this is the same answer for a caller that
+/// runs the invocation directly.
 pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
     match cli::help_topic(invocation) {
+        Ok(topic) if invocation.flag("--man").is_some() => {
+            report::artifact(io, &crate::man::page(topic))
+        }
         Ok(topic) => report::artifact(io, &text(topic)),
         Err(diagnostic) => report::error(io, diagnostic),
     }
@@ -30,11 +54,15 @@ pub(crate) fn text(topic: HelpTopic) -> String {
 }
 
 fn overview() -> String {
-    let mut text = format!(
-        "ggctl {} - the GreenGateway operator CLI\n\n\
-         Usage: ggctl <COMMAND> [OPTIONS]\n       ggctl help [COMMAND [SUBCOMMAND]]\n\nCommands:\n",
-        env!("CARGO_PKG_VERSION")
-    );
+    let mut text = format!("ggctl {} - {TAGLINE}\n\n", env!("CARGO_PKG_VERSION"));
+    let mut label = "Usage: ";
+    for usage in OVERVIEW_USAGE {
+        text.push_str(label);
+        text.push_str(usage);
+        text.push('\n');
+        label = "       ";
+    }
+    text.push_str("\nCommands:\n");
     let width = COMMANDS
         .iter()
         .map(|command| command.name.len())
@@ -47,24 +75,24 @@ fn overview() -> String {
     for exit in Exit::ALL {
         push_entry(&mut text, &exit.code().to_string(), 1, exit.meaning());
     }
-    text.push('\n');
-    push_paragraph(
-        &mut text,
-        "",
-        "ggctl reads no configuration file and no environment variable, and makes no network \
-         request unless a command is given --server. It never accepts a secret as an argument: \
-         pass an admin bearer token with --token-stdin or --token-file.",
-    );
-    text.push('\n');
-    push_paragraph(&mut text, "", "Reference: docs/ggctl.md");
+    for note in OVERVIEW_NOTES {
+        text.push('\n');
+        push_paragraph(&mut text, "", note);
+    }
     text
 }
 
+/// A command family's usage lines.
+pub(crate) fn family_usage(family: &FamilySpec) -> [String; 2] {
+    [
+        format!("ggctl {} <COMMAND> [OPTIONS]", family.name),
+        format!("ggctl help {} [COMMAND]", family.name),
+    ]
+}
+
 fn family_help(family: &FamilySpec) -> String {
-    let mut text = format!(
-        "Usage: ggctl {} <COMMAND> [OPTIONS]\n       ggctl help {} [COMMAND]\n\n",
-        family.name, family.name
-    );
+    let [usage, help_usage] = family_usage(family);
+    let mut text = format!("Usage: {usage}\n       {help_usage}\n\n");
     for paragraph in family.description {
         push_paragraph(&mut text, "", paragraph);
         text.push('\n');
@@ -109,14 +137,14 @@ fn command_help(command: &CommandSpec) -> String {
             Some((placeholder, _)) => format!("{} {placeholder}", option.name),
             None => option.name.to_owned(),
         })
-        .chain(std::iter::once("-h, --help".to_owned()))
+        .chain(std::iter::once(HELP_OPTION.0.join(", ")))
         .collect();
     let width = labels.iter().map(String::len).max().unwrap_or(0);
     let helps = command
         .options
         .iter()
         .map(|option| option.help)
-        .chain(std::iter::once("print this help"));
+        .chain(std::iter::once(HELP_OPTION.1));
     for (label, help) in labels.iter().zip(helps) {
         push_entry(&mut text, label, width, help);
     }

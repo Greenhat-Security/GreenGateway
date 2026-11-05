@@ -26,10 +26,10 @@ const MIGRATION_23: &str = include_str!("migrations/0023_document_and_catalog_ch
 /// Migration 29 replaces migration 23's `action` and `resource_type` CHECKs,
 /// so the vocabulary in force is the one it adds.
 const MIGRATION_29: &str = include_str!("migrations/0029_policy_test_suites.sql");
-/// Migration 30 widens migration 23's `actor_kind` CHECK to migration 24's
+/// Migration 32 widens migration 23's `actor_kind` CHECK to migration 24's
 /// vocabulary and pairs every new row's kind with its auth mode.
-const MIGRATION_30: &str =
-    include_str!("migrations/0030_document_and_catalog_evidence_journal.sql");
+const MIGRATION_32: &str =
+    include_str!("migrations/0032_document_and_catalog_evidence_journal.sql");
 const MIGRATION_24: &str = include_str!("migrations/0024_authority_evidence_actor_metadata.sql");
 
 const ALL_ACTIONS: [DocumentAction; 10] = [
@@ -153,19 +153,19 @@ fn actor_vocabulary_and_bounds_are_the_migrations() {
     .chain([ChangeActor::system("bootstrap").auth_mode().to_owned()])
     .collect::<BTreeSet<_>>();
     assert_eq!(auth_modes, document_check_values("actor_auth_mode"));
-    // Migration 23's own kinds, which rows committed before migration 30
-    // keep, and migration 30's, which are migration 24's: every kind a
+    // Migration 23's own kinds, which rows committed before migration 32
+    // keep, and migration 32's, which are migration 24's: every kind a
     // writer records.
     assert_eq!(
         document_check_values("actor_kind"),
         BTreeSet::from(["principal".to_owned(), "system".to_owned()])
     );
-    let alter = MIGRATION_30
+    let alter = MIGRATION_32
         .split("ALTER TABLE greengateway.document_change_evidence")
         .nth(1)
-        .expect("migration 30 alters document_change_evidence");
+        .expect("migration 32 alters document_change_evidence");
     assert_eq!(
-        quoted_values(alter, "actor_kind", "migration 30"),
+        quoted_values(alter, "actor_kind", "migration 32"),
         [
             ActorKind::Principal,
             ActorKind::ServiceToken,

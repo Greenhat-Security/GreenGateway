@@ -508,7 +508,10 @@ fn mcp_tool_from_definition(definition: &ToolDefinition) -> Result<Tool, ErrorDa
         Arc::new(input_schema),
     );
     tool.title = definition.title.clone();
-    tool.annotations = definition.annotations.clone().map(Into::into);
+    tool.annotations = definition
+        .annotations
+        .clone()
+        .map(crate::tools::definitions::mcp_tool_annotations);
     Ok(tool)
 }
 
@@ -1057,6 +1060,7 @@ mod tests {
     use rmcp::model::{ClientJsonRpcMessage, ClientRequest};
 
     use super::*;
+    use crate::rbac::policy::PolicyFile;
     use crate::{
         audit::{self, AuditSink},
         config,
@@ -2748,6 +2752,7 @@ mod tests {
             policy_file: None,
             tools_file: None,
             policy_history_sqlite_path: None,
+            policy_tests_required: false,
             cors_allow_origins: Vec::new(),
             max_body_size: 1_048_576,
             max_request_path_bytes: crate::config::DEFAULT_MAX_REQUEST_PATH_BYTES,

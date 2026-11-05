@@ -476,6 +476,32 @@ fn help_and_version_are_recognized_everywhere() {
         );
     }
     assert!(matches!(parsed(&["--version"]), Ok(Parsed::Version)));
+    assert!(matches!(
+        parsed(&["help", "--man"]),
+        Ok(Parsed::Manual(HelpTopic::Overview))
+    ));
+    for words in [
+        &["help", "--man", "validate"][..],
+        &["help", "validate", "--man"],
+    ] {
+        match parsed(words) {
+            Ok(Parsed::Manual(HelpTopic::Spec(command))) => assert_eq!(command.name, "validate"),
+            other => panic!("{words:?}: {other:?}"),
+        }
+    }
+    match parsed(&["help", "--man", "ledger"]) {
+        Ok(Parsed::Manual(HelpTopic::Family(family))) => assert_eq!(family.name, "ledger"),
+        other => panic!("{other:?}"),
+    }
+    match parsed(&["help", "ledger", "seed", "--man"]) {
+        Ok(Parsed::Manual(HelpTopic::Spec(command))) => assert_eq!(command.name, "ledger seed"),
+        other => panic!("{other:?}"),
+    }
+    // `--help` wins over `--man`, as it does over every other option.
+    assert!(matches!(
+        parsed(&["help", "--man", "--help"]),
+        Ok(Parsed::Help(HelpTopic::Spec(command))) if command.name == "help"
+    ));
     for words in [
         &["help", "version"][..],
         &["version", "--help"],
@@ -533,6 +559,9 @@ fn usage_errors_name_the_position_and_never_the_argument() {
         (&["completion"], Code::MissingArgument, None),
         (&["completion", "tcsh"], Code::InvalidValue, Some(2)),
         (&["help", "frobnicate"], Code::InvalidValue, Some(2)),
+        (&["help", "--man", "--man"], Code::DuplicateOption, Some(3)),
+        (&["help", "--man=yes"], Code::UnexpectedValue, Some(2)),
+        (&["version", "--man"], Code::UnknownOption, Some(2)),
     ] {
         let diagnostic = refused(words);
         assert_eq!(diagnostic.code, code, "{words:?}");

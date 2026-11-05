@@ -23,7 +23,7 @@ fn expected(rows: &[(&str, &str, &str)]) -> Vec<(String, String, String)> {
 }
 
 #[test]
-fn a_valid_production_bundle_passes_every_check_it_can_run() {
+fn a_valid_production_bundle_passes_every_check() {
     let fixture = Fixture::valid();
     let (exit, captured) = run(&["doctor", fixture.path(), "--format", "json"]);
     assert_eq!(exit, Exit::Success);
@@ -41,11 +41,7 @@ fn a_valid_production_bundle_passes_every_check_it_can_run() {
             ("bundle.resources", "pass", "doctor.passed"),
             ("bundle.profile", "pass", "doctor.passed"),
             ("bundle.unreferenced_entries", "pass", "doctor.passed"),
-            (
-                "resources.production_validators",
-                "skipped",
-                "doctor.validator_unavailable"
-            ),
+            ("resources.production_validators", "pass", "doctor.passed"),
             ("deployment.profile", "pass", "doctor.passed"),
         ])
     );
@@ -64,8 +60,7 @@ fn a_valid_production_bundle_passes_every_check_it_can_run() {
     let stdout = captured.stdout();
     assert!(stdout
         .starts_with("bundle payments-production (greengateway.dev/v1alpha1): offline checks\n"));
-    assert!(stdout
-        .contains("\n  skipped  resources.production_validators  doctor.validator_unavailable\n"));
+    assert!(stdout.contains("\n  pass     resources.production_validators  doctor.passed\n"));
     assert!(stdout.ends_with("\nno required check failed\n"));
     assert!(captured.stderr().is_empty());
 }
@@ -102,7 +97,7 @@ fn a_failed_stage_fails_the_doctor_and_unproven_stages_are_skipped_not_passed() 
             (
                 "resources.production_validators",
                 "skipped",
-                "doctor.validator_unavailable"
+                "doctor.incomplete"
             ),
             ("deployment.profile", "skipped", "doctor.incomplete"),
         ])
@@ -142,11 +137,7 @@ fn advice_and_skips_never_fail_the_doctor() {
                 "warning",
                 "bundle.unreferenced_entry"
             ),
-            (
-                "resources.production_validators",
-                "skipped",
-                "doctor.validator_unavailable"
-            ),
+            ("resources.production_validators", "pass", "doctor.passed"),
             (
                 "deployment.profile",
                 "warning",
@@ -181,15 +172,55 @@ fn advice_and_skips_never_fail_the_doctor() {
             "doctor.server_managed".to_owned()
         )
     );
-    // The tools document is still the bundle's.
+    // The tools document is still the bundle's, and passed.
     assert_eq!(
         found[8],
         (
             "resources.production_validators".to_owned(),
-            "skipped".to_owned(),
-            "doctor.validator_unavailable".to_owned()
+            "pass".to_owned(),
+            "doctor.passed".to_owned()
         )
     );
+}
+
+#[test]
+fn a_document_only_the_production_validator_refuses_fails_its_check() {
+    // Route hosts that differ only in case pass the published schema; the
+    // production policy validator refuses them.
+    let policy = format!(
+        "{{\"schema_version\": \"0.1.0\", \"routes\": [{{\"path_prefix\": \"/a\", \"permission\": \"p\", \"hosts\": [\"{CANARY}.example\", \"{}.example\"]}}]}}\n",
+        CANARY.to_ascii_uppercase()
+    );
+    let fixture = Fixture::with("production", &policy);
+    let (exit, captured) = run(&["doctor", fixture.path(), "--format", "json"]);
+    assert_eq!(exit, Exit::Invalid);
+    let report = report(&captured);
+    assert_eq!(
+        codes(&report),
+        ["resource.invalid", "doctor.required_check_failed"]
+    );
+    let found = statuses(&report);
+    assert_eq!(
+        found[5],
+        (
+            "bundle.resources".to_owned(),
+            "fail".to_owned(),
+            "resource.invalid".to_owned()
+        )
+    );
+    assert_eq!(
+        found[8],
+        (
+            "resources.production_validators".to_owned(),
+            "fail".to_owned(),
+            "resource.invalid".to_owned()
+        )
+    );
+    assert_eq!(
+        report["result"]["checks"][8]["remediation"],
+        "docs/configuration-bundles.md#diagnostics"
+    );
+    assert_no_canary(&captured);
 }
 
 #[test]
@@ -251,6 +282,34 @@ fn every_check_and_reason_is_documented() {
         .chain(OTHER_CHECKS.iter().copied())
         .collect();
     assert_eq!(rows(&section("Doctor checks")), checks);
+    assert_eq!(
+        rows(&section("Environment doctor checks")),
+        ENVIRONMENT_CHECKS
+    );
     let reasons: Vec<_> = Reason::ALL.iter().map(|reason| reason.as_str()).collect();
     assert_eq!(rows(&section("Doctor reasons")), reasons);
+}
+
+/// The published report schema names exactly the checks a doctor reports.
+#[test]
+fn the_report_schema_lists_every_check() {
+    let schema = gateway_config::documents::published_schema(
+        gateway_config::documents::API_VERSION_V1ALPHA1,
+        gateway_config::documents::REPORT_KIND,
+    )
+    .expect("the report schema is published");
+    let schema: Value = serde_json::from_str(schema.json).expect("JSON");
+    let listed: Vec<_> = schema["$defs"]["check"]["properties"]["id"]["enum"]
+        .as_array()
+        .expect("an enum of check IDs")
+        .iter()
+        .map(|id| id.as_str().expect("a check ID").to_owned())
+        .collect();
+    let checks: Vec<_> = Stage::ALL
+        .iter()
+        .map(|stage| stage.id())
+        .chain(OTHER_CHECKS.iter().copied())
+        .chain(ENVIRONMENT_CHECKS.iter().copied())
+        .collect();
+    assert_eq!(listed, checks);
 }

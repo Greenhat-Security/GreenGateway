@@ -5,15 +5,17 @@ and [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md) ("Change
 classes" and "Plan, risk acknowledgment, and conditional apply"): what it
 compares, how it classifies each change, the stable risk codes, and what it
 never shows. [`ggctl diff`](ggctl.md#diff) reports it for two bundles. The
-gateway compares two compiled environment configurations and two bundles it
-read with its production validators, and the standalone ledger's plans
+gateway compares two compiled environment configurations, `ggctl diff` and the
+gateway compare two bundles read with the production validators, and the
+standalone ledger's plans
 ([configuration-ledger.md](configuration-ledger.md#plans-and-conditional-apply))
 diff a candidate against the head this way and require every risk code to be
 acknowledged before an apply. Nothing serves or logs those comparisons yet:
-the admin routes are a later #242 slice, and `ggctl diff --env`,
-`--against-env` and `--server` need the environment compiler and those
-routes. Nothing here
-changes how a gateway is configured, started or reloaded.
+the admin routes are a later #242 slice. `ggctl diff --env` and
+`--against-env` need an environment-file front end over the compiler, which
+`ggctl` can now link (`gateway_config::compiler`), and `--server` needs those
+routes. Nothing here changes how a gateway is configured, started or
+reloaded.
 
 ## What it compares
 
@@ -23,8 +25,8 @@ a default never register:
 
 | Input | Compared as | Field identifiers |
 | --- | --- | --- |
-| Two environment configurations | the configuration compiler's validated plan (`gateway/src/config/plan.rs`), setting by setting | the environment variable name, for example `EGRESS_ALLOWED_HOSTS` |
-| Two [configuration bundles](configuration-bundles.md) | what the shared bundle reader accepted: the manifest, the deployment document, and the policy and tools documents, as written and checked against their published schemas (`ggctl diff`) or in the form the gateway's production validators produce (the gateway) | a dotted document path, for example `policy.egress.hosts` or `resources.policy.sha256` |
+| Two environment configurations | the configuration compiler's validated plan (`gateway-config/src/compiler/plan.rs`), setting by setting | the environment variable name, for example `EGRESS_ALLOWED_HOSTS` |
+| Two [configuration bundles](configuration-bundles.md) | what the shared bundle reader accepted with the production validators: the manifest, the deployment document, and the policy and tools documents in the form those validators produce, every default filled in (`gateway_config::semantic_diff::compare_production_bundles`, which `ggctl diff` and the ledger's plans both run) | a dotted document path, for example `policy.egress.hosts` or `resources.policy.sha256` |
 
 Every compiler input is compared exactly once: the environment adapter
 destructures every domain plan field by field, so a setting added to a plan
@@ -128,9 +130,9 @@ route and direct-rule edits are `unknown`; a route switched to
 `enforcement_mode: shadow` is also `risk.shadow_enabled`. An unset upstream
 timeout is compared as the egress timeout it inherits.
 
-The authoritative tables are `SETTINGS` in `gateway/src/config/semantic_diff.rs`
-for the environment and `gateway-config/src/semantic_diff/resources.rs` for
-bundles and documents.
+The authoritative tables are `SETTINGS` in
+`gateway-config/src/compiler/semantic_diff.rs` for the environment and
+`gateway-config/src/semantic_diff/resources.rs` for bundles and documents.
 
 ## Risk codes
 
@@ -158,6 +160,7 @@ record of them, and anything no detector can classify, are `high`.
 | `risk.plaintext_transport` | high | a connection that used TLS no longer does | listener TLS, `DATABASE_TLS_MODE`, `http://` upstreams |
 | `risk.policy_broadened` | high | a policy role or tool entry grants more or restricts less | `policy.roles`, `policy.tools` |
 | `risk.policy_default_allow` | high | requests no policy rule matches are allowed, or no policy is enforced at all | `policy.default_action`, removing `POLICY_FILE` |
+| `risk.policy_tests_not_required` | high | a policy change may be activated without passing the stored policy test suite | `POLICY_TESTS_REQUIRED` moving from `true` to `false`; turning it on tightens and carries no code |
 | `risk.private_egress_allowed` | high | outbound requests may reach private or other non-global addresses | `EGRESS_DENY_PRIVATE_IPS`, `policy.egress.cidrs` |
 | `risk.profile_changed` | high | the deployment profile moved to one with fewer guarantees | `deployment.profile` |
 | `risk.public_origin_changed` | medium | the public URL the gateway advertises changed | `GATEWAY_PUBLIC_URL` |
@@ -177,9 +180,9 @@ code or lowers the severity.
 ## Output in `ggctl diff`
 
 [`ggctl diff BUNDLE --against BUNDLE`](ggctl.md#diff) reads both bundles with
-the shared reader, as `ggctl validate` does (so the production policy and
-tools validators do not run and the report says so), and compares the
-documents as they were written. It writes:
+the shared reader and the production policy and tools validators, as `ggctl
+validate` does, and compares the documents those validators built, as the
+ledger's plans do: spelling out a default moves only the pin. It writes:
 
 - human output: one line per change (severity, field, kind, the value or
   `(value withheld)` / `(reference changed)` with entry counts, class, effect

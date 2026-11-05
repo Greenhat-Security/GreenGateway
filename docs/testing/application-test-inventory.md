@@ -182,7 +182,7 @@ path-independent:
   cite tests as a file and a function; their citations of `app_tests.rs` name
   the family modules, and `check-issue-240-acceptance.mjs` and
   `check-authority-evidence.mjs` find every cited function there.
-- `ENVIRONMENT_READS` (`gateway/src/config/inventory.rs`) counts the
+- `ENVIRONMENT_READS` (`gateway/src/config/environment_reads.rs`) counts the
   `GATEWAY_TEST_POSTGRES_URL_FILE` reads in the modules the inline PostgreSQL
   suites moved to.
 - [The load-sensitive test list](load-sensitive-tests.md) gives each test's

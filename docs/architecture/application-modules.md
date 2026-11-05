@@ -12,14 +12,15 @@ an exit code. Implementation is grouped by responsibility:
 | `probes` | Health/readiness, metrics and proxy fallback |
 | `admin_identity`, `admin_authorization` | Admin login, capabilities and final permission checks |
 | `admin_config` | The configuration admin API: the `config/capabilities` version handshake `ggctl` reads |
+| `admin_mcp_clients` | The credential-free MCP client configuration templates (`mcp/client-configs`) the admin UI and `ggctl mcp-config` read, rendered by `gateway-config` |
 | `admin_connections`, `admin_tools`, `admin_tokens`, `admin_policy`, `admin_policy_drafts` | Domain-specific handlers and mutations; policy drafts, including a discovery suggestion opened in one, publish only through `admin_policy`'s mutation path |
 | `admin_observability`, `admin_events` | Audit, traffic, signals, suggestions and change telemetry |
 | `admin_responses`, `admin_ui` | Shared error mapping and embedded UI serving |
-| `admin_policy_test_runs`, `admin_policy_tests`, `policy_testing` | Policy test suites: the run endpoint, the stored suite's `GET`/`PUT` (its stores are `storage::policy_tests` and `storage::postgres_policy_tests`), and the state-free suite parser, evaluator-backed runner and JSON/SARIF/JUnit reports |
+| `admin_policy_test_runs`, `admin_policy_tests`, `admin_policy_test_gate`, `policy_testing` | Policy test suites: the run endpoint, the stored suite's `GET`/`PUT` (its stores are `storage::policy_tests` and `storage::postgres_policy_tests`), the `POLICY_TESTS_REQUIRED` gate every policy publication asks inside its commit precondition, and the state-free suite parser, evaluator-backed runner and JSON/SARIF/JUnit reports |
 | `admin_policy_simulations`, `policy_simulation` | Synthetic policy simulation: the simulation endpoint and its concurrency bound, and the state-free request parser, position-aware edits, shadow projections and evaluator-backed runner |
-| `admin_policy_analyses`, `policy_analysis` | Structural policy analysis: the analysis endpoint and its concurrency bound, and the state-free request parser, sound inclusion checks, evaluator-confirmed findings, advisory patches and JSON/SARIF reports |
-| `admin_policy_replays`, `policy_replay` | Historical policy replay: the replay job endpoints, their process-local job registry and quotas, and the state-free `replay-context.v1` record and parser, the legacy adapters that read one out of a stored audit event, their evaluator-backed replay, the `policy-replay.v1` request parser, the bounded job engine and the base-to-candidate and recorded-to-base impact comparison |
-| `admin_policy_evidence`, `policy_evidence` | Policy evidence packages: the evidence endpoint, its history reads, revalidation, replay-job binding and export audit record, and the state-free `policy-evidence-request.v1` parser and deterministic `policy-evidence.v1` package assembler |
+| `admin_policy_analyses`, `admin_policy_analysis_suppressions`, `policy_analysis` | Structural policy analysis: the analysis endpoint and its concurrency bound, the finding suppression routes, and the state-free request parser, sound inclusion checks, evaluator-confirmed findings, advisory patches, suppression matching and JSON/SARIF reports |
+| `admin_policy_replays`, `policy_replay` | Historical policy replay: the replay job endpoints, their process-local job registry and quotas, the cluster-mode job store front and the replay worker every cluster replica runs (`admin_policy_replays_cluster.rs`), and the state-free `replay-context.v1` record and parser, the legacy adapters that read one out of a stored audit event, their evaluator-backed replay, the `policy-replay.v1` request parser, the bounded job engine and the base-to-candidate and recorded-to-base impact comparison |
+| `admin_policy_evidence`, `policy_evidence` | Policy evidence packages: the evidence endpoint, its history and owner-scoped draft reads, revalidation, analysis with suppressions, replay-job binding and export audit record, and the state-free `policy-evidence-request.v1` parser, deterministic `policy-evidence.v1` package assembler and fixed-template Markdown renderer |
 
 `bootstrap.rs` is startup's root. `run` either runs the one-shot command the
 arguments name or compiles the configuration and runs the serving stages, and
@@ -100,30 +101,51 @@ the server remains authoritative for permissions and secret binding validity.
 
 `gateway-config` is the library the gateway and `ggctl` both link (issue #242,
 ADR-0008). Besides the bundle reader, catalog, ledger and digests its own
-documentation lists, it holds the I/O-free leaves of the configuration
-compiler, which is moving into it from `gateway/src/config`: the types and
-validators a setting is parsed into, with no file, socket, clock or provider
-behind them. The gateway re-exports each one from the module it used to live
-in, so call sites did not change:
+documentation lists, it holds the environment configuration compiler, moved
+into it from `gateway/src/config`, and the I/O-free leaves the compiler calls:
+the types and validators a setting is parsed into, with no file, socket, clock
+or provider behind them. The gateway re-exports each one from the module it
+used to live in, so call sites did not change:
 
 | `gateway-config` module | Holds | Re-exported by |
 |---|---|---|
-| `connections` | Connections limits (`MAX_CREDENTIALS`, display name, Connection and secret ID bounds) and the Connection ID grammar | `connections::model` |
+| `compiler` | The configuration compiler ([contract](configuration-compiler.md)): `compile`, the input inventory, the parse and validate stages and the `ConfigPlan` they build, `ConfigError` and its value-free diagnostics, every setting's name, default and bound, the JSON setting types (`AuthProviderConfig`, `UpstreamRouteConfig`, `McpUpstreamServerConfig`, `InboundClientAuthConfig` and the rest), and the semantic diff of two plans | `config` (a glob re-export) |
+| `connections` | Connections limits (`MAX_CREDENTIALS`, display name, Connection and secret ID bounds), the Connection ID grammar, and the origin-relative path grammar (`normalize_origin_relative_path`, `ConnectionValidationError`) Connections and HTTP tool mappings share | `connections::model` |
 | `connections::secret` | The operator alias document, the secrets root, and the alias, environment-key and file-key grammars | `connections::secret` |
 | `connections::{aws,azure,gcp,vault,kubernetes}_secret` | Each secret provider's configuration document and validator | the gateway module of the same name |
 | `connections::local_secret` | The local keyring document and validator | `connections::local_secret` |
 | `inbound_tls` | `TlsMinVersion`, `ClientCertMode`, `ClientCertRequirement` | `inbound_tls` |
-| `auth` | Issuer canonicalization and bound, JWKS key age bounds, the cookie-name grammar, `ClientCertIdentitySource`, admin session settings | `auth::principal`, `auth::jwt`, `middleware::auth`, `auth::client_certificate`, `auth::admin_session` |
+| `auth` | Issuer canonicalization and the principal identity bounds, JWKS key age bounds, the cookie-name grammar, `ClientCertIdentitySource`, admin session settings | `auth::principal`, `auth::jwt`, `middleware::auth`, `auth::client_certificate`, `auth::admin_session` |
+| `rbac::{policy, policy_document, rule, conditions, identity_mappings}` | The policy document (v0 and v1): its model, `Policy::validate_json_value` and `Policy::from_source`, the schema dispatch, diagnostics and digests, and the rule, condition and identity-mapping models with their validation | `rbac::*` of the same names (glob re-exports) |
+| `tools::{definitions, composite, transforms, selector, codecs}` | The tools document (0.1.0): the `ToolDefinition` model, `definitions_from_json_value` and the registry's semantic checks, and the composite mapping, transform, JSON selector and codec models a definition carries | `tools::*` of the same names (glob re-exports) |
 | `path_match` | Exempt-path and prefix matching, unsafe request paths | `path_match` |
 | `request_bounds` | The request shape bounds admission, the policy kernel and configuration share | `request_bounds` |
 | `upstream_route` | The stable route ID grammar | `upstream_route` |
 | `discovery` | Signal detector thresholds and the rule suggestion window, with their defaults | `discovery::signals`, `discovery::suggestions` |
+
+The policy and tools models carry no evaluation: loading, persisting and
+watching their files, policy history, the tool registry, the policy kernel and
+rule matcher, and tool execution stay in the gateway. An inherent method that
+needs the gateway became a method of a gateway-side trait with the same name
+(`rbac::policy::PolicyFile` for `from_file`, `from_config` and
+`persist_to_file`, `ClusterDocumentFormat`, `RoleIdentity`,
+`rbac::rule::PrincipalMatch` and `RuleMatch`), so call sites import the trait
+and keep their syntax. The rule matcher keeps its own copy of the path
+pattern's capture grammar, which the pure-path microbenchmark compiles from
+it; a matcher property test holds `gateway_config::rbac`'s copy to it. The
+policy and tools suites stay in the gateway and run against the re-exports,
+with only their imports changed.
 
 Their unit tests moved with them and run under `cargo test -p gateway-config`,
 except `path_match`'s: the tests `security-mutations.json` selects and the
 property tests stay in the gateway's `path_match` module, because the mutation
 campaign builds and runs only the gateway's test binary. Tests that exercise a
 provider, a listener or a store, rather than the document, stay in the gateway.
+The compiler's parity goldens, stage tests and catalog tests moved with it and
+hold its plans to the values the gateway's `Config` always had; the gateway's
+`config_tests` still hold `Config::from_env_vars` to every setting.
 What touches files, the network or a clock (provider construction, key and
-secrets-root reads, listener binding) stays in the gateway, and the compiler's
-zero-I/O scan (`config::stage_tests`) reads these modules too.
+secrets-root reads, listener binding) stays in the gateway, and so do
+`Config`, its conversion from a plan (`config::into_config`) and the
+process-environment reader. The compiler's zero-I/O scan
+(`compiler::stage_tests`) reads the whole compiler module and these leaves.

@@ -155,9 +155,9 @@ fn seeding_creates_a_ledger_that_verifies_and_is_never_seeded_over() {
     assert!(
         stdout.contains(" (sequence 1, seed, bundle payments-production)\n  active         none\n")
     );
-    assert!(captured
+    assert!(!captured
         .stderr()
-        .contains("ggctl: info: validate.production_validators_not_run: "));
+        .contains("validate.production_validators_not_run"));
     assert!(captured
         .stderr()
         .contains("ggctl: info: ledger.gateway_recompiles_at_start: "));
@@ -442,13 +442,7 @@ fn a_rollback_needs_every_risk_code_named_and_appends_a_forward_revision() {
     let (exit, captured) = run(&words);
     assert_eq!(exit, Exit::Invalid);
     let found = report(&captured);
-    assert_eq!(
-        codes(&found),
-        [
-            "validate.production_validators_not_run",
-            "ledger.acknowledgement_required"
-        ]
-    );
+    assert_eq!(codes(&found), ["ledger.acknowledgement_required"]);
     let plan = &found["result"]["plan"];
     assert_eq!(plan["base"], second.as_str());
     assert_eq!(plan["target"], seed_id.as_str());
@@ -499,13 +493,7 @@ fn a_rollback_needs_every_risk_code_named_and_appends_a_forward_revision() {
     ]);
     assert_eq!(exit, Exit::Success);
     let found = report(&captured);
-    assert_eq!(
-        codes(&found),
-        [
-            "validate.production_validators_not_run",
-            "ledger.gateway_recompiles_at_start"
-        ]
-    );
+    assert_eq!(codes(&found), ["ledger.gateway_recompiles_at_start"]);
     let result = &found["result"];
     assert_eq!(result["rolledBack"], true);
     assert_eq!(result["plan"]["unacknowledged"], json!([]));

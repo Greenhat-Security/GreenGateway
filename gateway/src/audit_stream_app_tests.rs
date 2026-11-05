@@ -10,6 +10,7 @@
 //! `durable_sse_tests`.
 use super::*;
 use crate::audit::sink::tests::CaptureSink;
+use crate::rbac::policy::PolicyFile;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const STREAMER: &str = "audit-streamer";

@@ -1,10 +1,14 @@
-//! `ggctl doctor BUNDLE [--format human|json]`: the offline doctor
-//! (ADR-0008, "Doctor").
+//! `ggctl doctor (BUNDLE | --env FILE) [--format human|json]`: the offline
+//! doctor (ADR-0008, "Doctor").
 //!
-//! The doctor runs the same shared bundle reader as `validate`, once, and
-//! reports each of its stages as a check of its own, then the checks that
-//! need more than the reader: whether the production validators ran (they
-//! cannot, here) and whether the deployment profile is one for production.
+//! An environment file has checks of its own (`environment`); what follows
+//! describes a bundle's.
+//!
+//! The doctor runs the same shared bundle reader as `validate`, once, with
+//! the production validators, and reports each of its stages as a check of
+//! its own, then the checks that need more than the reader: whether the
+//! bundled policy and tools documents passed the production validators, and
+//! whether the deployment profile is one for production.
 //! It makes no network request, reads no environment variable and writes
 //! nothing; the network checks ADR-0008 describes run only inside a gateway.
 //!
@@ -27,9 +31,15 @@ use serde::Serialize;
 use crate::{
     cli::Invocation,
     diagnostic::{self, Diagnostic, Exit},
-    report::{self, Format, Io, BUNDLE_REMEDIATION},
+    env::{self, EnvRecord, Source},
+    report::{self, Format, Io, ReportDiagnostic, BUNDLE_REMEDIATION},
     validate::{self, BundleRead, BundleRecord},
 };
+
+mod environment;
+
+#[cfg(test)]
+pub(crate) use environment::CHECKS as ENVIRONMENT_CHECKS;
 
 /// Where `docs/ggctl.md` explains every check and reason.
 const DOCTOR_REMEDIATION: &str = "docs/ggctl.md#doctor-checks";
@@ -138,6 +148,7 @@ impl Stage {
             | Code::InvalidName
             | Code::InvalidDecimal
             | Code::NotApplicable
+            | Code::NotRepresentable
             | Code::InlineSecretValue
             | Code::InvalidSecretReference => Self::Structure,
             Code::FileMissing
@@ -169,9 +180,16 @@ pub(crate) enum Reason {
     Incomplete,
     ServerManaged,
     NotDeclared,
-    ValidatorUnavailable,
     MigrationProfile,
     DevelopmentProfile,
+    // An environment file against the production profile.
+    AuthenticationNotRequired,
+    PolicyNotConfigured,
+    PolicyNotRead,
+    CsrfDisabled,
+    PrivateEgressAllowed,
+    AuditBestEffort,
+    InlineClientSecret,
 }
 
 impl Reason {
@@ -181,9 +199,15 @@ impl Reason {
         Self::Incomplete,
         Self::ServerManaged,
         Self::NotDeclared,
-        Self::ValidatorUnavailable,
         Self::MigrationProfile,
         Self::DevelopmentProfile,
+        Self::AuthenticationNotRequired,
+        Self::PolicyNotConfigured,
+        Self::PolicyNotRead,
+        Self::CsrfDisabled,
+        Self::PrivateEgressAllowed,
+        Self::AuditBestEffort,
+        Self::InlineClientSecret,
     ];
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -192,9 +216,15 @@ impl Reason {
             Self::Incomplete => "doctor.incomplete",
             Self::ServerManaged => "doctor.server_managed",
             Self::NotDeclared => "doctor.not_declared",
-            Self::ValidatorUnavailable => "doctor.validator_unavailable",
             Self::MigrationProfile => "doctor.migration_profile",
             Self::DevelopmentProfile => "doctor.development_profile",
+            Self::AuthenticationNotRequired => "doctor.authentication_not_required",
+            Self::PolicyNotConfigured => "doctor.policy_not_configured",
+            Self::PolicyNotRead => "doctor.policy_not_read",
+            Self::CsrfDisabled => "doctor.csrf_disabled",
+            Self::PrivateEgressAllowed => "doctor.private_egress_allowed",
+            Self::AuditBestEffort => "doctor.audit_best_effort",
+            Self::InlineClientSecret => "doctor.inline_client_secret",
         }
     }
 }
@@ -264,6 +294,25 @@ impl CheckRecord {
         }
     }
 
+    /// A check whose reason is the first diagnostic it found, an
+    /// environment file's or the compiler's.
+    fn from_diagnostic(
+        id: &'static str,
+        required: bool,
+        status: Status,
+        diagnostic: &ReportDiagnostic,
+        took: Duration,
+    ) -> Self {
+        Self {
+            id,
+            severity: severity(required),
+            status,
+            reason: diagnostic.code(),
+            remediation: diagnostic.remediation(),
+            duration_ms: milliseconds(took),
+        }
+    }
+
     fn failed_required(&self) -> bool {
         self.severity == "error" && self.status == Status::Fail
     }
@@ -287,21 +336,7 @@ pub(crate) fn checks(read: &BundleRead, took: Duration) -> Vec<CheckRecord> {
         .iter()
         .map(|stage| stage_check(*stage, read, took))
         .collect();
-    let started = Instant::now();
-    let (status, reason) = match &read.manifest {
-        None => (Status::Skipped, Reason::Incomplete),
-        Some(_) if validate::supplies_a_resource(read) => {
-            (Status::Skipped, Reason::ValidatorUnavailable)
-        }
-        Some(_) => (Status::Skipped, Reason::NotDeclared),
-    };
-    checks.push(CheckRecord::new(
-        OTHER_CHECKS[0],
-        true,
-        status,
-        reason,
-        started.elapsed(),
-    ));
+    checks.push(production_validators_check(read, took));
     let started = Instant::now();
     let (status, reason) = match read.bundle.as_ref().map(|bundle| bundle.deployment.profile) {
         None => (Status::Skipped, Reason::Incomplete),
@@ -317,6 +352,41 @@ pub(crate) fn checks(read: &BundleRead, took: Duration) -> Vec<CheckRecord> {
         started.elapsed(),
     ));
     checks
+}
+
+/// Whether the bundled policy and tools documents passed the production
+/// validators, which the reader ran on them: `pass` once the bundle was
+/// read, `fail` with the first error of the resources stage (the reader
+/// reports a published-schema and a production-validator refusal by one
+/// code, `resource.invalid`), and otherwise `skipped` -- with nothing to
+/// validate, or when the reader stopped before it could show them valid.
+fn production_validators_check(read: &BundleRead, took: Duration) -> CheckRecord {
+    let id = OTHER_CHECKS[0];
+    let skipped = |reason| CheckRecord::new(id, true, Status::Skipped, reason, took);
+    if read.manifest.is_none() {
+        return skipped(Reason::Incomplete);
+    }
+    if !validate::supplies_a_resource(read) {
+        return skipped(Reason::NotDeclared);
+    }
+    if read.bundle.is_some() {
+        return CheckRecord::new(id, true, Status::Pass, Reason::Passed, took);
+    }
+    match read
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.is_error() && Stage::of(diagnostic.code) == Stage::Resources)
+    {
+        Some(diagnostic) => CheckRecord {
+            id,
+            severity: severity(true),
+            status: Status::Fail,
+            reason: diagnostic.code.as_str(),
+            remediation: BUNDLE_REMEDIATION,
+            duration_ms: milliseconds(took),
+        },
+        None => skipped(Reason::Incomplete),
+    }
 }
 
 fn stage_check(stage: Stage, read: &BundleRead, took: Duration) -> CheckRecord {
@@ -351,39 +421,57 @@ struct DoctorResult {
     /// Present once the manifest was read.
     #[serde(skip_serializing_if = "Option::is_none")]
     bundle: Option<BundleRecord>,
+    /// Present once an environment file was parsed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment: Option<EnvRecord>,
     checks: Vec<CheckRecord>,
 }
 
 pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
     let started = Instant::now();
-    let Some(read) = validate::read(invocation, false) else {
-        return report::error(io, Diagnostic::new(diagnostic::Code::MissingArgument));
+    let (result, mut diagnostics, title) = match validate::source(invocation) {
+        Err(diagnostic) => return report::error(io, diagnostic),
+        Ok(Source::Bundle(path)) => {
+            let read = validate::read_path(path, false);
+            let checks = checks(&read, started.elapsed());
+            let result = DoctorResult {
+                bundle: BundleRecord::of(&read),
+                environment: None,
+                checks,
+            };
+            let title = result
+                .bundle
+                .as_ref()
+                .map_or_else(|| "bundle".to_owned(), BundleRecord::title);
+            (result, validate::diagnostics(&read), title)
+        }
+        Ok(Source::Env { argument, path }) => {
+            // The doctor has no --strict: a repeated key is advice.
+            let read = env::read(argument, path, false);
+            let checks = environment::checks(&read, started.elapsed());
+            let result = DoctorResult {
+                bundle: None,
+                environment: read.record(),
+                checks,
+            };
+            (result, read.diagnostics, "environment file".to_owned())
+        }
     };
-    let checks = checks(&read, started.elapsed());
-    let mut diagnostics = validate::diagnostics(&read);
-    let failed = checks.iter().any(CheckRecord::failed_required);
+    let failed = result.checks.iter().any(CheckRecord::failed_required);
     if failed {
         diagnostics.push(Diagnostic::new(diagnostic::Code::RequiredCheckFailed).into());
     }
-    let result = DoctorResult {
-        bundle: BundleRecord::of(&read),
-        checks,
-    };
     report::finish_report(
         io,
         Format::of(invocation),
         "doctor",
         &result,
         &diagnostics,
-        |result, out| human(result, failed, out),
+        |result, out| human(result, &title, failed, out),
     )
 }
 
-fn human(result: &DoctorResult, failed: bool, out: &mut dyn Write) -> io::Result<()> {
-    let title = result
-        .bundle
-        .as_ref()
-        .map_or_else(|| "bundle".to_owned(), BundleRecord::title);
+fn human(result: &DoctorResult, title: &str, failed: bool, out: &mut dyn Write) -> io::Result<()> {
     writeln!(out, "{title}: offline checks")?;
     let width = result
         .checks

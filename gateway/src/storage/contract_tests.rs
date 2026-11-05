@@ -39,12 +39,18 @@ use crate::rbac::{
     Policy,
 };
 use crate::storage::{
+    analysis_suppressions::{
+        is_analysis_suppression_id, is_policy_etag, is_sha256_digest, AnalysisSuppressionActor,
+        AnalysisSuppressionCreated, AnalysisSuppressionLimits, NewAnalysisSuppression,
+        ANALYSIS_SUPPRESSION_ID_PREFIX,
+    },
     policy_drafts::{
         is_policy_draft_id, NewPolicyDraft, PolicyDraftChange, PolicyDraftCreated,
         PolicyDraftLimits, PolicyDraftOwner, POLICY_DRAFT_ID_PREFIX,
     },
-    AuditEventStore, PolicyDraftStore, PolicyHistory, PrincipalDirectoryStore, RepositoryError,
-    RepositoryErrorKind, ServiceTokenStore, SqliteAuditEventStore, SqlitePolicyDraftStore,
+    AnalysisSuppressionStore, AuditEventStore, PolicyDraftStore, PolicyHistory,
+    PrincipalDirectoryStore, RepositoryError, RepositoryErrorKind, ServiceTokenStore,
+    SqliteAnalysisSuppressionStore, SqliteAuditEventStore, SqlitePolicyDraftStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -2566,6 +2572,437 @@ fn policy_draft_ids_have_one_exact_shape() {
     ] {
         assert!(!is_policy_draft_id(invalid), "{invalid:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Policy analysis suppressions (issue #243, slice 15)
+// ---------------------------------------------------------------------------
+
+/// What a suppression contract test needs from an adapter beyond the trait:
+/// a way to move a suppression's expiry into the past and a way to corrupt
+/// a row, each on the adapter's own storage.
+#[async_trait::async_trait]
+pub(crate) trait AnalysisSuppressionBackdoor: Sync {
+    /// Move the suppression's creation and expiry into the past on the
+    /// adapter's clock.
+    async fn expire(&self, suppression_id: &str);
+    /// Rewrite the row into one no gateway path writes but the adapter's
+    /// own constraints admit.
+    async fn tamper(&self, suppression_id: &str);
+}
+
+/// The bounds the suppression contract runs under: small enough to fill.
+pub(crate) const CONTRACT_SUPPRESSION_LIMITS: AnalysisSuppressionLimits =
+    AnalysisSuppressionLimits {
+        max_ttl_secs: 3_600,
+        max_total: 2,
+    };
+
+fn contract_suppression_id(index: u8) -> String {
+    format!(
+        "{ANALYSIS_SUPPRESSION_ID_PREFIX}{:032x}",
+        u128::from(index) + 0x5a00
+    )
+}
+
+fn contract_digest(seed: u8) -> String {
+    format!("sha256:{}", hex::encode([seed; 32]))
+}
+
+fn contract_suppression_actor() -> AnalysisSuppressionActor {
+    AnalysisSuppressionActor {
+        issuer: "https://issuer.example".to_owned(),
+        subject: "reviewer".to_owned(),
+    }
+}
+
+/// A suppression of the finding `finding`, bound to the snapshot
+/// `snapshot`, expiring `expires_in` seconds after the test's clock read.
+fn new_contract_suppression<'a>(
+    suppression_id: &'a str,
+    finding: &'a str,
+    snapshot: &'a str,
+    actor: &'a AnalysisSuppressionActor,
+    expires_at: i64,
+) -> NewAnalysisSuppression<'a> {
+    NewAnalysisSuppression {
+        suppression_id,
+        fingerprint: finding,
+        code: "rule_shadowed",
+        reason: "reviewed: the deny is kept for the alias lane",
+        actor,
+        policy_etag: CONTRACT_SUPPRESSION_POLICY_ETAG,
+        policy_semantic_digest: None,
+        resource_snapshot_digest: snapshot,
+        expires_at,
+    }
+}
+
+const CONTRACT_SUPPRESSION_POLICY_ETAG: &str =
+    "\"sha256:0101010101010101010101010101010101010101010101010101010101010101\"";
+
+fn unix_now() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+/// Assert the suppression contract: the expiry window on the store's clock,
+/// the duplicate rule, the deployment bound counted over unended rows,
+/// withdrawal as a compare-and-set on the revision, ended rows kept until a
+/// create needs their room, and fail-closed reads of a row no gateway path
+/// writes.
+pub(crate) async fn analysis_suppression_store_contract(
+    store: &dyn AnalysisSuppressionStore,
+    backdoor: &dyn AnalysisSuppressionBackdoor,
+) {
+    assert_eq!(store.limits(), CONTRACT_SUPPRESSION_LIMITS);
+    let actor = contract_suppression_actor();
+    let finding = contract_digest(0xf1);
+    let other_finding = contract_digest(0xf2);
+    let snapshot = contract_digest(0x51);
+    let moved_snapshot = contract_digest(0x52);
+    let first_id = contract_suppression_id(1);
+    // Ten minutes of margin either side of the window, so a database clock a
+    // little off the test's cannot move a case across a bound.
+    let in_window = unix_now() + 600;
+
+    // The expiry window is judged on the store's clock: not after now, or
+    // more than the maximum lifetime ahead, writes nothing.
+    for expires_at in [unix_now() - 600, unix_now() + 3_600 + 600] {
+        assert_eq!(
+            store
+                .create(new_contract_suppression(
+                    &first_id, &finding, &snapshot, &actor, expires_at
+                ))
+                .await
+                .expect("an out-of-window create is an outcome"),
+            AnalysisSuppressionCreated::ExpiryOutOfRange
+        );
+    }
+    assert!(store.list().await.expect("list").is_empty());
+
+    // Create: revision 1, unended, exactly what was written.
+    let AnalysisSuppressionCreated::Created(created) = store
+        .create(new_contract_suppression(
+            &first_id, &finding, &snapshot, &actor, in_window,
+        ))
+        .await
+        .expect("create")
+    else {
+        panic!("the first suppression should be admitted");
+    };
+    assert_eq!(created.suppression_id, first_id);
+    assert_eq!(created.revision, 1);
+    assert_eq!(created.fingerprint, finding);
+    assert_eq!(created.code, "rule_shadowed");
+    assert_eq!(created.actor, actor);
+    assert_eq!(created.policy_etag, CONTRACT_SUPPRESSION_POLICY_ETAG);
+    assert_eq!(created.policy_semantic_digest, None);
+    assert_eq!(created.resource_snapshot_digest, snapshot);
+    assert_eq!(created.expires_at, in_window);
+    assert_eq!(created.withdrawn_at, None);
+    assert!(!created.ended);
+    assert!(created.created_at < created.expires_at);
+    assert_eq!(
+        store.get(&first_id).await.expect("get").as_ref(),
+        Some(&*created)
+    );
+    assert_eq!(store.list().await.expect("list"), vec![(*created).clone()]);
+
+    // The same finding under the same binding is not suppressed twice; under
+    // another resource snapshot it is a separate decision.
+    assert_eq!(
+        store
+            .create(new_contract_suppression(
+                &contract_suppression_id(2),
+                &finding,
+                &snapshot,
+                &actor,
+                in_window,
+            ))
+            .await
+            .expect("duplicate create"),
+        AnalysisSuppressionCreated::Duplicate {
+            suppression_id: first_id.clone()
+        }
+    );
+    let second_id = contract_suppression_id(3);
+    assert!(matches!(
+        store
+            .create(new_contract_suppression(
+                &second_id,
+                &finding,
+                &moved_snapshot,
+                &actor,
+                in_window,
+            ))
+            .await
+            .expect("create under another snapshot"),
+        AnalysisSuppressionCreated::Created(_)
+    ));
+
+    // The deployment bound counts unended suppressions.
+    assert_eq!(
+        store
+            .create(new_contract_suppression(
+                &contract_suppression_id(4),
+                &other_finding,
+                &snapshot,
+                &actor,
+                in_window,
+            ))
+            .await
+            .expect("create over the bound"),
+        AnalysisSuppressionCreated::DeploymentQuotaExceeded
+    );
+    assert!(store
+        .get(&contract_suppression_id(4))
+        .await
+        .expect("refused read")
+        .is_none());
+
+    // Withdrawal is a compare-and-set on the revision, and ends the row.
+    assert!(store
+        .withdraw(&first_id, 2)
+        .await
+        .expect("stale withdrawal")
+        .is_none());
+    let withdrawn = store
+        .withdraw(&first_id, 1)
+        .await
+        .expect("withdrawal")
+        .expect("the current revision wins");
+    assert_eq!(withdrawn.revision, 2);
+    assert!(withdrawn.ended);
+    assert!(withdrawn
+        .withdrawn_at
+        .is_some_and(|at| at >= withdrawn.created_at && at < withdrawn.expires_at));
+    assert_eq!(
+        withdrawn.expires_at, in_window,
+        "the granted expiry is kept"
+    );
+    for revision in [1, 2] {
+        assert!(store
+            .withdraw(&first_id, revision)
+            .await
+            .expect("withdrawal of an ended suppression")
+            .is_none());
+    }
+    // An ended row stays readable, and no longer counts as a duplicate.
+    assert_eq!(
+        store.get(&first_id).await.expect("get").as_ref(),
+        Some(&withdrawn)
+    );
+    let third_id = contract_suppression_id(5);
+    assert!(matches!(
+        store
+            .create(new_contract_suppression(
+                &third_id, &finding, &snapshot, &actor, in_window,
+            ))
+            .await
+            .expect("re-suppress after withdrawal"),
+        AnalysisSuppressionCreated::Created(_)
+    ));
+    // That create needed the ended row's room: the table holds at most the
+    // bound, and the earliest-ended row went.
+    assert_eq!(
+        store
+            .list()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|record| record.suppression_id)
+            .collect::<Vec<_>>(),
+        vec![second_id.clone(), third_id.clone()]
+    );
+
+    // Expiry is the store's: an expired row reads as ended and takes no
+    // withdrawal.
+    backdoor.expire(&second_id).await;
+    let expired = store
+        .get(&second_id)
+        .await
+        .expect("expired read")
+        .expect("an expired row is kept until its room is needed");
+    assert!(expired.ended);
+    assert_eq!(expired.withdrawn_at, None);
+    assert!(store
+        .withdraw(&second_id, 1)
+        .await
+        .expect("withdrawal of an expired suppression")
+        .is_none());
+
+    // Two creators racing for the last slot: exactly one is admitted.
+    let (left, right) = (contract_suppression_id(6), contract_suppression_id(7));
+    let (left_finding, right_finding) = (contract_digest(0xf3), contract_digest(0xf4));
+    let (first, second) = tokio::join!(
+        store.create(new_contract_suppression(
+            &left,
+            &left_finding,
+            &snapshot,
+            &actor,
+            in_window
+        )),
+        store.create(new_contract_suppression(
+            &right,
+            &right_finding,
+            &snapshot,
+            &actor,
+            in_window
+        )),
+    );
+    let outcomes = [first.expect("first racer"), second.expect("second racer")];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, AnalysisSuppressionCreated::Created(_)))
+            .count(),
+        1,
+        "{outcomes:?}"
+    );
+    assert!(outcomes.contains(&AnalysisSuppressionCreated::DeploymentQuotaExceeded));
+
+    // Two withdrawals holding one revision: exactly one wins.
+    let (first, second) = tokio::join!(store.withdraw(&third_id, 1), store.withdraw(&third_id, 1));
+    assert_eq!(
+        [first.expect("first"), second.expect("second")]
+            .into_iter()
+            .flatten()
+            .count(),
+        1
+    );
+
+    // A row no gateway path writes is never served, alone or in a listing.
+    backdoor.tamper(&third_id).await;
+    let refused = store
+        .get(&third_id)
+        .await
+        .expect_err("a tampered suppression must not be served");
+    assert_eq!(refused.kind(), RepositoryErrorKind::InvalidData);
+    assert_eq!(
+        store.list().await.expect_err("nor listed").kind(),
+        RepositoryErrorKind::InvalidData
+    );
+
+    // A malformed suppression never reaches the storage.
+    let refused = store
+        .create(NewAnalysisSuppression {
+            reason: "\u{7}",
+            ..new_contract_suppression(
+                &contract_suppression_id(8),
+                &other_finding,
+                &snapshot,
+                &actor,
+                in_window,
+            )
+        })
+        .await
+        .expect_err("a control character is refused");
+    assert_eq!(refused.invalid_parameter_name(), Some("reason"));
+}
+
+struct SqliteSuppressionBackdoor {
+    path: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl AnalysisSuppressionBackdoor for SqliteSuppressionBackdoor {
+    async fn expire(&self, suppression_id: &str) {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let changed = rusqlite::Connection::open(&self.path)
+            .expect("backdoor connection")
+            .execute(
+                "UPDATE policy_analysis_suppressions
+                 SET created_at = ?1 - 7200, expires_at = ?1 - 1
+                 WHERE suppression_id = ?2",
+                rusqlite::params![now, suppression_id],
+            )
+            .expect("expire suppression");
+        assert_eq!(changed, 1);
+    }
+
+    async fn tamper(&self, suppression_id: &str) {
+        let changed = rusqlite::Connection::open(&self.path)
+            .expect("backdoor connection")
+            .execute(
+                "UPDATE policy_analysis_suppressions SET fingerprint = 'sha256:short'
+                 WHERE suppression_id = ?1",
+                rusqlite::params![suppression_id],
+            )
+            .expect("tamper suppression");
+        assert_eq!(changed, 1);
+    }
+}
+
+#[tokio::test]
+async fn sqlite_analysis_suppression_store_satisfies_the_contract() {
+    let db = TempDb::new("suppression-contract");
+    let store = SqliteAnalysisSuppressionStore::open(&db.path)
+        .expect("suppression store should open")
+        .with_limits(CONTRACT_SUPPRESSION_LIMITS);
+    analysis_suppression_store_contract(
+        &store,
+        &SqliteSuppressionBackdoor {
+            path: db.path.clone(),
+        },
+    )
+    .await;
+}
+
+/// The suppression table shares the policy history database with the
+/// history and the drafts, and reopening keeps the suppressions.
+#[tokio::test]
+async fn sqlite_analysis_suppressions_share_the_history_database_and_survive_reopen() {
+    let db = TempDb::new("suppression-history-share");
+    let _history = PolicyHistoryStore::open(&db.path).expect("history store should open");
+    let _drafts = SqlitePolicyDraftStore::open(&db.path).expect("draft store should open");
+    let store =
+        SqliteAnalysisSuppressionStore::open(&db.path).expect("suppression store should open");
+    let actor = contract_suppression_actor();
+    let (finding, snapshot) = (contract_digest(0xf1), contract_digest(0x51));
+    let id = contract_suppression_id(1);
+    assert!(matches!(
+        store
+            .create(new_contract_suppression(
+                &id,
+                &finding,
+                &snapshot,
+                &actor,
+                unix_now() + 600
+            ))
+            .await
+            .expect("create"),
+        AnalysisSuppressionCreated::Created(_)
+    ));
+    drop(store);
+    let reopened =
+        SqliteAnalysisSuppressionStore::open(&db.path).expect("suppression store should reopen");
+    assert!(reopened
+        .get(&id)
+        .await
+        .expect("read after reopen")
+        .is_some_and(|record| !record.ended));
+}
+
+#[test]
+fn analysis_suppression_ids_and_digests_have_one_exact_shape() {
+    assert!(is_analysis_suppression_id(&contract_suppression_id(1)));
+    for invalid in [
+        "",
+        "pas_",
+        "pas_0123456789abcdef0123456789abcde",
+        "pas_0123456789abcdef0123456789abcdef0",
+        "pas_0123456789ABCDEF0123456789ABCDEF",
+        "pd_0123456789abcdef0123456789abcdef",
+        "../pas_0123456789abcdef0123456789ab",
+    ] {
+        assert!(!is_analysis_suppression_id(invalid), "{invalid:?}");
+    }
+    assert!(is_sha256_digest(&contract_digest(1)));
+    for invalid in ["sha256:", "sha256:ABCD", "sha512:00", "00"] {
+        assert!(!is_sha256_digest(invalid), "{invalid:?}");
+    }
+    assert!(is_policy_etag(CONTRACT_SUPPRESSION_POLICY_ETAG));
+    assert!(!is_policy_etag("W/\"sha256:00\""));
 }
 
 // ---------------------------------------------------------------------------
@@ -7718,6 +8155,171 @@ pub(crate) mod postgres_audit_tests {
             .expect("a well-formed row is accepted");
     }
 
+    // ------------------------------------------------------------------
+    // Policy analysis suppressions (issue #243, slice 15)
+    // ------------------------------------------------------------------
+
+    struct PostgresSuppressionBackdoor {
+        pool: deadpool_postgres::Pool,
+    }
+
+    #[async_trait::async_trait]
+    impl super::AnalysisSuppressionBackdoor for PostgresSuppressionBackdoor {
+        async fn expire(&self, suppression_id: &str) {
+            let changed = self
+                .pool
+                .get()
+                .await
+                .expect("backdoor checkout")
+                .execute(
+                    "UPDATE greengateway.policy_analysis_suppressions
+                     SET created_at = c.now - interval '2 hours',
+                         expires_at = c.now - interval '1 second'
+                     FROM (SELECT clock_timestamp() AS now) c
+                     WHERE suppression_id = $1",
+                    &[&suppression_id],
+                )
+                .await
+                .expect("expire suppression");
+            assert_eq!(changed, 1);
+        }
+
+        async fn tamper(&self, suppression_id: &str) {
+            // An ideographic space passes the table's own checks, and is not
+            // a reason a gateway path writes.
+            let changed = self
+                .pool
+                .get()
+                .await
+                .expect("backdoor checkout")
+                .execute(
+                    "UPDATE greengateway.policy_analysis_suppressions
+                     SET reason = chr(12288)
+                     WHERE suppression_id = $1",
+                    &[&suppression_id],
+                )
+                .await
+                .expect("tamper suppression");
+            assert_eq!(changed, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_analysis_suppression_store_satisfies_the_contract() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_store(&database).await;
+        let suppressions = store
+            .analysis_suppression_store()
+            .with_limits(super::CONTRACT_SUPPRESSION_LIMITS);
+
+        super::analysis_suppression_store_contract(
+            &suppressions,
+            &PostgresSuppressionBackdoor { pool: pool.clone() },
+        )
+        .await;
+
+        // Suppressions are review state, not authority: nothing above
+        // advanced the security revision or wrote the outbox.
+        assert_eq!(
+            store
+                .revision_source()
+                .current()
+                .await
+                .expect("revision read"),
+            0
+        );
+        assert_eq!(count_rows(&pool, "security_outbox").await, 0);
+    }
+
+    /// Migration 31's constraints refuse rows no gateway path writes, so a
+    /// store defect or an out-of-band edit cannot plant one.
+    #[tokio::test]
+    async fn policy_analysis_suppressions_table_refuses_rows_the_store_never_writes() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_store, pool) = migrated_policy_store(&database).await;
+        let client = pool.get().await.expect("checkout");
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let etag = format!("\"{digest}\"");
+        let id = format!("pas_{}", "b".repeat(32));
+        let row = |column: &str, value: &str| {
+            let mut values = vec![
+                ("suppression_id", format!("'{id}'")),
+                ("revision", "1".to_owned()),
+                ("fingerprint", format!("'{digest}'")),
+                ("code", "'rule_shadowed'".to_owned()),
+                ("reason", "'reviewed'".to_owned()),
+                ("actor_issuer", "''".to_owned()),
+                ("actor_subject", "'reviewer'".to_owned()),
+                ("policy_etag", format!("'{etag}'")),
+                ("policy_semantic_digest", "NULL".to_owned()),
+                ("resource_snapshot_digest", format!("'{digest}'")),
+                ("created_at", "now()".to_owned()),
+                ("expires_at", "now() + interval '1 hour'".to_owned()),
+                ("withdrawn_at", "NULL".to_owned()),
+            ];
+            for (name, current) in &mut values {
+                if *name == column {
+                    *current = value.to_owned();
+                }
+            }
+            format!(
+                "INSERT INTO greengateway.policy_analysis_suppressions ({}) VALUES ({})",
+                values
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                values
+                    .iter()
+                    .map(|(_, value)| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        for (column, value) in [
+            ("suppression_id", "'pas_NOT-HEX'"),
+            ("revision", "3"),
+            ("revision", "2"),
+            ("fingerprint", "'sha256:short'"),
+            ("code", "'Rule Shadowed'"),
+            ("reason", "''"),
+            ("reason", "'   '"),
+            ("reason", "chr(10)"),
+            ("reason", "repeat('r', 513)"),
+            ("actor_subject", "''"),
+            ("policy_etag", "'W/\"weak\"'"),
+            ("policy_semantic_digest", "'sha256:short'"),
+            ("resource_snapshot_digest", "'not-a-digest'"),
+            ("expires_at", "now()"),
+            ("expires_at", "now() + interval '91 days'"),
+            ("withdrawn_at", "now() + interval '2 hours'"),
+        ] {
+            let error = client
+                .batch_execute(&row(column, value))
+                .await
+                .expect_err("the row must be refused");
+            assert_eq!(
+                error.code(),
+                Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION),
+                "{column} = {value}: {error}"
+            );
+        }
+        client
+            .batch_execute(&row("revision", "1"))
+            .await
+            .expect("a well-formed row is accepted");
+    }
+
     #[tokio::test]
     async fn policy_history_contract_on_postgres_matches_the_standalone_shape() {
         let Some(admin_dsn) = locator() else {
@@ -11287,7 +11889,7 @@ pub(crate) mod postgres_audit_tests {
             members[0].capabilities,
             "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
              operation_requirements,policy_document_v1,policy_role_descriptions,\
-             policy_rule_conditions"
+             policy_rule_conditions,policy_tool_argument_conditions"
         );
         assert!(RecognizedCapabilities::parse(&members[0].capabilities)
             .contains(Capability::OperationRequirements));
@@ -11303,6 +11905,8 @@ pub(crate) mod postgres_audit_tests {
             .contains(Capability::PolicyDocumentV1));
         assert!(RecognizedCapabilities::parse(&members[0].capabilities)
             .contains(Capability::PolicyRuleConditions));
+        assert!(RecognizedCapabilities::parse(&members[0].capabilities)
+            .contains(Capability::PolicyToolArgumentConditions));
         assert_eq!(
             (
                 members[0].document_version_min,
@@ -11338,7 +11942,7 @@ pub(crate) mod postgres_audit_tests {
             store.members(window).await.expect("members")[0].capabilities,
             "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
              operation_requirements,policy_document_v1,policy_role_descriptions,\
-             policy_rule_conditions"
+             policy_rule_conditions,policy_tool_argument_conditions"
         );
 
         let older = insert_pre_protocol_member(&pool).await;
@@ -11879,20 +12483,12 @@ pub(crate) mod postgres_audit_tests {
 
     /// A policy v1 document whose rules carry conditions (issue #243) in the
     /// cluster authority. The store commits format 1 whatever it carries and
-    /// keeps the conditions exactly: the stored document reads back, under
-    /// the reader that admits them, as the committed policy at the committed
-    /// ETag. This build enforces every condition leaf but `tool_argument`, so
-    /// a document whose conditions read the organization, the source network
-    /// and a header is served exactly as committed. One with a `tool_argument`
-    /// condition is not: its replicas refuse to serve it -- the active read
-    /// fails closed as invalid data rather than reading the document without
-    /// it -- and the policy API never hands one to the store
-    /// (`typed_matchers_not_enforced`). Once a release enforces that leaf too,
-    /// this commit is the document its replicas serve. Recovery is forward: a
-    /// document this build serves commits over it.
+    /// keeps the conditions exactly: the stored document reads back as the
+    /// committed policy at the committed ETag, and the active read serves it
+    /// with every condition -- request leaves and a tool argument alike --
+    /// as standalone mode serves it.
     #[tokio::test]
-    async fn a_v1_document_with_rule_conditions_commits_in_cluster_mode_and_is_served_only_once_enforced(
-    ) {
+    async fn a_v1_document_with_rule_conditions_commits_and_is_served_in_cluster_mode() {
         let Some(admin_dsn) = locator() else {
             eprintln!("skipping: no test database locator; CI runs this test");
             return;
@@ -11900,9 +12496,9 @@ pub(crate) mod postgres_audit_tests {
         let _guard = DATABASE.lock().await;
         let database = create_test_database(&admin_dsn).await;
         let (store, pool) = migrated_policy_store(&database).await;
-        let served_document = json!({
+        let document = json!({
             "schema_version": "1.0.0",
-            "id": "request-conditions",
+            "id": "typed-matchers",
             "default_action": "deny",
             "roles": {
                 "admin": { "permissions": ["admin:policy:write"] },
@@ -11914,50 +12510,26 @@ pub(crate) mod postgres_audit_tests {
                 "organizations": ["acme"],
                 "grant_roles": ["reader"]
             }],
-            "rules": [{
-                "id": "internal-reads",
-                "path": "/data/**",
-                "action": "allow",
-                "conditions": { "all": [
-                    { "organization": { "issuer": "https://idp.example.test/", "in": ["acme"] } },
-                    { "any": [
+            "rules": [
+                {
+                    "id": "internal-reads",
+                    "path": "/data/**",
+                    "action": "allow",
+                    "conditions": { "any": [
                         { "source_network": { "cidrs": ["10.0.0.0/8"] } },
                         { "header": { "name": "x-environment", "in": ["staging"] } }
                     ] }
-                ] }
-            }]
+                },
+                {
+                    "id": "no-eu-exports",
+                    "tool_name": "reports.export",
+                    "action": "deny",
+                    "conditions": { "tool_argument": { "pointer": "/region", "in": ["eu"] } }
+                }
+            ]
         });
-        let served = Policy::validate_json_value(served_document)
-            .expect("this build serves organization, source-network and header conditions");
-        let mut document = json!({
-            "schema_version": "1.0.0",
-            "id": "typed-matchers",
-            "default_action": "deny",
-            "roles": {
-                "admin": { "permissions": ["admin:policy:write"] },
-                "reader": { "permissions": ["data:read"] }
-            },
-            "rules": [{
-                "id": "internal-reads",
-                "path": "/data/**",
-                "action": "allow",
-                "conditions": { "source_network": { "cidrs": ["10.0.0.0/8"] } }
-            }, {
-                "id": "eu-exports",
-                "tool_name": "reports.export",
-                "action": "deny",
-                "conditions": { "any": [
-                    { "source_network": { "cidrs": ["10.0.0.0/8"] } },
-                    { "tool_argument": { "pointer": "/region", "in": ["eu"] } }
-                ] }
-            }]
-        });
-        let typed = crate::rbac::policy_document::parse_v1_with_typed_matchers(&document)
-            .expect("the typed-matcher document is sound");
-        assert!(
-            Policy::validate_json_value(document.clone()).is_err(),
-            "this build accepts no document whose conditions read a tool argument"
-        );
+        let typed = Policy::validate_json_value(document.clone())
+            .expect("this build serves every rule condition");
 
         let initial = PolicyControlPlane::commit(
             &*store,
@@ -11969,33 +12541,14 @@ pub(crate) mod postgres_audit_tests {
         )
         .await
         .expect("initialize should commit");
-        let conditioned = PolicyControlPlane::commit(
+        let committed = PolicyControlPlane::commit(
             &*store,
             commit_request(
                 PolicyCommitPrecondition::Expected {
                     etag: initial.etag.clone(),
                 },
-                &served,
-                "op-2",
-            ),
-        )
-        .await
-        .expect("a document with served conditions commits in cluster mode");
-        let active = PolicyControlPlane::active(&*store)
-            .await
-            .expect("a document this build enforces is served")
-            .expect("an active policy");
-        assert_eq!(active.etag, conditioned.etag);
-        assert_eq!(active.policy, served, "the conditions are served exactly");
-
-        let committed = PolicyControlPlane::commit(
-            &*store,
-            commit_request(
-                PolicyCommitPrecondition::Expected {
-                    etag: conditioned.etag.clone(),
-                },
                 &typed,
-                "op-3",
+                "op-2",
             ),
         )
         .await
@@ -12013,7 +12566,7 @@ pub(crate) mod postgres_audit_tests {
             .expect("the stored document reads")
             .get(0);
         let stored: Value = serde_json::from_str(&stored).expect("the stored document is JSON");
-        let reread = crate::rbac::policy_document::parse_v1_with_typed_matchers(&stored)
+        let reread = Policy::validate_json_value(stored)
             .expect("the stored document is the committed v1 document");
         assert_eq!(reread, typed, "the matchers are kept exactly");
         assert_eq!(
@@ -12022,35 +12575,20 @@ pub(crate) mod postgres_audit_tests {
             "at the committed ETag"
         );
 
-        let refused = PolicyControlPlane::active(&*store)
-            .await
-            .expect_err("a tool_argument condition this build does not enforce is never served");
-        assert_eq!(refused.kind(), RepositoryErrorKind::InvalidData);
-
-        // Without the tool_argument leaf the same document is one this build
-        // serves; the refusal is that leaf's alone.
-        document["rules"][1]["conditions"] =
-            json!({ "source_network": { "cidrs": ["10.0.0.0/8"] } });
-        assert!(Policy::validate_json_value(document).is_ok());
-
-        let recovered = PolicyControlPlane::commit(
-            &*store,
-            commit_request(
-                PolicyCommitPrecondition::Expected {
-                    etag: committed.etag.clone(),
-                },
-                &contract_policy_v1("recovered"),
-                "op-4",
-            ),
-        )
-        .await
-        .expect("a document this build serves commits over it");
         let active = PolicyControlPlane::active(&*store)
             .await
             .expect("active read")
             .expect("an active policy");
-        assert_eq!(active.etag, recovered.etag);
+        assert_eq!(active.etag, committed.etag);
         assert_eq!(active.policy.schema_version, "1.0.0");
+        assert!(
+            active
+                .policy
+                .rules
+                .iter()
+                .all(|rule| rule.conditions.is_some()),
+            "every rule is served with its conditions"
+        );
     }
 
     // ------------------------------------------------------------------

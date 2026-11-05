@@ -154,6 +154,12 @@ pub(crate) const IMPORT_ACTOR: &str = "import-standalone";
 ///   records and bindings only, so that history stays in the standalone
 ///   database: the cluster's own Connection evidence table starts empty (it
 ///   records deletions today), and cluster mode has no local secrets.
+/// - `catalog_change_evidence` is the same database's record of who
+///   published each managed MCP and OpenAPI catalog and each overlay (that
+///   store's migration 13). The Connections section carries the current
+///   catalogs and overlays only, so that history stays in the standalone
+///   database too; the cluster's own catalog evidence table starts empty and
+///   records the cluster's first publication (the import writes none).
 /// - `policy_test_suite_versions` is the standalone policy history
 ///   database's stored policy test suite (issue #243). The cluster starts
 ///   with none; the operator stores the suite again with `If-None-Match: *`.
@@ -168,6 +174,8 @@ const NOT_IMPORTED: &[&str] = &[
     "admin_sessions",
     "jwt_revocations",
     "policy_drafts",
+    "policy_replay_jobs",
+    "policy_analysis_suppressions",
     "security_outbox (the import announces nothing; a commit appends its own row)",
     "principal_directory (cluster mode has none; the audit log it projects from is imported)",
     "connection_local_secrets (the local-secret keyring stays with the standalone deployment; \
@@ -179,6 +187,8 @@ const NOT_IMPORTED: &[&str] = &[
      Connections database; the cluster's own evidence table starts empty)",
     "connection_local_secret_change_evidence (standalone local-secret change evidence stays with \
      the local-secret keyring in the standalone Connections database)",
+    "catalog_change_evidence (standalone catalog and overlay publication evidence stays in the \
+     standalone Connections database; the cluster's own catalog evidence table starts empty)",
     "policy_test_suite_versions (the standalone stored policy test suite stays in the standalone \
      policy history database; store it in the cluster with PUT .../policy/tests and \
      If-None-Match: *)",
@@ -670,6 +680,17 @@ pub(crate) async fn run(
             &deployment_id,
             target.cluster_member_stale_window(),
             &crate::storage::compatibility::POLICY_RULE_CONDITIONS,
+        )
+        .await?;
+    }
+    // One whose conditions read a tool argument needs every live replica to
+    // enforce that leaf as well.
+    if source.writes_policy_tool_argument_conditions() {
+        preflight::live_members_admit(
+            &pool,
+            &deployment_id,
+            target.cluster_member_stale_window(),
+            &crate::storage::compatibility::POLICY_TOOL_ARGUMENT_CONDITIONS,
         )
         .await?;
     }

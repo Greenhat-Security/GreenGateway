@@ -13,8 +13,8 @@
 //! that was pinned; the report gives its new source digest. Nothing else is
 //! written, no network request is made and no environment variable is read.
 //!
-//! As for `validate`, the gateway's production policy and tools validators
-//! are not part of `ggctl` and do not run, and the report says so.
+//! As for `validate`, the bundled policy and tools documents are held to the
+//! production validators, both before pinning and on the read back.
 
 use std::{
     fs,
@@ -22,7 +22,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use gateway_config::bundle::{self, pin::FilePin, PublishedSchemasOnly, ReadOptions};
+use gateway_config::bundle::{self, pin::FilePin, ProductionValidators, ReadOptions};
 use serde::Serialize;
 
 use crate::{
@@ -30,7 +30,7 @@ use crate::{
     diagnostic::{Code, Diagnostic, Exit},
     output::{self, Rename},
     report::{self, Format, Io, ReportDiagnostic},
-    validate::{self, BundleRecord},
+    validate::BundleRecord,
 };
 
 /// The `pin` result.
@@ -126,13 +126,10 @@ fn pin(root: &Path, options: ReadOptions, rename: Rename) -> (PinResult, Vec<Rep
         return (result, diagnostics);
     }
 
-    let planned = bundle::pin::pin_bundle(root, options, &PublishedSchemasOnly);
+    let planned = bundle::pin::pin_bundle(root, options, &ProductionValidators);
     diagnostics.extend(planned.diagnostics.into_iter().map(ReportDiagnostic::from));
     if let Some(manifest) = &planned.manifest {
         result.bundle = Some(BundleRecord::declared(manifest));
-        if validate::declares_a_bundled_resource(manifest) {
-            diagnostics.push(Diagnostic::new(Code::ProductionValidatorsNotRun).into());
-        }
     }
     let Some(plan) = planned.plan else {
         return (result, diagnostics);
@@ -153,7 +150,7 @@ fn pin(root: &Path, options: ReadOptions, rename: Rename) -> (PinResult, Vec<Rep
 
     // Read back with every check, the pins included, as the gateway would
     // read it: it must be exactly the bundle that was pinned.
-    let read = bundle::read_bundle(root, options, &PublishedSchemasOnly);
+    let read = bundle::read_bundle(root, options, &ProductionValidators);
     match &read.bundle {
         Some(read_back) if plan.is_read_back_by(read_back) => {
             result.pinned = BundleRecord::of(&read);

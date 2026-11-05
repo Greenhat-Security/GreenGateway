@@ -7,7 +7,7 @@ import {
 } from '@testing-library/react';
 import { Buffer } from 'node:buffer';
 import { MemoryRouter } from 'react-router-dom';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 
 import { clearMemoryToken, setMemoryToken } from '../lib/auth';
 import type { PolicyDocument } from '../lib/policy';
@@ -156,6 +156,44 @@ describe('TokensView', () => {
       </MemoryRouter>,
     );
     expect(screen.queryByDisplayValue('ggw_plaintext_created')).toBeNull();
+  });
+
+  it('selects the one-time token for a manual copy and never touches the clipboard', async () => {
+    const writeText = vi.fn(() => Promise.resolve());
+    const readText = vi.fn(() => Promise.resolve(''));
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText, readText },
+    });
+    onTestFinished(() => {
+      Reflect.deleteProperty(navigator, 'clipboard');
+    });
+    const fetcher = tokensFetchMock({
+      page: tokenPage({ tokens: [] }),
+      createResponse: createdToken({ plaintext_token: 'ggw_plaintext_selected' }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+    renderTokensView();
+
+    fireEvent.change(await screen.findByLabelText('Scopes'), {
+      target: { value: 'admin:tokens:read' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Create token' }));
+    const input = (await screen.findByDisplayValue(
+      'ggw_plaintext_selected',
+    )) as HTMLInputElement;
+    expect(screen.queryByRole('button', { name: /copy/i })).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Select token' }));
+
+    expect(document.activeElement).toBe(input);
+    expect(input.selectionStart).toBe(0);
+    expect(input.selectionEnd).toBe('ggw_plaintext_selected'.length);
+    expect(
+      screen.getByText('Token selected. Press Ctrl+C (or Cmd+C) to copy it.'),
+    ).toBeTruthy();
+    expect(writeText).not.toHaveBeenCalled();
+    expect(readText).not.toHaveBeenCalled();
   });
 
   it('requires confirming before revoking a token and supports canceling confirmation', async () => {

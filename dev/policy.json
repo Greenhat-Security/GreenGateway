@@ -38,6 +38,11 @@
     },
     {
       "methods": ["GET"],
+      "path_prefix": "/v1/admin/mcp",
+      "permission": "admin:mcp:clients:read"
+    },
+    {
+      "methods": ["GET"],
       "path_prefix": "/v1/admin/connections",
       "permission": "admin:connections:read"
     },
@@ -80,6 +85,11 @@
       "methods": ["POST"],
       "path_prefix": "/v1/admin/policy/evidence",
       "permission": "admin:policy:evidence:read"
+    },
+    {
+      "methods": ["POST", "DELETE"],
+      "path_prefix": "/v1/admin/policy/analyses/suppressions",
+      "permission": "admin:policy:write"
     },
     {
       "methods": ["POST"],

@@ -18,6 +18,8 @@ pub(super) const ADMIN_AUTH_CALLBACK_ROUTE: &str = "/v1/admin/auth/callback";
 pub(super) const ADMIN_CAPABILITIES_ROUTE: &str = "/v1/admin/capabilities";
 pub(super) const STATUS_ADMIN_ROUTE: &str = "/v1/admin/status";
 pub(super) const CONFIG_CAPABILITIES_ADMIN_ROUTE: &str = "/v1/admin/config/capabilities";
+/// Credential-free MCP client configuration templates (issue #242).
+pub(super) const MCP_CLIENT_CONFIGS_ADMIN_ROUTE: &str = "/v1/admin/mcp/client-configs";
 pub(super) const CLUSTER_ADMIN_ROUTE: &str = "/v1/admin/cluster";
 pub(super) const CLUSTER_REPLICAS_ADMIN_ROUTE: &str = "/v1/admin/cluster/replicas";
 pub(super) const POLICY_ADMIN_ROUTE: &str = "/v1/admin/policy";
@@ -50,6 +52,13 @@ pub(super) const POLICY_EVIDENCE_ADMIN_ROUTE: &str = "/v1/admin/policy/evidence"
 /// Analyze the structure of the active policy or a candidate (issue #243,
 /// slice 15).
 pub(super) const POLICY_ANALYSES_ADMIN_ROUTE: &str = "/v1/admin/policy/analyses";
+/// List and create suppressions of analyzer findings (issue #243, slice
+/// 15).
+pub(super) const POLICY_ANALYSIS_SUPPRESSIONS_ADMIN_ROUTE: &str =
+    "/v1/admin/policy/analyses/suppressions";
+/// End one suppression before its expiry.
+pub(super) const POLICY_ANALYSIS_SUPPRESSION_ADMIN_ROUTE: &str =
+    "/v1/admin/policy/analyses/suppressions/{id}";
 pub(super) const POLICY_RULES_ADMIN_ROUTE: &str = "/v1/admin/policy/rules";
 pub(super) const POLICY_RULE_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/{id}";
 pub(super) const POLICY_RULES_ORDER_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/order";
@@ -124,6 +133,10 @@ pub(super) const ADMIN_STATUS_READ_PERMISSION: &str = "admin:status:read";
 /// (issue #242, ADR-0008). Later slices extend what it grants; it never grants
 /// a write.
 pub(super) const ADMIN_CONFIG_READ_PERMISSION: &str = "admin:config:read";
+/// Reads the MCP client configuration templates (issue #242, ADR-0008). It
+/// is not `admin:config:read` and implies nothing else: the templates name
+/// only the gateway's public MCP endpoint and hold no credential.
+pub(super) const ADMIN_MCP_CLIENTS_READ_PERMISSION: &str = "admin:mcp:clients:read";
 pub(super) const ADMIN_CLUSTER_READ_PERMISSION: &str = connections::permissions::ADMIN_CLUSTER_READ;
 pub(super) const ADMIN_POLICY_READ_PERMISSION: &str = "admin:policy:read";
 pub(super) const ADMIN_POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
@@ -258,6 +271,7 @@ pub(super) struct AdminRoutes {
     pub(super) auth_callback_route: String,
     pub(super) status_route: String,
     pub(super) config_capabilities_route: String,
+    pub(super) mcp_client_configs_route: String,
     pub(super) cluster_route: String,
     pub(super) cluster_replicas_route: String,
     pub(super) policy_route: String,
@@ -273,6 +287,8 @@ pub(super) struct AdminRoutes {
     pub(super) policy_simulations_route: String,
     pub(super) policy_replays_route: String,
     pub(super) policy_analyses_route: String,
+    pub(super) policy_analysis_suppressions_route: String,
+    pub(super) policy_analysis_suppression_route: String,
     pub(super) policy_replay_route: String,
     pub(super) policy_evidence_route: String,
     pub(super) policy_rules_route: String,
@@ -374,6 +390,7 @@ impl AdminRoutes {
             auth_callback_route: format!("{api_prefix}/auth/callback"),
             status_route: format!("{api_prefix}/status"),
             config_capabilities_route: format!("{api_prefix}/config/capabilities"),
+            mcp_client_configs_route: format!("{api_prefix}/mcp/client-configs"),
             cluster_route: format!("{api_prefix}/cluster"),
             cluster_replicas_route: format!("{api_prefix}/cluster/replicas"),
             policy_route: format!("{api_prefix}/policy"),
@@ -389,6 +406,12 @@ impl AdminRoutes {
             policy_simulations_route: format!("{api_prefix}/policy/simulations"),
             policy_replays_route: format!("{api_prefix}/policy/replays"),
             policy_analyses_route: format!("{api_prefix}/policy/analyses"),
+            policy_analysis_suppressions_route: format!(
+                "{api_prefix}/policy/analyses/suppressions"
+            ),
+            policy_analysis_suppression_route: format!(
+                "{api_prefix}/policy/analyses/suppressions/{{id}}"
+            ),
             policy_replay_route: format!("{api_prefix}/policy/replays/{{id}}"),
             policy_evidence_route: format!("{api_prefix}/policy/evidence"),
             policy_rules_route: format!("{api_prefix}/policy/rules"),
@@ -515,6 +538,15 @@ pub(super) struct PolicyAdminState {
     /// `None` leaves the suite routes, and every run or evidence package
     /// that names the stored suite, answering `503`.
     pub(super) test_suite_store: Option<Arc<dyn storage::PolicyTestSuiteStore>>,
+    /// Analyzer finding suppressions (issue #243, slice 15): a table in the
+    /// policy history database standalone, migration 31's table in cluster
+    /// mode. `None` leaves the suppression routes answering `503` and every
+    /// analysis reporting its suppressions unavailable.
+    pub(super) analysis_suppression_store: Option<Arc<dyn storage::AnalysisSuppressionStore>>,
+    /// `POLICY_TESTS_REQUIRED`: every policy publication must first pass
+    /// the stored suite (`admin_policy_test_gate`). With no `test_suite_store`
+    /// it is refused instead.
+    pub(super) policy_tests_required: bool,
     /// Cluster mode's authoritative control plane. Present exactly when
     /// `policy_file` is absent-but-cluster: mutations commit through its
     /// CAS transaction instead of the file, and history is its documents.
@@ -526,6 +558,11 @@ pub(super) struct PolicyAdminState {
     /// refuses every gated write.
     #[cfg(feature = "postgres")]
     pub(super) membership: Option<Arc<cluster_membership::ClusterMembership>>,
+    /// Cluster mode's durable replay jobs (issue #243): migration 30's job
+    /// table and the audit stream they read. Present in cluster mode; a
+    /// cluster without it answers every replay route `503`.
+    #[cfg(feature = "postgres")]
+    pub(super) replay_cluster: Option<Arc<ClusterPolicyReplays>>,
     pub(super) event_store: Option<Arc<dyn storage::AuditEventStore>>,
     pub(super) query_store: Option<Arc<storage::SqliteAuditEventStore>>,
     /// Asked before every policy mutation (issue #425, PR 4): standalone
@@ -554,9 +591,6 @@ pub(super) struct ConnectionAdminState {
     pub(super) openapi_catalogs: connections::openapi::OpenApiConnectionCatalogService,
     pub(super) tests: connections::test::ConnectionTestService,
     pub(super) rbac_state: Option<middleware::rbac::RbacState>,
-    /// Asked before every Connection, catalog and local-secret change
-    /// (issue #425, PR 4).
-    pub(super) authority_evidence: authority_events::required::AuthorityEvidenceGate,
     pub(super) audit: audit::AuditLog,
     pub(super) client_ip_policy: client_ip::ClientIpPolicy,
     pub(super) max_body_size: usize,

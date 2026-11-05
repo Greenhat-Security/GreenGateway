@@ -23,6 +23,18 @@ test("inventory covers each required operation in both modes with live source an
   assert.equal(validateInventory(inventory()).operationModePairs, OPERATIONS.length * 2);
 });
 
+test("evidence anchors only in the gateway or the compiler it links", () => {
+  const anchored = (path) => {
+    const value = inventory();
+    value.groups[0].sources[0] = { path, anchor: "fn reject_local_authority_in_postgres_mode(" };
+    return value;
+  };
+  assert.doesNotThrow(() => validateInventory(anchored("gateway-config/src/compiler/storage.rs")));
+  for (const path of ["docs/configuration.md", "gateway-config/tests/storage.rs", "ggctl/src/main.rs"]) {
+    assert.throws(() => validateInventory(anchored(path), () => "fn reject_local_authority_in_postgres_mode("), /runtime or regression source/, path);
+  }
+});
+
 test("deleting a mode or duplicating its coverage cannot silently pass", () => {
   const missing = inventory();
   missing.groups[0].modes = ["standalone"];
@@ -160,7 +172,7 @@ test("required mode never admits an unsupported row or waves through a reachable
   assert.equal(byId.connection_standalone, "admitted");
   assert.equal(byId.connection_delete_standalone, "admitted");
   assert.equal(byId.local_secrets, "admitted");
-  assert.equal(byId.catalog_standalone, "refused");
+  assert.equal(byId.catalog_standalone, "admitted");
   assert.equal(byId.configuration_activation, "not_refused");
 
   const unknown = inventory();

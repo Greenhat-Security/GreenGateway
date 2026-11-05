@@ -1,11 +1,14 @@
 # Configuration compiler contract
 
-Issue #433 split the gateway's environment configuration into a compiler
-(`gateway/src/config/`) and the startup stages that act on what it compiles
-(`gateway/src/bootstrap/stages.rs`). This page is the compiler's contract: what it
-reads, what it returns, how secret material travels through it, what it never
-does, and what the configuration bundles, `ggctl` and doctor work of #242 can
-build on today. It describes the code as it is. Where
+Issue #433 split the gateway's environment configuration into a compiler and
+the startup stages that act on what it compiles
+(`gateway/src/bootstrap/stages.rs`). Issue #242 then moved the compiler into the
+shared `gateway-config` library (`gateway-config/src/compiler.rs` and
+`gateway-config/src/compiler/`), which the gateway and `ggctl` both link. This
+page is the compiler's contract: what it reads, what it returns, how secret
+material travels through it, what it never does, and what the configuration
+bundles, `ggctl` and doctor work of #242 can build on today. It describes the
+code as it is. Where
 [ADR-0008](../adr/0008-setup-cli-and-configuration-bundles.md#configuration-compiler-and-field-catalog)
 describes the compiler #242 needs, the sections on [extension
 points](#extension-points-for-242) say how far today's compiler goes and what
@@ -13,8 +16,8 @@ is still missing.
 
 The per-variable reference stays in [configuration.md](../configuration.md).
 Nothing here changes a variable, a default, or a message: the compiler was
-extracted under golden parity with the parser it replaced
-(`gateway/src/config/parity_tests.rs`).
+extracted under golden parity with the parser it replaced, and moved under the
+same goldens (`gateway-config/src/compiler/parity_tests.rs`).
 
 ## Scope
 
@@ -22,28 +25,35 @@ extracted under golden parity with the parser it replaced
   from a reader and nothing else. No bundle, file, store, or command-line
   argument is a configuration source, and no released gateway can start from
   a bundle (see [configuration-bundles.md](../configuration-bundles.md)).
-- **One semantic validator.** `config::compile` is the only code that parses
-  and validates these settings. `Config::from_env_vars` is `compile` followed
-  by a conversion; it adds no rule of its own.
-- **Gateway crate only.** The compiler is `pub(crate)` in the `gateway` crate.
-  `ggctl` and the `gateway-config` library cannot call it (see [Moving the
-  compiler](#moving-the-compiler-into-gateway-config)).
+- **One semantic validator.** `gateway_config::compiler::compile` is the only
+  code that parses and validates these settings. The gateway re-exports the
+  compiler from its `config` module, at the paths it has always named the
+  settings by, and `Config::from_env_vars` is `compile` followed by the
+  gateway's conversion (`config::into_config`); it adds no rule of its own.
+- **Shared with `ggctl`.** The compiler is a public module of the library both
+  binaries link, so `ggctl` runs the gateway's own compiler rather than an
+  approximation of it (see [The compiler in
+  `gateway-config`](#the-compiler-in-gateway-config)). The gateway keeps
+  `Config`, the process-environment reader, the conversion and every startup
+  stage.
 
 ## Callers
 
 | Caller | Reader | What it does with the result |
 | --- | --- | --- |
-| `gateway` with no arguments: `bootstrap::start_serving` | `config::process_environment`, the process environment | Runs the startup stages on the plan (see [Startup](#startup)). A refused configuration is printed and the process exits with status 1 before any stage runs. |
+| `gateway` with no arguments: `bootstrap::start_serving` | `config::process_environment`, the process environment | Converts the plan with `config::into_config` and runs the startup stages on it (see [Startup](#startup)). A refused configuration is printed and the process exits with status 1 before any stage runs. |
 | The one-shot commands: `migrate`, `connection-secret`, `revoke-jwt`, `jwt-revocations-cleanup`, `rate-limit-buckets-cleanup`, `cluster-members`, `maintenance-run`, and `import-standalone`'s own configuration | `Config::from_env`, the same reader | Uses the converted `Config`. A refusal is returned as the command's error, in the same operator-facing form. |
-| `gateway import-standalone --from FILE`, for the source deployment | The variables parsed from `FILE`, as a map | Refuses the import with `ImportError::StandaloneConfigInvalid`, naming only the settings that failed, never their values. |
-| Tests | Fixture maps and recording doubles | Parity goldens, stage tests, and the startup-stage tests. |
+| `gateway import-standalone --from FILE`, for the source deployment | The variables `gateway_config::env_file` parses from `FILE`, as a map | Refuses the import with `ImportError::StandaloneConfigInvalid`, naming only the settings that failed, never their values. |
+| `ggctl validate`, `ggctl doctor` and `ggctl diff` with `--env FILE` (and `--against-env FILE`) | `gateway_config::env_file::EnvFile::var`: the variables the file sets, parsed with the same grammar as the import's, every other input unset | Reports each diagnostic as a `config` code with the rule's stable name, located by the line of its setting ([docs/ggctl.md](../ggctl.md#environment-files)); the doctor evaluates an accepted plan against the production profile as advice, and the diff compares two plans with `semantic_diff::plans`. |
+| Tests | Fixture maps and recording doubles | Parity goldens, stage and catalog tests in `gateway-config`; the gateway's `config_tests`, startup-stage tests and `config/env_file_tests.rs`, which holds what the environment file path decides to `Config::from_env_vars`. |
 
 ## Inputs
 
 ### The reader
 
 ```rust
-pub(crate) fn compile(
+// gateway_config::compiler
+pub fn compile(
     get_var: impl FnMut(&str) -> Result<String, VarError>,
 ) -> Result<ConfigPlan, ConfigError>
 ```
@@ -53,12 +63,15 @@ The reader answers one variable name at a time, as `std::env::var` does:
 `Err(VarError::NotUnicode(_))` for a value that is not valid Unicode. A value
 that is not Unicode counts as set, never as the default, and a problem about
 it gets the diagnostic code `NotUnicode`. The compiler never reads the process
-environment itself; whatever the reader returns is the configuration.
+environment itself (the [zero-I/O scan](#the-zero-io-guarantee) refuses an
+environment read anywhere in it); whatever the reader returns is the
+configuration.
 
 ### The inventory
 
-`inventory::CONFIG_INPUTS` (`gateway/src/config/inventory.rs`) lists every
-variable the compiler asks for, in the order it asks. The contract on reads:
+`inventory::CONFIG_INPUTS` (`gateway-config/src/compiler/inventory.rs`) lists
+every variable the compiler asks for, in the order it asks. The contract on
+reads:
 
 - Every inventoried variable is requested exactly once, and no other name is
   requested.
@@ -67,7 +80,7 @@ variable the compiler asks for, in the order it asks. The contract on reads:
   refused, unset, or unusual value never skips or adds a read.
 - Requests follow inventory order.
 
-`inventory::tests::the_inventory_is_exactly_what_from_env_vars_requests` and
+`inventory::tests::the_inventory_is_exactly_what_the_compiler_requests` and
 `stage_tests::each_block_requests_its_inputs_once_and_the_blocks_read_the_inventory_in_order`
 hold the compiler to this. A variable added to a stage and not to the
 inventory, or left in the inventory after its stage stops reading it, fails
@@ -117,12 +130,12 @@ The compiler sees only what its reader returns. These are read elsewhere and
 are not configuration inputs:
 
 - **Other reads in the gateway's own source**, listed and source-scanned in
-  `inventory.rs` (`ENVIRONMENT_READS`): `HOSTNAME` or `COMPUTERNAME`, read
-  once at startup and only when `CLUSTER_STATUS_EXPOSE_HOSTNAMES=true`; the
-  variable an environment-kind operator secret alias names, read when a
-  Connection credential is resolved (the compiler checks only the alias's
-  shape); and the test harness's `GATEWAY_TEST_POSTGRES_*` locators, which a
-  deployment never sets.
+  `gateway/src/config/environment_reads.rs` (`ENVIRONMENT_READS`): `HOSTNAME`
+  or `COMPUTERNAME`, read once at startup and only when
+  `CLUSTER_STATUS_EXPOSE_HOSTNAMES=true`; the variable an environment-kind
+  operator secret alias names, read when a Connection credential is resolved
+  (the compiler checks only the alias's shape); and the test harness's
+  `GATEWAY_TEST_POSTGRES_*` locators, which a deployment never sets.
 - **Dependency reads**, recorded from the dependencies' sources but not
   scanned (`DEPENDENCY_READS`): `SSL_CERT_FILE` and `SSL_CERT_DIR` choose the
   platform trust anchors of the egress and PostgreSQL TLS verifiers on Linux;
@@ -180,14 +193,14 @@ Three properties follow:
 
 ### The plan
 
-`ConfigPlan` (`gateway/src/config/plan.rs`) holds one validated plan per
-domain: `listeners`, `identity`, `proxy`, `storage`, `connections`, `egress`,
-and `runtime`. Each records the provenance of its inputs:
+`ConfigPlan` (`gateway-config/src/compiler/plan.rs`) holds one validated plan
+per domain: `listeners`, `identity`, `proxy`, `storage`, `connections`,
+`egress`, and `runtime`. Each records the provenance of its inputs:
 
 ```rust
-pub(crate) struct Provenance {
-    pub(crate) setting: &'static str,
-    pub(crate) source: Source, // Default | Environment
+pub struct Provenance {
+    pub setting: &'static str,
+    pub source: Source, // Default | Environment
 }
 ```
 
@@ -195,13 +208,17 @@ pub(crate) struct Provenance {
 or the environment set the value. A blank value that means unset is
 `Default`; a blank value that clears a list is `Environment`. Both fields are
 fixed text chosen by the gateway, so provenance cannot carry a value or a
-locator however it is printed. Provenance is recorded today but no production
-path reports it; the stage tests read it.
+locator however it is printed. `ConfigPlan::provenance` returns every input's
+record in inventory order, but no production path reports it yet; the stage
+tests read it.
 
-`ConfigPlan::into_config` consumes the plan and returns the legacy `Config`
-that startup and the one-shot commands build from. It moves every value
-across unchanged and hands the locators over as the plain paths activation
-opens. There is no conversion back.
+The gateway's `config::into_config` consumes the plan and returns the legacy
+`Config` that startup and the one-shot commands build from. It moves every
+value across unchanged and hands the locators over as the plain paths
+activation opens (`TlsMaterial::into_files`, `DatabasePlan::into_settings`).
+It destructures every domain plan field by field, so a setting the compiler
+adds does not build until the gateway carries it. There is no conversion
+back.
 
 ### Refusals
 
@@ -218,9 +235,12 @@ in the legacy order:
   begins with, a code describing how that variable was set, the rule that
   refused it, and a message built from those and fixed text alone. Nothing in
   a diagnostic is copied from a value or from a problem's wording, so it is
-  value-free by construction rather than by redaction. No production path
-  reports diagnostics yet; `import-standalone` keeps only the leading setting
-  names of the problems instead.
+  value-free by construction rather than by redaction. `ggctl --env` reports
+  them; `import-standalone` keeps only the leading setting names of the
+  problems instead.
+
+Both are public on `gateway_config::compiler::ConfigError`, as `problems()`
+and `diagnostics()`.
 
 #### Codes
 
@@ -272,9 +292,13 @@ holds this table to `diagnostic::ConfigRule`.
 | `AuthorityEvidenceDeliveryRequired` | `AUTHORITY_EVIDENCE_DURABILITY=required` in cluster mode with `AUTHORITY_EVENT_SINK=none`, which would journal evidence that is never delivered. |
 | `AuthorityEvidenceUnsupportedConfiguration` | `AUTHORITY_EVIDENCE_DURABILITY=required` with a setting that enables an authority change the evidence inventory marks unsupported in this mode: `ADMIN_SESSION_MODE=standalone_memory`. |
 
-Codes and rules are Rust enums. They have no serialized names yet: the first
-report format that carries them must assign stable codes, and from then on a
-rule's meaning is part of that format's contract.
+Codes and rules are Rust enums. `ConfigRule::as_str` gives every rule
+(`ConfigRule::ALL`) a stable name, its variant name in snake case
+(`admin_listener_collision`), and `ggctl`'s report format (`GgctlReport`)
+publishes those names and one `config` code per code (`config.refused`,
+`config.unset`, ...; see [docs/ggctl.md](../ggctl.md#config-diagnostics)).
+From now on a rule's meaning is part of that format's contract: renaming or
+removing one needs a new report version.
 
 ## Sensitivity wrappers
 
@@ -295,7 +319,11 @@ type whose `Debug` output does not show it:
 
 The client secret is the one secret value in the plan. The legacy document
 holds it inline; making it a reference is an input-format change for #242's
-bundle format, not a change to this stage.
+bundle format, not a change to this stage. The deployment document already
+takes it only as a secret reference (`admin_login.client_secret`), and the
+URLs and static headers above only as references or not at all
+([structured settings](../configuration-bundles.md#structured-settings)); the
+compiler does not read a deployment document yet.
 
 What the contract covers, and what holds it:
 
@@ -312,7 +340,9 @@ What the contract covers, and what holds it:
 - **The static-configuration fingerprint does not depend on secrets or their
   locators.** Two configurations that differ only in them get the same
   fingerprint
-  (`stage_tests::the_fingerprint_is_the_same_whatever_the_secrets_and_their_locators_are`).
+  (`gateway/src/config/fingerprint_tests.rs`,
+  `the_fingerprint_is_the_same_whatever_the_secrets_and_their_locators_are`;
+  the fingerprint is computed from the gateway's `Config`).
   A route's upstream TLS material locators are deliberately part of it, because
   they decide which trust the route carries.
 - **The compiler logs one thing**: a warning naming the setting when an audit
@@ -352,17 +382,20 @@ What holds it:
    domains' plans. `compile` takes nothing but the reader, and no stage is
    given one.
 2. **A source scan.**
-   `stage_tests::the_configuration_modules_name_no_input_or_output_api` reads
-   `config.rs`, the compiler's modules, and the `gateway-config` modules they
-   call into (path matching, issuer and cookie-name canonicalization, the route
-   and Connection ID shapes, the request bounds, the TLS, admin session and
-   discovery settings, and the Connections document validators), and refuses
-   any line of code (outside comments and string literals) naming a file,
-   socket, resolver, process, Tokio, Hyper, SQLite, or PostgreSQL API, and
-   counts their logging. It sees only those files; header parsing, the one
-   other call, is the `http` crate's. `scripts/check-egress-only.sh`
-   separately refuses the outbound HTTP client anywhere outside
-   `gateway/src/egress.rs`.
+   `stage_tests::the_compiler_modules_name_no_input_or_output_api` reads the
+   whole compiler module, every file of `gateway-config/src/compiler.rs` and
+   `gateway-config/src/compiler/` but its tests, found by walking the
+   directory so a stage added later is covered without being listed, and the
+   other `gateway-config` modules the stages call into (path matching, issuer
+   and cookie-name canonicalization, the route and Connection ID shapes, the
+   request bounds, the TLS, admin session and discovery settings, the
+   Connections document validators, and the semantic diff engine the plan
+   diff feeds). It refuses any line of code (outside comments and string
+   literals) naming a file, socket, resolver, process, Tokio, Hyper, SQLite,
+   or PostgreSQL API, or an environment variable read, and counts their
+   logging. It sees only those files; header parsing, the one other call, is
+   the `http` crate's. `scripts/check-egress-only.sh` separately refuses the
+   outbound HTTP client anywhere outside `gateway/src/egress.rs`.
 3. **Behavior.**
    `stage_tests::the_stages_carry_locators_and_destinations_without_touching_them`
    compiles a configuration of absent files and `.invalid` hosts and finds
@@ -373,17 +406,18 @@ What holds it:
    call after the compiler returns, finds the configured directory still
    absent.
 
-Two limits. The reader is the caller's: `process_environment` reads the
-process environment, and the import reader is a map the import parsed from
-its file before compiling. And `gateway/src/config/bundle.rs`, the gateway's
-half of the bundle reader, does read files. It is not part of the compiler,
-the scan does not cover it, and nothing at startup calls it.
+Two limits. The reader is the caller's: the gateway's `process_environment`
+reads the process environment, and the import reader is a map the import
+parsed from its file before compiling. And the bundle reader
+(`gateway_config::bundle`) does read files, beneath the bundle root it is
+given. It is not part of the compiler, the scan does not cover it, and
+nothing at startup calls it.
 
 ## Startup
 
 `bootstrap::start_serving` runs the compiler first and alone, converts the
-plan once, and then runs the stages of `StartupStages` in order, each given
-that one `Config`:
+plan once with `config::into_config`, and then runs the stages of
+`StartupStages` in order, each given that one `Config`:
 
 1. **Preflight** proves the configured authority can be served: the backend
    this build carries and, in cluster mode, the database foundation, the
@@ -432,8 +466,9 @@ Cloudflare](../deployment/cloudflare.md#blank-values).
 ADR-0008 places the compiler under bundle mode, `ggctl validate`, offline
 doctor, and the Setup Center. Today's compiler covers stages 2 to 5 of the
 ADR's pipeline (document validation, normalization, typing of secret
-locators, and cross-field validation) for the environment only. What a #242
-slice can build on, and what it must add:
+locators, and cross-field validation) for the environment only, and with the
+bundle reader beside it in `gateway-config`, `ggctl` can link stages 1 to 5.
+What a #242 slice can build on, and what it must add:
 
 ### A second source
 
@@ -454,19 +489,26 @@ holding the string a reader returned, and `Source` has two variants,
 
 The bundle reader in `gateway-config` (`bundle::read_bundle`) validates a
 bundle's files, digests, documents, and profile today. Its deployment document
-has one member, `spec.profile`, and nothing maps a bundle onto compiler
-inputs. Profile invariants on deployment settings (authentication required,
-private-address egress denied, and so on) are not enforced by the compiler
-yet.
+carries the profile and every catalog field with a document path, in the
+closed sections those paths imply (`bundle::settings`), each held to its
+catalog type and its own bounds; the parity tests below hold those bounds to
+this compiler. Nothing maps a bundle onto compiler inputs yet, so the
+cross-field rules and each value's own grammar are not applied to a document,
+and profile invariants on deployment settings (authentication required,
+private-address egress denied, and so on) are not enforced yet. A front end
+gives a decimal setting the `f64` its text parses to, which is the value the
+same text gives in the environment.
 
 ### Reports
 
-`ConfigDiagnostic` is the form a validate or doctor report should carry for
+`ConfigDiagnostic` is the form a validate or doctor report carries for
 environment configuration: it is value-free by construction and names the
-setting, how it was set, and the rule. The report format must give codes and
-rules stable string names (see [Rules](#rules)). Provenance is recorded per
+setting, how it was set, and the rule. `ggctl --env` reports it with stable
+codes and rule names (see [Rules](#rules)), located by the line of the
+setting's effective assignment. Provenance is recorded per
 input and is what a status or Setup Center view needs to explain where a
-field came from; no API exposes it yet.
+field came from; `ConfigPlan::provenance` returns it, and no report or admin
+API carries it yet.
 
 ### The field catalog
 
@@ -499,7 +541,9 @@ beside it:
 | `.env.example` | Every field assigned once, to its default or left blank where blank means unset, so copying the file configures exactly the defaults | `catalog_tests::the_env_example_assigns_every_field_its_default` |
 | Bootstrap inputs | ADR-0008's bootstrap table | `catalog_tests::the_bootstrap_fields_are_adr_0008s_bootstrap_inputs` |
 | Sensitivity | The [sensitivity wrappers](#sensitivity-wrappers) table | `catalog_tests::the_secret_fields_are_the_compiler_contracts_sensitive_inputs` |
-| Document paths | The deployment schema's settings | `catalog_tests::the_deployment_schema_defines_exactly_the_catalogs_document_paths` |
+| Document paths | The deployment schema's settings, and the schema rendered from the catalog | `catalog_tests::the_deployment_schema_defines_exactly_the_catalogs_document_paths`, `bundle::settings::tests::the_committed_schema_is_the_rendered_schema` |
+| Deployment-document bounds | The values the compiler accepts on their own, at every bound and for generated values | `catalog_tests::the_deployment_document_accepts_exactly_what_the_compiler_accepts`, `generated_integer_settings_agree_with_the_compiler`, `generated_decimal_settings_agree_with_the_compiler_and_canonicalize_exactly` |
+| Structured forms of the JSON documents | The compiler's own types (`RawAuthProviderConfig`, `UpstreamRouteConfig` and the route types, `McpUpstreamServerConfig`), and the environment form | `bundle::settings::structured_tests::every_form_lists_exactly_its_compiler_types_members`, `every_environment_fixture_converts_to_a_document_that_compiles_to_the_same_values` |
 | Cloudflare | `GREEN_GATEWAY_ENV_KEYS` and the Cloudflare guide | `env_example::cloudflare_forwarding_matches_supported_gateway_env_vars` |
 | The rendered catalog | `render_json` and its schema | `catalog::tests::the_committed_catalog_is_the_rendered_catalog`, `the_rendered_catalog_matches_its_published_schema` |
 
@@ -512,13 +556,11 @@ catalog's range is what a value is accepted or refused for on its own.
 What the catalog does not hold yet, because nothing decides or checks it
 today:
 
-- **Document paths.** The deployment schema defines no setting beside the
-  profile, so no deployment field has a path and a bundle cannot set any of
-  them.
-- **Two host paths ADR-0008 does not place.** `OPENAPI_SPEC_PATH` and
-  `AUTHORITY_EVENT_FILE` are neither bootstrap inputs nor bundle resources;
-  the catalog marks them `unplaced`, and the bundle front end must refuse
-  them until the ADR decides.
+- **A host path ADR-0008 does not place.** `AUTHORITY_EVENT_FILE` is
+  neither a bootstrap input nor a bundle resource; the catalog marks it
+  `unplaced`, and the bundle front end must refuse it until the ADR decides.
+  (`OPENAPI_SPEC_PATH`, which the ADR makes not representable in `v1alpha1`,
+  is catalogued `not_representable` with the legacy JWT provider.)
 - **Exportability and template placeholders, membership of the
   static-configuration fingerprint, and doctor checks.** `ha.rs` stays the
   authority on the fingerprint.
@@ -526,22 +568,39 @@ today:
   the environment directly, so every field is available there; no renderer
   exists to check yet.
 
-### Moving the compiler into `gateway-config`
+### The compiler in `gateway-config`
 
-`ggctl` cannot compile environment configuration, because the compiler lives
-in the gateway crate. ADR-0008 does not allow `ggctl` to approximate the
-gateway, so moving the compiler means moving the validators it calls with it.
-The first step has landed: those validators, all of them I/O-free, are now
-`gateway-config` modules that the gateway re-exports from their old paths
-([the module map](application-modules.md#shared-configuration-contracts)). They
-are the Connections secret provider, alias and keyring documents and the
-Connection ID grammar, the stable route ID grammar, issuer canonicalization,
-the cookie-name grammar, the JWKS key age bounds, the admin session settings,
-the inbound TLS and client-certificate modes, the request bounds, path
-matching, and the discovery signal and suggestion defaults. The compiler
-itself (`gateway/src/config` and `config.rs`) has not moved yet, so until it
-does, any `ggctl` report on environment configuration must say it did not run
-the gateway's compiler.
+ADR-0008 does not allow `ggctl` to approximate the gateway, so the compiler
+moved into `gateway-config` whole, with the validators it calls, in two
+steps. First the I/O-free leaves: the Connections secret provider, alias and
+keyring documents and the Connection ID grammar, the stable route ID grammar,
+issuer canonicalization, the cookie-name grammar, the JWKS key age bounds,
+the admin session settings, the inbound TLS and client-certificate modes, the
+request bounds, path matching, and the discovery signal and suggestion
+defaults. Then the compiler itself, as `gateway_config::compiler`: the
+inventory, the stages and the plan they build, the diagnostics and
+`ConfigError`, the settings with their defaults and bounds, the JSON setting
+types the inputs parse into (`AuthProviderConfig`, `UpstreamRouteConfig`,
+`McpUpstreamServerConfig`, `InboundClientAuthConfig` and the rest), and the
+semantic diff of two plans (`compiler::semantic_diff::plans`). The gateway
+re-exports all of it from the paths it moved out of
+([the module map](application-modules.md#shared-configuration-contracts)), so
+no call site changed.
+
+The parity goldens, stage tests and catalog tests moved with the code and
+hold the compiler's plans, rather than the gateway's `Config`, to the same
+expected values. What stays in the gateway is what needs the gateway:
+`Config` and its conversion from a plan, the process-environment reader and
+its table of the gateway's other environment reads, the fingerprint test,
+and the `config_tests` suite, which still holds `Config::from_env_vars` to
+every setting. The bundle diff with the production policy and tools
+validators followed them into `gateway-config` with those validators
+(`semantic_diff::compare_production_bundles`).
+
+`ggctl validate`, `ggctl doctor` and `ggctl diff` compile an environment file
+(`--env`) with the gateway's own compiler, through the `KEY=VALUE` grammar in
+`gateway_config::env_file` that `gateway import-standalone` reads too, and
+report diagnostics, never problems, because problems may quote values.
 
 ### Local filesystem checks and preflight
 
@@ -557,7 +616,8 @@ which the zero-I/O scan holds to no I/O.
 
 - **A new variable** gets a constant, an entry in `CONFIG_INPUTS` where its
   block reads it, a field in its block's inputs read in that block's `read`,
-  its parse in the stage, a plan field, the `into_config` mapping, an entry
+  its parse in the stage, a plan field, the gateway's `into_config` mapping,
+  its comparison in the plan diff, an entry
   in the field catalog at the same position (its blank-value rule included,
   and the reason if the Cloudflare wrapper does not forward it), the
   regenerated `docs/configuration-catalog.json`, a `### NAME` entry in
@@ -569,8 +629,9 @@ which the zero-I/O scan holds to no I/O.
   `stage_tests::rule_fixture`, and a row in [Rules](#rules).
 - **No I/O in the compiler modules**, or in the `gateway-config` modules
   they call. Work that needs a file, a store, a provider, or the network
-  belongs to a startup stage. A new `gateway-config` module the stages call
-  gets an entry in the zero-I/O scan.
+  belongs to a startup stage. A new file in the compiler module is scanned
+  without being listed; a new `gateway-config` module outside it that the
+  stages call gets an entry in the zero-I/O scan.
 - **A changed golden is a behavior change.** The parity fixtures pin legacy
   semantics on purpose; a pull request that changes one says so in the
   CHANGELOG.

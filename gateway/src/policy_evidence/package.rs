@@ -1,28 +1,40 @@
 //! Assemble a `policy-evidence.v1` package from what the admin endpoint
-//! established about one publication.
+//! established about one candidate: a publication or a draft.
 //!
-//! The package is an envelope around one report:
+//! The package is an envelope around the artifacts its manifest names:
 //!
 //! ```json
 //! {
 //!   "schema_version": "policy-evidence.v1",
 //!   "generated_at": "2026-10-28T12:00:00Z",
-//!   "manifest": [{
-//!     "name": "report",
-//!     "media_type": "application/vnd.greengateway.policy-evidence-report+json",
-//!     "schema_version": "policy-evidence-report.v1",
-//!     "digest": "sha256:...",
-//!     "size": 1234
-//!   }],
-//!   "report": { ... }
+//!   "manifest": [
+//!     {
+//!       "name": "report",
+//!       "media_type": "application/vnd.greengateway.policy-evidence-report+json",
+//!       "schema_version": "policy-evidence-report.v1",
+//!       "digest": "sha256:...",
+//!       "size": 1234
+//!     },
+//!     { "name": "analysis", ... },
+//!     { "name": "report_markdown", ... }
+//!   ],
+//!   "report": { ... },
+//!   "analysis": { ... },
+//!   "report_markdown": "# Policy evidence report\n..."
 //! }
 //! ```
 //!
-//! The manifest's `digest` is the ADR-0004 semantic digest of `report` and
-//! its `size` the length of the report's RFC 8785 bytes, so a reader who
-//! canonicalizes the report it received can check both. The package itself
-//! is served as its RFC 8785 bytes. Everything a reader could rely on is in
-//! the report; the envelope adds only when it was generated.
+//! Each manifest entry names the envelope member of the same name. For a
+//! JSON artifact (`report`, and `analysis` when the request asked for it) the
+//! `digest` is the ADR-0004 semantic digest of that member and `size` the
+//! length of its RFC 8785 bytes, so a reader who canonicalizes the member it
+//! received can check both. `report_markdown` is a string; its `digest` is
+//! the ADR-0004 source digest of its UTF-8 bytes and `size` their length. The
+//! report also names the analysis artifact by the same entry, so the report
+//! digest binds it; the Markdown is derived from the report and carries
+//! nothing it lacks. The package itself is served as its RFC 8785 bytes.
+//! Everything a reader could rely on is in the report; the envelope adds only
+//! when it was generated.
 //!
 //! Assembly is pure: it formats values and computes digests, and reads,
 //! writes and logs nothing.
@@ -30,11 +42,12 @@
 use serde_json::{json, Map, Value};
 
 use super::{
-    MAX_EVIDENCE_DIAGNOSTICS, MAX_PACKAGE_BYTES, PACKAGE_SCHEMA_VERSION, REDACTION_PROFILE,
-    REPORT_MEDIA_TYPE, REPORT_SCHEMA_VERSION, TRUST_STATEMENT,
+    markdown, ANALYSIS_MEDIA_TYPE, DRAFT_TRUST_STATEMENT, MARKDOWN_MEDIA_TYPE,
+    MARKDOWN_SCHEMA_VERSION, MAX_EVIDENCE_DIAGNOSTICS, MAX_PACKAGE_BYTES, PACKAGE_SCHEMA_VERSION,
+    REDACTION_PROFILE, REPORT_MEDIA_TYPE, REPORT_SCHEMA_VERSION, TRUST_STATEMENT,
 };
 use crate::{
-    canonical_json,
+    canonical_json, policy_analysis,
     policy_eval::{
         tools::{TOOL_CONTEXT_VERSION, TOOL_SEMANTICS_VERSION},
         CONTEXT_VERSION, HTTP_SEMANTICS_VERSION,
@@ -47,6 +60,11 @@ use crate::{
     policy_testing::{self, report::RunReport, runner::RunStatus},
     rbac::policy_document::PolicyDiagnostic,
 };
+
+/// The manifest names of the artifacts a package carries, in manifest order.
+pub(crate) const REPORT_ARTIFACT: &str = "report";
+pub(crate) const ANALYSIS_ARTIFACT: &str = "analysis";
+pub(crate) const MARKDOWN_ARTIFACT: &str = "report_markdown";
 
 /// The largest integer a report repeats from a history row: the I-JSON safe
 /// range. A larger one is not a value the gateway recorded.
@@ -68,7 +86,7 @@ const RECORDED_OPERATIONS: &[&str] = &[
 /// The shadow-review transitions a bound rule change records.
 const SHADOW_REVIEW_TRANSITIONS: &[&str] = &["disable", "promote"];
 
-/// The identity of one policy document as the history holds it.
+/// The identity of one policy document as its authority holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PolicyIdentity {
     pub(crate) schema_version: String,
@@ -97,7 +115,57 @@ pub(crate) struct PredecessorRecord {
     pub(crate) policy: PolicyIdentity,
 }
 
-/// The publication revalidated by this build, as `POST .../policy/validate`
+/// A server-side draft of the caller's, as the drafts store held it at the
+/// draft ETag the request named.
+pub(crate) struct DraftRecord {
+    pub(crate) draft_id: String,
+    pub(crate) revision: i64,
+    /// The strong draft ETag the request pinned, which the draft still had.
+    pub(crate) draft_etag: String,
+    pub(crate) policy: PolicyIdentity,
+    /// The live policy the draft is pinned to: what publishing it would
+    /// replace, and so its predecessor wherever a report compares.
+    pub(crate) base: PolicyIdentity,
+}
+
+/// What a package is about.
+pub(crate) enum CandidateRecord {
+    /// A version of the policy history and the version before it.
+    Publication {
+        record: PublicationRecord,
+        predecessor: Option<PredecessorRecord>,
+    },
+    /// A draft, never presented as a publication.
+    Draft(DraftRecord),
+}
+
+impl CandidateRecord {
+    /// The report's `candidate_kind`.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Publication { .. } => "publication",
+            Self::Draft(_) => "draft",
+        }
+    }
+
+    /// The candidate's own document.
+    pub(crate) fn policy(&self) -> &PolicyIdentity {
+        match self {
+            Self::Publication { record, .. } => &record.policy,
+            Self::Draft(draft) => &draft.policy,
+        }
+    }
+
+    /// Whether the report knows what the candidate replaces.
+    fn has_predecessor(&self) -> bool {
+        match self {
+            Self::Publication { predecessor, .. } => predecessor.is_some(),
+            Self::Draft(_) => true,
+        }
+    }
+}
+
+/// The candidate revalidated by this build, as `POST .../policy/validate`
 /// would judge it now.
 pub(crate) struct ValidationOutcome {
     pub(crate) valid: bool,
@@ -114,33 +182,42 @@ pub(crate) struct ValidationOutcome {
 pub(crate) struct SimulationEvidence {
     pub(crate) trace: TraceLevel,
     pub(crate) projections: Vec<Projection>,
-    /// Whether every case was also decided under the predecessor, so results
-    /// compare the publication with what it replaced.
+    /// Whether every case was also decided under what the candidate replaces
+    /// (a publication's predecessor, a draft's base), so results compare the
+    /// candidate with it.
     pub(crate) compared_with_predecessor: bool,
     pub(crate) outcome: SimulationOutcome,
 }
 
-/// A finished replay job of the caller's, bound to the publication.
+/// A finished replay job of the caller's, bound to the candidate.
 pub(crate) struct ReplayEvidence {
     /// Whether the job's result is complete.
     pub(crate) complete: bool,
-    /// Whether the active policy the job compared its candidate with is the
-    /// publication's predecessor, so its impact comparison is the
-    /// publication against what it replaced.
+    /// Whether the active policy the job compared its candidate with is what
+    /// the candidate replaces, so its impact comparison is the candidate's
+    /// own.
     pub(crate) compared_with_predecessor: bool,
     /// The job's section of the report, as the replay registry renders it.
     pub(crate) view: Value,
 }
 
-/// Everything a report is assembled from.
+/// The structural analyzer's results over the candidate.
+pub(crate) struct AnalysisEvidence {
+    /// The `policy-analysis-results.v1` document, as
+    /// `policy_analysis::report::to_json` rendered it: findings, proof
+    /// bases, suppression states, completeness and the bindings.
+    pub(crate) results: Value,
+}
+
+/// Everything a package is assembled from.
 pub(crate) struct EvidenceInputs {
     pub(crate) request_digest: String,
-    pub(crate) publication: PublicationRecord,
-    pub(crate) predecessor: Option<PredecessorRecord>,
+    pub(crate) candidate: CandidateRecord,
     pub(crate) validation: ValidationOutcome,
     pub(crate) tests: Option<RunReport>,
     pub(crate) simulation: Option<SimulationEvidence>,
     pub(crate) replay: Option<ReplayEvidence>,
+    pub(crate) analysis: Option<AnalysisEvidence>,
 }
 
 /// An assembled package and what the endpoint records about it.
@@ -149,6 +226,10 @@ pub(crate) struct EvidencePackage {
     /// The package's RFC 8785 bytes, exactly as served.
     pub(crate) bytes: Vec<u8>,
     pub(crate) report_digest: String,
+    /// The analysis artifact's digest, when the package carries one.
+    pub(crate) analysis_digest: Option<String>,
+    /// The Markdown rendering's digest.
+    pub(crate) markdown_digest: String,
     pub(crate) complete: bool,
     pub(crate) limitations: Vec<&'static str>,
 }
@@ -156,93 +237,202 @@ pub(crate) struct EvidencePackage {
 /// Why no package was assembled. Neither is a partial package.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PackageError {
-    /// A value had no canonical form. Never expected for the values a report
-    /// holds.
+    /// A value had no canonical form, the analysis results lacked a member
+    /// the report repeats, or the Markdown template refused the report.
+    /// Never expected for the values the endpoint hands over.
     Encoding,
     /// The package exceeds [`MAX_PACKAGE_BYTES`].
     TooLarge,
 }
 
-/// Assemble the package for `inputs`, stamped with `generated_at`.
-pub(crate) fn assemble(
-    inputs: EvidenceInputs,
-    generated_at: &str,
-) -> Result<EvidencePackage, PackageError> {
-    let (report, limitations) = report(inputs)?;
-    let complete = limitations.is_empty();
-    let report_bytes =
-        canonical_json::canonical_json_bytes(&report).map_err(|_| PackageError::Encoding)?;
-    let report_digest =
-        canonical_json::semantic_digest(REPORT_MEDIA_TYPE, REPORT_SCHEMA_VERSION, &report)
-            .map_err(|_| PackageError::Encoding)?;
-    if report_bytes.len() > MAX_PACKAGE_BYTES {
+/// A JSON artifact as a manifest names it.
+struct JsonArtifact {
+    entry: Value,
+    digest: String,
+    /// The artifact's RFC 8785 bytes, which `entry` sizes and `digest` frames.
+    bytes: Vec<u8>,
+}
+
+/// The manifest entry of a JSON artifact: its semantic digest and the length
+/// of its RFC 8785 bytes.
+fn json_artifact(
+    name: &str,
+    media_type: &str,
+    schema_version: &str,
+    value: &Value,
+) -> Result<JsonArtifact, PackageError> {
+    let bytes = canonical_json::canonical_json_bytes(value).map_err(|_| PackageError::Encoding)?;
+    if bytes.len() > MAX_PACKAGE_BYTES {
         return Err(PackageError::TooLarge);
     }
-    let envelope = json!({
-        "schema_version": PACKAGE_SCHEMA_VERSION,
-        "generated_at": generated_at,
-        "manifest": [{
-            "name": "report",
-            "media_type": REPORT_MEDIA_TYPE,
-            "schema_version": REPORT_SCHEMA_VERSION,
-            "digest": report_digest,
-            "size": report_bytes.len(),
-        }],
-        "report": report,
-    });
-    let bytes =
-        canonical_json::canonical_json_bytes(&envelope).map_err(|_| PackageError::Encoding)?;
+    let digest = canonical_json::semantic_digest(media_type, schema_version, value)
+        .map_err(|_| PackageError::Encoding)?;
+    Ok(JsonArtifact {
+        entry: manifest_entry(name, media_type, schema_version, &digest, bytes.len()),
+        digest,
+        bytes,
+    })
+}
+
+fn manifest_entry(
+    name: &str,
+    media_type: &str,
+    schema_version: &str,
+    digest: &str,
+    size: usize,
+) -> Value {
+    json!({
+        "name": name,
+        "media_type": media_type,
+        "schema_version": schema_version,
+        "digest": digest,
+        "size": size,
+    })
+}
+
+/// Assemble the package for `inputs`, stamped with `generated_at`.
+pub(crate) fn assemble(
+    mut inputs: EvidenceInputs,
+    generated_at: &str,
+) -> Result<EvidencePackage, PackageError> {
+    let analysis = match inputs.analysis.take() {
+        None => None,
+        Some(analysis) => {
+            let artifact = json_artifact(
+                ANALYSIS_ARTIFACT,
+                ANALYSIS_MEDIA_TYPE,
+                policy_analysis::RESULT_SCHEMA_VERSION,
+                &analysis.results,
+            )?;
+            Some((analysis, artifact))
+        }
+    };
+    let (report, limitations) = report(
+        inputs,
+        analysis
+            .as_ref()
+            .map(|(analysis, artifact)| (analysis, &artifact.entry)),
+    )?;
+    let complete = limitations.is_empty();
+    let report_artifact = json_artifact(
+        REPORT_ARTIFACT,
+        REPORT_MEDIA_TYPE,
+        REPORT_SCHEMA_VERSION,
+        &report,
+    )?;
+    // Rendered from the report's own canonical bytes, and from nothing else.
+    let rendered = markdown::render(&report_artifact.bytes).map_err(|_| PackageError::Encoding)?;
+    let markdown_digest = canonical_json::source_digest(
+        MARKDOWN_MEDIA_TYPE,
+        MARKDOWN_SCHEMA_VERSION,
+        rendered.as_bytes(),
+    );
+    let report_digest = report_artifact.digest;
+    let mut manifest = vec![report_artifact.entry];
+    let mut envelope = Map::new();
+    let mut analysis_digest = None;
+    if let Some((analysis, artifact)) = analysis {
+        manifest.push(artifact.entry);
+        envelope.insert(ANALYSIS_ARTIFACT.to_owned(), analysis.results);
+        analysis_digest = Some(artifact.digest);
+    }
+    manifest.push(manifest_entry(
+        MARKDOWN_ARTIFACT,
+        MARKDOWN_MEDIA_TYPE,
+        MARKDOWN_SCHEMA_VERSION,
+        &markdown_digest,
+        rendered.len(),
+    ));
+    envelope.insert("schema_version".to_owned(), json!(PACKAGE_SCHEMA_VERSION));
+    envelope.insert("generated_at".to_owned(), json!(generated_at));
+    envelope.insert("manifest".to_owned(), Value::Array(manifest));
+    envelope.insert(REPORT_ARTIFACT.to_owned(), report);
+    envelope.insert(MARKDOWN_ARTIFACT.to_owned(), Value::String(rendered));
+    let bytes = canonical_json::canonical_json_bytes(&Value::Object(envelope))
+        .map_err(|_| PackageError::Encoding)?;
     if bytes.len() > MAX_PACKAGE_BYTES {
         return Err(PackageError::TooLarge);
     }
     Ok(EvidencePackage {
         bytes,
         report_digest,
+        analysis_digest,
+        markdown_digest,
         complete,
         limitations,
     })
 }
 
-/// The report for `inputs` and its sorted limitation codes.
-fn report(inputs: EvidenceInputs) -> Result<(Value, Vec<&'static str>), PackageError> {
+/// The report for `inputs` and its sorted limitation codes. `analysis` is the
+/// analysis artifact and its manifest entry, which the report repeats.
+fn report(
+    inputs: EvidenceInputs,
+    analysis: Option<(&AnalysisEvidence, &Value)>,
+) -> Result<(Value, Vec<&'static str>), PackageError> {
     let EvidenceInputs {
         request_digest,
-        publication,
-        predecessor,
+        candidate,
         validation,
         tests,
         simulation,
         replay,
+        analysis: _,
     } = inputs;
     let mut limitations = Vec::new();
 
-    if publication.policy.semantic_digest.is_none() {
+    if candidate.policy().semantic_digest.is_none() {
         limitations.push("policy_semantic_digest_unavailable");
     }
-    let (approval, recorded_base) = approval_view(&publication);
-    let predecessor_check = match (&predecessor, recorded_base.as_deref()) {
-        (None, _) => {
-            limitations.push("predecessor_not_in_history");
-            "no_predecessor"
+    let mut members = Map::new();
+    match &candidate {
+        CandidateRecord::Publication {
+            record,
+            predecessor,
+        } => {
+            let (approval, recorded_base) = approval_view(record);
+            let predecessor_check = match (predecessor, recorded_base.as_deref()) {
+                (None, _) => {
+                    limitations.push("predecessor_not_in_history");
+                    "no_predecessor"
+                }
+                (Some(_), None) => "no_recorded_base",
+                (Some(predecessor), Some(base)) if predecessor.policy.etag == base => {
+                    "matches_recorded_base"
+                }
+                (Some(_), Some(_)) => {
+                    limitations.push("predecessor_differs_from_recorded_base");
+                    "differs_from_recorded_base"
+                }
+            };
+            members.insert(
+                "publication".to_owned(),
+                json!({
+                    "version": record.version,
+                    "policy": identity_view(&record.policy),
+                    "predecessor": predecessor.as_ref().map(|predecessor| json!({
+                        "version": predecessor.version,
+                        "policy": identity_view(&predecessor.policy),
+                    })),
+                    "predecessor_check": predecessor_check,
+                }),
+            );
+            members.insert("approval".to_owned(), approval);
         }
-        (Some(_), None) => "no_recorded_base",
-        (Some(predecessor), Some(base)) if predecessor.policy.etag == base => {
-            "matches_recorded_base"
+        CandidateRecord::Draft(draft) => {
+            // What the draft would replace is always known: the store
+            // refuses a draft whose pinned base is not the live policy.
+            members.insert(
+                "draft".to_owned(),
+                json!({
+                    "draft_id": draft.draft_id,
+                    "revision": draft.revision,
+                    "draft_etag": draft.draft_etag,
+                    "policy": identity_view(&draft.policy),
+                    "base": { "source": "active", "policy": identity_view(&draft.base) },
+                }),
+            );
         }
-        (Some(_), Some(_)) => {
-            limitations.push("predecessor_differs_from_recorded_base");
-            "differs_from_recorded_base"
-        }
-    };
-    let publication_view = json!({
-        "version": publication.version,
-        "policy": identity_view(&publication.policy),
-        "predecessor": predecessor.as_ref().map(|predecessor| json!({
-            "version": predecessor.version,
-            "policy": identity_view(&predecessor.policy),
-        })),
-        "predecessor_check": predecessor_check,
-    });
+    }
 
     let validation_view = validation_view(&validation, &mut limitations)?;
 
@@ -269,17 +459,32 @@ fn report(inputs: EvidenceInputs) -> Result<(Value, Vec<&'static str>), PackageE
             json!({ "included": false })
         }
         Some(simulation) => {
-            let base = match (&predecessor, simulation.compared_with_predecessor) {
-                (Some(predecessor), true) => json!({
-                    "version": predecessor.version,
-                    "etag": predecessor.policy.etag,
-                }),
-                (Some(_), false) => {
-                    limitations.push("simulation_base_not_evaluable");
-                    Value::Null
-                }
-                // Already reported as `predecessor_not_in_history`.
-                (None, _) => Value::Null,
+            let compared = simulation.compared_with_predecessor && candidate.has_predecessor();
+            if candidate.has_predecessor() && !simulation.compared_with_predecessor {
+                limitations.push("simulation_base_not_evaluable");
+            }
+            // A publication without a predecessor is already reported as
+            // `predecessor_not_in_history`.
+            let (base, candidate_view) = match &candidate {
+                CandidateRecord::Publication {
+                    record,
+                    predecessor,
+                } => (
+                    predecessor
+                        .as_ref()
+                        .filter(|_| compared)
+                        .map(|predecessor| {
+                            json!({
+                                "version": predecessor.version,
+                                "etag": predecessor.policy.etag,
+                            })
+                        }),
+                    json!({ "version": record.version, "etag": record.policy.etag }),
+                ),
+                CandidateRecord::Draft(draft) => (
+                    compared.then(|| json!({ "etag": draft.base.etag })),
+                    json!({ "draft_revision": draft.revision, "etag": draft.policy.etag }),
+                ),
             };
             json!({
                 "included": true,
@@ -291,10 +496,7 @@ fn report(inputs: EvidenceInputs) -> Result<(Value, Vec<&'static str>), PackageE
                     .map(|projection| projection.as_str())
                     .collect::<Vec<_>>(),
                 "base": base,
-                "candidate": {
-                    "version": publication.version,
-                    "etag": publication.policy.etag,
-                },
+                "candidate": candidate_view,
                 "not_evaluated": policy_testing::NOT_EVALUATED,
                 "summary": simulation.outcome.summary,
                 "cases": simulation.outcome.cases,
@@ -311,14 +513,17 @@ fn report(inputs: EvidenceInputs) -> Result<(Value, Vec<&'static str>), PackageE
             if !replay.complete {
                 limitations.push("replay_incomplete");
             }
-            let predecessor_check = match (&predecessor, replay.compared_with_predecessor) {
-                (Some(_), true) => "matches_predecessor",
-                (Some(_), false) => {
+            let predecessor_check = match (
+                candidate.has_predecessor(),
+                replay.compared_with_predecessor,
+            ) {
+                (true, true) => "matches_predecessor",
+                (true, false) => {
                     limitations.push("replay_base_not_predecessor");
                     "differs_from_predecessor"
                 }
                 // Already reported as `predecessor_not_in_history`.
-                (None, _) => "no_predecessor",
+                (false, _) => "no_predecessor",
             };
             let mut view = replay.view;
             if let Some(members) = view.as_object_mut() {
@@ -328,34 +533,53 @@ fn report(inputs: EvidenceInputs) -> Result<(Value, Vec<&'static str>), PackageE
         }
     };
 
+    let analysis_view = analysis_view(analysis, &mut limitations)?;
+
     limitations.sort_unstable();
     limitations.dedup();
-    let report = json!({
-        "schema_version": REPORT_SCHEMA_VERSION,
-        "redaction_profile": REDACTION_PROFILE,
-        "gateway_version": env!("CARGO_PKG_VERSION"),
-        "evaluator": {
+    members.insert("schema_version".to_owned(), json!(REPORT_SCHEMA_VERSION));
+    members.insert("redaction_profile".to_owned(), json!(REDACTION_PROFILE));
+    members.insert("candidate_kind".to_owned(), json!(candidate.kind()));
+    members.insert(
+        "gateway_version".to_owned(),
+        json!(env!("CARGO_PKG_VERSION")),
+    );
+    members.insert(
+        "evaluator".to_owned(),
+        json!({
             "http_semantics_version": HTTP_SEMANTICS_VERSION,
             "http_context_version": CONTEXT_VERSION,
             "tool_semantics_version": TOOL_SEMANTICS_VERSION,
             "tool_context_version": TOOL_CONTEXT_VERSION,
             "replay_context_version": REPLAY_CONTEXT_SCHEMA_VERSION,
-        },
-        "request_digest": request_digest,
-        "publication": publication_view,
-        "approval": approval,
-        "validation": validation_view,
-        "tests": tests_view,
-        "simulation": simulation_view,
-        "replay": replay_view,
-        "completeness": if limitations.is_empty() { "complete" } else { "incomplete" },
-        "limitations": limitations,
-        "trust": {
+        }),
+    );
+    members.insert("request_digest".to_owned(), json!(request_digest));
+    members.insert("validation".to_owned(), validation_view);
+    members.insert("tests".to_owned(), tests_view);
+    members.insert("simulation".to_owned(), simulation_view);
+    members.insert("replay".to_owned(), replay_view);
+    members.insert("analysis".to_owned(), analysis_view);
+    members.insert(
+        "completeness".to_owned(),
+        json!(if limitations.is_empty() {
+            "complete"
+        } else {
+            "incomplete"
+        }),
+    );
+    members.insert("limitations".to_owned(), json!(limitations));
+    members.insert(
+        "trust".to_owned(),
+        json!({
             "signed": false,
-            "statement": TRUST_STATEMENT,
-        },
-    });
-    Ok((report, limitations))
+            "statement": match &candidate {
+                CandidateRecord::Publication { .. } => TRUST_STATEMENT,
+                CandidateRecord::Draft(_) => DRAFT_TRUST_STATEMENT,
+            },
+        }),
+    );
+    Ok((Value::Object(members), limitations))
 }
 
 fn identity_view(identity: &PolicyIdentity) -> Value {
@@ -385,12 +609,72 @@ fn validation_view(
         &validation.diagnostics[..validation.diagnostics.len().min(MAX_EVIDENCE_DIAGNOSTICS)];
     Ok(json!({
         // Judged now, by this build and this deployment's checks: the
-        // history does not record what validation said at publication time.
+        // history does not record what validation said at publication time,
+        // and a draft's store judged it when it was saved.
         "basis": "revalidated_by_this_build",
         "valid": validation.valid,
         "diagnostics": serde_json::to_value(listed).map_err(|_| PackageError::Encoding)?,
         "diagnostics_truncated": truncated,
         "resource_snapshot": validation.resource_snapshot,
+    }))
+}
+
+/// The report's analysis section: the analysis artifact's manifest entry,
+/// so the report digest binds it, and what a reader gates on and reviews --
+/// completeness, the analyzer's own limitations, whether the suppression
+/// records were read, the counts, and each finding's code, fingerprint,
+/// severity, proof basis, element and suppression state. Rationales,
+/// remediations, lanes, details and patches stay in the artifact.
+fn analysis_view(
+    analysis: Option<(&AnalysisEvidence, &Value)>,
+    limitations: &mut Vec<&'static str>,
+) -> Result<Value, PackageError> {
+    let Some((analysis, entry)) = analysis else {
+        limitations.push("analysis_not_included");
+        return Ok(json!({ "included": false }));
+    };
+    let results = &analysis.results;
+    let member = |name: &str| results.get(name).ok_or(PackageError::Encoding);
+    let complete = member("complete")?
+        .as_bool()
+        .ok_or(PackageError::Encoding)?;
+    if !complete {
+        limitations.push("analysis_incomplete");
+    }
+    let suppressions = member("suppressions")?;
+    if !suppressions
+        .get("available")
+        .and_then(Value::as_bool)
+        .ok_or(PackageError::Encoding)?
+    {
+        limitations.push("analysis_suppressions_unavailable");
+    }
+    let findings = member("findings")?
+        .as_array()
+        .ok_or(PackageError::Encoding)?
+        .iter()
+        .map(|finding| {
+            let field = |name: &str| finding.get(name).cloned().ok_or(PackageError::Encoding);
+            Ok(json!({
+                "code": field("code")?,
+                "fingerprint": field("fingerprint")?,
+                "severity": field("severity")?,
+                "proof_basis": field("proof_basis")?,
+                "element": field("element")?,
+                "suppression": field("suppression")?,
+            }))
+        })
+        .collect::<Result<Vec<_>, PackageError>>()?;
+    Ok(json!({
+        "included": true,
+        "artifact": entry,
+        "analyzer": member("analyzer")?,
+        "analyzed": member("analyzed")?,
+        "complete": complete,
+        "limitations": member("limitations")?,
+        "suppressions": suppressions,
+        "summary": member("summary")?,
+        "findings": findings,
     }))
 }
 

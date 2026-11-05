@@ -104,7 +104,7 @@ const AZURE_PROVIDER_LABEL: &str = "azure_key_vault";
 // the configuration compiler (issue #242).
 pub(crate) use gateway_config::connections::azure_secret::{
     is_valid_azure_secret_version, validate_azure_provider_config, AzureAuthConfig,
-    AzureProviderConfig, AzureProviderConfigError, MAX_AZURE_PROVIDER_CONFIG_BYTES,
+    AzureProviderConfig, AzureProviderConfigError,
 };
 // The parts of the document only tests assemble by hand.
 #[cfg(test)]

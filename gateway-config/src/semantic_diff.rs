@@ -45,7 +45,8 @@ mod resources;
 mod tests;
 
 pub use resources::{
-    compare_bundles, compare_policy, compare_read_bundles, compare_tools, BundleView, ResourceView,
+    compare_bundles, compare_policy, compare_production_bundles, compare_read_bundles,
+    compare_tools, policy_document_value, tools_document_value, BundleView, ResourceView,
     DEFAULT_TOOL_MAX_CONCURRENT, DEFAULT_TOOL_TIMEOUT_MS,
 };
 
@@ -92,6 +93,7 @@ pub enum RiskCode {
     PlaintextTransport,
     PolicyBroadened,
     PolicyDefaultAllow,
+    PolicyTestsNotRequired,
     PrivateEgressAllowed,
     ProfileChanged,
     PublicOriginChanged,
@@ -124,6 +126,7 @@ impl RiskCode {
         Self::PlaintextTransport,
         Self::PolicyBroadened,
         Self::PolicyDefaultAllow,
+        Self::PolicyTestsNotRequired,
         Self::PrivateEgressAllowed,
         Self::ProfileChanged,
         Self::PublicOriginChanged,
@@ -155,6 +158,7 @@ impl RiskCode {
             Self::PlaintextTransport => "risk.plaintext_transport",
             Self::PolicyBroadened => "risk.policy_broadened",
             Self::PolicyDefaultAllow => "risk.policy_default_allow",
+            Self::PolicyTestsNotRequired => "risk.policy_tests_not_required",
             Self::PrivateEgressAllowed => "risk.private_egress_allowed",
             Self::ProfileChanged => "risk.profile_changed",
             Self::PublicOriginChanged => "risk.public_origin_changed",
@@ -186,6 +190,7 @@ impl RiskCode {
             | Self::PlaintextTransport
             | Self::PolicyBroadened
             | Self::PolicyDefaultAllow
+            | Self::PolicyTestsNotRequired
             | Self::PrivateEgressAllowed
             | Self::ProfileChanged
             | Self::ShadowEnabled
@@ -244,6 +249,9 @@ impl RiskCode {
             Self::PolicyBroadened => "a policy role or tool entry grants more or restricts less",
             Self::PolicyDefaultAllow => {
                 "requests no policy rule matches are allowed, or no policy is enforced at all"
+            }
+            Self::PolicyTestsNotRequired => {
+                "a policy change may be activated without passing the stored policy test suite"
             }
             Self::PrivateEgressAllowed => {
                 "outbound requests may reach private or other non-global addresses"

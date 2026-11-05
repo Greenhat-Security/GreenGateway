@@ -9,7 +9,6 @@
     "mode",
     "request_digest",
     "analyzer",
-    "base",
     "analyzed",
     "resources",
     "complete",
@@ -26,7 +25,12 @@
       "type": "object",
       "required": ["version", "http_semantics_version", "http_context_version", "tool_semantics_version", "tool_context_version", "gateway_version"]
     },
-    "base": {"type": "object", "required": ["source", "etag"], "properties": {"source": {"const": "active"}}},
+    "base": {
+      "description": "The active policy the analysis was pinned to. Every response of POST /v1{ADMIN_PREFIX}/policy/analyses carries it; only the analysis artifact of a policy evidence package, which pins no active policy, omits it.",
+      "type": "object",
+      "required": ["source", "etag"],
+      "properties": {"source": {"const": "active"}}
+    },
     "analyzed": {
       "type": "object",
       "required": ["source", "etag"],

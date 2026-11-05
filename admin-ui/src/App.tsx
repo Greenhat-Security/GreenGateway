@@ -39,6 +39,7 @@ import { ConnectionsView } from './views/ConnectionsView';
 import { IdentitiesView } from './views/IdentitiesView';
 import { LiveTail } from './views/LiveTail';
 import { LogExplorer } from './views/LogExplorer';
+import { McpClientsView } from './views/McpClientsView';
 import { OpenApiToolsView } from './views/OpenApiToolsView';
 import { PolicyHistoryView } from './views/PolicyHistoryView';
 import { PolicyStudioView } from './views/PolicyStudioView';
@@ -179,6 +180,9 @@ export function AdminShell() {
           <NavLink to="/tools/openapi" className={navItemClassName}>
             OpenAPI tools
           </NavLink>
+          <NavLink to="/mcp-clients" className={navItemClassName}>
+            MCP clients
+          </NavLink>
           <NavLink to="/identities" className={navItemClassName}>
             Identities
           </NavLink>
@@ -255,6 +259,7 @@ export function AdminShell() {
           <Route path="/tools" element={<CapabilityInventoryView />} />
           <Route path="/tools/:id/playground" element={<ToolPlayground />} />
           <Route path="/tools/:id" element={<CapabilityDetail />} />
+          <Route path="/mcp-clients" element={<McpClientsView />} />
           <Route path="/identities" element={<IdentitiesView />} />
           <Route path="/identities/detail" element={<PrincipalDetail />} />
           <Route path="/policy/history" element={<PolicyHistoryView />} />

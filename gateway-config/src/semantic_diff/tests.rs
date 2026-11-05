@@ -133,6 +133,7 @@ fn authentication_egress_policy_evidence_and_unknown_risks_are_high() {
         RiskCode::PolicyBroadened,
         RiskCode::ExemptionsBroadened,
         RiskCode::EvidenceNotRequired,
+        RiskCode::PolicyTestsNotRequired,
         RiskCode::UnknownImpact,
     ] {
         assert_eq!(code.severity(), Severity::High, "{}", code.as_str());
@@ -972,4 +973,17 @@ fn the_reference_describes_every_risk_code_with_its_severity() {
             "docs/semantic-diff.md lacks {row}"
         );
     }
+}
+
+/// The policy members the diff models take the policy loader's defaults,
+/// so spelling a default out is no change.
+#[test]
+fn the_policy_model_takes_the_policy_loaders_defaults() {
+    use crate::rbac::policy::{DEFAULT_TOOL_POLICY_MAX_CONCURRENT, DEFAULT_TOOL_POLICY_TIMEOUT_MS};
+
+    assert_eq!(DEFAULT_TOOL_TIMEOUT_MS, DEFAULT_TOOL_POLICY_TIMEOUT_MS);
+    assert_eq!(
+        DEFAULT_TOOL_MAX_CONCURRENT,
+        u64::from(DEFAULT_TOOL_POLICY_MAX_CONCURRENT)
+    );
 }

@@ -28,6 +28,7 @@ pub(super) fn forbidden() -> Response {
             permission: None,
             path_prefix: None,
             matched_rule_id: None,
+            facts: None,
         });
     response
 }
@@ -140,6 +141,16 @@ pub(super) fn config_rbac_not_configured() -> Response {
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
             error: "configuration API requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+pub(super) fn mcp_clients_rbac_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "MCP client configuration API requires POLICY_FILE to be configured".to_owned(),
         }),
     )
         .into_response()

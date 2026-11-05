@@ -8,10 +8,12 @@
 //! back with [`read_bundle`](super::read_bundle), and only then renames them
 //! into place.
 //!
-//! A `v1alpha1` deployment document carries the profile and nothing else, so
-//! the profiles' other invariants (authentication, egress, CSRF, audit
-//! durability, loopback listeners) cannot be written down yet; they arrive
-//! with the deployment settings. What can be written is the same safe
+//! The deployment document carries the profile and nothing else. Every
+//! setting it leaves out keeps its default, which is already what the
+//! production profile asks for (authentication required, private-address
+//! egress denied, CSRF on, required audit durability); the reader does not
+//! enforce the profiles' invariants on deployment settings yet, so writing
+//! them out would promise nothing more. What is written is the same safe
 //! starting point for every profile:
 //!
 //! - **standalone** topology: a policy that denies by default and enforces
@@ -27,8 +29,8 @@
 //! provider-agnostic. The permissive starter policy is never written.
 //!
 //! Nothing here can hold or make a secret: the answers document has no
-//! member that can carry a secret value, `v1alpha1` has no sensitive setting
-//! for a reference to fill, and no credential is generated.
+//! member that can carry a secret value, no setting is written (so no
+//! sensitive setting needs a reference), and no credential is generated.
 
 use super::{
     diagnostic::{BundleDiagnostic, Code, Pointer, Position},

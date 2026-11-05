@@ -287,6 +287,10 @@ pub(super) fn add_admin_api_routes(
                     get(config_capabilities_endpoint),
                 )
                 .route(
+                    routes.admin.mcp_client_configs_route.as_str(),
+                    get(mcp_client_configs_endpoint),
+                )
+                .route(
                     &format!("{}/capabilities", routes.admin.api_prefix),
                     get(admin_capabilities_endpoint),
                 )
@@ -447,6 +451,15 @@ pub(super) fn add_admin_api_routes(
                     post(policy_analyses_endpoint).layer(Extension(Arc::new(
                         PolicyEvaluationLimiter::new(MAX_CONCURRENT_POLICY_ANALYSES),
                     ))),
+                )
+                .route(
+                    routes.admin.policy_analysis_suppressions_route.as_str(),
+                    get(policy_analysis_suppressions_list_endpoint)
+                        .post(policy_analysis_suppression_create_endpoint),
+                )
+                .route(
+                    routes.admin.policy_analysis_suppression_route.as_str(),
+                    axum::routing::delete(policy_analysis_suppression_delete_endpoint),
                 )
                 .route(
                     routes.admin.policy_rules_route.as_str(),

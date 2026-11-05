@@ -2,7 +2,7 @@
 //!
 //! Migration 21 adds three tables beside the evidence tables of migrations 16
 //! and 18 (since migration 26 also migration 19's admin session evidence, and
-//! since migration 30 migration 23's policy, tools and catalog evidence):
+//! since migration 32 migration 23's policy, tools and catalog evidence):
 //!
 //! - `authority_event_journal`: one row per committed evidence row, appended
 //!   by the producer in the evidence row's own transaction, naming the
@@ -92,7 +92,7 @@ const RETENTION_SCAN_FACTOR: i64 = 10;
 pub(crate) const MAX_READ_BATCH: usize = 1_000;
 
 /// Which evidence table a journal row indexes. The values are the table
-/// names, and migration 30's CHECK holds the same closed list.
+/// names, and migration 32's CHECK holds the same closed list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JournalSource {
     ConnectionChange,
@@ -102,10 +102,10 @@ pub(crate) enum JournalSource {
     /// migration 26.
     AdminSession,
     /// Migration 23's policy, tools and policy test suite commits, journaled
-    /// since migration 30.
+    /// since migration 32.
     DocumentChange,
     /// Migration 23's managed catalog publications, journaled since
-    /// migration 30.
+    /// migration 32.
     CatalogChange,
 }
 
@@ -245,7 +245,7 @@ pub(crate) struct JournaledEvidence {
     /// those migrations, which recorded none of them, and for admin session
     /// evidence, which records none of them; the issuer is also `None` for
     /// an actor that has none. Document evidence always records all three,
-    /// in migration 23's vocabulary for a row committed before migration 30,
+    /// in migration 23's vocabulary for a row committed before migration 32,
     /// which the delivery projection reads in migration 24's.
     pub(crate) actor_issuer: Option<String>,
     pub(crate) actor_kind: Option<String>,
@@ -650,15 +650,15 @@ fn invalid_data(operation: &'static str) -> RepositoryError {
 mod tests {
     use super::*;
 
-    /// The source vocabulary is migration 30's CHECK, value for value, and
+    /// The source vocabulary is migration 32's CHECK, value for value, and
     /// every value round-trips.
     #[test]
     fn the_journal_sources_are_the_migrations_closed_vocabulary() {
         let journal = include_str!("migrations/0021_authority_event_journal.sql");
-        let migration = include_str!("migrations/0030_document_and_catalog_evidence_journal.sql");
+        let migration = include_str!("migrations/0032_document_and_catalog_evidence_journal.sql");
         let (_, check) = migration
             .split_once("ADD CONSTRAINT authority_event_journal_source_check CHECK (")
-            .expect("migration 30 replaces the source CHECK");
+            .expect("migration 32 replaces the source CHECK");
         let (check, _) = check.split_once(");").expect("the CHECK ends");
         assert_eq!(
             check.matches("_evidence'").count(),
@@ -668,7 +668,7 @@ mod tests {
         for source in JournalSource::ALL {
             assert!(
                 check.contains(&format!("'{}'", source.table())),
-                "migration 30 must allow {}",
+                "migration 32 must allow {}",
                 source.table()
             );
             assert_eq!(JournalSource::from_table(source.table()), Some(source));

@@ -843,7 +843,7 @@ impl PostgresConnectionStore {
     /// addition -- the shared security revision, the connections
     /// high-water mark, the outbox row and the replacement's durable
     /// evidence (`catalog_change_evidence`, migration 23, with the whole
-    /// actor since migration 25, journaled since migration 30), all in the
+    /// actor since migration 25, journaled since migration 32), all in the
     /// one transaction. The evidence outlives the catalog row it describes,
     /// which the next replacement deletes and a Connection delete cascades;
     /// a refused or failed replacement writes none, and a replacement whose
@@ -5208,7 +5208,7 @@ struct CatalogChangeEvidence<'a> {
 }
 
 /// Append one catalog evidence row inside the caller's transaction, and
-/// journal it for delivery (migration 30). The row's `event_id` is minted
+/// journal it for delivery (migration 32). The row's `event_id` is minted
 /// here, once, and the journal carries the same one; `committed_at` is the
 /// database clock's. The actor is recorded whole, as
 /// [`record_change_evidence`] records it: subject, canonical issuer, kind and

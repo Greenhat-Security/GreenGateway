@@ -5,21 +5,33 @@ edition.workspace = true
 license-file.workspace = true
 
 # The configuration contracts `gateway` and `ggctl` share (issue #242,
-# ADR-0008). No build script and no network: both binaries link it, and
-# `ggctl` must build without Node or the admin UI. The one I/O it performs is
-# the bundle reader's contained, read-only file access beneath the bundle root
-# it is given, and, beneath the state directory it is given, the revision
-# ledger's one SQLite database and the directory's lock file. Every
-# dependency below is already in the workspace graph through the gateway, at
-# the same version and features.
+# ADR-0008), the environment configuration compiler among them. No build
+# script and no network: both binaries link it, and `ggctl` must build without
+# Node or the admin UI. The one I/O it performs is the bundle reader's
+# contained, read-only file access beneath the bundle root it is given, and,
+# beneath the state directory it is given, the revision ledger's one SQLite
+# database and the directory's lock file. Every dependency below is already in
+# the workspace graph through the gateway, at the same version and features.
 [dependencies]
 # The bundle reader opens files beneath one directory capability, without
 # following links, and reads link counts from open handles.
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 hex.workspace = true
-# Referenced policy and tools documents must pass their published schemas.
+# The configuration compiler (`src/compiler`) parses header names and values
+# (CSRF, CORS, route headers) with the types the gateway serves them with, and
+# trusted-proxy, NAT64 and egress networks as IP prefixes; the tools document
+# (`src/tools`) parses a tool mapping's HTTP method, and the policy document
+# (`src/rbac`) its egress and condition networks. Parsing only: no connection
+# is opened.
+http.workspace = true
+ipnet.workspace = true
+# Referenced policy and tools documents must pass their published schemas,
+# and a tool definition's input schema must compile (`src/tools`).
 jsonschema.workspace = true
+# Percent-decoding the segments of an origin-relative path and a JSON Schema
+# `$ref` fragment (`src/connections.rs`, `src/tools/definitions.rs`).
+percent-encoding.workspace = true
 # The standalone configuration revision ledger (`src/ledger`), the same
 # bundled SQLite the gateway's standalone stores use.
 rusqlite.workspace = true
@@ -27,6 +39,14 @@ serde.workspace = true
 serde_json.workspace = true
 # Pinned file digests and the ADR-0004 digest frame.
 sha2.workspace = true
+# A policy v1 time-window condition's bounds are RFC 3339 UTC instants
+# (`src/rbac/conditions.rs`). Parsing only: no clock is read.
+time.workspace = true
+# The compiler's one log line: an audit retention of `0` days is taken as no
+# pruning and warned about, by setting name only, as the gateway always has.
+# The policy 0.x reader's one log line: the unknown top-level members it
+# drops, by name (`src/rbac/policy.rs`), as the gateway always has.
+tracing.workspace = true
 # The secret provider documents' endpoint and address validators parse the
 # URLs an operator configures (they never dial them).
 url.workspace = true

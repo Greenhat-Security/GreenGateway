@@ -14,6 +14,9 @@ use std::{
     thread,
 };
 
+use gateway_config::mcp_client_configs::{
+    Auth, ClientKind, Format, McpClientConfigs, McpUrl, ServerName,
+};
 use serde_json::{json, Value};
 use tokio_rustls::rustls::{
     self,
@@ -199,6 +202,69 @@ fn help_completion_and_schema_are_artifacts_on_standard_output() {
         report["result"]["client"]["version"],
         env!("CARGO_PKG_VERSION")
     );
+}
+
+/// The release archives ship `ggctl help --man` output as their man pages;
+/// each must cover what the binary's own help lists.
+#[test]
+fn every_command_has_a_manual_page_naming_every_option_its_help_lists() {
+    let manual = ggctl(&["help", "--man"], None);
+    assert_eq!(manual.status.code(), Some(0));
+    assert!(manual.stderr.is_empty());
+    let manual = text(&manual.stdout);
+    assert!(manual.contains("\n.TH GGCTL 1 "));
+    assert!(!manual.contains('\r'));
+
+    let overview = text(&ggctl(&["help"], None).stdout);
+    let listed = overview
+        .split("\nCommands:\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n").next())
+        .expect("the overview lists the commands");
+    // A name and its summary are two spaces apart; a family's command is
+    // listed by its full name, such as `ledger seed`.
+    let commands: Vec<&str> = listed
+        .lines()
+        .filter(|line| line.starts_with("  ") && !line.starts_with("   "))
+        .filter_map(|line| line.trim_start().split("  ").next())
+        .collect();
+    assert!(
+        commands.contains(&"validate")
+            && commands.contains(&"ledger seed")
+            && commands.contains(&"backup create")
+    );
+    let mut topics: Vec<&str> = commands
+        .iter()
+        .filter_map(|command| command.split_once(' ').map(|(family, _)| family))
+        .collect();
+    topics.dedup();
+    assert_eq!(topics, ["ledger", "backup", "policy", "evidence"]);
+    topics.extend(&commands);
+    for command in topics {
+        // A page is named by its words joined with hyphens, and roff escapes
+        // every hyphen, including those inside a name such as `mcp-config`.
+        let name = command.replace([' ', '-'], "\\-");
+        assert!(
+            manual.contains(&format!("\\fBggctl\\-{name}\\fR(1)")),
+            "{command}"
+        );
+        let words: Vec<&str> = command.split(' ').collect();
+        let page = ggctl(&[&["help", "--man"][..], &words].concat(), None);
+        assert_eq!(page.status.code(), Some(0), "{command}");
+        let page = text(&page.stdout);
+        assert!(
+            page.contains(&format!(".TH GGCTL\\-{} 1 ", name.to_ascii_uppercase())),
+            "{command}"
+        );
+        let help = text(&ggctl(&[&["help"][..], &words].concat(), None).stdout);
+        for option in help.lines().filter_map(|line| line.strip_prefix("  --")) {
+            let name = option.split_whitespace().next().expect("an option name");
+            assert!(
+                page.contains(&format!("\\fB\\-\\-{}\\fR", name.replace('-', "\\-"))),
+                "{command} --{name}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -579,9 +645,7 @@ fn validate_and_doctor_read_a_bundle_offline_with_their_exit_codes() {
     assert_eq!(output.status.code(), Some(0));
     assert!(text(&output.stdout)
         .starts_with("bundle payments-production (greengateway.dev/v1alpha1): valid\n"));
-    assert!(
-        text(&output.stderr).starts_with("ggctl: info: validate.production_validators_not_run: ")
-    );
+    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
     assert_path_not_echoed(&output, bundle.path());
 
     for command in ["validate", "doctor"] {
@@ -598,10 +662,20 @@ fn validate_and_doctor_read_a_bundle_offline_with_their_exit_codes() {
     assert!(output.stderr.is_empty());
     let log: Value = serde_json::from_slice(&output.stdout).expect("one SARIF log");
     assert_eq!(log["version"], "2.1.0");
-    assert_eq!(
-        log["runs"][0]["results"][0]["ruleId"],
-        "validate.production_validators_not_run"
-    );
+    assert_eq!(log["runs"][0]["results"], json!([]));
+
+    // Route hosts that differ only in case pass the published schema; the
+    // production policy validator, which ggctl runs, refuses them by code.
+    let colliding = Bundle::new(&format!(
+        "{{\"schema_version\": \"0.1.0\", \"routes\": [{{\"path_prefix\": \"/a\", \"permission\": \"p\", \"hosts\": [\"{CANARY}.example\", \"{}.example\"]}}]}}\n",
+        CANARY.to_ascii_uppercase()
+    ));
+    let output = ggctl(&["validate", colliding.path(), "--format", "json"], None);
+    assert_eq!(output.status.code(), Some(3));
+    let refused = report(&output);
+    assert_eq!(refused["diagnostics"][0]["code"], "resource.invalid");
+    assert_eq!(refused["diagnostics"].as_array().map(Vec::len), Some(1));
+    assert_no_canary(&output);
 
     // A production bundle with an allow-by-default policy is invalid, and
     // the policy's values never reach the output.
@@ -632,6 +706,113 @@ fn validate_and_doctor_read_a_bundle_offline_with_their_exit_codes() {
         assert!(text(&output.stderr).contains("bundle.root_unavailable"));
         assert_path_not_echoed(&output, missing);
     }
+}
+
+/// `--env` end to end: real processes, the published report schema, the
+/// exit codes, and a secret in the file that never reaches either stream.
+#[test]
+fn environment_files_are_validated_diagnosed_and_compared_without_echoing_a_value() {
+    let bundle = Bundle::new("{\"schema_version\": \"0.1.0\", \"default_action\": \"deny\"}\n");
+    bundle.write(
+        "base.env",
+        &format!(
+            "AUTH_ENABLED=true\nTLS_CERT_FILE=/run/tls/a.crt\nTLS_KEY_FILE=/run/{CANARY}/a.key\n"
+        ),
+    );
+    bundle.write(
+        "candidate.env",
+        &format!(
+            "# reviewed\nexport AUTH_ENABLED=false\nTLS_CERT_FILE=/run/tls/a.crt\nTLS_KEY_FILE=/run/{CANARY}/b.key\n{CANARY}={CANARY}\n"
+        ),
+    );
+    bundle.write(
+        "refused.env",
+        &format!("AUTH_MODE={CANARY}\nAUTH_MODE={CANARY}\n"),
+    );
+    let path = |name: &str| bundle.0.join(name).to_str().expect("UTF-8").to_owned();
+    let (base, candidate, refused) = (path("base.env"), path("candidate.env"), path("refused.env"));
+
+    for command in ["validate", "doctor"] {
+        let output = ggctl(&[command, "--env", &candidate, "--format", "json"], None);
+        assert_eq!(output.status.code(), Some(0), "{command}");
+        let found = report(&output);
+        assert_eq!(found["command"], command);
+        assert_no_canary(&output);
+        assert_path_not_echoed(&output, &candidate);
+
+        let output = ggctl(&[command, "--env", &refused, "--format", "json"], None);
+        assert_eq!(output.status.code(), Some(3), "{command}");
+        let found = report(&output);
+        let codes: Vec<_> = found["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .map(|diagnostic| diagnostic["code"].as_str().expect("code").to_owned())
+            .collect();
+        assert_eq!(
+            codes[..2],
+            ["env.duplicate_key", "config.refused"],
+            "{command}"
+        );
+        assert_no_canary(&output);
+
+        let output = ggctl(&[command, "--env", &refused], None);
+        assert_eq!(output.status.code(), Some(3), "{command}");
+        assert!(text(&output.stderr).contains("  at: argument 2, line 2\n  setting: AUTH_MODE\n"));
+        assert_no_canary(&output);
+        assert_path_not_echoed(&output, &refused);
+    }
+
+    let output = ggctl(
+        &[
+            "validate", "--env", &refused, "--strict", "--format", "sarif",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    let log: Value = serde_json::from_slice(&output.stdout).expect("one SARIF log");
+    assert_eq!(log["runs"][0]["results"][0]["ruleId"], "env.duplicate_key");
+    assert_eq!(log["runs"][0]["results"][0]["level"], "error");
+    assert_no_canary(&output);
+
+    let output = ggctl(
+        &[
+            "diff",
+            "--env",
+            &candidate,
+            "--against-env",
+            &base,
+            "--check",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(4));
+    let report = report(&output);
+    assert!(report["result"]["diff"]["riskCodes"]
+        .as_array()
+        .expect("risk codes")
+        .contains(&json!("risk.auth_disabled")));
+    assert_no_canary(&output);
+
+    let output = ggctl(
+        &["diff", "--env", &candidate, "--against", bundle.path()],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(text(&output.stderr).contains("diff.not_comparable"));
+
+    let missing = path("missing.env");
+    let output = ggctl(&["validate", "--env", &missing], None);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stderr).starts_with("ggctl: error: env.unreadable: "));
+    assert_path_not_echoed(&output, &missing);
+
+    let output = ggctl(&["validate", bundle.path(), "--env", &candidate], None);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(text(&output.stderr).starts_with("ggctl: error: usage.conflicting_options: "));
 }
 
 #[test]
@@ -747,6 +928,243 @@ fn init_writes_a_bundle_that_validates_strictly_and_converts_to_itself() {
     );
     assert_eq!(output.status.code(), Some(3));
     assert!(text(&output.stderr).contains("convert.unsupported_version"));
+}
+
+fn mcp_document(name: &str, oauth: bool) -> McpClientConfigs {
+    McpClientConfigs::render(
+        &McpUrl::new("https://gateway.example.test/base/mcp").expect("valid URL"),
+        &ServerName::new(name).expect("valid name"),
+        oauth,
+    )
+    .expect("renders")
+}
+
+/// Runs `ggctl mcp-config` in `directory`, with the canary token piped in.
+fn mcp_config(directory: &std::path::Path, base: &str, extra: &[&str]) -> Output {
+    let mut arguments = vec!["mcp-config", "--server", base, "--token-stdin"];
+    arguments.extend_from_slice(extra);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ggctl"))
+        .args(&arguments)
+        .current_dir(directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("ggctl should start");
+    // A command refused before it reads the token may already have closed
+    // its standard input.
+    let _ = child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(CANARY.as_bytes());
+    child.wait_with_output().expect("ggctl should finish")
+}
+
+#[test]
+fn mcp_config_writes_exactly_the_served_template_and_never_a_client_file_or_the_token() {
+    let document = mcp_document("greengateway", true);
+    let body = serde_json::to_string(&document).expect("serializes");
+    let gateway = FakeGateway::start(http_response("200 OK", &body), None);
+    // Client files ggctl must never open, edit or replace.
+    let directory = TempDirectory::new("mcp-config");
+    for file in [".cursor/mcp.json", ".vscode/mcp.json"] {
+        let path = directory.0.join(file);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("client directory");
+        std::fs::write(&path, "{\"sentinel\": true}\n").expect("client file");
+    }
+    let mut requests = 0;
+    for client in ClientKind::ALL {
+        for auth in Auth::ALL {
+            if !client.supports(auth) {
+                continue;
+            }
+            let output = mcp_config(
+                &directory.0,
+                &gateway.base("http"),
+                &["--client", client.as_str(), "--auth", auth.as_str()],
+            );
+            requests += 1;
+            assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+            assert!(output.stderr.is_empty());
+            assert_no_canary(&output);
+            let stdout = text(&output.stdout);
+            let template = document.template(client, auth).expect("served");
+            assert_eq!(stdout, template.content);
+            match template.format {
+                Format::Json => {
+                    let parsed: Value = serde_json::from_str(&stdout).expect("JSON template");
+                    assert!(parsed
+                        .to_string()
+                        .contains("https://gateway.example.test/base/mcp"));
+                }
+                Format::Url => assert_eq!(
+                    url::Url::parse(stdout.trim_end()).expect("URL").as_str(),
+                    "https://gateway.example.test/base/mcp"
+                ),
+            }
+            assert_eq!(
+                stdout.contains("GREENGATEWAY_MCP_TOKEN"),
+                auth == Auth::Token
+            );
+        }
+    }
+    let seen = gateway.requests();
+    assert_eq!(seen.len(), requests);
+    for request in &seen {
+        assert!(
+            request.starts_with("GET /v1/admin/mcp/client-configs HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(request.contains(&format!("authorization: Bearer {CANARY}\r\n")));
+    }
+    for file in [".cursor/mcp.json", ".vscode/mcp.json"] {
+        assert_eq!(
+            std::fs::read_to_string(directory.0.join(file)).expect("client file"),
+            "{\"sentinel\": true}\n"
+        );
+    }
+    let mut left: Vec<_> = std::fs::read_dir(&directory.0)
+        .expect("directory")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    left.sort();
+    assert_eq!(left, [".cursor", ".vscode"]);
+}
+
+#[test]
+fn mcp_config_names_the_server_entry_and_refuses_a_hostile_name_unsent() {
+    let named = serde_json::to_string(&mcp_document("prod-gw", true)).expect("serializes");
+    let gateway = FakeGateway::start(http_response("200 OK", &named), None);
+    let directory = TempDirectory::new("mcp-config-name");
+    let output = mcp_config(
+        &directory.0,
+        &gateway.base("http"),
+        &["--client", "vscode", "--name", "prod-gw"],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(
+        parsed["servers"]["prod-gw"]["url"],
+        "https://gateway.example.test/base/mcp"
+    );
+    assert!(gateway.requests()[0]
+        .starts_with("GET /v1/admin/mcp/client-configs?name=prod-gw HTTP/1.1\r\n"));
+
+    // A server that answers with another name is not trusted with this one.
+    let output = mcp_config(&directory.0, &gateway.base("http"), &["--client", "vscode"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(text(&output.stderr).contains("mcp.client_configs_invalid"));
+
+    for hostile in ["a\"b", "${env:HOME}", "__proto__", "a b", "-x"] {
+        let output = mcp_config(
+            &directory.0,
+            &gateway.base("http"),
+            &["--client", "cursor", "--name", hostile],
+        );
+        assert_eq!(output.status.code(), Some(2), "{hostile}");
+        assert!(output.stdout.is_empty());
+        assert!(!text(&output.stderr).contains(hostile), "{hostile}");
+    }
+    assert_eq!(gateway.requests().len(), 2);
+}
+
+#[test]
+fn mcp_config_failures_write_nothing_and_have_their_documented_exit_codes() {
+    let mut tampered = serde_json::to_value(mcp_document("greengateway", true)).expect("JSON");
+    tampered["templates"][4]["content"] = format!("Bearer {CANARY}\n").into();
+    let mut newer = serde_json::to_value(mcp_document("greengateway", true)).expect("JSON");
+    newer["apiVersion"] = "greengateway.dev/v1beta1".into();
+    let no_oauth = serde_json::to_string(&mcp_document("greengateway", false)).expect("JSON");
+    let directory = TempDirectory::new("mcp-config-failures");
+    for (response, client, exit, code) in [
+        (
+            http_response(
+                "409 Conflict",
+                r#"{"error":"MCP client configuration templates require GATEWAY_PUBLIC_URL","reason":"public_url_not_configured"}"#,
+            ),
+            "cursor",
+            3,
+            "mcp.public_url_unusable",
+        ),
+        (
+            http_response("404 Not Found", "{}"),
+            "cursor",
+            3,
+            "mcp.client_configs_unavailable",
+        ),
+        (
+            http_response("403 Forbidden", "{}"),
+            "cursor",
+            8,
+            "remote.forbidden",
+        ),
+        (
+            http_response("401 Unauthorized", "{}"),
+            "cursor",
+            8,
+            "remote.unauthenticated",
+        ),
+        (
+            http_response("200 OK", &tampered.to_string()),
+            "cursor",
+            3,
+            "mcp.client_configs_invalid",
+        ),
+        (
+            http_response("200 OK", &newer.to_string()),
+            "cursor",
+            3,
+            "mcp.unsupported_version",
+        ),
+        (
+            http_response("200 OK", &no_oauth),
+            "claude-desktop",
+            3,
+            "mcp.oauth_unavailable",
+        ),
+    ] {
+        let gateway = FakeGateway::start(response, None);
+        let output = mcp_config(&directory.0, &gateway.base("http"), &["--client", client]);
+        assert_eq!(output.status.code(), Some(exit), "{code}");
+        assert!(output.stdout.is_empty(), "{code}");
+        assert!(
+            text(&output.stderr).contains(code),
+            "{code}: {}",
+            text(&output.stderr)
+        );
+        assert_no_canary(&output);
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 1, "{code}");
+    }
+
+    // Refused before anything is read or sent.
+    let gateway = FakeGateway::start(http_response("200 OK", &no_oauth), None);
+    for (extra, code) in [
+        (
+            &["--client", "claude-desktop", "--auth", "token"][..],
+            "mcp.no_token_template",
+        ),
+        (
+            &["--client", "cursor", "--format", "json"],
+            "usage.unknown_option",
+        ),
+        (&["--client", "zed"], "usage.invalid_value"),
+        (&[], "usage.missing_argument"),
+    ] {
+        let output = mcp_config(&directory.0, &gateway.base("http"), extra);
+        assert_eq!(output.status.code(), Some(2), "{code}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            text(&output.stderr).contains(code),
+            "{code}: {}",
+            text(&output.stderr)
+        );
+    }
+    assert_eq!(gateway.connections.load(Ordering::SeqCst), 0);
+    let output = ggctl(&["mcp-config", "--client", "cursor"], None);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("usage.missing_argument"));
 }
 
 /// A standalone state directory under the system temporary directory,

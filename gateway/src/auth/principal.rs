@@ -25,10 +25,11 @@ impl AuthMethod {
     }
 }
 
-// Issuer canonicalization and the issuer bound, which the configuration
-// compiler shares with `ggctl` (issue #242).
+// Issuer canonicalization and the identity bounds, which the configuration
+// compiler and the policy's identity mappings share with `ggctl` (issue #242).
 pub(crate) use gateway_config::auth::{
-    canonical_issuer, provider_issuer, MAX_PRINCIPAL_ISSUER_BYTES, PROVIDER_ISSUER_PREFIX,
+    canonical_issuer, provider_issuer, MAX_PRINCIPAL_ISSUER_BYTES, MAX_PRINCIPAL_ROLE_BYTES,
+    MAX_PRINCIPAL_SUBJECT_BYTES,
 };
 
 /// Authenticated caller identity used for authorization and audit attribution.
@@ -56,10 +57,6 @@ pub struct Principal {
 
 /// Most role names a principal may carry.
 pub(crate) const MAX_PRINCIPAL_ROLES: usize = 256;
-/// Longest role name, in bytes.
-pub(crate) const MAX_PRINCIPAL_ROLE_BYTES: usize = 256;
-/// Longest subject (`user_id`), in bytes.
-pub(crate) const MAX_PRINCIPAL_SUBJECT_BYTES: usize = 4096;
 
 /// Why a principal's identity facts are outside the shape every consumer of a
 /// [`Principal`] is entitled to assume.

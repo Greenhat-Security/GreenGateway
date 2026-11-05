@@ -468,7 +468,7 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
     producers
         .create_rebind_and_delete_connection(&ChangeActor::for_test("deleting-admin"))
         .await;
-    // Since migration 30 the document and catalog sources too, interleaved
+    // Since migration 32 the document and catalog sources too, interleaved
     // with a Connection's: a policy published by a service token, a managed
     // Connection and its first catalog, and the first-boot tools seed.
     let policy = producers
@@ -1202,7 +1202,7 @@ async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing() {
 
 /// A full journal refuses a policy publication, a catalog publication and
 /// the first-boot tools seed exactly as it refuses every other producer
-/// (migration 30): each is answered unavailable, which the admin API answers
+/// (migration 32): each is answered unavailable, which the admin API answers
 /// `503` and a first boot fails closed on, and commits nothing -- no version,
 /// active pointer, shared revision, outbox row, catalog, tool name
 /// reservation, evidence row or journal row -- and each refusal is counted
