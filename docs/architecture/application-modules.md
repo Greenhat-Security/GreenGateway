@@ -76,6 +76,19 @@ them with `cargo llvm-cov -p gateway --bin gateway`, the one test binary all of
 these modules are compiled into: where a test lives decides neither what a floor
 measures nor whether the test counts toward it.
 
+The inbound TLS suite in `inbound_tls_tests.rs`, which drives real handshakes
+against real listeners, is split the same way by the part of `inbound_tls.rs`
+each family exercises: `inbound_tls_listener_tests.rs` (the accept path, the
+handshake bound, saturation shedding and the negotiated protocol),
+`inbound_tls_material_tests.rs` (loading certificates and keys at startup,
+and their permission rules), `inbound_tls_client_certificate_tests.rs`
+(client-certificate verification and failure labels),
+`inbound_tls_session_resumption_tests.rs`,
+`inbound_tls_credential_precedence_tests.rs`, `inbound_tls_sni_tests.rs` and
+`inbound_tls_reload_tests.rs`. `inbound_tls_tests.rs` declares them as
+modules of `inbound_tls::tests` and keeps the fixtures more than one of them
+uses.
+
 The React connection editor delegates validation, binding intent and request
 serialization to `connection-editor/model.ts`; reusable form sections and local
 secret controls live in `connection-editor/sections.tsx`. The view owns loading,
