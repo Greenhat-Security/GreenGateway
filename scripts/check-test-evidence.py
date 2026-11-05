@@ -221,7 +221,8 @@ def stream_summary(report):
 # unless every declared cell produced complete evidence. Numbers are checked
 # for shape and consistency only: there are no capacity budgets to compare with.
 CAPACITY_OPERATION_CLASSES = ('revision_check', 'credential_check', 'rate_limit', 'execution_lease',
-                              'security_state_read', 'control_plane_write', 'maintenance')
+                              'security_state_read', 'control_plane_write', 'maintenance',
+                              'policy_replay')
 CAPACITY_ERROR_CLASSES = ('none', 'unavailable', 'timeout', 'conflict', 'invalid_data',
                           'incompatible_schema', 'internal', 'cancelled')
 CAPACITY_MIXES = {
