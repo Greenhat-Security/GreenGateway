@@ -1093,6 +1093,753 @@ fn a_held_state_directory_exits_5_and_two_ggctl_processes_have_one_winner() {
     assert_eq!(state.revisions(), 3);
 }
 
+/// A loopback HTTP server that answers the n-th request with the n-th
+/// response (the last one again after that), recording each request's head
+/// and body.
+struct ScriptedGateway {
+    address: SocketAddr,
+    requests: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+}
+
+impl ScriptedGateway {
+    fn start(responses: Vec<Vec<u8>>) -> Self {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let address = listener.local_addr().expect("address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        thread::spawn(move || {
+            for (index, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { break };
+                let response = responses
+                    .get(index)
+                    .or(responses.last())
+                    .cloned()
+                    .unwrap_or_default();
+                let Some(request) = read_request(&mut stream) else {
+                    continue;
+                };
+                recorded.lock().expect("lock").push(request);
+                let _ = stream.write_all(&response);
+                let _ = stream.flush();
+            }
+        });
+        Self { address, requests }
+    }
+
+    fn base(&self) -> String {
+        format!("http://{}/v1/admin", self.address)
+    }
+
+    fn requests(&self) -> Vec<(String, Vec<u8>)> {
+        self.requests.lock().expect("lock").clone()
+    }
+}
+
+/// One request's head and its `Content-Length` body.
+fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, Vec<u8>)> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() > 16 * 1024 || stream.read(&mut byte).ok()? != 1 {
+            return None;
+        }
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    let length = head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).ok()?;
+    Some((head, body))
+}
+
+fn json_response(status: &str, headers: &str, body: &Value) -> Vec<u8> {
+    let body = body.to_string();
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// A request document under the system temporary directory, removed on drop.
+struct Document(PathBuf);
+
+impl Document {
+    fn new(name: &str, contents: &[u8]) -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ggctl-cli-{}-{}-{name}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, contents).expect("the document should write");
+        Self(path)
+    }
+
+    fn path(&self) -> &str {
+        self.0
+            .to_str()
+            .expect("the temporary directory should be UTF-8")
+    }
+}
+
+impl Drop for Document {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Asserts the request line and the bearer token of a recorded request,
+/// and that a body is sent as JSON.
+fn assert_request(request: &(String, Vec<u8>), line: &str) {
+    let head = request.0.to_ascii_lowercase();
+    assert!(
+        head.starts_with(&format!("{} http/1.1\r\n", line.to_ascii_lowercase())),
+        "{head}"
+    );
+    assert!(head.contains(&format!(
+        "authorization: bearer {}",
+        CANARY.to_ascii_lowercase()
+    )));
+    if !request.1.is_empty() {
+        assert!(
+            head.contains("content-type: application/json\r\n"),
+            "{head}"
+        );
+    }
+}
+
+const POLICY_ETAG: &str = "\"sha256:5f2c\"";
+const REPLAY_JOB: &str = "rpl_00112233445566778899aabbccddeeff";
+
+#[test]
+fn policy_lint_sends_the_exact_bytes_and_reports_the_validators_findings() {
+    let policy = b"{ \"schema_version\": \"1.0.0\",\n  \"default_action\": \"allow\" }\n";
+    let document = Document::new("policy.json", policy);
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let inspection = json!({
+        "valid": false,
+        "errors": [format!("rules must not be empty near {CANARY}")],
+        "schema_version": "1.0.0",
+        "diagnostics": [
+            {"code": "required_member_missing", "severity": "error", "pointer": "/rules",
+             "message": "a required member is missing", "remediation": "add the member",
+             "blocks": {"simulation": true, "tests": true, "publication": true, "evidence": true}},
+            {"code": "default_action_allow", "severity": "risk", "pointer": "/default_action",
+             "message": "the default action allows", "remediation": "deny by default",
+             "blocks": {"simulation": false, "tests": false, "publication": false, "evidence": false}}
+        ],
+        "source_digest": digest,
+        "resource_snapshot": {"digest": digest, "complete": true}
+    });
+    let gateway = ScriptedGateway::start(vec![json_response("400 Bad Request", "", &inspection)]);
+    let output = ggctl(
+        &[
+            "policy",
+            "lint",
+            document.path(),
+            "--server",
+            &gateway.base(),
+            "--token-stdin",
+            "--format",
+            "json",
+        ],
+        Some(CANARY.as_bytes()),
+    );
+    assert_eq!(output.status.code(), Some(3), "{}", text(&output.stdout));
+    let reported = report(&output);
+    assert_eq!(reported["command"], "policy lint");
+    assert_eq!(reported["diagnostics"][0]["code"], "policy.invalid");
+    assert_eq!(reported["result"]["valid"], false);
+    assert_eq!(reported["result"]["diagnostics"][1]["severity"], "risk");
+    assert_eq!(reported["result"]["resourceSnapshot"]["complete"], true);
+    assert!(output.stderr.is_empty());
+    assert_no_canary(&output);
+    assert_path_not_echoed(&output, document.path());
+    let requests = gateway.requests();
+    assert_eq!(requests.len(), 1);
+    assert_request(&requests[0], "POST /v1/admin/policy/validate");
+    assert_eq!(
+        requests[0].1, policy,
+        "the document is sent as its exact bytes"
+    );
+
+    // SARIF: one result per finding, located by JSON Pointer only.
+    let output = ggctl(
+        &[
+            "policy",
+            "lint",
+            document.path(),
+            "--server",
+            &gateway.base(),
+            "--token-stdin",
+            "--format",
+            "sarif",
+        ],
+        Some(CANARY.as_bytes()),
+    );
+    assert_eq!(output.status.code(), Some(3));
+    let log: Value = serde_json::from_slice(&output.stdout).expect("one SARIF log");
+    let results = log["runs"][0]["results"].as_array().expect("results");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[1]["ruleId"], "required_member_missing");
+    assert_eq!(
+        results[2]["locations"][0]["logicalLocations"][0]["fullyQualifiedName"],
+        "/default_action"
+    );
+    assert!(output.stderr.is_empty());
+    assert_no_canary(&output);
+    assert_path_not_echoed(&output, document.path());
+
+    // A valid document exits 0, unless a risk is an error by request.
+    let valid = json!({"valid": true, "diagnostics": [inspection["diagnostics"][1].clone()]});
+    let gateway = ScriptedGateway::start(vec![json_response("200 OK", "", &valid)]);
+    let output = ggctl(
+        &[
+            "policy",
+            "lint",
+            document.path(),
+            "--server",
+            &gateway.base(),
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        text(&output.stdout),
+        "policy: valid, 1 risk\nrisk default_action_allow at /default_action: the default action allows\n"
+    );
+    let output = ggctl(
+        &[
+            "policy",
+            "lint",
+            document.path(),
+            "--server",
+            &gateway.base(),
+            "--warnings-as-errors",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(text(&output.stderr).contains("validate.warnings_as_errors"));
+}
+
+#[test]
+fn policy_test_splices_the_suite_and_candidate_and_gates_on_the_status() {
+    let suite = b"{\"schema_version\": \"policy-tests.v1\", \"cases\": []}\n";
+    let candidate = b"{ \"schema_version\": \"1.0.0\", \"rules\": [] }";
+    let suite_file = Document::new("suite.json", suite);
+    let candidate_file = Document::new("candidate.json", candidate);
+    let results = json!({
+        "schema_version": "policy-test-results.v1",
+        "status": "failed",
+        "mode": "test",
+        "suite": {"schema_version": "policy-tests.v1", "digest": "sha256:d"},
+        "policy": {"source": "inline_candidate", "etag": POLICY_ETAG},
+        "summary": {"total": 1, "passed": 0, "failed": 1, "incomplete": 0, "errors": 0},
+        "cases": [{"id": "orders-blocked", "kind": "http", "status": "failed", "mismatches": ["effect"]}],
+        "not_evaluated": ["authentication"]
+    });
+    let gateway = ScriptedGateway::start(vec![json_response(
+        "200 OK",
+        "X-GreenGateway-Policy-Tests-Status: failed\r\n",
+        &results,
+    )]);
+    let output = ggctl(
+        &[
+            "policy",
+            "test",
+            suite_file.path(),
+            "--candidate",
+            candidate_file.path(),
+            "--server",
+            &gateway.base(),
+            "--token-stdin",
+            "--format",
+            "json",
+        ],
+        Some(CANARY.as_bytes()),
+    );
+    assert_eq!(output.status.code(), Some(3), "{}", text(&output.stdout));
+    let reported = report(&output);
+    assert_eq!(
+        reported["diagnostics"][0]["code"],
+        "policy.tests_not_passed"
+    );
+    assert_eq!(reported["result"]["status"], "failed");
+    assert_eq!(reported["result"]["results"], results);
+    let requests = gateway.requests();
+    assert_eq!(requests.len(), 1);
+    assert_request(&requests[0], "POST /v1/admin/policy/tests/runs");
+    let mut expected = b"{\"suite\":".to_vec();
+    expected.extend_from_slice(suite);
+    expected.extend_from_slice(b",\"format\":\"json\",\"policy\":");
+    expected.extend_from_slice(candidate);
+    expected.push(b'}');
+    assert_eq!(requests[0].1, expected);
+    assert_no_canary(&output);
+    assert_path_not_echoed(&output, suite_file.path());
+    assert_path_not_echoed(&output, candidate_file.path());
+
+    // JUnit is the gateway's own report, on standard output as answered.
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuite name=\"policy-tests.v1\" tests=\"1\"></testsuite>\n";
+    let gateway = ScriptedGateway::start(vec![format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/xml; charset=utf-8\r\nX-GreenGateway-Policy-Tests-Status: passed\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
+        xml.len()
+    )
+    .into_bytes()]);
+    let output = ggctl(
+        &[
+            "policy",
+            "test",
+            suite_file.path(),
+            "--draft",
+            "pd_0123456789abcdef0123456789abcdef",
+            "--draft-etag",
+            POLICY_ETAG,
+            "--server",
+            &gateway.base(),
+            "--format",
+            "junit",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), xml);
+    assert!(output.stderr.is_empty());
+    let body: Value =
+        serde_json::from_slice(&gateway.requests()[0].1).expect("the request is JSON");
+    assert_eq!(body["format"], "junit");
+    assert_eq!(
+        body["candidate"],
+        json!({"source": "draft", "draft_id": "pd_0123456789abcdef0123456789abcdef", "draft_etag": POLICY_ETAG})
+    );
+
+    // A JUnit report without its status header is not trusted.
+    let gateway = ScriptedGateway::start(vec![format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
+        xml.len()
+    )
+    .into_bytes()]);
+    let output = ggctl(
+        &[
+            "policy",
+            "test",
+            suite_file.path(),
+            "--server",
+            &gateway.base(),
+            "--format",
+            "junit",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(text(&output.stderr).contains("policy.response_invalid"));
+}
+
+#[test]
+fn policy_explain_sends_the_request_as_written_and_reports_refusals_by_code() {
+    let request = b"{\"schema_version\": \"policy-simulation.v1\", \"base_etag\": \"\\\"sha256:5f2c\\\"\",\n \"candidate\": {\"source\": \"active\"}, \"cases\": [{\"id\": \"reader\", \"kind\": \"http\", \"request\": {\"method\": \"GET\", \"path\": \"/orders/1\"}}]}";
+    let cases = Document::new("cases.json", request);
+    let results = json!({
+        "schema_version": "policy-simulation-results.v1",
+        "mode": "synthetic",
+        "trace": {"level": "terminal"},
+        "base": {"source": "active", "etag": POLICY_ETAG},
+        "candidate": {"source": "active", "etag": POLICY_ETAG},
+        "cases": [{"id": "reader", "kind": "http", "results": [{"projection": "as_authored",
+            "candidate": {"lane": "http", "logical": "deny", "enforcement": "shadowed",
+                          "effective_action": "would_forward", "reason": "matched_rule"}}]}],
+        "not_evaluated": ["authentication"]
+    });
+    let gateway = ScriptedGateway::start(vec![json_response("200 OK", "", &results)]);
+    let output = ggctl(
+        &[
+            "policy",
+            "explain",
+            cases.path(),
+            "--server",
+            &gateway.base(),
+            "--token-stdin",
+        ],
+        Some(CANARY.as_bytes()),
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(
+        text(&output.stdout),
+        format!(
+            "simulation: 1 case, trace terminal\n  base       active {POLICY_ETAG}\n  candidate  active {POLICY_ETAG}\ncase reader (http)\n  as_authored: http deny shadowed would_forward matched_rule\nnot evaluated: authentication\n"
+        )
+    );
+    let requests = gateway.requests();
+    assert_request(&requests[0], "POST /v1/admin/policy/simulations");
+    assert_eq!(requests[0].1, request);
+    assert_no_canary(&output);
+
+    // A stale base is a precondition conflict, reported by its stable reason.
+    let gateway = ScriptedGateway::start(vec![json_response(
+        "412 Precondition Failed",
+        "",
+        &json!({
+            "error": format!("the active policy changed near {CANARY}"),
+            "reason": "policy_simulation_base_stale",
+            "current_etag": "\"sha256:9a\""
+        }),
+    )]);
+    let output = ggctl(
+        &[
+            "policy",
+            "explain",
+            cases.path(),
+            "--server",
+            &gateway.base(),
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(5));
+    let reported = report(&output);
+    assert_eq!(
+        reported["diagnostics"][0]["code"],
+        "policy.precondition_failed"
+    );
+    assert_eq!(
+        reported["result"]["refusal"],
+        json!({"status": 412, "reason": "policy_simulation_base_stale"})
+    );
+    assert_no_canary(&output);
+
+    // A document that is not JSON is refused before anything is sent.
+    let broken = Document::new("broken.json", b"{\"cases\": [");
+    let gateway = ScriptedGateway::start(vec![json_response("200 OK", "", &results)]);
+    let output = ggctl(
+        &[
+            "policy",
+            "explain",
+            broken.path(),
+            "--server",
+            &gateway.base(),
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(text(&output.stderr).contains("input.not_json"));
+    assert!(gateway.requests().is_empty());
+    assert_path_not_echoed(&output, broken.path());
+}
+
+fn replay_job(state: &str) -> Value {
+    let mut job = json!({
+        "schema_version": "policy-replay-job.v1",
+        "job_id": REPLAY_JOB,
+        "state": state,
+        "cancel_requested": false,
+        "base": {"source": "active", "etag": POLICY_ETAG, "current": true},
+        "freshness": {"state": "current"},
+        "candidate": {"source": "active", "etag": POLICY_ETAG},
+        "window": {"from": "2026-10-27T00:00:00Z", "to": "2026-10-28T00:00:00Z"},
+        "cutoff": {"high_water": 41, "selected_records": 3}
+    });
+    if state == "completed" {
+        job["result_digest"] = json!(format!("sha256:{}", "b".repeat(64)));
+        job["result"] = json!({
+            "schema_version": "policy-replay-results.v1",
+            "complete": true,
+            "limitations": [],
+            "records": {"selected": 3, "scanned": 3, "replayable": 3}
+        });
+    }
+    job
+}
+
+#[test]
+fn policy_replay_starts_waits_reads_and_cancels_without_resending() {
+    let gateway = ScriptedGateway::start(vec![
+        json_response("202 Accepted", "", &replay_job("queued")),
+        json_response("200 OK", "", &replay_job("running")),
+        json_response("200 OK", "", &replay_job("completed")),
+    ]);
+    let output = ggctl(
+        &[
+            "policy",
+            "replay",
+            "--server",
+            &gateway.base(),
+            "--base-etag",
+            POLICY_ETAG,
+            "--window",
+            "2026-10-27T00:00:00Z/2026-10-28T00:00:00Z",
+            "--idempotency-key",
+            "nightly",
+            "--wait",
+            "--token-stdin",
+            "--format",
+            "json",
+        ],
+        Some(CANARY.as_bytes()),
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stdout));
+    let reported = report(&output);
+    assert_eq!(reported["command"], "policy replay");
+    assert_eq!(reported["result"]["action"], "start");
+    assert_eq!(reported["result"]["job"]["state"], "completed");
+    let requests = gateway.requests();
+    assert_eq!(requests.len(), 3);
+    assert_request(&requests[0], "POST /v1/admin/policy/replays");
+    for poll in &requests[1..] {
+        assert_request(poll, &format!("GET /v1/admin/policy/replays/{REPLAY_JOB}"));
+        assert!(poll.1.is_empty());
+    }
+    let body: Value = serde_json::from_slice(&requests[0].1).expect("JSON");
+    assert_eq!(
+        body,
+        json!({
+            "schema_version": "policy-replay.v1",
+            "base_etag": POLICY_ETAG,
+            "candidate": {"source": "active"},
+            "window": {"from": "2026-10-27T00:00:00Z", "to": "2026-10-28T00:00:00Z"},
+            "projections": ["as_authored"],
+            "idempotency_key": "nightly"
+        })
+    );
+    assert_no_canary(&output);
+
+    // An incomplete result satisfies no gate.
+    let mut incomplete = replay_job("completed_incomplete");
+    incomplete["result"] = json!({"complete": false, "limitations": ["no_data"]});
+    let gateway = ScriptedGateway::start(vec![json_response("200 OK", "", &incomplete)]);
+    let output = ggctl(
+        &[
+            "policy",
+            "replay",
+            "--server",
+            &gateway.base(),
+            "--job",
+            REPLAY_JOB,
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(text(&output.stdout)
+        .starts_with(&format!("replay job {REPLAY_JOB}: completed_incomplete\n")));
+    assert!(text(&output.stderr).contains("policy.replay_incomplete"));
+
+    // Cancelling a finished job discards it.
+    let gateway = ScriptedGateway::start(vec![
+        b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_vec(),
+    ]);
+    let output = ggctl(
+        &[
+            "policy",
+            "replay",
+            "--server",
+            &gateway.base(),
+            "--cancel",
+            REPLAY_JOB,
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "replay job discarded\n");
+    let requests = gateway.requests();
+    assert!(requests[0].0.starts_with(&format!(
+        "DELETE /v1/admin/policy/replays/{REPLAY_JOB} HTTP/1.1\r\n"
+    )));
+
+    // A start whose answer is lost is never resent, and the job may exist.
+    let gateway = ScriptedGateway::start(vec![Vec::new()]);
+    let candidate = Document::new("replay-candidate.json", b"{\"schema_version\": \"1.0.0\"}");
+    let output = ggctl(
+        &[
+            "policy",
+            "replay",
+            "--server",
+            &gateway.base(),
+            "--base-etag",
+            POLICY_ETAG,
+            "--window",
+            "2026-10-27T00:00:00Z",
+            "--candidate",
+            candidate.path(),
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let reported = report(&output);
+    let codes: Vec<_> = reported["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .map(|diagnostic| diagnostic["code"].clone())
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            json!("remote.transport_failed"),
+            json!("policy.outcome_unknown")
+        ]
+    );
+    assert!(reported["diagnostics"][1]["hint"]
+        .as_str()
+        .is_some_and(|hint| hint.contains("--idempotency-key")));
+    assert_eq!(gateway.requests().len(), 1, "a start is never resent");
+    assert_path_not_echoed(&output, candidate.path());
+}
+
+#[test]
+fn policy_commands_need_a_server_and_refuse_bad_values_before_any_request() {
+    for words in [
+        &["policy", "lint", "policy.json"][..],
+        &["policy", "replay", "--job", REPLAY_JOB],
+    ] {
+        let output = ggctl(words, None);
+        assert_eq!(output.status.code(), Some(2), "{words:?}");
+        assert!(output.stdout.is_empty());
+        assert!(text(&output.stderr).contains("usage.server_required"));
+    }
+    let gateway = ScriptedGateway::start(vec![json_response("200 OK", "", &json!({}))]);
+    let base = gateway.base();
+    for (words, code) in [
+        (
+            &["policy", "replay", "--job", "rpl_../../config"][..],
+            "usage.invalid_value",
+        ),
+        (
+            &["policy", "test", "suite.json", "--draft", "pd_1"],
+            "usage.missing_option",
+        ),
+        (
+            &[
+                "policy",
+                "replay",
+                "--base-etag",
+                "unquoted",
+                "--window",
+                "2026",
+            ],
+            "usage.invalid_value",
+        ),
+    ] {
+        let mut arguments = words.to_vec();
+        arguments.extend(["--server", base.as_str()]);
+        let output = ggctl(&arguments, None);
+        assert_eq!(output.status.code(), Some(2), "{words:?}");
+        assert!(output.stdout.is_empty());
+        assert!(text(&output.stderr).contains(code), "{words:?}");
+    }
+    assert!(gateway.requests().is_empty());
+    for (words, code) in [
+        (&["policy"][..], "usage.missing_command"),
+        (&["policy", "frobnicate"], "usage.unknown_command"),
+    ] {
+        let output = ggctl(words, None);
+        assert_eq!(output.status.code(), Some(2), "{words:?}");
+        assert!(text(&output.stderr).contains(code), "{words:?}");
+    }
+    let output = ggctl(&["help", "policy"], None);
+    assert_eq!(output.status.code(), Some(0));
+    for command in ["lint", "test", "explain", "replay"] {
+        assert!(
+            text(&output.stdout).contains(&format!("\n  {command}  ")),
+            "{command}"
+        );
+    }
+}
+
+/// A served evidence package: the report alone, built with the gateway's
+/// digest code.
+fn evidence_package() -> Vec<u8> {
+    use gateway_config::canonical_json;
+    let report = json!({
+        "schema_version": "policy-evidence-report.v1",
+        "completeness": "incomplete",
+        "limitations": ["tests_not_included"],
+        "trust": {"signed": false, "statement": "This package is unsigned."}
+    });
+    let media_type = "application/vnd.greengateway.policy-evidence-report+json";
+    let package = json!({
+        "schema_version": "policy-evidence.v1",
+        "generated_at": "2026-10-28T12:00:00Z",
+        "manifest": [{
+            "name": "report",
+            "media_type": media_type,
+            "schema_version": "policy-evidence-report.v1",
+            "digest": canonical_json::semantic_digest(media_type, "policy-evidence-report.v1", &report)
+                .expect("digest"),
+            "size": canonical_json::canonical_json_bytes(&report).expect("canonical").len(),
+        }],
+        "report": report,
+    });
+    canonical_json::canonical_json_bytes(&package).expect("canonical")
+}
+
+#[test]
+fn evidence_verify_runs_offline_and_reports_integrity_never_trust() {
+    let package = Document::new("policy-evidence.json", &evidence_package());
+    // There is no server, and the proxy variables `ggctl` is run with point
+    // at a closed port: nothing could be reached even if it were tried.
+    let output = ggctl(
+        &["evidence", "verify", package.path(), "--format", "json"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stdout));
+    let reported = report(&output);
+    assert_eq!(reported["command"], "evidence verify");
+    assert_eq!(reported["result"]["verdict"], "integrity_valid");
+    assert_eq!(reported["result"]["signature"], "unsigned");
+    assert_eq!(reported["result"]["trusted"], false);
+    assert_eq!(reported["diagnostics"][0]["code"], "evidence.unsigned");
+    assert_eq!(reported["diagnostics"][0]["severity"], "info");
+    assert_path_not_echoed(&output, package.path());
+
+    let output = ggctl(&["evidence", "verify", package.path()], None);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(text(&output.stdout)
+        .starts_with("evidence package: integrity_valid, unsigned (not trusted)\n"));
+    assert!(text(&output.stderr).starts_with("ggctl: info: evidence.unsigned: "));
+    assert_path_not_echoed(&output, package.path());
+
+    // One changed byte of the report is an integrity failure.
+    let tampered = String::from_utf8(evidence_package())
+        .expect("UTF-8")
+        .replacen("tests_not_included", "tests_not_includex", 1);
+    let tampered = Document::new("tampered.json", tampered.as_bytes());
+    let output = ggctl(
+        &["evidence", "verify", tampered.path(), "--format", "json"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(7));
+    let reported = report(&output);
+    assert_eq!(reported["result"]["verdict"], "integrity_invalid");
+    assert_eq!(
+        reported["diagnostics"][0]["code"],
+        "evidence.digest_mismatch"
+    );
+
+    // There is no remote form.
+    let output = ggctl(
+        &[
+            "evidence",
+            "verify",
+            package.path(),
+            "--server",
+            "http://127.0.0.1:9/v1/admin",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("usage.unknown_option"));
+}
+
 #[test]
 fn backup_create_refuses_a_locked_state_directory_and_verify_exits_7_on_damage() {
     use gateway_config::{
