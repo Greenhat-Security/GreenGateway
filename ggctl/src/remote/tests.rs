@@ -455,6 +455,116 @@ async fn an_unreadable_document_is_an_incompatible_server_not_a_partial_read() {
     }
 }
 
+fn mcp_document(name: &str, oauth: bool) -> McpClientConfigs {
+    McpClientConfigs::render(
+        &gateway_config::mcp_client_configs::McpUrl::new("https://gateway.example.test/base/mcp")
+            .expect("valid URL"),
+        &ServerName::new(name).expect("valid name"),
+        oauth,
+    )
+    .expect("renders")
+}
+
+#[tokio::test]
+async fn mcp_client_configs_are_read_with_the_name_and_the_bearer_token_only() {
+    for (name, oauth) in [(None, true), (Some("prod-gw_2"), false)] {
+        let expected = mcp_document(name.unwrap_or("greengateway"), oauth);
+        let body = serde_json::to_string(&expected).expect("serializes");
+        let (address, seen) = serve(
+            Some(http_response("200 OK", "application/json", &body)),
+            None,
+        )
+        .await;
+        let name = name.map(|name| ServerName::new(name).expect("valid name"));
+        assert_eq!(
+            mcp_client_configs(&plain_client(address), name.as_ref()).await,
+            Ok(expected)
+        );
+        let requests = seen.requests();
+        assert_eq!(requests.len(), 1);
+        let request = requests[0].to_ascii_lowercase();
+        let line = match &name {
+            None => "get /v1/admin/mcp/client-configs http/1.1\r\n".to_owned(),
+            Some(name) => format!(
+                "get /v1/admin/mcp/client-configs?name={} http/1.1\r\n",
+                name.as_str().to_ascii_lowercase()
+            ),
+        };
+        assert!(request.starts_with(&line), "{request}");
+        assert!(request.contains(&format!(
+            "authorization: bearer {}",
+            CANARY.to_ascii_lowercase()
+        )));
+        assert!(!request.contains("cookie"));
+    }
+}
+
+#[tokio::test]
+async fn mcp_client_config_refusals_and_unrendered_documents_have_their_own_codes() {
+    let mut newer = serde_json::to_value(mcp_document("greengateway", true)).expect("JSON");
+    newer["apiVersion"] = "greengateway.dev/v1beta1".into();
+    let mut tampered = serde_json::to_value(mcp_document("greengateway", true)).expect("JSON");
+    tampered["templates"][1]["content"] = format!("Bearer {CANARY}\n").into();
+    for (response, code) in [
+        (
+            http_response("404 Not Found", "application/json", "{}"),
+            Code::McpConfigsUnavailable,
+        ),
+        (
+            http_response(
+                "409 Conflict",
+                "application/json",
+                r#"{"error":"x","reason":"public_url_not_configured"}"#,
+            ),
+            Code::McpPublicUrlUnusable,
+        ),
+        (
+            http_response("400 Bad Request", "application/json", "{}"),
+            Code::UnexpectedStatus,
+        ),
+        (
+            http_response("403 Forbidden", "application/json", "{}"),
+            Code::Forbidden,
+        ),
+        (
+            http_response("200 OK", "application/json", &newer.to_string()),
+            Code::McpUnsupportedVersion,
+        ),
+        (
+            http_response("200 OK", "application/json", &tampered.to_string()),
+            Code::McpConfigsInvalid,
+        ),
+        (
+            http_response("200 OK", "application/json", "[]"),
+            Code::McpConfigsInvalid,
+        ),
+        (
+            http_response(
+                "200 OK",
+                "text/plain",
+                &serde_json::to_string(&mcp_document("greengateway", true)).expect("JSON"),
+            ),
+            Code::UnexpectedContentType,
+        ),
+    ] {
+        let (address, _) = serve(Some(response), None).await;
+        assert_eq!(
+            mcp_client_configs(&plain_client(address), None).await,
+            Err(code)
+        );
+    }
+    // The capability document's route keeps its own refusals only.
+    let (address, _) = serve(
+        Some(http_response("409 Conflict", "application/json", "{}")),
+        None,
+    )
+    .await;
+    assert_eq!(
+        handshake(&plain_client(address)).await,
+        Err(Code::UnexpectedStatus)
+    );
+}
+
 #[tokio::test]
 async fn responses_are_bounded_with_or_without_a_length() {
     let large = "x".repeat(MAX_CAPABILITIES_BYTES + 1);
@@ -801,4 +911,180 @@ fn a_ca_file_reached_through_a_directory_link_is_judged_along_its_target() {
         load_roots(&path).map(|_| ()),
         Err(Code::CaFileUnsafePermissions)
     );
+}
+
+/// Answers one connection on 127.0.0.1 with `response` after reading the
+/// whole request, its `Content-Length` body included, and hands back what
+/// it read.
+async fn serve_once(response: Vec<u8>) -> (SocketAddr, tokio::task::JoinHandle<(String, Vec<u8>)>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    let served = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.expect("head");
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head).into_owned();
+        let length = head
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = vec![0u8; length];
+        stream.read_exact(&mut body).await.expect("body");
+        stream.write_all(&response).await.expect("answer");
+        let _ = stream.shutdown().await;
+        (head, body)
+    });
+    (address, served)
+}
+
+fn raw_response(status: &str, headers: &str, body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn an_exchange_sends_its_body_as_json_and_reads_the_headers_it_asks_for() {
+    let (address, served) = serve_once(raw_response(
+        "422 Unprocessable Entity",
+        "Content-Type: application/json\r\nX-GreenGateway-Policy-Tests-Status: failed\r\nX-Spaced: two words\r\n",
+        "{\"reason\":\"x\"}",
+    ))
+    .await;
+    let reply = plain_client(address)
+        .exchange(&Exchange {
+            method: Method::Post,
+            path: "/policy/validate",
+            body: Some(b"{\"a\": 1}".to_vec()),
+            accept: JSON_MEDIA_TYPE,
+            headers: &["x-greengateway-policy-tests-status", "x-spaced", "x-absent"],
+            maximum: 1024,
+        })
+        .await
+        .expect("an answer");
+    assert_eq!(reply.status, 422);
+    assert_eq!(reply.body.as_deref(), Some(&b"{\"reason\":\"x\"}"[..]));
+    assert_eq!(
+        reply.header("X-GreenGateway-Policy-Tests-Status"),
+        Some("failed")
+    );
+    // A value with anything but visible ASCII is not read at all.
+    assert_eq!(reply.header("x-spaced"), None);
+    assert_eq!(reply.header("x-absent"), None);
+    let (head, body) = served.await.expect("served");
+    let head = head.to_ascii_lowercase();
+    assert!(
+        head.starts_with("post /v1/admin/policy/validate http/1.1\r\n"),
+        "{head}"
+    );
+    assert!(head.contains("content-type: application/json\r\n"));
+    assert!(head.contains("accept: application/json\r\n"));
+    assert!(head.contains(&format!(
+        "authorization: bearer {}",
+        CANARY.to_ascii_lowercase()
+    )));
+    assert_eq!(body, b"{\"a\": 1}");
+}
+
+#[tokio::test]
+async fn an_exchange_reads_only_the_media_type_it_accepts() {
+    // An error page is not read as a document, and is not an error itself.
+    let (address, _) = serve_once(raw_response(
+        "413 Payload Too Large",
+        "Content-Type: text/plain\r\n",
+        "too large",
+    ))
+    .await;
+    let reply = plain_client(address)
+        .exchange(&Exchange::get("/policy/replays", 1024))
+        .await
+        .expect("an answer");
+    assert_eq!((reply.status, reply.body), (413, None));
+
+    // A success must be of the accepted type...
+    let (address, _) = serve_once(raw_response(
+        "200 OK",
+        "Content-Type: application/json\r\n",
+        "{}",
+    ))
+    .await;
+    let exchange = Exchange {
+        method: Method::Post,
+        path: "/policy/tests/runs",
+        body: Some(b"{}".to_vec()),
+        accept: "application/xml",
+        headers: &[],
+        maximum: 1024,
+    };
+    assert_eq!(
+        plain_client(address).exchange(&exchange).await.map(|_| ()),
+        Err(Code::UnexpectedContentType)
+    );
+    // ...unless it has no content at all.
+    let (address, served) =
+        serve_once(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_vec()).await;
+    let reply = plain_client(address)
+        .exchange(&Exchange {
+            method: Method::Delete,
+            path: "/policy/replays/rpl_0",
+            body: None,
+            accept: JSON_MEDIA_TYPE,
+            headers: &[],
+            maximum: 1024,
+        })
+        .await
+        .expect("an answer");
+    assert_eq!((reply.status, reply.body), (204, None));
+    let (head, body) = served.await.expect("served");
+    assert!(head.starts_with("DELETE /v1/admin/policy/replays/rpl_0 HTTP/1.1\r\n"));
+    assert!(!head.to_ascii_lowercase().contains("content-type"));
+    assert!(body.is_empty());
+
+    // A refusal of the credential is the remote client's, whatever the method.
+    let (address, _) = serve_once(raw_response(
+        "401 Unauthorized",
+        "Content-Type: application/json\r\n",
+        "{}",
+    ))
+    .await;
+    assert_eq!(
+        plain_client(address)
+            .exchange(&Exchange {
+                body: Some(b"{}".to_vec()),
+                ..exchange
+            })
+            .await
+            .map(|_| ()),
+        Err(Code::Unauthenticated)
+    );
+}
+
+#[tokio::test]
+async fn a_post_whose_connection_was_refused_is_never_retried_and_never_sent() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind");
+    let closed = listener.local_addr().expect("address");
+    drop(listener);
+    let outcome = plain_client(closed)
+        .exchange(&Exchange {
+            method: Method::Post,
+            path: "/policy/replays",
+            body: Some(b"{}".to_vec()),
+            accept: JSON_MEDIA_TYPE,
+            headers: &[],
+            maximum: 1024,
+        })
+        .await;
+    assert_eq!(outcome.map(|_| ()), Err(Code::ConnectFailed));
 }

@@ -19,6 +19,10 @@
 //! - [`capabilities`]: the `GatewayCapabilities` document a gateway serves at
 //!   `GET /v1{ADMIN_PREFIX}/config/capabilities`, which `ggctl` reads before
 //!   any configuration operation and refuses to proceed without;
+//! - [`mcp_client_configs`]: the credential-free MCP client configuration
+//!   templates a gateway serves at `GET /v1{ADMIN_PREFIX}/mcp/client-configs`
+//!   and `ggctl mcp-config` prints, rendered and read here so the two cannot
+//!   disagree about a template;
 //! - [`bundle`]: the configuration bundle reader, which `ggctl validate` and
 //!   `ggctl doctor` run and the gateway will start from in bundle mode;
 //! - [`canonical_json`]: RFC 8785 canonical JSON and ADR-0004's digest frame;
@@ -105,6 +109,7 @@ pub mod discovery;
 pub mod documents;
 pub mod inbound_tls;
 pub mod ledger;
+pub mod mcp_client_configs;
 pub mod opaque_id;
 pub mod path_match;
 pub mod permissions;

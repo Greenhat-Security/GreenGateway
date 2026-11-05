@@ -349,6 +349,17 @@
             }
           }
         },
+        "policy_tests": {
+          "description": "The stored policy test suite as a gate on policy changes.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "required": {
+              "description": "POLICY_TESTS_REQUIRED in environment mode: docs/configuration.md#policy_tests_required.",
+              "type": "boolean"
+            }
+          }
+        },
         "cors": {
           "description": "Cross-origin resource sharing.",
           "type": "object",

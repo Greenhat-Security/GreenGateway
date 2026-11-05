@@ -299,7 +299,7 @@ fn migrations_are_ordered_idempotent_and_restart_safe() {
         .expect("migration query should run")
         .collect::<Result<Vec<_>, _>>()
         .expect("migration rows should read");
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
 }
 
 #[test]
@@ -627,7 +627,7 @@ fn migration_five_preserves_populated_v4_catalog_state() {
         .expect("migration query should run")
         .collect::<Result<Vec<_>, _>>()
         .expect("migration rows should read");
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
 }
 
 #[test]
@@ -729,7 +729,7 @@ fn migration_six_preserves_populated_v5_mcp_catalog_state() {
         .expect("migration query should run")
         .collect::<Result<Vec<_>, _>>()
         .expect("migration rows should read");
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
 }
 
 #[test]
@@ -1071,7 +1071,7 @@ fn migrations_eight_and_nine_preserve_bindings_and_openapi_catalogs() {
         .expect("migration query should run")
         .collect::<Result<Vec<_>, _>>()
         .expect("migration rows should read");
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
     assert!(connection
         .prepare("SELECT source_digest, values_json FROM connection_enum_source_values LIMIT 0")
         .is_ok());
@@ -1103,6 +1103,7 @@ fn mcp_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
                 "gg://resource/{id}",
                 "resource-by-id",
             )],
+            &ChangeActor::for_test("test-admin"),
         )
         .expect("first MCP catalog should publish");
     assert_eq!(first.catalog_revision, 1);
@@ -1136,6 +1137,7 @@ fn mcp_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
                 "gg://resource/{slug}",
                 "resource-by-slug",
             )],
+            &ChangeActor::for_test("test-admin"),
         )
         .expect("second MCP catalog should publish");
     assert_eq!(second.catalog_revision, 2);
@@ -1188,7 +1190,14 @@ fn mcp_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
         mcp_catalog_entry("duplicate", "Second"),
     ];
     assert!(matches!(
-        store.replace_mcp_catalog(&created.id, &created.etag(), &duplicate, &[], &[]),
+        store.replace_mcp_catalog(
+            &created.id,
+            &created.etag(),
+            &duplicate,
+            &[],
+            &[],
+            &ChangeActor::for_test("test-admin")
+        ),
         Err(ConnectionStoreError::Validation { .. })
     ));
     let duplicate_resources = [
@@ -1202,6 +1211,7 @@ fn mcp_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
             &[mcp_catalog_entry("replacement", "Replacement")],
             &duplicate_resources,
             &[],
+            &ChangeActor::for_test("test-admin"),
         ),
         Err(ConnectionStoreError::Validation { .. })
     ));
@@ -1254,6 +1264,7 @@ fn multi_byte_remote_tool_name_rejects_as_invalid_input_not_a_storage_failure() 
             &[mcp_catalog_entry(&remote_tool_name, "Multi-byte tool")],
             &[],
             &[],
+            &ChangeActor::for_test("test-admin"),
         )
         .expect_err("an unstorable remote tool name must reject the catalog");
     match error {
@@ -1292,6 +1303,7 @@ fn mcp_catalog_combined_count_and_byte_limits_preserve_last_known_good() {
                 "gg://baseline/{id}",
                 "baseline-template",
             )],
+            &ChangeActor::for_test("test-admin"),
         )
         .expect("baseline MCP catalog should publish");
 
@@ -1305,6 +1317,7 @@ fn mcp_catalog_combined_count_and_byte_limits_preserve_last_known_good() {
             &maximum_tools,
             &[mcp_resource("gg://overflow", "overflow")],
             &[],
+            &ChangeActor::for_test("test-admin"),
         ),
         Err(ConnectionStoreError::LimitExceeded {
             resource: "connection MCP catalog entries",
@@ -1326,7 +1339,14 @@ fn mcp_catalog_combined_count_and_byte_limits_preserve_last_known_good() {
         })
         .collect::<Vec<_>>();
     assert!(matches!(
-        store.replace_mcp_catalog(&created.id, &created.etag(), &oversized_bytes, &[], &[],),
+        store.replace_mcp_catalog(
+            &created.id,
+            &created.etag(),
+            &oversized_bytes,
+            &[],
+            &[],
+            &ChangeActor::for_test("test-admin")
+        ),
         Err(ConnectionStoreError::LimitExceeded {
             resource: "connection MCP catalog bytes",
             ..
@@ -1359,6 +1379,7 @@ fn aggregate_mcp_catalog_byte_bound_preserves_all_last_known_good_catalogs() {
             &[mcp_catalog_entry("baseline", "Baseline")],
             &[],
             &[],
+            &ChangeActor::for_test("test-admin"),
         )
         .expect("second MCP baseline should publish");
 
@@ -1370,7 +1391,14 @@ fn aggregate_mcp_catalog_byte_bound_preserves_all_last_known_good_catalogs() {
         .expect("first half-bound catalog should validate")
         .stored_bytes;
     store
-        .replace_mcp_catalog(&first.id, &first.etag(), &first_entries, &[], &[])
+        .replace_mcp_catalog(
+            &first.id,
+            &first.etag(),
+            &first_entries,
+            &[],
+            &[],
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("first half-bound catalog should publish");
     drop(first_entries);
 
@@ -1390,7 +1418,14 @@ fn aggregate_mcp_catalog_byte_bound_preserves_all_last_known_good_catalogs() {
     );
 
     assert!(matches!(
-        store.replace_mcp_catalog(&second.id, &second.etag(), &second_entries, &[], &[],),
+        store.replace_mcp_catalog(
+            &second.id,
+            &second.etag(),
+            &second_entries,
+            &[],
+            &[],
+            &ChangeActor::for_test("test-admin")
+        ),
         Err(ConnectionStoreError::LimitExceeded {
             resource: "connection MCP catalog bytes",
             maximum: MAX_MANAGED_MCP_CATALOG_BYTES,
@@ -1424,7 +1459,14 @@ fn corrupt_aggregate_mcp_bytes_are_preflighted_on_load_and_restart() {
         .create(mcp_candidate(), &ChangeActor::for_test("test-admin"))
         .expect("MCP Connection should create");
     store
-        .replace_mcp_catalog(&created.id, &created.etag(), &[], &[], &[])
+        .replace_mcp_catalog(
+            &created.id,
+            &created.etag(),
+            &[],
+            &[],
+            &[],
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("empty MCP catalog should publish");
     persist_oversized_mcp_resource_catalog(&store, &created.id, LOCATOR_CANARY);
 
@@ -1472,6 +1514,7 @@ fn mcp_resource_locators_reject_secret_bearing_components_without_leaking() {
                 "gg://resource/{id}",
                 "baseline-template",
             )],
+            &ChangeActor::for_test("test-admin"),
         )
         .expect("baseline MCP catalog should publish");
 
@@ -1534,6 +1577,7 @@ fn mcp_resource_locators_reject_secret_bearing_components_without_leaking() {
                 &[mcp_catalog_entry("replacement", "Replacement")],
                 &resources,
                 &resource_templates,
+                &ChangeActor::for_test("test-admin"),
             )
             .expect_err("secret-bearing MCP locator should fail closed");
         assert!(matches!(error, ConnectionStoreError::Validation { .. }));
@@ -1568,6 +1612,7 @@ fn empty_mcp_catalog_is_removed_on_incompatible_update_or_delete() {
             &[],
             &[],
             &[],
+            &ChangeActor::for_test("test-admin"),
         )
         .expect("empty MCP catalog should publish");
     let converted = store
@@ -1597,7 +1642,14 @@ fn empty_mcp_catalog_is_removed_on_incompatible_update_or_delete() {
         .create(mcp_candidate(), &ChangeActor::for_test("test-admin"))
         .expect("deletable MCP Connection should create");
     store
-        .replace_mcp_catalog(&deleted.id, &deleted.etag(), &[], &[], &[])
+        .replace_mcp_catalog(
+            &deleted.id,
+            &deleted.etag(),
+            &[],
+            &[],
+            &[],
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("deletable empty MCP catalog should publish");
     store
         .delete(
@@ -1638,6 +1690,7 @@ fn openapi_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
                 openapi_catalog_entry("alpha"),
                 openapi_catalog_entry("beta"),
             ],
+            &ChangeActor::for_test("test-admin"),
         )
         .expect("first OpenAPI catalog should publish");
     assert_eq!(first.spec_revision, 1);
@@ -1666,6 +1719,7 @@ fn openapi_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
             first_spec,
             &first_digest,
             &[openapi_catalog_entry("stale")],
+            &ChangeActor::for_test("test-admin"),
         ),
         Err(ConnectionStoreError::Conflict { .. })
     ));
@@ -1678,6 +1732,7 @@ fn openapi_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
             first_spec,
             &"0".repeat(SHA256_HEX_CHARS),
             &[openapi_catalog_entry("invalid-digest")],
+            &ChangeActor::for_test("test-admin"),
         ),
         Err(ConnectionStoreError::Validation { .. })
     ));
@@ -1698,6 +1753,7 @@ fn openapi_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
             first_spec,
             &first_digest,
             &[openapi_catalog_entry("gamma")],
+            &ChangeActor::for_test("test-admin"),
         )
         .expect("same-spec OpenAPI catalog should publish");
     assert_eq!(second.spec_revision, 1);
@@ -1714,6 +1770,7 @@ fn openapi_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
             second_spec,
             &second_digest,
             &[openapi_catalog_entry("delta")],
+            &ChangeActor::for_test("test-admin"),
         )
         .expect("changed-spec OpenAPI catalog should publish");
     assert_eq!(third.spec_revision, 2);
@@ -1730,6 +1787,7 @@ fn openapi_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
             second_spec,
             &second_digest,
             &[duplicate.clone(), duplicate],
+            &ChangeActor::for_test("test-admin"),
         ),
         Err(ConnectionStoreError::Validation { .. })
     ));
@@ -2350,7 +2408,16 @@ fn empty_openapi_catalog_is_removed_on_incompatible_update_and_delete_cascades()
     let spec = r#"{"openapi":"3.1.0","info":{"title":"Empty","version":"1"}}"#;
     let digest = spec_digest(spec);
     store
-        .replace_openapi_catalog(&source.id, &source.etag(), 0, 0, spec, &digest, &[])
+        .replace_openapi_catalog(
+            &source.id,
+            &source.etag(),
+            0,
+            0,
+            spec,
+            &digest,
+            &[],
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("empty OpenAPI catalog should publish");
     let converted = store
         .replace(
@@ -2376,7 +2443,16 @@ fn empty_openapi_catalog_is_removed_on_incompatible_update_and_delete_cascades()
         .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("deletable OpenAPI Connection should create");
     store
-        .replace_openapi_catalog(&deleted.id, &deleted.etag(), 0, 0, spec, &digest, &[])
+        .replace_openapi_catalog(
+            &deleted.id,
+            &deleted.etag(),
+            0,
+            0,
+            spec,
+            &digest,
+            &[],
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("deletable empty OpenAPI catalog should publish");
     store
         .delete(
@@ -2417,13 +2493,21 @@ fn combined_mcp_and_openapi_catalog_bound_is_enforced_in_both_replacements() {
                 openapi_catalog_entry("openapi-a"),
                 openapi_catalog_entry("openapi-b"),
             ],
+            &ChangeActor::for_test("test-admin"),
         )
         .expect("small OpenAPI catalog should publish");
     let oversized_mcp = (0..(MAX_CATALOG_ENTRIES - 1))
         .map(|index| mcp_catalog_entry(&format!("m{index:04}"), "Bounded"))
         .collect::<Vec<_>>();
     assert!(matches!(
-        store.replace_mcp_catalog(&mcp.id, &mcp.etag(), &oversized_mcp, &[], &[]),
+        store.replace_mcp_catalog(
+            &mcp.id,
+            &mcp.etag(),
+            &oversized_mcp,
+            &[],
+            &[],
+            &ChangeActor::for_test("test-admin")
+        ),
         Err(ConnectionStoreError::LimitExceeded {
             resource: "connection catalog entries",
             ..
@@ -2435,7 +2519,14 @@ fn combined_mcp_and_openapi_catalog_bound_is_enforced_in_both_replacements() {
         .take(MAX_CATALOG_ENTRIES - 2)
         .collect::<Vec<_>>();
     store
-        .replace_mcp_catalog(&mcp.id, &mcp.etag(), &bounded_mcp, &[], &[])
+        .replace_mcp_catalog(
+            &mcp.id,
+            &mcp.etag(),
+            &bounded_mcp,
+            &[],
+            &[],
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("combined catalog at the exact limit should publish");
     assert!(matches!(
         store.replace_openapi_catalog(
@@ -2450,6 +2541,7 @@ fn combined_mcp_and_openapi_catalog_bound_is_enforced_in_both_replacements() {
                 openapi_catalog_entry("openapi-b"),
                 openapi_catalog_entry("openapi-c"),
             ],
+            &ChangeActor::for_test("test-admin"),
         ),
         Err(ConnectionStoreError::LimitExceeded {
             resource: "connection catalog entries",
@@ -2485,6 +2577,7 @@ fn aggregate_openapi_definition_byte_bound_preserves_prior_catalogs() {
             spec,
             &digest,
             &first_entries,
+            &ChangeActor::for_test("test-admin"),
         )
         .expect("first catalog below the aggregate bound should publish");
     drop(first_entries);
@@ -2502,6 +2595,7 @@ fn aggregate_openapi_definition_byte_bound_preserves_prior_catalogs() {
             spec,
             &digest,
             &second_entries,
+            &ChangeActor::for_test("test-admin"),
         ),
         Err(ConnectionStoreError::LimitExceeded {
             resource: "connection OpenAPI catalog definition bytes",
@@ -2529,7 +2623,16 @@ fn aggregate_openapi_definition_byte_bound_preserves_prior_catalogs() {
         MAX_MANAGED_OPENAPI_CATALOG_BYTES + 1,
     );
     assert!(matches!(
-        store.replace_openapi_catalog(&second.id, &second.etag(), 0, 0, spec, &digest, &oversized,),
+        store.replace_openapi_catalog(
+            &second.id,
+            &second.etag(),
+            0,
+            0,
+            spec,
+            &digest,
+            &oversized,
+            &ChangeActor::for_test("test-admin")
+        ),
         Err(ConnectionStoreError::LimitExceeded {
             resource: "connection OpenAPI catalog definition bytes",
             maximum: MAX_MANAGED_OPENAPI_CATALOG_BYTES,
@@ -2550,7 +2653,16 @@ fn aggregate_openapi_definition_byte_corruption_is_rejected_on_restart() {
     let spec = r#"{"openapi":"3.1.0","info":{"title":"Bytes","version":"1"}}"#;
     let digest = spec_digest(spec);
     store
-        .replace_openapi_catalog(&created.id, &created.etag(), 0, 0, spec, &digest, &[])
+        .replace_openapi_catalog(
+            &created.id,
+            &created.etag(),
+            0,
+            0,
+            spec,
+            &digest,
+            &[],
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("empty OpenAPI catalog should publish");
     drop(store);
 
@@ -2662,6 +2774,7 @@ fn corrupt_openapi_catalog_definition_is_rejected_on_restart() {
             spec,
             &digest,
             &[openapi_catalog_entry("alpha")],
+            &ChangeActor::for_test("test-admin"),
         )
         .expect("OpenAPI catalog should publish");
     drop(store);
@@ -2697,6 +2810,7 @@ fn corrupt_mcp_resource_catalog_is_rejected_on_restart() {
                 "gg://resource/{id}",
                 "resource-by-id",
             )],
+            &ChangeActor::for_test("test-admin"),
         )
         .expect("MCP resource catalog should publish");
     drop(store);
@@ -4947,8 +5061,8 @@ fn a_failed_evidence_insert_rolls_back_create_replace_and_delete() {
 /// A database written before migration 12 gains both evidence tables,
 /// empty, on its first open by this build: nothing is fabricated for the
 /// records that already exist, and the first change afterwards is recorded.
-/// The pre-12 file is made by removing what migration 12 adds, so it holds
-/// exactly today's record shape.
+/// The pre-12 file is made by removing what migrations 12 and 13 add, so it
+/// holds exactly today's record shape.
 #[test]
 fn migration_twelve_adds_empty_evidence_tables_to_an_existing_database() {
     let (_directory, path, store) = temporary_store("migration-twelve");
@@ -4960,6 +5074,8 @@ fn migration_twelve_adds_empty_evidence_tables_to_an_existing_database() {
         .expect("database should open")
         .execute_batch(
             r#"
+            DROP TABLE catalog_change_evidence;
+            DELETE FROM connection_schema_migrations WHERE version = 13;
             DROP TABLE connection_change_evidence;
             DROP TABLE connection_local_secret_change_evidence;
             DELETE FROM connection_schema_migrations WHERE version = 12;
@@ -5248,4 +5364,1119 @@ fn change_evidence_bounds_match_the_migration() {
         2,
         "every row records the whole actor"
     );
+}
+
+// ---- Catalog change evidence (issue #425, PR 4: migration 13) ------------
+
+/// One `catalog_change_evidence` row as stored, every column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CatalogEvidenceRow {
+    sequence: i64,
+    event_id: String,
+    operation_id: String,
+    actor_user_id: String,
+    actor_issuer: Option<String>,
+    actor_kind: String,
+    actor_auth_mode: String,
+    action: String,
+    connection_id: String,
+    prior_version: Option<i64>,
+    new_version: i64,
+    overlay_revision: Option<i64>,
+    committed_at: String,
+}
+
+impl CatalogEvidenceRow {
+    /// The recorded actor: subject, issuer, kind and auth mode.
+    fn actor(&self) -> (&str, Option<&str>, &str, &str) {
+        (
+            self.actor_user_id.as_str(),
+            self.actor_issuer.as_deref(),
+            self.actor_kind.as_str(),
+            self.actor_auth_mode.as_str(),
+        )
+    }
+}
+
+/// The catalog evidence as a separate connection to the file reads it.
+fn catalog_evidence(path: &Path) -> Vec<CatalogEvidenceRow> {
+    let connection = Connection::open(path).expect("Connections database should open");
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer,
+                   actor_kind, actor_auth_mode, action, connection_id, prior_version,
+                   new_version, overlay_revision, committed_at
+            FROM catalog_change_evidence
+            ORDER BY sequence ASC
+            "#,
+        )
+        .expect("catalog evidence query should prepare");
+    let rows = statement
+        .query_map([], |row| {
+            Ok(CatalogEvidenceRow {
+                sequence: row.get(0)?,
+                event_id: row.get(1)?,
+                operation_id: row.get(2)?,
+                actor_user_id: row.get(3)?,
+                actor_issuer: row.get(4)?,
+                actor_kind: row.get(5)?,
+                actor_auth_mode: row.get(6)?,
+                action: row.get(7)?,
+                connection_id: row.get(8)?,
+                prior_version: row.get(9)?,
+                new_version: row.get(10)?,
+                overlay_revision: row.get(11)?,
+                committed_at: row.get(12)?,
+            })
+        })
+        .expect("catalog evidence query should run")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("catalog evidence rows should read");
+    rows
+}
+
+const CATALOG_EVIDENCE_SPEC: &str =
+    r#"{"openapi":"3.1.0","info":{"title":"Evidence","version":"1"}}"#;
+const EMPTY_SOURCE_REPORTS: &str = r#"{"schema_version":"0.1.0","sources":[]}"#;
+
+/// An overlay put of `document` over the stored overlay revision.
+fn overlay_put(document: &str, expected_overlay_revision: u64) -> StoredOverlayWrite {
+    StoredOverlayWrite::Put {
+        schema_version: "0.1.0".to_owned(),
+        overlay_json: document.to_owned(),
+        source_reports_json: EMPTY_SOURCE_REPORTS.to_owned(),
+        expected_overlay_revision,
+    }
+}
+
+/// Every catalog publication commits one row in its own transaction, naming
+/// its whole actor -- an issuer-less principal, a service token and a
+/// principal an identity provider vouched for -- and named by what it did to
+/// the overlay, as the PostgreSQL store names it: an MCP publication, an
+/// OpenAPI registration, an overlay put, a refresh that rewrites only the
+/// source reports, and an overlay delete. The rows outlive the catalogs they
+/// replaced and the Connections whose deletion cascades the current ones,
+/// and a restart reads every row unchanged.
+#[test]
+fn catalog_publications_record_evidence_that_survives_deletion_and_restart() {
+    let (_directory, path, store) = temporary_store("catalog-evidence");
+    let creator = ChangeActor::for_test("creating-admin");
+    let publisher = ChangeActor::for_test("publishing-admin");
+    let token = ChangeActor::service_token_for_test("service-token:token_1");
+    let vouched = ChangeActor::for_test_with_issuer("overlay-admin", "https://idp-a.example.test");
+
+    let mcp = store
+        .create(mcp_candidate(), &creator)
+        .expect("MCP Connection should create");
+    let first_mcp = store
+        .replace_mcp_catalog_expecting(
+            &mcp.id,
+            &mcp.etag(),
+            &[mcp_catalog_entry("alpha", "Alpha")],
+            &[],
+            &[],
+            Some(0),
+            &publisher,
+        )
+        .expect("the first MCP catalog should publish");
+    // Emptying the catalog releases the managed-tool dependency the delete
+    // would otherwise refuse on.
+    let emptied_mcp = store
+        .replace_mcp_catalog_expecting(&mcp.id, &mcp.etag(), &[], &[], &[], Some(1), &token)
+        .expect("the emptied MCP catalog should publish");
+
+    let openapi = store
+        .create(candidate(), &creator)
+        .expect("OpenAPI Connection should create");
+    let digest = spec_digest(CATALOG_EVIDENCE_SPEC);
+    let registered = store
+        .replace_openapi_catalog(
+            &openapi.id,
+            &openapi.etag(),
+            0,
+            0,
+            CATALOG_EVIDENCE_SPEC,
+            &digest,
+            &[openapi_catalog_entry("alpha")],
+            &publisher,
+        )
+        .expect("the OpenAPI registration should publish");
+    let replaced = store
+        .replace_openapi_catalog_with_overlay(
+            &openapi.id,
+            &openapi.etag(),
+            1,
+            1,
+            CATALOG_EVIDENCE_SPEC,
+            &digest,
+            &[openapi_catalog_entry("alpha")],
+            Some(&overlay_put(r#"{"schema_version":"0.1.0","tools":{}}"#, 0)),
+            1,
+            &vouched,
+            &[],
+        )
+        .expect("the overlay put should publish");
+    let refreshed = store
+        .replace_openapi_catalog_with_overlay(
+            &openapi.id,
+            &openapi.etag(),
+            1,
+            2,
+            CATALOG_EVIDENCE_SPEC,
+            &digest,
+            &[openapi_catalog_entry("alpha")],
+            Some(&StoredOverlayWrite::Reports {
+                source_reports_json: EMPTY_SOURCE_REPORTS.to_owned(),
+                expected_overlay_revision: 1,
+            }),
+            1,
+            &token,
+            &[],
+        )
+        .expect("the refresh should publish");
+    let removed = store
+        .replace_openapi_catalog_with_overlay(
+            &openapi.id,
+            &openapi.etag(),
+            1,
+            3,
+            CATALOG_EVIDENCE_SPEC,
+            &digest,
+            &[],
+            Some(&StoredOverlayWrite::Delete {
+                expected_overlay_revision: 1,
+            }),
+            0,
+            &vouched,
+            &[],
+        )
+        .expect("the overlay delete should publish");
+    assert_eq!(
+        [
+            registered.catalog_revision,
+            replaced.catalog_revision,
+            refreshed.catalog_revision,
+            removed.catalog_revision,
+        ],
+        [1, 2, 3, 4]
+    );
+    store
+        .delete(&mcp.id, &mcp.etag(), &creator)
+        .expect("the MCP Connection should delete");
+    store
+        .delete(&openapi.id, &openapi.etag(), &creator)
+        .expect("the OpenAPI Connection should delete");
+    assert!(store
+        .mcp_catalogs()
+        .expect("MCP catalogs should load")
+        .is_empty());
+    assert!(store
+        .openapi_catalogs()
+        .expect("OpenAPI catalogs should load")
+        .is_empty());
+
+    let rows = catalog_evidence(&path);
+    let publishing = ("publishing-admin", None, "principal", "bearer_token");
+    let tokened = (
+        "service-token:token_1",
+        None,
+        "service_token",
+        "service_token",
+    );
+    let vouching = (
+        "overlay-admin",
+        Some("https://idp-a.example.test"),
+        "principal",
+        "bearer_token",
+    );
+    let mcp_id = mcp.id.as_str();
+    let openapi_id = openapi.id.as_str();
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row.action.as_str(),
+                row.actor(),
+                row.connection_id.as_str(),
+                row.prior_version,
+                row.new_version,
+                row.overlay_revision,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("catalog.mcp.publish", publishing, mcp_id, None, 1, None),
+            ("catalog.mcp.publish", tokened, mcp_id, Some(1), 2, None),
+            (
+                "catalog.openapi.publish",
+                publishing,
+                openapi_id,
+                None,
+                1,
+                Some(0)
+            ),
+            (
+                "catalog.overlay.replace",
+                vouching,
+                openapi_id,
+                Some(1),
+                2,
+                Some(1)
+            ),
+            (
+                "catalog.openapi.publish",
+                tokened,
+                openapi_id,
+                Some(2),
+                3,
+                Some(1)
+            ),
+            (
+                "catalog.overlay.delete",
+                vouching,
+                openapi_id,
+                Some(3),
+                4,
+                Some(0)
+            ),
+        ]
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.committed_at.as_str())
+            .collect::<Vec<_>>(),
+        [
+            first_mcp.refreshed_at.as_str(),
+            emptied_mcp.refreshed_at.as_str(),
+            registered.refreshed_at.as_str(),
+            replaced.refreshed_at.as_str(),
+            refreshed.refreshed_at.as_str(),
+            removed.refreshed_at.as_str(),
+        ],
+        "each row carries its publication's own commit time"
+    );
+    assert!(
+        rows.windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence),
+        "sequence is commit order"
+    );
+    for row in &rows {
+        Uuid::parse_str(&row.event_id).expect("event ID is a UUID");
+        Uuid::parse_str(&row.operation_id).expect("operation ID is a UUID");
+    }
+    let events = rows
+        .iter()
+        .map(|row| row.event_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let operations = rows
+        .iter()
+        .map(|row| row.operation_id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(events.len(), rows.len());
+    assert_eq!(
+        operations.len(),
+        rows.len(),
+        "one publication, one operation"
+    );
+
+    drop(store);
+    let reopened = SqliteConnectionStore::open(&path).expect("store should reopen");
+    assert_eq!(reopened.get(&mcp.id).expect("get should answer"), None);
+    assert_eq!(
+        catalog_evidence(&path),
+        rows,
+        "the evidence survives the replacements, the cascade and the restart unchanged"
+    );
+}
+
+/// Identifiers, revisions and the actor only: no tool or resource name,
+/// description, schema, specification or its digest, definition, overlay
+/// document, source report, enum value, endpoint or credential binding
+/// reaches a row. An enum-value refresh and a status observation publish no
+/// catalog, so neither writes a row.
+#[test]
+fn catalog_evidence_records_no_catalog_material_and_nothing_for_unpublished_writes() {
+    let (_directory, path, store) = temporary_store("catalog-evidence-markers");
+    let admin = ChangeActor::for_test("test-admin");
+    let mcp = store
+        .create(mcp_candidate(), &admin)
+        .expect("MCP Connection should create");
+    let mut marked_tool = mcp_catalog_entry("marker_mcp_tool", "Marker MCP description");
+    marked_tool.title = Some("Marker MCP title".to_owned());
+    store
+        .replace_mcp_catalog(
+            &mcp.id,
+            &mcp.etag(),
+            &[marked_tool],
+            &[mcp_resource("gg://marker/resource", "marker-resource")],
+            &[mcp_resource_template("gg://marker/{id}", "marker-template")],
+            &admin,
+        )
+        .expect("the marked MCP catalog should publish");
+
+    let openapi = store
+        .create(candidate(), &admin)
+        .expect("OpenAPI Connection should create");
+    let spec = r#"{"openapi":"3.1.0","info":{"title":"Marker Spec Title","version":"1"}}"#;
+    let digest = spec_digest(spec);
+    let source_reports = r#"{"schema_version":"0.1.0","sources":[{"id":"regions","kind":"enum","state":"fresh","item_count":1,"resolved_at":"2026-09-03T00:00:00Z"}]}"#;
+    let overlay = StoredOverlayWrite::Put {
+        schema_version: "0.1.0".to_owned(),
+        overlay_json: r#"{"schema_version":"0.1.0","tools":{"marker_openapi_tool":{"description":"Marker overlay description"}}}"#.to_owned(),
+        source_reports_json: source_reports.to_owned(),
+        expected_overlay_revision: 0,
+    };
+    let enum_write = StoredEnumSourceValueWrite {
+        connection_id: openapi.id.clone(),
+        source_id: "regions".to_owned(),
+        overlay_revision: 1,
+        source_digest: "a".repeat(SHA256_HEX_CHARS),
+        expected_values_revision: 0,
+        connection_revision: openapi.revisions.connection,
+        credential_revision: openapi.revisions.credential,
+        credential_generation_digest: Some("b".repeat(SHA256_HEX_CHARS)),
+        values: vec![json!("marker-enum-value")],
+        labels: Some(vec!["Marker enum label".to_owned()]),
+        resolved_at: "2026-09-03T00:00:00Z".to_owned(),
+    };
+    store
+        .replace_openapi_catalog_with_overlay_and_enum_values(
+            &openapi.id,
+            &openapi.etag(),
+            0,
+            0,
+            spec,
+            &digest,
+            &[openapi_catalog_entry("marker_openapi_tool")],
+            Some(&overlay),
+            1,
+            &admin,
+            &[],
+            std::slice::from_ref(&enum_write),
+        )
+        .expect("the marked OpenAPI catalog should publish");
+    let published = catalog_evidence(&path);
+    assert_eq!(
+        published
+            .iter()
+            .map(|row| row.action.as_str())
+            .collect::<Vec<_>>(),
+        ["catalog.mcp.publish", "catalog.overlay.replace"]
+    );
+
+    // An enum-value refresh and status observations change no publication.
+    let mut refreshed_values = enum_write.clone();
+    refreshed_values.expected_values_revision = 1;
+    refreshed_values.values = vec![json!("marker-refreshed-value")];
+    refreshed_values.labels = None;
+    store
+        .replace_enum_source_value(&refreshed_values, 1)
+        .expect("the enum values should refresh");
+    for (id, etag) in [(&mcp.id, mcp.etag()), (&openapi.id, openapi.etag())] {
+        store
+            .append_status(
+                id,
+                &etag,
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Healthy,
+                    reason: ConnectionStatusReason::TestSucceeded,
+                    latency_ms: Some(5),
+                    catalog_age_secs: None,
+                    catalog_entry_count: None,
+                },
+            )
+            .expect("the status observation should append");
+    }
+    let rows = catalog_evidence(&path);
+    assert_eq!(rows, published, "neither write recorded anything");
+
+    let stored = format!("{rows:?}");
+    for material in [
+        "marker_mcp_tool",
+        "Marker MCP description",
+        "Marker MCP title",
+        "gg://marker",
+        "marker-resource",
+        "marker-template",
+        "Marker Spec Title",
+        digest.as_str(),
+        "marker_openapi_tool",
+        "Marker overlay description",
+        "regions",
+        "marker-enum-value",
+        "Marker enum label",
+        "marker-refreshed-value",
+        "mcp.example.test",
+        "billing.example.test",
+        "/openapi.json",
+        "billing-token",
+    ] {
+        assert!(
+            !stored.contains(material),
+            "{material} reached the evidence: {stored}"
+        );
+    }
+}
+
+/// A publication the store refuses writes no evidence: a stale catalog
+/// revision, a stale Connection ETag, a stale spec, catalog or overlay
+/// revision, a compiled overlay revision that does not match, a catalog over
+/// its bounds, a Connection that does not serve the catalog's kind, a
+/// missing Connection, and an actor the evidence cannot record exactly,
+/// which is refused before anything else is judged. The catalogs and the
+/// overlay stay exactly as they were.
+#[test]
+fn refused_catalog_publications_write_no_evidence() {
+    let (_directory, path, store) = temporary_store("refused-catalog-evidence");
+    let admin = ChangeActor::for_test("test-admin");
+    let mcp = store
+        .create(mcp_candidate(), &admin)
+        .expect("MCP Connection should create");
+    store
+        .replace_mcp_catalog_expecting(
+            &mcp.id,
+            &mcp.etag(),
+            &[mcp_catalog_entry("alpha", "Alpha")],
+            &[],
+            &[],
+            Some(0),
+            &admin,
+        )
+        .expect("the baseline MCP catalog should publish");
+    let openapi = store
+        .create(candidate(), &admin)
+        .expect("OpenAPI Connection should create");
+    let digest = spec_digest(CATALOG_EVIDENCE_SPEC);
+    let document = r#"{"schema_version":"0.1.0","tools":{}}"#;
+    store
+        .replace_openapi_catalog_with_overlay(
+            &openapi.id,
+            &openapi.etag(),
+            0,
+            0,
+            CATALOG_EVIDENCE_SPEC,
+            &digest,
+            &[openapi_catalog_entry("alpha")],
+            Some(&overlay_put(document, 0)),
+            1,
+            &admin,
+            &[],
+        )
+        .expect("the baseline OpenAPI catalog and overlay should publish");
+    let baseline = catalog_evidence(&path);
+    assert_eq!(baseline.len(), 2);
+    let mcp_before = store.mcp_catalog(&mcp.id).expect("MCP catalog should load");
+    let openapi_before = store
+        .openapi_catalog(&openapi.id)
+        .expect("OpenAPI catalog should load");
+    let overlay_before = store
+        .openapi_overlay(&openapi.id)
+        .expect("overlay should load");
+
+    let stale = ConnectionEtag::from_stored("\"connection:stale\"".to_owned());
+    let missing = ConnectionId::new_managed();
+    let entries = [mcp_catalog_entry("beta", "Beta")];
+    let mcp_publish = |id: &ConnectionId,
+                       etag: &ConnectionEtag,
+                       entries: &[StoredMcpCatalogEntry],
+                       expected: Option<u64>,
+                       actor: &ChangeActor| {
+        store.replace_mcp_catalog_expecting(id, etag, entries, &[], &[], expected, actor)
+    };
+    assert!(matches!(
+        mcp_publish(&mcp.id, &mcp.etag(), &entries, Some(0), &admin),
+        Err(ConnectionStoreError::Conflict { .. })
+    ));
+    assert!(matches!(
+        mcp_publish(&mcp.id, &stale, &entries, Some(1), &admin),
+        Err(ConnectionStoreError::Conflict { .. })
+    ));
+    assert!(matches!(
+        mcp_publish(&missing, &mcp.etag(), &entries, Some(1), &admin),
+        Err(ConnectionStoreError::NotFound { .. })
+    ));
+    assert!(matches!(
+        mcp_publish(&openapi.id, &openapi.etag(), &entries, Some(0), &admin),
+        Err(ConnectionStoreError::Validation { .. })
+    ));
+    let oversized = (0..=MAX_CATALOG_ENTRIES)
+        .map(|index| mcp_catalog_entry(&format!("tool_{index}"), "Bounded"))
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        mcp_publish(&mcp.id, &mcp.etag(), &oversized, Some(1), &admin),
+        Err(ConnectionStoreError::LimitExceeded { .. })
+    ));
+
+    let openapi_publish = |etag: &ConnectionEtag,
+                           expected_catalog_revision: u64,
+                           overlay: Option<&StoredOverlayWrite>,
+                           compiled_overlay_revision: u64,
+                           actor: &ChangeActor| {
+        store.replace_openapi_catalog_with_overlay(
+            &openapi.id,
+            etag,
+            1,
+            expected_catalog_revision,
+            CATALOG_EVIDENCE_SPEC,
+            &digest,
+            &[openapi_catalog_entry("alpha")],
+            overlay,
+            compiled_overlay_revision,
+            actor,
+            &[],
+        )
+    };
+    assert!(matches!(
+        openapi_publish(&stale, 1, None, 1, &admin),
+        Err(ConnectionStoreError::Conflict { .. })
+    ));
+    assert!(matches!(
+        openapi_publish(&stale, 1, Some(&overlay_put(document, 1)), 2, &admin),
+        Err(ConnectionStoreError::OverlayConflict { .. })
+    ));
+    assert!(matches!(
+        openapi_publish(&openapi.etag(), 0, None, 1, &admin),
+        Err(ConnectionStoreError::Conflict { .. })
+    ));
+    assert!(matches!(
+        openapi_publish(
+            &openapi.etag(),
+            1,
+            Some(&overlay_put(document, 0)),
+            1,
+            &admin
+        ),
+        Err(ConnectionStoreError::OverlayConflict { .. })
+    ));
+    assert!(matches!(
+        openapi_publish(
+            &openapi.etag(),
+            1,
+            Some(&StoredOverlayWrite::Delete {
+                expected_overlay_revision: 0
+            }),
+            0,
+            &admin
+        ),
+        Err(ConnectionStoreError::OverlayConflict { .. })
+    ));
+    assert!(matches!(
+        openapi_publish(&openapi.etag(), 1, None, 0, &admin),
+        Err(ConnectionStoreError::OverlayConflict { .. })
+    ));
+    assert!(matches!(
+        openapi_publish(
+            &openapi.etag(),
+            1,
+            Some(&overlay_put(document, 1)),
+            3,
+            &admin
+        ),
+        Err(ConnectionStoreError::Validation { .. })
+    ));
+    assert!(matches!(
+        store.replace_openapi_catalog(
+            &mcp.id,
+            &mcp.etag(),
+            0,
+            0,
+            CATALOG_EVIDENCE_SPEC,
+            &digest,
+            &[],
+            &admin,
+        ),
+        Err(ConnectionStoreError::Validation { .. })
+    ));
+
+    let oversized_subject = "a".repeat(MAX_CHANGE_EVIDENCE_ACTOR_BYTES + 1);
+    let oversized_issuer = "i".repeat(MAX_CHANGE_EVIDENCE_ACTOR_ISSUER_BYTES + 1);
+    for actor in [
+        ChangeActor::for_test(""),
+        ChangeActor::for_test(&oversized_subject),
+        ChangeActor::for_test_with_issuer("test-admin", ""),
+        ChangeActor::for_test_with_issuer("test-admin", &oversized_issuer),
+        ChangeActor::service_token_with_issuer_for_test(
+            "service-token:token_1",
+            "https://idp.example.test",
+        ),
+    ] {
+        for result in [
+            mcp_publish(&mcp.id, &mcp.etag(), &entries, Some(1), &actor).map(|_| ()),
+            openapi_publish(&openapi.etag(), 1, None, 1, &actor).map(|_| ()),
+            openapi_publish(
+                &openapi.etag(),
+                1,
+                Some(&overlay_put(document, 1)),
+                2,
+                &actor,
+            )
+            .map(|_| ()),
+        ] {
+            assert!(
+                matches!(result, Err(ConnectionStoreError::Validation { .. })),
+                "an actor evidence cannot record is refused first: {result:?}"
+            );
+        }
+    }
+
+    assert_eq!(
+        catalog_evidence(&path),
+        baseline,
+        "no refused publication recorded anything"
+    );
+    assert_eq!(
+        store.mcp_catalog(&mcp.id).expect("MCP catalog should load"),
+        mcp_before
+    );
+    assert_eq!(
+        store
+            .openapi_catalog(&openapi.id)
+            .expect("OpenAPI catalog should load"),
+        openapi_before
+    );
+    assert_eq!(
+        store
+            .openapi_overlay(&openapi.id)
+            .expect("overlay should load"),
+        overlay_before
+    );
+}
+
+/// Evidence is required, not best effort: while its insert fails, an MCP
+/// publication and an OpenAPI overlay put each fail as a store failure under
+/// the evidence's own operation label -- not as the constraint SQLite
+/// reports -- are counted once each on the standalone evidence-failure
+/// counter, and leave the catalog, the overlay and the dependencies exactly
+/// as they were. Once evidence can be written again the same publications
+/// commit with their rows, and count nothing.
+#[test]
+fn a_failed_catalog_evidence_insert_rolls_back_the_publication() {
+    let (_directory, path, store) = temporary_store("catalog-evidence-fault");
+    let admin = ChangeActor::for_test("test-admin");
+    let mcp = store
+        .create(mcp_candidate(), &admin)
+        .expect("MCP Connection should create");
+    store
+        .replace_mcp_catalog_expecting(
+            &mcp.id,
+            &mcp.etag(),
+            &[mcp_catalog_entry("alpha", "Alpha")],
+            &[],
+            &[],
+            Some(0),
+            &admin,
+        )
+        .expect("the baseline MCP catalog should publish");
+    let openapi = store
+        .create(candidate(), &admin)
+        .expect("OpenAPI Connection should create");
+    let digest = spec_digest(CATALOG_EVIDENCE_SPEC);
+    store
+        .replace_openapi_catalog(
+            &openapi.id,
+            &openapi.etag(),
+            0,
+            0,
+            CATALOG_EVIDENCE_SPEC,
+            &digest,
+            &[openapi_catalog_entry("alpha")],
+            &admin,
+        )
+        .expect("the baseline OpenAPI catalog should publish");
+    let mcp_before = store.mcp_catalog(&mcp.id).expect("MCP catalog should load");
+    let openapi_before = store
+        .openapi_catalog(&openapi.id)
+        .expect("OpenAPI catalog should load");
+    let dependencies_before = (
+        store
+            .dependencies(&mcp.id)
+            .expect("dependencies should load"),
+        store
+            .dependencies(&openapi.id)
+            .expect("dependencies should load"),
+    );
+    // The recorder is this thread's, and the store runs on this thread.
+    let recorder = crate::audit::sink::tests::CountingRecorder::default();
+    let _recording = ::metrics::set_default_local_recorder(&recorder);
+    let evidence_failures = |store: &str| {
+        recorder.count(
+            crate::metrics::STANDALONE_EVIDENCE_FAILURES_TOTAL,
+            &[("store", store)],
+        )
+    };
+
+    // Test-only fault injection through a second connection; no production
+    // hook exists for it.
+    Connection::open(&path)
+        .expect("database should open")
+        .execute_batch(
+            "CREATE TRIGGER fail_catalog_change_evidence \
+             BEFORE INSERT ON catalog_change_evidence \
+             BEGIN SELECT RAISE(ABORT, 'injected evidence failure'); END;",
+        )
+        .expect("failure trigger should install");
+    let faulted = ChangeActor::for_test("faulted-admin");
+    let mcp_publish = |actor: &ChangeActor| {
+        store.replace_mcp_catalog_expecting(
+            &mcp.id,
+            &mcp.etag(),
+            &[mcp_catalog_entry("beta", "Beta")],
+            &[],
+            &[],
+            Some(1),
+            actor,
+        )
+    };
+    let overlay_publish = |actor: &ChangeActor| {
+        store.replace_openapi_catalog_with_overlay(
+            &openapi.id,
+            &openapi.etag(),
+            1,
+            1,
+            CATALOG_EVIDENCE_SPEC,
+            &digest,
+            &[openapi_catalog_entry("beta")],
+            Some(&overlay_put(r#"{"schema_version":"0.1.0","tools":{}}"#, 0)),
+            1,
+            actor,
+            &[],
+        )
+    };
+    let failures = [
+        mcp_publish(&faulted).map(|_| ()),
+        overlay_publish(&faulted).map(|_| ()),
+    ];
+    assert_eq!(evidence_failures("connections"), 2);
+    assert_eq!(evidence_failures("service_tokens"), 0);
+    for failure in failures {
+        let Err(error) = failure else {
+            panic!("a publication whose evidence failed must not commit");
+        };
+        assert!(
+            matches!(
+                &error,
+                ConnectionStoreError::Sqlite {
+                    operation: "catalog change evidence append",
+                    ..
+                }
+            ),
+            "an evidence failure is a store failure: {error:?}"
+        );
+        assert!(error.is_evidence_append_failure());
+    }
+    Connection::open(&path)
+        .expect("database should open")
+        .execute_batch("DROP TRIGGER fail_catalog_change_evidence;")
+        .expect("failure trigger should drop");
+
+    assert_eq!(
+        store.mcp_catalog(&mcp.id).expect("MCP catalog should load"),
+        mcp_before,
+        "the failed MCP publication changed nothing"
+    );
+    assert_eq!(
+        store
+            .openapi_catalog(&openapi.id)
+            .expect("OpenAPI catalog should load"),
+        openapi_before,
+        "the failed overlay put changed nothing"
+    );
+    assert_eq!(
+        store
+            .openapi_overlay(&openapi.id)
+            .expect("overlay should load"),
+        None
+    );
+    assert_eq!(
+        (
+            store
+                .dependencies(&mcp.id)
+                .expect("dependencies should load"),
+            store
+                .dependencies(&openapi.id)
+                .expect("dependencies should load"),
+        ),
+        dependencies_before
+    );
+    assert_eq!(catalog_evidence(&path).len(), 2);
+
+    let recovered = ChangeActor::for_test("recovered-admin");
+    mcp_publish(&recovered).expect("the MCP publication commits once evidence can be written");
+    overlay_publish(&recovered).expect("the overlay put commits once evidence can be written");
+    assert_eq!(
+        evidence_failures("connections"),
+        2,
+        "a recorded publication counts nothing"
+    );
+    assert_eq!(
+        catalog_evidence(&path)
+            .into_iter()
+            .map(|row| (row.action, row.actor_user_id))
+            .collect::<Vec<_>>(),
+        [
+            ("catalog.mcp.publish", "test-admin"),
+            ("catalog.openapi.publish", "test-admin"),
+            ("catalog.mcp.publish", "recovered-admin"),
+            ("catalog.overlay.replace", "recovered-admin"),
+        ]
+        .map(|(action, actor)| (action.to_owned(), actor.to_owned()))
+    );
+}
+
+/// A database written before migration 13 -- with an MCP catalog, an OpenAPI
+/// catalog and an overlay that names who last wrote it -- gains the catalog
+/// evidence table, empty, on its first open by this build: nothing is
+/// fabricated for the catalogs that already exist, not even from the
+/// overlay's actor, and the first publication afterwards is recorded. The
+/// pre-13 file is made by removing what migration 13 adds, so it holds
+/// exactly today's catalog shape.
+#[test]
+fn migration_thirteen_adds_an_empty_catalog_evidence_table_to_an_existing_database() {
+    let (_directory, path, store) = temporary_store("migration-thirteen");
+    let admin = ChangeActor::for_test("test-admin");
+    let mcp = store
+        .create(mcp_candidate(), &admin)
+        .expect("MCP Connection should create");
+    store
+        .replace_mcp_catalog(
+            &mcp.id,
+            &mcp.etag(),
+            &[mcp_catalog_entry("alpha", "Alpha")],
+            &[],
+            &[],
+            &admin,
+        )
+        .expect("the MCP catalog should publish");
+    let openapi = store
+        .create(candidate(), &admin)
+        .expect("OpenAPI Connection should create");
+    let digest = spec_digest(CATALOG_EVIDENCE_SPEC);
+    store
+        .replace_openapi_catalog_with_overlay(
+            &openapi.id,
+            &openapi.etag(),
+            0,
+            0,
+            CATALOG_EVIDENCE_SPEC,
+            &digest,
+            &[openapi_catalog_entry("alpha")],
+            Some(&overlay_put(r#"{"schema_version":"0.1.0","tools":{}}"#, 0)),
+            1,
+            &ChangeActor::for_test("overlay-author"),
+            &[],
+        )
+        .expect("the OpenAPI catalog and overlay should publish");
+    let mcp_before = store.mcp_catalog(&mcp.id).expect("MCP catalog should load");
+    let openapi_before = store
+        .openapi_catalog(&openapi.id)
+        .expect("OpenAPI catalog should load");
+    let overlay_before = store
+        .openapi_overlay(&openapi.id)
+        .expect("overlay should load");
+    drop(store);
+    let file = Connection::open(&path).expect("database should open");
+    let overlay_author: String = file
+        .query_row(
+            "SELECT actor_user_id FROM connection_openapi_overlays WHERE connection_id = ?1",
+            params![openapi.id.as_str()],
+            |row| row.get(0),
+        )
+        .expect("the overlay should name its author");
+    assert_eq!(overlay_author, "overlay-author");
+    file.execute_batch(
+        r#"
+            DROP TABLE catalog_change_evidence;
+            DELETE FROM connection_schema_migrations WHERE version = 13;
+            "#,
+    )
+    .expect("the database should roll back to migration 12");
+
+    let reopened = SqliteConnectionStore::open(&path).expect("the store should migrate and open");
+    assert_eq!(
+        reopened
+            .mcp_catalog(&mcp.id)
+            .expect("MCP catalog should load"),
+        mcp_before
+    );
+    assert_eq!(
+        reopened
+            .openapi_catalog(&openapi.id)
+            .expect("OpenAPI catalog should load"),
+        openapi_before
+    );
+    assert_eq!(
+        reopened
+            .openapi_overlay(&openapi.id)
+            .expect("overlay should load"),
+        overlay_before
+    );
+    assert!(
+        catalog_evidence(&path).is_empty(),
+        "migration 13 fabricates no evidence"
+    );
+
+    reopened
+        .replace_mcp_catalog(
+            &mcp.id,
+            &mcp.etag(),
+            &[],
+            &[],
+            &[],
+            &ChangeActor::for_test("upgrading-admin"),
+        )
+        .expect("the first publication after the upgrade should commit");
+    let rows = catalog_evidence(&path);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].action, "catalog.mcp.publish");
+    assert_eq!(
+        rows[0].actor(),
+        ("upgrading-admin", None, "principal", "bearer_token")
+    );
+    assert_eq!((rows[0].prior_version, rows[0].new_version), (Some(1), 2));
+}
+
+/// Migration 13's row CHECKs are the backstop behind the store, and the
+/// revision CHECKs are PostgreSQL migration 23's: a row whose revisions or
+/// overlay revision do not fit its action, or whose actor is not one
+/// authentication produces, is refused. Each insert below differs from a
+/// valid one in one column, or in its actor shape.
+#[test]
+fn migration_thirteen_refuses_catalog_evidence_rows_that_do_not_fit_their_action() {
+    let (_directory, path, store) = temporary_store("catalog-evidence-checks");
+    drop(store);
+    let connection = Connection::open(&path).expect("database should open");
+    let catalog_row =
+        |action: &str,
+         prior: Option<i64>,
+         new: Option<i64>,
+         overlay: Option<i64>,
+         (issuer, kind, mode): (Option<&str>, Option<&str>, Option<&str>)| {
+            connection.execute(
+                r#"
+            INSERT INTO catalog_change_evidence (
+                event_id, operation_id, actor_user_id, actor_issuer, actor_kind,
+                actor_auth_mode, action, connection_id, prior_version, new_version,
+                overlay_revision, committed_at
+            ) VALUES (
+                ?1, ?2, 'checking-admin', ?3, ?4, ?5, ?6, 'billing', ?7, ?8, ?9,
+                '2026-10-22T00:00:00Z'
+            )
+            "#,
+                params![
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    issuer,
+                    kind,
+                    mode,
+                    action,
+                    prior,
+                    new,
+                    overlay
+                ],
+            )
+        };
+    let bearer = RECORDABLE_ACTOR_SHAPES[0];
+    for (action, prior, new, overlay) in [
+        ("catalog.mcp.publish", None, Some(1), None),
+        ("catalog.mcp.publish", Some(1), Some(2), None),
+        ("catalog.openapi.publish", None, Some(1), Some(0)),
+        ("catalog.openapi.publish", Some(2), Some(3), Some(4)),
+        ("catalog.overlay.replace", Some(1), Some(2), Some(1)),
+        ("catalog.overlay.delete", Some(2), Some(3), Some(0)),
+    ] {
+        catalog_row(action, prior, new, overlay, bearer).expect("a fitting row is accepted");
+    }
+    for (action, prior, new, overlay) in [
+        ("catalog.mcp.publish", None, None, None),
+        ("catalog.mcp.publish", None, Some(0), None),
+        ("catalog.mcp.publish", Some(0), Some(1), None),
+        ("catalog.mcp.publish", Some(2), Some(2), None),
+        ("catalog.mcp.publish", Some(3), Some(2), None),
+        ("catalog.mcp.publish", None, Some(1), Some(0)),
+        ("catalog.openapi.publish", None, Some(1), None),
+        ("catalog.openapi.publish", None, Some(1), Some(-1)),
+        ("catalog.overlay.replace", Some(1), Some(2), None),
+        ("catalog.overlay.replace", Some(1), Some(2), Some(0)),
+        ("catalog.overlay.delete", Some(1), Some(2), None),
+        ("catalog.overlay.delete", Some(1), Some(2), Some(1)),
+        ("catalog.tools.publish", None, Some(1), Some(0)),
+    ] {
+        assert!(
+            catalog_row(action, prior, new, overlay, bearer).is_err(),
+            "{action} {prior:?} -> {new:?} (overlay {overlay:?}) must be refused"
+        );
+    }
+    for shape in RECORDABLE_ACTOR_SHAPES {
+        catalog_row("catalog.mcp.publish", None, Some(1), None, shape)
+            .expect("an actor authentication produces is accepted");
+    }
+    for shape in UNRECORDABLE_ACTOR_SHAPES {
+        assert!(
+            catalog_row("catalog.mcp.publish", None, Some(1), None, shape).is_err(),
+            "{shape:?} must be refused"
+        );
+    }
+}
+
+/// Migration 13 writes the actor bounds, the Connection ID bound and the
+/// actor pairing CHECK exactly as migration 12 does, and the action
+/// vocabulary and revision CHECKs exactly as PostgreSQL migration 23 does,
+/// so the standalone and cluster catalog evidence cannot disagree about what
+/// is recordable. The store's action constants are that vocabulary.
+#[test]
+fn catalog_change_evidence_matches_migration_twelve_and_postgresql() {
+    let squeeze = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sqlite = squeeze(MIGRATION_13_SQL);
+    for bound in [
+        format!(
+            "length(CAST(actor_user_id AS BLOB)) BETWEEN 1 AND {MAX_CHANGE_EVIDENCE_ACTOR_BYTES}"
+        ),
+        format!(
+            "actor_issuer IS NULL OR length(CAST(actor_issuer AS BLOB)) BETWEEN 1 AND {MAX_CHANGE_EVIDENCE_ACTOR_ISSUER_BYTES}"
+        ),
+        format!(
+            "length(CAST(connection_id AS BLOB)) BETWEEN 1 AND {}",
+            super::super::model::MAX_CONNECTION_ID_BYTES
+        ),
+        "actor_kind TEXT NOT NULL, actor_auth_mode TEXT NOT NULL".to_owned(),
+    ] {
+        assert_eq!(sqlite.matches(&bound).count(), 1, "{bound}");
+    }
+    let pairing = squeeze(
+        "(actor_kind = 'principal'
+            AND actor_auth_mode IN ('bearer_token', 'session_cookie', 'client_certificate'))
+        OR (actor_kind = 'service_token'
+            AND actor_auth_mode = 'service_token' AND actor_issuer IS NULL)
+        OR (actor_kind = 'system' AND actor_auth_mode = 'system' AND actor_issuer IS NULL)",
+    );
+    assert_eq!(sqlite.matches(&pairing).count(), 1);
+    assert_eq!(squeeze(MIGRATION_12_SQL).matches(&pairing).count(), 2);
+
+    let postgres = squeeze(include_str!(
+        "../storage/migrations/0023_document_and_catalog_change_evidence.sql"
+    ));
+    let actions = format!(
+        "action IN ( '{CATALOG_EVIDENCE_ACTION_MCP_PUBLISH}', '{CATALOG_EVIDENCE_ACTION_OPENAPI_PUBLISH}', '{CATALOG_EVIDENCE_ACTION_OVERLAY_REPLACE}', '{CATALOG_EVIDENCE_ACTION_OVERLAY_DELETE}' )"
+    );
+    for check in [
+        actions.as_str(),
+        "prior_version IS NULL OR prior_version >= 1",
+        "CHECK (prior_version IS NULL OR new_version > prior_version)",
+        "CHECK ((action = 'catalog.mcp.publish') = (overlay_revision IS NULL))",
+        "overlay_revision IS NULL OR overlay_revision >= 0",
+    ] {
+        assert!(sqlite.contains(check), "SQLite: {check}");
+        assert!(postgres.contains(check), "PostgreSQL: {check}");
+    }
+    // PostgreSQL's NULL-tolerant overlay CHECKs, guarded here because
+    // SQLite passes a CHECK whose expression is NULL.
+    assert!(
+        postgres.contains("CHECK (action <> 'catalog.overlay.replace' OR overlay_revision >= 1)")
+    );
+    assert!(postgres.contains("CHECK (action <> 'catalog.overlay.delete' OR overlay_revision = 0)"));
+    assert!(sqlite.contains(
+        "action <> 'catalog.overlay.replace' OR (overlay_revision IS NOT NULL AND overlay_revision >= 1)"
+    ));
+    assert!(sqlite.contains(
+        "action <> 'catalog.overlay.delete' OR (overlay_revision IS NOT NULL AND overlay_revision = 0)"
+    ));
 }

@@ -437,6 +437,14 @@ API discovery, payload capture and the discovery signals.
 | `discovery.signals.volume_outlier_threshold` | decimal string, above 1 | `"3"` | [`VOLUME_OUTLIER_SIGNAL_THRESHOLD`](configuration.md#volume_outlier_signal_threshold) |
 | `discovery.rule_suggestion_baseline_window_hours` | integer hours, 1 to 876000 | `24` | [`RULE_SUGGESTION_BASELINE_WINDOW_HOURS`](configuration.md#rule_suggestion_baseline_window_hours) |
 
+#### `spec.policy_tests`
+
+The stored policy test suite as a gate on policy changes.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `policy_tests.required` | `true` or `false` | `false` | [`POLICY_TESTS_REQUIRED`](configuration.md#policy_tests_required) |
+
 #### `spec.cors`
 
 Cross-origin resource sharing.

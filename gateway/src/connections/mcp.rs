@@ -1051,12 +1051,15 @@ fn refresh_store_error(error: &ConnectionStoreError) -> McpCatalogRefreshError {
         }
         // A rejected constraint is a verdict on the catalog we tried to store,
         // not a storage outage: retrying the same discovery result reproduces
-        // it exactly, so it must not be reported as retryable.
+        // it exactly, so it must not be reported as retryable. A failed
+        // evidence insert is the exception: it is the store failing to record
+        // the publication, whatever class SQLite gave it.
         ConnectionStoreError::Sqlite { source, .. }
-            if matches!(
-                source.sqlite_error_code(),
-                Some(rusqlite::ErrorCode::ConstraintViolation)
-            ) =>
+            if !error.is_evidence_append_failure()
+                && matches!(
+                    source.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::ConstraintViolation)
+                ) =>
         {
             McpCatalogRefreshError::InvalidResponse
         }
@@ -1740,6 +1743,21 @@ mod tests {
             refresh_store_error(&outage),
             McpCatalogRefreshError::StorageUnavailable,
             "a genuine storage failure must stay retryable"
+        );
+
+        let evidence = ConnectionStoreError::Sqlite {
+            path: PathBuf::from("connections.sqlite"),
+            operation: "catalog change evidence append",
+            source: rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+                Some("evidence refused".to_owned()),
+            ),
+        };
+        assert!(evidence.is_evidence_append_failure());
+        assert_eq!(
+            refresh_store_error(&evidence),
+            McpCatalogRefreshError::StorageUnavailable,
+            "a publication whose evidence could not be recorded is a store failure, not a verdict on the catalog"
         );
     }
 

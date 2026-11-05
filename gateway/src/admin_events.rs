@@ -5,7 +5,8 @@ use super::*;
 /// after summary and the `diff_summary`, plus what the cross-resource checks
 /// that admitted it read and found (issue #243, slice 8) -- the digest of the
 /// resource snapshot and the stable codes of the risks it carried, never
-/// what they describe.
+/// what they describe -- and, when policy tests are required, the stored
+/// suite version and ETag that admitted it and its case count.
 pub(super) fn emit_policy_published(
     state: &PolicyAdminState,
     parts: &http::request::Parts,
@@ -23,14 +24,18 @@ pub(super) fn emit_policy_published(
             json!(review.resource_snapshot_digest),
         );
         payload.insert("risks".to_owned(), json!(review.risks));
+        if let Some(required_tests) = review.required_tests.as_ref() {
+            payload.insert("required_tests".to_owned(), required_tests.to_json());
+        }
     }
 
     emit_policy_changed_payload(state, parts, principal, payload);
 }
 
-/// A policy write the cross-resource checks refused, and what it was
-/// compared with. Stable codes, an ETag and a digest only: no principals,
-/// hosts, paths or policy contents.
+/// A policy write the cross-resource checks or the required policy tests
+/// refused, and what it was compared with. Stable codes, an ETag, a digest
+/// and counts only: no principals, hosts, paths, case ids or policy
+/// contents.
 pub(super) struct PolicyPublicationRefusal<'a> {
     /// The `diff_summary.action` the write would have recorded.
     pub(super) action: Option<&'a str>,
@@ -39,6 +44,9 @@ pub(super) struct PolicyPublicationRefusal<'a> {
     /// The ETag of the policy it would have replaced.
     pub(super) policy_etag: &'a str,
     pub(super) resource_snapshot_digest: Option<&'a str>,
+    /// What the required suite said, when it refused the write: its status,
+    /// the stored suite's version and ETag, and the summary counts.
+    pub(super) required_tests: Option<Value>,
 }
 
 pub(super) fn emit_policy_publication_refused(
@@ -50,12 +58,16 @@ pub(super) fn emit_policy_publication_refused(
     let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
     let source_ip =
         client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
-    let payload = json!({
+    let mut payload = json!({
         "action": refusal.action,
         "codes": refusal.codes,
         "policy_etag": refusal.policy_etag,
         "resource_snapshot_digest": refusal.resource_snapshot_digest,
     });
+    if let (Some(required_tests), Some(payload)) = (refusal.required_tests, payload.as_object_mut())
+    {
+        payload.insert("required_tests".to_owned(), required_tests);
+    }
 
     state.audit.emit(audit::AuditEvent::new(
         audit::event::POLICY_PUBLICATION_REFUSED,

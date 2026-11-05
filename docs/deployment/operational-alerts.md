@@ -408,8 +408,10 @@ The store could not insert that evidence row, so the change rolled back with it 
 was refused: a service token that was to be rotated or revoked is unchanged, and a
 token that was to be revoked still authenticates; a Connection that was to be
 created, replaced or deleted is as it was; a local secret keeps its version and
-envelope. The admin API answered `503` for a Connection or secret change, and an
-internal or unavailable error, by the failure's class, for a token change.
+envelope; a managed catalog or overlay keeps its revision and the runtime keeps
+serving it. The admin API answered `503` for a Connection, secret, catalog or overlay
+change, and an internal or unavailable error, by the failure's class, for a token
+change.
 
 `store` names the file: `service_tokens` is `SERVICE_TOKEN_SQLITE_PATH`, and
 `connections` is `CONNECTIONS_SQLITE_PATH`, which holds the local secrets too.
@@ -419,9 +421,11 @@ changed permissions or a lock another process holds can fail the background
 write check too, and `/readyz` then reports `storage_unavailable`. A refusal while
 the checks pass points at the evidence table rather than the file. The refusing
 process logs a token refusal as
-`failed to record service-token change evidence` and a Connection refusal as the
-`change evidence append` operation, each with the file and the SQLite error; a
-local-secret refusal carries no SQLite detail. Once the cause is fixed, have each
+`failed to record service-token change evidence`, a Connection refusal as the
+`change evidence append` operation and a catalog or overlay refusal as
+`failed to record catalog change evidence` with the `catalog change evidence append`
+operation, each with the file and the SQLite error; a local-secret refusal carries no
+SQLite detail. Once the cause is fixed, have each
 refused change retried and confirm its evidence row. Never drop or edit the
 evidence tables or their triggers and constraints to make a change go through. The
 `connection-secrets reencrypt` command reports a batch it could not record by

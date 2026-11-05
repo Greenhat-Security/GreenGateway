@@ -686,3 +686,216 @@ fn a_condition_round_trips_through_its_one_serialization() {
         );
     }
 }
+
+/// A tool's input schema with one field of each kind the eligibility rule
+/// tells apart.
+fn eligibility_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "region": { "type": "string", "enum": ["eu", "us"] },
+            "count": { "type": "integer" },
+            "ratio": { "type": "number" },
+            "dry_run": { "type": "boolean" },
+            "password": { "type": "string", "format": "password" },
+            "shouted": { "type": "string", "format": "PASSWORD" },
+            "api_secret": { "type": "string", "writeOnly": true },
+            "readable": { "type": "string", "writeOnly": false },
+            "labels": { "type": "array", "items": { "type": "string" } },
+            "either": { "type": ["string", "null"] },
+            "untyped": {},
+            "referenced": { "$ref": "#/$defs/region" },
+            "composed": { "type": "string", "allOf": [{ "writeOnly": true }] },
+            "a/b": { "type": "object", "properties": { "~c": { "type": "string" } } },
+            "scope": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string" },
+                    "token": { "type": "string", "writeOnly": true }
+                }
+            },
+            "vault": {
+                "type": "object",
+                "writeOnly": true,
+                "properties": { "name": { "type": "string" } }
+            },
+            "loose": { "properties": { "name": { "type": "string" } } },
+            "patterned": {
+                "type": "object",
+                "properties": { "name": { "type": "string" } },
+                "patternProperties": { ".*": { "writeOnly": true } }
+            }
+        },
+        "$defs": { "region": { "type": "string" } }
+    })
+}
+
+#[test]
+fn a_tool_argument_pointer_is_eligible_only_through_declared_plain_properties() {
+    let schema = eligibility_schema();
+    for (pointer, eligible) in [
+        ("/region", true),
+        ("/count", true),
+        ("/ratio", true),
+        ("/dry_run", true),
+        ("/readable", true),
+        ("/scope/kind", true),
+        ("/a~1b/~0c", true),
+        // Secret-marked, on the leaf or on the way to it.
+        ("/password", false),
+        ("/shouted", false),
+        ("/api_secret", false),
+        ("/scope/token", false),
+        ("/vault/name", false),
+        // Not one scalar type.
+        ("/labels", false),
+        ("/labels/0", false),
+        ("/either", false),
+        ("/untyped", false),
+        ("/scope", false),
+        // Judged by schemas the path does not show.
+        ("/referenced", false),
+        ("/composed", false),
+        ("/patterned/name", false),
+        // Through a schema that does not say it is an object.
+        ("/loose/name", false),
+        // Not declared, or not a pointer at all.
+        ("/missing", false),
+        ("/region/more", false),
+        ("", false),
+        ("region", false),
+    ] {
+        assert_eq!(
+            tool_argument_pointer_eligible(&schema, pointer),
+            eligible,
+            "{pointer}"
+        );
+    }
+    // A root that is not an object schema declares nothing.
+    for root in [
+        json!(true),
+        json!({ "properties": { "region": { "type": "string" } } }),
+        json!({ "type": "object", "anyOf": [{}], "properties": { "region": { "type": "string" } } }),
+        json!({ "type": "object", "writeOnly": true, "properties": { "region": { "type": "string" } } }),
+    ] {
+        assert!(!tool_argument_pointer_eligible(&root, "/region"), "{root}");
+    }
+}
+
+#[test]
+fn referenced_tool_arguments_keep_only_the_scalars_the_pointers_reach() {
+    let arguments = json!({
+        "region": "eu",
+        "count": 3,
+        "password": "kept-out-canary",
+        "scope": { "kind": "full", "token": "also-kept-out-canary" },
+        "a/b": { "~c": "deep" },
+        "labels": ["eu"],
+        "nothing": null
+    });
+    let pointers = [
+        "/a~1b/~0c".to_owned(),
+        "/count".to_owned(),
+        "/labels".to_owned(),
+        "/missing".to_owned(),
+        "/nothing".to_owned(),
+        "/region".to_owned(),
+        "/scope/kind".to_owned(),
+    ];
+    let referenced = referenced_tool_arguments(&arguments, &pointers);
+    assert_eq!(
+        referenced,
+        json!({
+            "a/b": { "~c": "deep" },
+            "count": 3,
+            "region": "eu",
+            "scope": { "kind": "full" }
+        })
+    );
+    let text = referenced.to_string();
+    assert!(!text.contains("kept-out-canary"));
+    // A leaf reads the reduced arguments exactly as it reads the whole
+    // ones, for every pointer it was reduced to.
+    let mut whole = facts();
+    whole.tool_arguments = Fact::Captured(arguments.clone());
+    let mut reduced = facts();
+    reduced.tool_arguments = Fact::Captured(referenced);
+    for (pointer, values) in [
+        ("/region", json!(["eu"])),
+        ("/count", json!([3.0])),
+        ("/scope/kind", json!(["full"])),
+        ("/a~1b/~0c", json!(["deep"])),
+        ("/labels", json!(["eu"])),
+        ("/missing", json!(["eu"])),
+    ] {
+        let leaf = compiled(json!({ "tool_argument": { "pointer": pointer, "in": values } }));
+        assert_eq!(
+            leaf.evaluate(None, &whole),
+            leaf.evaluate(None, &reduced),
+            "{pointer}"
+        );
+    }
+    assert_eq!(referenced_tool_arguments(&arguments, &[]), json!({}));
+}
+
+#[test]
+fn fact_needs_name_the_argument_pointers_of_each_tool() {
+    let rule = |tool_name: Option<&str>, conditions: Value| {
+        let mut rule = json!({ "action": "deny", "conditions": conditions });
+        match tool_name {
+            Some(tool_name) => rule["tool_name"] = json!(tool_name),
+            None => rule["path"] = json!("/stray"),
+        }
+        serde_json::from_value::<super::super::rule::Rule>(rule).expect("rule fixture")
+    };
+    let rules = [
+        rule(
+            Some("reports.export"),
+            json!({ "any": [
+                { "tool_argument": { "pointer": "/region", "in": ["eu"] } },
+                { "not": { "tool_argument": { "pointer": "/scope/kind", "in": ["full"] } } }
+            ] }),
+        ),
+        rule(
+            Some("reports.export"),
+            json!({ "tool_argument": { "pointer": "/region", "in": ["us"] } }),
+        ),
+        rule(
+            Some("reports.purge"),
+            json!({ "time_window": { "until": "2027-01-01T00:00:00Z" } }),
+        ),
+        // Only a policy assembled in memory puts one here; no lane reads it.
+        rule(
+            None,
+            json!({ "tool_argument": { "pointer": "/stray", "in": ["x"] } }),
+        ),
+    ];
+    let needs = FactNeeds::of(&rules, false);
+    assert_eq!(
+        needs.tool_argument_pointers("reports.export"),
+        ["/region".to_owned(), "/scope/kind".to_owned()]
+    );
+    assert!(needs.tool_argument_pointers("reports.purge").is_empty());
+    assert!(needs.tool_argument_pointers("missing").is_empty());
+    assert_eq!(needs.tool_arguments.len(), 1);
+    assert!(needs.reads_request_facts());
+    assert!(FactNeeds::of(&[], false).tool_arguments.is_empty());
+
+    let mut leaves = Vec::new();
+    if let Some(conditions) = &rules[0].conditions {
+        conditions.tool_argument_leaves("/rules/0/conditions", &mut leaves);
+    }
+    assert_eq!(
+        leaves,
+        vec![
+            (
+                "/rules/0/conditions/any/0/tool_argument/pointer".to_owned(),
+                "/region"
+            ),
+            (
+                "/rules/0/conditions/any/1/not/tool_argument/pointer".to_owned(),
+                "/scope/kind"
+            ),
+        ]
+    );
+}

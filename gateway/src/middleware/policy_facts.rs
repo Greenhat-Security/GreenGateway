@@ -34,6 +34,11 @@
 //! - **Instant**: whole seconds since the Unix epoch from the [`PolicyClock`]
 //!   the state carries -- the system clock in production, a fixed one in
 //!   tests.
+//! - **Tool arguments**: only on tool invocation admission, only once the
+//!   call's arguments have passed the tool's input schema, and only the
+//!   scalars at the pointers the tool's rules read, each of which the schema
+//!   must make eligible ([`tool_argument_facts`]). No other lane, and no
+//!   listing or inventory preview, ever has a call's arguments.
 //!
 //! Headers and query parameters are bounded by the evaluator's own fact
 //! bounds before they are copied; past them the request is refused
@@ -53,6 +58,7 @@ use std::{
 };
 
 use http::{Extensions, HeaderMap, Uri};
+use serde_json::Value;
 
 use crate::{
     auth::Principal,
@@ -61,6 +67,7 @@ use crate::{
         CompiledPolicy, Fact, PolicyFacts, MAX_FACT_ENTRIES, MAX_FACT_NAME_BYTES,
         MAX_FACT_VALUE_BYTES,
     },
+    rbac::conditions::{referenced_tool_arguments, tool_argument_pointer_eligible},
 };
 
 /// The clock a `time_window` condition is judged by on the serving lanes.
@@ -182,6 +189,34 @@ pub(crate) fn tool_call_facts(
         facts.now = captured(call.clock.now());
     }
     facts
+}
+
+/// The argument fact tool invocation admission decides a call's tool-name
+/// rules by, from `arguments` that have already passed the input schema
+/// `schema` they were validated against: the scalars at `pointers` -- the
+/// pointers those rules read ([`CompiledPolicy::fact_needs`]) -- and nothing
+/// else, so a field no condition reads, a secret-marked one included, never
+/// reaches the kernel.
+///
+/// Uncaptured when any of `pointers` is not one the schema makes eligible
+/// (`rbac::conditions::tool_argument_pointer_eligible`): a rule that reads
+/// the arguments is then undetermined and the call refused, rather than
+/// decided as though a field the schema does not let a condition read were
+/// absent. Publication refuses such a pointer; this holds when the tool's
+/// schema changed after the policy was published.
+pub(crate) fn tool_argument_facts(
+    schema: &Value,
+    arguments: &Value,
+    pointers: &[String],
+) -> Fact<Value> {
+    if pointers
+        .iter()
+        .all(|pointer| tool_argument_pointer_eligible(schema, pointer))
+    {
+        Fact::Captured(referenced_tool_arguments(arguments, pointers))
+    } else {
+        Fact::Uncaptured
+    }
 }
 
 fn captured<T>(value: Option<T>) -> Fact<T> {
