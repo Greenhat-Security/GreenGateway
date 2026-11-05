@@ -427,6 +427,8 @@ impl SchemaCompatibility {
 // carries migration 25 byte for byte, so its migrator records the approved
 // checksum, but it serves only schema 29, so from a prepared fleet it is a
 // coordinated drain/migrate/restart like every other step.
+// That shared column list left out the three columns; this build's catalog
+// writer records all three.
 // `migration_twenty_five_is_the_extension_its_prepared_release_approved` pins
 // the manifest entry to the checksum that release approved, and the
 // published matrix's rolling step to both.
@@ -2570,7 +2572,7 @@ mod tests {
                         }
                     }),
                 }],
-                "migration-fixture",
+                &crate::auth::change_actor::ChangeActor::for_test("migration-fixture"),
             )
             .await
             .expect("fixture catalog should publish");
@@ -3633,8 +3635,9 @@ mod tests {
                 .expect("migrations through 24 should apply");
         }
 
-        // The column list `record_catalog_change_evidence` writes, in this
-        // build and in its prepared release alike.
+        // The column list `record_catalog_change_evidence` wrote in the
+        // prepared release and in the schema-25 release alike; this build
+        // also writes the three columns migration 25 adds.
         const PREPARED_INSERT: &str = "INSERT INTO greengateway.catalog_change_evidence \
                  (event_id, operation_id, actor_user_id, action, connection_id, \
                   prior_version, new_version, overlay_revision, security_revision) \

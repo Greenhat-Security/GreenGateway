@@ -13,6 +13,8 @@ mod admin_policy_app_tests;
 mod admin_policy_drafts_tests;
 #[path = "admin_session_app_tests.rs"]
 mod admin_session_app_tests;
+#[path = "admin_suggestion_acceptance_tests.rs"]
+mod admin_suggestion_acceptance_tests;
 #[path = "admin_suggestion_drafts_tests.rs"]
 mod admin_suggestion_drafts_tests;
 #[path = "admin_tokens_app_tests.rs"]

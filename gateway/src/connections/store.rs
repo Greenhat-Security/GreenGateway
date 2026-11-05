@@ -2769,7 +2769,8 @@ impl SqliteConnectionStore {
             entries,
             None,
             0,
-            "standalone",
+            // No overlay is written, so nothing records this actor.
+            &ChangeActor::system("standalone"),
             &[],
         )
     }
@@ -2790,7 +2791,7 @@ impl SqliteConnectionStore {
         entries: &[StoredOpenApiCatalogEntry],
         overlay: Option<&StoredOverlayWrite>,
         compiled_overlay_revision: u64,
-        actor_user_id: &str,
+        actor: &ChangeActor,
         policy_protected_names: &[String],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
         self.replace_openapi_catalog_with_overlay_and_enum_values(
@@ -2803,7 +2804,7 @@ impl SqliteConnectionStore {
             entries,
             overlay,
             compiled_overlay_revision,
-            actor_user_id,
+            actor,
             policy_protected_names,
             &[],
         )
@@ -2824,7 +2825,7 @@ impl SqliteConnectionStore {
         entries: &[StoredOpenApiCatalogEntry],
         overlay: Option<&StoredOverlayWrite>,
         compiled_overlay_revision: u64,
-        actor_user_id: &str,
+        actor: &ChangeActor,
         policy_protected_names: &[String],
         enum_values: &[StoredEnumSourceValueWrite],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
@@ -3088,7 +3089,7 @@ impl SqliteConnectionStore {
             compiled_overlay_revision,
             current.revisions.connection,
             previous_catalog_revision,
-            actor_user_id,
+            actor.subject(),
             &now,
         )?;
         write_catalog_enum_source_values(
