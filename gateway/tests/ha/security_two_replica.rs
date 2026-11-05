@@ -2995,6 +2995,19 @@ async fn a_security_incident_rehearsal_holds_through_a_replica_replacement() {
         )],
         "the JWT withdrawal should leave one evidence row, naming the command, at its revision"
     );
+    // The token's issue (migration 27) recorded its own row first, at the
+    // revision its create outbox row took.
+    let issued_revision: i64 = cluster
+        .database
+        .query_all(&format!(
+            "SELECT revision FROM greengateway.security_outbox \
+             WHERE resource_type = 'service_token' AND resource_id = '{token_id}' \
+               AND from_version IS NULL"
+        ))
+        .await
+        .first()
+        .map(|row| row.get(0))
+        .unwrap_or_else(|| panic!("the token's create should have an outbox row"));
     let token_evidence: Vec<(String, String, String, i64)> = cluster
         .database
         .query_all(
@@ -3007,14 +3020,22 @@ async fn a_security_incident_rehearsal_holds_through_a_replica_replacement() {
         .collect();
     assert_eq!(
         token_evidence,
-        vec![(
-            "responder@ha.test".to_owned(),
-            "service_token.revoke".to_owned(),
-            token_id.clone(),
-            decisions[1].0,
-        )],
-        "the service-token withdrawal should leave one evidence row, naming the responder, at \
-         its revision"
+        vec![
+            (
+                "responder@ha.test".to_owned(),
+                "service_token.issue".to_owned(),
+                token_id.clone(),
+                issued_revision,
+            ),
+            (
+                "responder@ha.test".to_owned(),
+                "service_token.revoke".to_owned(),
+                token_id.clone(),
+                decisions[1].0,
+            ),
+        ],
+        "the service token should leave its issue's evidence row and its withdrawal's, each \
+         naming the responder, at its revision"
     );
     for replica in ["a", "b"] {
         // Two withdrawn credentials, each refused here at least once.
