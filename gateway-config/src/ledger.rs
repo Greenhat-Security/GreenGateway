@@ -52,10 +52,14 @@
 //! which is why ADR-0008 treats filesystem access to the state directory as
 //! full control of a standalone deployment.
 //!
+//! `ggctl ledger seed`, `verify` and `rollback` are the offline commands
+//! over it: [`RevisionLedger::seed`], [`RevisionLedger::inspect`] and
+//! [`crate::revisions::RevisionService::apply_offline_rollback`].
+//!
 //! Not here yet: selecting ledger mode at startup, delivery of the
-//! revisions' evidence to the audit pipeline, `ggctl ledger
-//! seed|verify|rollback`, and pruning. Until pruning lands an append beyond
-//! [`MAX_RETAINED_REVISIONS`] is refused rather than history dropped.
+//! revisions' evidence to the audit pipeline, and pruning. Until pruning
+//! lands an append beyond [`MAX_RETAINED_REVISIONS`] is refused rather than
+//! history dropped.
 //!
 //! Like the rest of this crate the ledger reads no clock and no environment:
 //! callers stamp each revision with its time.
@@ -151,6 +155,14 @@ impl PlanId {
     /// The plan ID made of 16 random bytes.
     pub fn from_random(bytes: [u8; 16]) -> Self {
         Self(format!("{}{}", Self::PREFIX, hex::encode(bytes)))
+    }
+
+    /// The ID of the one plan an offline operator command makes, all zero
+    /// digits. It needs no randomness: the plan lives only in that command's
+    /// own short-lived service, is never shown to another actor, and an
+    /// offline revision records no request, so the ID is never recorded.
+    pub fn offline() -> Self {
+        Self::from_random([0; 16])
     }
 
     pub fn as_str(&self) -> &str {
@@ -930,6 +942,20 @@ impl RevisionLedger {
             corruption: None,
             max_revisions: MAX_RETAINED_REVISIONS,
         })
+    }
+
+    /// Fully verifies the ledger in the held `state_dir` as [`Self::open`]
+    /// does, through a read-only connection, and closes it again: what
+    /// `ggctl ledger verify` reports.
+    ///
+    /// Nothing is written to the ledger: not its journal mode, not a
+    /// checkpoint of its write-ahead log, not a change of any page. SQLite
+    /// may still create the `-wal` and `-shm` files beside a write-ahead
+    /// ledger to read it, as any reader does.
+    pub fn inspect(state_dir: &StateDirectory) -> Result<LedgerState, LedgerError> {
+        let path = location::existing_ledger(state_dir.path())?;
+        let connection = store::open_read_only(&path)?;
+        store::verify(&connection, MAX_RETAINED_REVISIONS)
     }
 
     /// Verifies the whole ledger again, as [`Self::open`] did.
