@@ -66,7 +66,7 @@ fn converting_to_the_bundles_own_version_copies_it_unchanged_and_again_changes_n
     assert_eq!(contents(&second), contents(&first));
     let found = report(&captured);
     assert_eq!(found["command"], "convert");
-    assert_eq!(codes(&found), ["validate.production_validators_not_run"]);
+    assert!(codes(&found).is_empty());
     let result = &found["result"];
     assert_eq!(result["valid"], true);
     assert_eq!(result["from"], V1ALPHA1);
@@ -129,14 +129,8 @@ fn an_unknown_target_is_refused_without_echoing_it_and_nothing_is_written() {
         ]);
         assert_eq!(exit, Exit::Invalid, "{target}");
         let found = report(&captured);
-        assert_eq!(
-            codes(&found),
-            [
-                "validate.production_validators_not_run",
-                "convert.unsupported_version"
-            ]
-        );
-        assert_eq!(found["diagnostics"][1]["location"], json!({"argument": 3}));
+        assert_eq!(codes(&found), ["convert.unsupported_version"]);
+        assert_eq!(found["diagnostics"][0]["location"], json!({"argument": 3}));
         assert!(found["result"].get("to").is_none());
         if !V1ALPHA1.contains(target) {
             assert!(!captured.stdout().contains(target), "{target}");

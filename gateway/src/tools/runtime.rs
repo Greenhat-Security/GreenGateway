@@ -2123,7 +2123,7 @@ mod tests {
         sink::{tests::CaptureSink, AuditSink},
         Actor, AuditEvent, AuditLog,
     };
-    use crate::rbac::{Policy, PrincipalMatcher, Rule, RuleAction};
+    use crate::rbac::{policy::PolicyFile, Policy, PrincipalMatcher, Rule, RuleAction};
 
     #[tokio::test]
     async fn unknown_tool_is_rejected_and_audited_once() {

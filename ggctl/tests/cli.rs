@@ -645,9 +645,7 @@ fn validate_and_doctor_read_a_bundle_offline_with_their_exit_codes() {
     assert_eq!(output.status.code(), Some(0));
     assert!(text(&output.stdout)
         .starts_with("bundle payments-production (greengateway.dev/v1alpha1): valid\n"));
-    assert!(
-        text(&output.stderr).starts_with("ggctl: info: validate.production_validators_not_run: ")
-    );
+    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
     assert_path_not_echoed(&output, bundle.path());
 
     for command in ["validate", "doctor"] {
@@ -664,10 +662,20 @@ fn validate_and_doctor_read_a_bundle_offline_with_their_exit_codes() {
     assert!(output.stderr.is_empty());
     let log: Value = serde_json::from_slice(&output.stdout).expect("one SARIF log");
     assert_eq!(log["version"], "2.1.0");
-    assert_eq!(
-        log["runs"][0]["results"][0]["ruleId"],
-        "validate.production_validators_not_run"
-    );
+    assert_eq!(log["runs"][0]["results"], json!([]));
+
+    // Route hosts that differ only in case pass the published schema; the
+    // production policy validator, which ggctl runs, refuses them by code.
+    let colliding = Bundle::new(&format!(
+        "{{\"schema_version\": \"0.1.0\", \"routes\": [{{\"path_prefix\": \"/a\", \"permission\": \"p\", \"hosts\": [\"{CANARY}.example\", \"{}.example\"]}}]}}\n",
+        CANARY.to_ascii_uppercase()
+    ));
+    let output = ggctl(&["validate", colliding.path(), "--format", "json"], None);
+    assert_eq!(output.status.code(), Some(3));
+    let refused = report(&output);
+    assert_eq!(refused["diagnostics"][0]["code"], "resource.invalid");
+    assert_eq!(refused["diagnostics"].as_array().map(Vec::len), Some(1));
+    assert_no_canary(&output);
 
     // A production bundle with an allow-by-default policy is invalid, and
     // the policy's values never reach the output.

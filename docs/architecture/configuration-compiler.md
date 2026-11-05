@@ -408,9 +408,10 @@ What holds it:
 
 Two limits. The reader is the caller's: the gateway's `process_environment`
 reads the process environment, and the import reader is a map the import
-parsed from its file before compiling. And `gateway/src/config/bundle.rs`, the
-gateway's half of the bundle reader, does read files. It is not part of the
-compiler, the scan does not cover it, and nothing at startup calls it.
+parsed from its file before compiling. And the bundle reader
+(`gateway_config::bundle`) does read files, beneath the bundle root it is
+given. It is not part of the compiler, the scan does not cover it, and
+nothing at startup calls it.
 
 ## Startup
 
@@ -591,9 +592,10 @@ hold the compiler's plans, rather than the gateway's `Config`, to the same
 expected values. What stays in the gateway is what needs the gateway:
 `Config` and its conversion from a plan, the process-environment reader and
 its table of the gateway's other environment reads, the fingerprint test,
-the bundle diff with the production policy and tools validators, and the
-`config_tests` suite, which still holds `Config::from_env_vars` to every
-setting.
+and the `config_tests` suite, which still holds `Config::from_env_vars` to
+every setting. The bundle diff with the production policy and tools
+validators followed them into `gateway-config` with those validators
+(`semantic_diff::compare_production_bundles`).
 
 `ggctl validate`, `ggctl doctor` and `ggctl diff` compile an environment file
 (`--env`) with the gateway's own compiler, through the `KEY=VALUE` grammar in

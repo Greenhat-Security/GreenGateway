@@ -502,7 +502,7 @@
       "required": ["valid"],
       "properties": {
         "valid": {
-          "description": "No stage of the bundle reader found an error, or, for an environment file, the file was read, every line is blank, a comment or an assignment, no key is assigned twice under --strict, and the configuration compiler accepted it. The gateway's production policy and tools validators are not part of ggctl and did not run; a warning under --warnings-as-errors changes the exit code, not this.",
+          "description": "No stage of the bundle reader found an error, the production policy and tools validators included, or, for an environment file, the file was read, every line is blank, a comment or an assignment, no key is assigned twice under --strict, and the configuration compiler accepted it; a warning under --warnings-as-errors changes the exit code, not this.",
           "type": "boolean"
         },
         "bundle": {"$ref": "#/$defs/bundle"},
@@ -611,8 +611,8 @@
         "schemaVersion": {"type": "string"},
         "sha256": {"$ref": "#/$defs/sha256"},
         "productionValidator": {
-          "description": "For a document the bundle supplies: the gateway's production validator is not part of ggctl and did not run.",
-          "const": "not_run"
+          "description": "For a document the bundle supplies, once the bundle was read with no error: passed, the production validator the gateway's loader runs accepted it. not_run is deprecated: earlier releases, which could not run the production validators, reported it, and no release reports it now.",
+          "enum": ["passed", "not_run"]
         }
       }
     },
@@ -687,7 +687,7 @@
       "required": ["created", "profile"],
       "properties": {
         "created": {
-          "description": "The bundle is at the --output directory. It was read back with the bundle reader before it was moved there; the gateway's production policy and tools validators are not part of ggctl and did not run.",
+          "description": "The bundle is at the --output directory. It was read back with the bundle reader and the production policy and tools validators before it was moved there.",
           "type": "boolean"
         },
         "profile": {
@@ -713,7 +713,7 @@
       "required": ["valid", "changed", "written"],
       "properties": {
         "valid": {
-          "description": "The bundle reader accepted BUNDLE, so it could be converted. The gateway's production policy and tools validators are not part of ggctl and did not run.",
+          "description": "The bundle reader accepted BUNDLE, with the production policy and tools validators, so it could be converted.",
           "type": "boolean"
         },
         "bundle": {
@@ -748,7 +748,7 @@
       "required": ["valid", "files", "changed", "written"],
       "properties": {
         "valid": {
-          "description": "Every check of the bundle reader except the comparison of each referenced file with its pin passed, so the bundle could be pinned. The gateway's production policy and tools validators are not part of ggctl and did not run.",
+          "description": "Every check of the bundle reader except the comparison of each referenced file with its pin passed, the production policy and tools validators included, so the bundle could be pinned.",
           "type": "boolean"
         },
         "bundle": {
@@ -802,7 +802,7 @@
       "required": ["valid"],
       "properties": {
         "valid": {
-          "description": "Both sides were read with no error and could be compared, so they were: two bundles, or two environment files. An environment file and a bundle are never compared (diff.not_comparable). The gateway's production policy and tools validators are not part of ggctl and did not run.",
+          "description": "Both sides were read with no error and could be compared, so they were: two bundles, read with the production policy and tools validators included and compared by the documents those validators built, or two environment files. An environment file and a bundle are never compared (diff.not_comparable).",
           "type": "boolean"
         },
         "bundle": {
@@ -833,7 +833,7 @@
       "required": ["valid", "seeded"],
       "properties": {
         "valid": {
-          "description": "The bundle reader accepted BUNDLE strictly: an entry the manifest does not reference is an error. The gateway's production policy and tools validators are not part of ggctl and did not run.",
+          "description": "The bundle reader accepted BUNDLE strictly, the production policy and tools validators included: an entry the manifest does not reference is an error.",
           "type": "boolean"
         },
         "seeded": {
@@ -873,7 +873,7 @@
       "required": ["rolledBack"],
       "properties": {
         "rolledBack": {
-          "description": "A new forward revision restores the target's content. The gateway's production policy and tools validators are not part of ggctl and did not run.",
+          "description": "A new forward revision restores the target's content, held to the production policy and tools validators when it was compiled again.",
           "type": "boolean"
         },
         "corruption": {"$ref": "#/$defs/ledgerCorruption"},

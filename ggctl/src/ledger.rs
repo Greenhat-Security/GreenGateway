@@ -12,13 +12,13 @@
 //!   `ggctl` holding it is `state_dir.locked` (exit `5`) before anything is
 //!   read;
 //! - `seed` reads the bundle strictly with the shared reader and the
-//!   published schemas, as `ggctl validate --strict` does, then calls
+//!   production validators, as `ggctl validate --strict` does, then calls
 //!   [`RevisionLedger::seed`], which refuses a state directory that holds a
 //!   ledger or a ledger's journal files;
 //! - `verify` runs [`RevisionLedger::inspect`]: the full verification a
 //!   gateway runs at start, through a read-only connection;
 //! - `rollback` plans the rollback through [`RevisionService`] with the
-//!   published-schemas compiler under the fixed system actor
+//!   production compiler under the fixed system actor
 //!   [`ACTOR_LABEL`], and applies it with
 //!   [`RevisionService::apply_offline_rollback`] only when every risk code is
 //!   named with `--acknowledge`; it appends a forward revision that records
@@ -26,10 +26,10 @@
 //!
 //! Reports never echo a positional argument or a path: the bundle is named
 //! by its manifest, revisions by the opaque IDs the ledger holds, arguments
-//! by their position, and an actor only by its kind. The gateway's
-//! production policy and tools validators are not part of `ggctl`, so the
-//! reports about a revision say they did not run and that a gateway compiles
-//! the revision again at start. No network request is made, no environment
+//! by their position, and an actor only by its kind. A revision is held to
+//! the production policy and tools validators the gateway compiles with, and
+//! the reports about one say that a gateway compiles it again at start. No
+//! network request is made, no environment
 //! variable is read, and no gateway audit event is written: a revision's
 //! record is its own evidence.
 
@@ -40,20 +40,18 @@ use std::{
 };
 
 use gateway_config::{
-    bundle::{self, Bundle, PublishedSchemasOnly, ReadOptions},
+    bundle::{self, ProductionBundle, ProductionValidators, ReadOptions},
     ledger::{
         LedgerActor, LedgerError, LedgerState, Operation, PlanId, RevisionId, RevisionLedger,
         RevisionSummary,
     },
     revisions::{
-        OfflineRollback, Plan, PlanSubject, PublishedSchemasCompiler, RevisionError,
-        RevisionService,
+        OfflineRollback, Plan, PlanSubject, ProductionCompiler, RevisionError, RevisionService,
     },
     semantic_diff::SemanticDiff,
     state_dir::{StateDirError, StateDirectory},
 };
 use serde::Serialize;
-use serde_json::Value;
 
 use crate::{
     cli::Invocation,
@@ -290,12 +288,9 @@ pub(crate) fn seed(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
     let read = bundle::read_bundle(
         Path::new(path),
         ReadOptions { strict: true },
-        &PublishedSchemasOnly,
+        &ProductionValidators,
     );
     let mut diagnostics = validate::diagnostics(&read);
-    if validate::supplies_a_resource(&read) {
-        diagnostics.push(Diagnostic::new(Code::ProductionValidatorsNotRun).into());
-    }
     let mut result = SeedResult {
         valid: read.bundle.is_some(),
         seeded: false,
@@ -324,7 +319,7 @@ pub(crate) fn seed(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
 fn seed_ledger(
     state_dir: &Path,
     state_position: usize,
-    bundle: &Bundle<Value, Value>,
+    bundle: &ProductionBundle,
     result: &mut SeedResult,
 ) -> Vec<ReportDiagnostic> {
     let held = match StateDirectory::acquire(state_dir) {
@@ -482,7 +477,7 @@ fn roll_back(
             return vec![ledger_diagnostic(&error)];
         }
     };
-    let mut service = RevisionService::new(ledger, PublishedSchemasCompiler);
+    let mut service = RevisionService::new(ledger, ProductionCompiler);
     let now = SystemTime::now();
     // The rollback the gateway's revision service would plan: the target's
     // stored content, compiled again and diffed against the desired
@@ -497,9 +492,7 @@ fn roll_back(
         Err(error) => return revision_diagnostics(&error, revision_position, result),
     };
     result.plan = Some(PlanRecord::of(&plan, &target, &acknowledged));
-    // Every report about a planned rollback says what did not run.
-    let mut diagnostics: Vec<ReportDiagnostic> =
-        vec![Diagnostic::new(Code::ProductionValidatorsNotRun).into()];
+    let mut diagnostics: Vec<ReportDiagnostic> = Vec::new();
     let applied = service.apply_offline_rollback(
         OfflineRollback {
             plan: plan.id,

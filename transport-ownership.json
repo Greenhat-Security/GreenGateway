@@ -1111,12 +1111,14 @@
           "http@1.5.0|registry+https://github.com/rust-lang/crates.io-index",
           "ipnet@2.12.2|registry+https://github.com/rust-lang/crates.io-index",
           "jsonschema@0.60.2|registry+https://github.com/rust-lang/crates.io-index",
+          "percent-encoding@2.3.2|registry+https://github.com/rust-lang/crates.io-index",
           "proptest@1.11.0|registry+https://github.com/rust-lang/crates.io-index",
           "rusqlite@0.40.2|registry+https://github.com/rust-lang/crates.io-index",
           "rustix@1.1.5|registry+https://github.com/rust-lang/crates.io-index",
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
           "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index",
           "sha2@0.11.1|registry+https://github.com/rust-lang/crates.io-index",
+          "time@0.3.55|registry+https://github.com/rust-lang/crates.io-index",
           "tracing@0.1.44|registry+https://github.com/rust-lang/crates.io-index",
           "url@2.5.8|registry+https://github.com/rust-lang/crates.io-index",
           "uuid@1.26.1|registry+https://github.com/rust-lang/crates.io-index"
@@ -6261,6 +6263,20 @@
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           {
+            "name": "time",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^0.3.53",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "formatting",
+              "parsing"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
             "name": "rustix",
             "rename": null,
             "kind": null,
@@ -6347,6 +6363,17 @@
             "kind": null,
             "target": null,
             "req": "^2.11.0",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "percent-encoding",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^2.3.2",
             "optional": false,
             "uses_default_features": true,
             "features": [],
@@ -9406,6 +9433,16 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway-config/src/rbac/policy.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway_config::rbac::policy::EnforcementMode#1",
+      "sha256": "99db9307f073e50f7c0486a22599850b7a3795dffa048be6e43d37823b7029c3",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
       "file": "gateway-config/src/ledger/location.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -9424,6 +9461,36 @@
       "sha256": "b614645a054675446906c5e5bd9cd95dfc6bdbcdab6ca5c8d79e8f422cbd3882",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed for #242 (standalone state directory; moved here from the revision ledger's location checks): reads the Windows reparse-point attribute of state-directory, lock-file and ledger-file metadata through std::os::windows::fs::MetadataExt to refuse links and junctions. Read-only metadata; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/tools/codecs.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway_config::tools::codecs::DecimalWireEncoding#1",
+      "sha256": "215b8fe68ca05606491df97cb2586bcd3ef52fff87e1490030fbdb1574853a06",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway-config/src/tools/definitions.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway_config::tools::definitions::ToolVisibility#1",
+      "sha256": "e19ec6ff716d7c13539b9d63347470b8011a5ea6721ab0334ba3221d82588a6e",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway-config/src/tools/definitions.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway_config::tools::definitions::ToolSource#1",
+      "sha256": "ce61dcadbae9a900a488a74aa9e877c0dc1d0192bf94e2e8b16eba72d11d3bea",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
       "file": "gateway-config/src/state_dir.rs",
@@ -12109,14 +12176,24 @@
       "purpose": "The IpAddr value type for the canonical client address a source_network rule condition compares against policy CIDRs (issue #243, item 16). The address is a fact the caller supplies after trusted-proxy processing; the module only compares it with ipnet networks. No socket, resolver, connection or other network or process capability is introduced."
     },
     {
-      "file": "gateway/src/rbac/policy.rs",
+      "file": "gateway/src/rbac/conditions.rs",
       "reasons": [
-        "unexpanded-attribute"
+        "capability-import-or-glob"
       ],
-      "scope": "gateway::rbac::policy::EnforcementMode#1",
-      "sha256": "99db9307f073e50f7c0486a22599850b7a3795dffa048be6e43d37823b7029c3",
+      "scope": "gateway::rbac::conditions::use gateway_config :: rbac :: conditions :: *#1",
+      "sha256": "28a11715f95d5419897909bf450ffd8416a0f5f59a000652162e7790f4f37341",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/rbac/identity_mappings.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::rbac::identity_mappings::use gateway_config :: rbac :: identity_mappings :: *#1",
+      "sha256": "29a5b722705aa7df66fd87058fd6ca74d3c27d851ea977dfaf77e881665fe19d",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
       "file": "gateway/src/rbac/policy.rs",
@@ -12127,6 +12204,26 @@
       "sha256": "bb080ff83476544ea8ef58c08ac706237cbec29ecc0f7312f1a933df6f0dbcf9",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+    },
+    {
+      "file": "gateway/src/rbac/policy_document.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::rbac::policy_document::use gateway_config :: rbac :: policy_document :: *#1",
+      "sha256": "2e538b3c5444995354d1dc9e306255d2602f4f038c0bc85c7eb9da64eac42738",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/rbac/policy.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::rbac::policy::use gateway_config :: rbac :: policy :: *#1",
+      "sha256": "eb8809b6874c7daeb2317374db1eef53354165ab08f48297503a3d322e711654",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
       "file": "gateway/src/rbac/policy_history.rs",
@@ -12157,6 +12254,16 @@
       "sha256": "563ec54565e1acf88c0af65ef2f343103630ff2285ee28b48da1b7e03103a374",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+    },
+    {
+      "file": "gateway/src/rbac/rule.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::rbac::rule::use gateway_config :: rbac :: rule :: *#1",
+      "sha256": "173d13dffa353f17c5edcb011b1fa7e6bdad4c45f1273f3457168b7abdb45116",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
       "file": "gateway/src/security_cluster.rs",
@@ -14604,12 +14711,22 @@
     {
       "file": "gateway/src/tools/codecs/mod.rs",
       "reasons": [
-        "unexpanded-attribute"
+        "capability-import-or-glob"
       ],
-      "scope": "gateway::tools::codecs::DecimalWireEncoding#1",
-      "sha256": "215b8fe68ca05606491df97cb2586bcd3ef52fff87e1490030fbdb1574853a06",
+      "scope": "gateway::tools::codecs::use gateway_config :: tools :: codecs :: *#1",
+      "sha256": "3cc2233441d4529c9b2d65598a435a04cd493fdb6d722efabc0b302e6f41b6e8",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/tools/composite.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::tools::composite::use gateway_config :: tools :: composite :: *#1",
+      "sha256": "2a5ed4095e27595d9a737bc41c4a83d2bb1e2263e8b5b568e8f22d21f6059d8b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
       "file": "gateway/src/tools/definitions.rs",
@@ -14620,66 +14737,6 @@
       "sha256": "5776bb64c7038f66adb12c32dcd2326a96856c3bdfcaf16011d1957aa9fa1c52",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
-    },
-    {
-      "file": "gateway/src/tools/definitions.rs",
-      "reasons": [
-        "network-or-process-reference"
-      ],
-      "scope": "gateway::tools::definitions::impl From < McpToolAnnotations > ToolAnnotations::header#1",
-      "sha256": "9e8ffe87f2b11e49018b454278981cfc8c73eddca277873d4931577f86b3b470",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
-    },
-    {
-      "file": "gateway/src/tools/definitions.rs",
-      "reasons": [
-        "network-or-process-reference"
-      ],
-      "scope": "gateway::tools::definitions::impl From < McpToolAnnotations > ToolAnnotations::from#1",
-      "sha256": "2bb74040b786e0fac6efc3e5597b23c6a24212399c1168359863c4258063fa85",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
-    },
-    {
-      "file": "gateway/src/tools/definitions.rs",
-      "reasons": [
-        "network-or-process-reference"
-      ],
-      "scope": "gateway::tools::definitions::impl From < ToolAnnotations > McpToolAnnotations::header#1",
-      "sha256": "63f315e7654a97278c29ccb171e794b660df31100b3ec948b9cae96a4f3311c3",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
-    },
-    {
-      "file": "gateway/src/tools/definitions.rs",
-      "reasons": [
-        "network-or-process-reference"
-      ],
-      "scope": "gateway::tools::definitions::impl From < ToolAnnotations > McpToolAnnotations::from#1",
-      "sha256": "7620de996c728cda5da71cc863ddf437cabe47e9204fed4d4807249a1f67c270",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
-    },
-    {
-      "file": "gateway/src/tools/definitions.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::tools::definitions::ToolVisibility#1",
-      "sha256": "e19ec6ff716d7c13539b9d63347470b8011a5ea6721ab0334ba3221d82588a6e",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
-    },
-    {
-      "file": "gateway/src/tools/definitions.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::tools::definitions::ToolSource#1",
-      "sha256": "ce61dcadbae9a900a488a74aa9e877c0dc1d0192bf94e2e8b16eba72d11d3bea",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
       "file": "gateway/src/tools/definitions.rs",
@@ -14740,6 +14797,36 @@
       "sha256": "05d742e7a9bb701ef58372e3a22e98fbe2a412abdcaa26b33e7c3e26d6920a13",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/tools/definitions.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::tools::definitions::use gateway_config :: tools :: definitions :: *#1",
+      "sha256": "c7d38bab7551aabd061963d97769b11ba7e68a316672d41e895174ce4b3a2291",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/tools/definitions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::tools::definitions::tool_annotations_from_mcp#1",
+      "sha256": "f80459cc6a43df923fcd608ee4cab0db1cffbfcf5eccc38d9ab70424c9fc482a",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+    },
+    {
+      "file": "gateway/src/tools/definitions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::tools::definitions::mcp_tool_annotations#1",
+      "sha256": "775802573b1f1fe3d92c441ae0dcf91071da7fc5ed1889c83bb492b800f5142b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
     {
       "file": "gateway/src/tools/enum_source.rs",
@@ -15517,6 +15604,26 @@
       "purpose": "Issue #243 tool invocation context: carries the canonical client address the call entered with (Option<std::net::IpAddr>, a value set by the MCP and admin playground entry points) as the policy fact a source_network condition reads; a data field that adds no network, process or transport capability."
     },
     {
+      "file": "gateway/src/tools/selector.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::tools::selector::use gateway_config :: tools :: selector :: *#1",
+      "sha256": "b8c7c2a233bec4dd203b5e4afc25778c6b5477388092f3ec0b23bafdf1c3b4ae",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/tools/transforms.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::tools::transforms::use gateway_config :: tools :: transforms :: *#1",
+      "sha256": "276375f24027964db8096450ea558d0e02d261a83598a1f2da66288d5dfb7937",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
       "file": "gateway/src/upstream_route.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -15766,26 +15873,6 @@
       "sha256": "fb2fec901399a9d0163dcea0a2dec839f0a413e04004a2993d18fcf748902309",
       "owner": "GreenGateway maintainers",
       "purpose": "Clone/Copy/Debug/Default/PartialEq/Eq derives and #[default] on the two-value AUTHORITY_EVIDENCE_DURABILITY setting; no transport, file or process capability (issue #425)."
-    },
-    {
-      "file": "gateway/src/config/bundle.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::config::bundle::file_attributes#1",
-      "sha256": "6651893f61abaf3a3a584a1a4bf787888b6316908097bba4afe06cbd13196060",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the gateway's production validators passed to the shared bundle reader, which bundle mode (a later #242 slice) will call; it only calls the existing policy and tools validators and has no transport or process capability."
-    },
-    {
-      "file": "gateway/src/config/revisions.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::config::revisions::file_attributes#1",
-      "sha256": "fcfb2792059c7e0101f8eeebf037c18bedf13bbf7dc634eced0a54abb31f3244",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the production plan compiler the standalone ledger's plan, apply and rollback service (#242 PR 11) takes, which ledger startup and the admin routes (later #242 slices) will hold; it only hands that service the existing production policy and tools validators and their JSON forms, and has no transport or process capability."
     },
     {
       "file": "gateway/src/storage/postgres_authority_events.rs",

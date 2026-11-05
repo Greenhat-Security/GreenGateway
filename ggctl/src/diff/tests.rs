@@ -162,7 +162,7 @@ fn diff_compares_two_bundles_by_what_they_configure() {
         json!(["risk.egress_broadened", "risk.policy_broadened"])
     );
     assert_eq!(found["result"]["diff"]["severity"], "high");
-    assert_eq!(codes(&found), ["validate.production_validators_not_run"]);
+    assert!(codes(&found).is_empty());
     assert_no_canary(&captured);
     assert_paths_not_echoed(&captured, &[&base, &candidate]);
 
@@ -217,7 +217,6 @@ fn check_exits_4_on_any_difference_and_sarif_carries_the_risk_codes() {
     assert_eq!(
         rule_ids,
         [
-            "validate.production_validators_not_run",
             "diff.drift_found",
             "risk.egress_broadened",
             "risk.policy_broadened",

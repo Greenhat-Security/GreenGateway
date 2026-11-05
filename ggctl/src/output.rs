@@ -48,7 +48,7 @@ use std::{
 };
 
 use gateway_config::bundle::{
-    self, init::GITATTRIBUTES, PublishedSchemasOnly, ReadOptions, SourceFile, MANIFEST_FILE_NAME,
+    self, init::GITATTRIBUTES, ProductionValidators, ReadOptions, SourceFile, MANIFEST_FILE_NAME,
     MAX_MANIFEST_BYTES,
 };
 
@@ -123,7 +123,7 @@ pub(crate) fn write_new_bundle(
     let read = bundle::read_bundle(
         &staging.path,
         ReadOptions { strict: true },
-        &PublishedSchemasOnly,
+        &ProductionValidators,
     );
     if read
         .bundle
