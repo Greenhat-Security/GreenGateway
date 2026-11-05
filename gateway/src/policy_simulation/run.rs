@@ -3,9 +3,12 @@
 //!
 //! Each case becomes the context a live adapter builds -- through the same
 //! builders the policy test runner uses -- and is asked of the same
-//! [`CompiledPolicy`] methods: `evaluate_with_stages` (which *is* `evaluate`,
-//! with a collecting sink) for HTTP, `evaluate_tool` for the tool lanes and
-//! `select_rate_lane` for rate overrides. Nothing here matches a rule.
+//! [`CompiledPolicy`] methods, with the facts a live lane captures for the
+//! case's principal (`case_facts`): `evaluate_with_stages` (which *is*
+//! `evaluate_with_facts`, with a collecting sink) for HTTP,
+//! `evaluate_tool_with_facts` for the tool lanes and
+//! `select_rate_lane_with_facts` for rate overrides. Nothing here matches a
+//! rule.
 //!
 //! Results carry case ids, stable codes, element positions and, for an admin
 //! who already holds `admin:policy:read`, the matched element's stable `id`
@@ -28,8 +31,8 @@ use crate::{
     },
     policy_testing::{
         runner::{
-            evaluation_error_code, http_context, limitation_code, logical_code, rate_context,
-            tool_context, tool_limitation_code,
+            case_facts, evaluation_error_code, http_context, limitation_code, logical_code,
+            rate_context, tool_context, tool_limitation_code,
         },
         suite::{CaseContext, SyntheticCase},
     },
@@ -333,7 +336,7 @@ fn evaluate_case(
             let context = http_context(compiled.snapshot(), request, principal);
             let mut stages = Vec::with_capacity(MAX_HTTP_STAGES);
             let evaluation = compiled
-                .evaluate_with_stages(&context, &mut stages)
+                .evaluate_with_stages(&context, &case_facts(compiled, principal), &mut stages)
                 .map_err(refused)?;
             let key = decision_key(
                 evaluation.logical(),
@@ -386,7 +389,8 @@ fn evaluate_case(
             principal,
         } => {
             let context = tool_context(compiled.snapshot(), *operation, tool_name, principal, None);
-            tool_evaluated(policy, *operation, &context, trace).map_err(refused)
+            let facts = case_facts(compiled, principal);
+            tool_evaluated(policy, *operation, &context, &facts, trace).map_err(refused)
         }
         CaseContext::ToolHttp {
             tool_name,
@@ -401,7 +405,9 @@ fn evaluate_case(
                 principal,
                 Some((method, path)),
             );
-            tool_evaluated(policy, ToolOperation::RenderedHttp, &context, trace).map_err(refused)
+            let facts = case_facts(compiled, principal);
+            tool_evaluated(policy, ToolOperation::RenderedHttp, &context, &facts, trace)
+                .map_err(refused)
         }
         CaseContext::Rate {
             method,
@@ -409,7 +415,9 @@ fn evaluate_case(
             principal,
         } => {
             let context = rate_context(compiled.snapshot(), method, path, principal);
-            let selection = compiled.select_rate_lane(&context).map_err(refused)?;
+            let selection = compiled
+                .select_rate_lane_with_facts(&context, &case_facts(compiled, principal))
+                .map_err(refused)?;
             let mut view = Map::new();
             view.insert("lane".to_owned(), json!("rate_selection"));
             let key = match selection.outcome() {
@@ -470,9 +478,10 @@ fn tool_evaluated(
     policy: &SimulatedPolicy,
     operation: ToolOperation,
     context: &crate::policy_eval::tools::ToolEvaluationContext,
+    facts: &crate::policy_eval::PolicyFacts,
     trace: TraceLevel,
 ) -> Result<Evaluated, EvaluationError> {
-    let evaluation = policy.compiled.evaluate_tool(context)?;
+    let evaluation = policy.compiled.evaluate_tool_with_facts(context, facts)?;
     let key = decision_key(
         evaluation.logical(),
         evaluation.effect(),

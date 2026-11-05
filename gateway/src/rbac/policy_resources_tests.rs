@@ -262,6 +262,252 @@ fn another_administrator_may_withdraw_every_grant_a_principal_holds() {
     );
 }
 
+const ISSUER: &str = "https://idp.example.test";
+
+/// [`administered`] as a policy v1 document, so a candidate can carry
+/// identity mappings.
+fn administered_v1(extra: Value) -> Value {
+    let mut document = json!({
+        "schema_version": "1.0.0",
+        "default_action": "deny",
+        "roles": {
+            "admin": { "permissions": ["admin:policy:read", "admin:policy:write"] },
+            "reader": { "permissions": ["admin:policy:read"] }
+        },
+        "routes": [{
+            "id": "policy-put",
+            "methods": ["PUT"],
+            "path_prefix": POLICY_ROUTE,
+            "permission": "admin:policy:write"
+        }]
+    });
+    if let (Some(document), Some(extra)) = (document.as_object_mut(), extra.as_object()) {
+        for (name, value) in extra {
+            document.insert(name.clone(), value.clone());
+        }
+    }
+    document
+}
+
+fn mapping(id: &str, extra: Value) -> Value {
+    let mut mapping = json!({ "id": id, "issuer": ISSUER });
+    if let (Some(mapping), Some(extra)) = (mapping.as_object_mut(), extra.as_object()) {
+        for (name, value) in extra {
+            mapping.insert(name.clone(), value.clone());
+        }
+    }
+    mapping
+}
+
+#[test]
+fn mapped_role_mode_that_maps_no_writer_cannot_be_published() {
+    let live = policy(administered(json!({})));
+    let unreachable = |candidate: Value| {
+        let validation = validate(&policy(candidate), &live, &complete_view());
+        has(&validation, IssueCode::PolicyWriteUnreachable).then(|| {
+            let refusal = finding(&validation, IssueCode::PolicyWriteUnreachable).clone();
+            assert_eq!(refusal.diagnostic.pointer, "/identity_mappings");
+            assert_eq!(refusal.diagnostic.blocks, PUBLICATION_ONLY);
+            refusal
+        })
+    };
+
+    // The roles still grant the permission, but in mapped-role mode a role
+    // is held only as a mapping grants it.
+    let refusal = unreachable(administered_v1(json!({ "identity_mappings": [] })))
+        .expect("no mapping grants a writer");
+    assert!(refusal
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("service token")));
+    assert!(unreachable(administered_v1(json!({
+        "identity_mappings": [mapping("readers", json!({ "grant_roles": ["reader"] }))]
+    })))
+    .is_some());
+    assert!(unreachable(administered_v1(json!({
+        "identity_mappings": [mapping("admins", json!({ "grant_roles": ["admin"] }))]
+    })))
+    .is_none());
+
+    // A mapping can grant a writer only to a principal the role admits: one
+    // of the role's issuers and one of its authentication methods.
+    let scoped = |role: Value, mapping_extra: Value| {
+        administered_v1(json!({
+            "roles": { "admin": role, "reader": { "permissions": ["admin:policy:read"] } },
+            "identity_mappings": [mapping("admins", mapping_extra)]
+        }))
+    };
+    let writer = json!(["admin:policy:write"]);
+    for (role, mapped, reachable) in [
+        (
+            json!({ "permissions": writer, "issuers": ["https://other.example.test"] }),
+            json!({ "grant_roles": ["admin"] }),
+            false,
+        ),
+        (
+            json!({ "permissions": writer, "issuers": [ISSUER] }),
+            json!({ "grant_roles": ["admin"] }),
+            true,
+        ),
+        (
+            json!({ "permissions": writer, "auth_methods": ["session_cookie"] }),
+            json!({ "grant_roles": ["admin"], "auth_methods": ["bearer_token"] }),
+            false,
+        ),
+        (
+            json!({ "permissions": writer, "auth_methods": ["session_cookie"] }),
+            json!({ "grant_roles": ["admin"] }),
+            true,
+        ),
+        // A service token carries no issuer, so no mapping applies to one.
+        (
+            json!({ "permissions": writer }),
+            json!({ "grant_roles": ["admin"], "auth_methods": ["service_token"] }),
+            false,
+        ),
+    ] {
+        assert_eq!(
+            unreachable(scoped(role.clone(), mapped.clone())).is_none(),
+            reachable,
+            "role {role}, mapping {mapped}"
+        );
+    }
+}
+
+#[test]
+fn mapped_role_mode_strips_a_service_token_writer() {
+    // Only service tokens can write the live policy: its one writer role
+    // admits them alone.
+    let roles = json!({
+        "service-admin": { "permissions": ["*"], "auth_methods": ["service_token"] },
+        "reader": { "permissions": ["admin:policy:read"] }
+    });
+    let live = policy(administered(json!({ "roles": roles.clone() })));
+    let candidate = policy(administered_v1(json!({
+        "roles": roles,
+        "identity_mappings": [mapping("service-admins", json!({ "grant_roles": ["service-admin"] }))]
+    })));
+    let validation = validate(&candidate, &live, &complete_view());
+    assert_eq!(
+        validation.blocking_codes(),
+        vec!["policy_write_unreachable"],
+        "{:?}",
+        codes(&validation)
+    );
+
+    // A service-token publisher loses the permission it holds today, even
+    // where the candidate maps a writer for somebody else.
+    let token = Principal {
+        user_id: "service-token:synthetic".to_owned(),
+        issuer: None,
+        roles: vec!["admin".to_owned()],
+        auth_method: AuthMethod::ServiceToken,
+        email: None,
+        org_id: None,
+        session_id: "synthetic".to_owned(),
+    };
+    let live = policy(administered(json!({})));
+    let candidate = policy(administered_v1(json!({
+        "identity_mappings": [mapping("admins", json!({ "grant_roles": ["admin"] }))]
+    })));
+    let validation = validate_as(&candidate, &live, &complete_view(), &token, None);
+    let lost = finding(&validation, IssueCode::PublisherPolicyWriteLost);
+    assert_eq!(lost.diagnostic.pointer, "/identity_mappings");
+    assert!(!has(&validation, IssueCode::PolicyWriteUnreachable));
+}
+
+#[test]
+fn a_publisher_is_judged_by_the_roles_the_candidates_mappings_grant_it() {
+    let live = policy(administered(json!({})));
+    let view = complete_view();
+    let publisher = |organization: Option<&str>| {
+        let mut publisher = principal(&["admin"]);
+        publisher.org_id = organization.map(str::to_owned);
+        publisher
+    };
+
+    // Its claimed `admin` is only an attribute now; the mapping that grants
+    // the internal `admin` asks for another claim.
+    let candidate = policy(administered_v1(json!({
+        "identity_mappings": [mapping("platform-admins", json!({
+            "claimed_roles": ["Platform-Admins"],
+            "grant_roles": ["admin"]
+        }))]
+    })));
+    let validation = validate_as(&candidate, &live, &view, &publisher(Some("acme")), None);
+    assert_eq!(
+        codes(&validation),
+        vec![(
+            "publisher_policy_write_lost",
+            "/identity_mappings".to_owned()
+        )]
+    );
+
+    // An organization mapping is answered from the organization the
+    // publisher's own issuer verified, in both the permission check and the
+    // HTTP lane: never indeterminate, never guessed.
+    let candidate = policy(administered_v1(json!({
+        "identity_mappings": [mapping("acme-admins", json!({
+            "organizations": ["acme"],
+            "grant_roles": ["admin"]
+        }))]
+    })));
+    for (organization, keeps) in [(Some("acme"), true), (Some("globex"), false), (None, false)] {
+        let validation = validate_as(&candidate, &live, &view, &publisher(organization), None);
+        assert_eq!(
+            !has(&validation, IssueCode::PublisherPolicyWriteLost),
+            keeps,
+            "{organization:?}: {:?}",
+            codes(&validation)
+        );
+    }
+
+    // The HTTP lane judges the publisher's own PUT by the mapped roles too: a
+    // rule that refuses principals holding the internal role `admin` refuses
+    // nobody the mapping grants only `writer`, whatever it claims.
+    let candidate = policy(administered_v1(json!({
+        "roles": {
+            "writer": { "permissions": ["admin:policy:read", "admin:policy:write"] },
+            "admin": { "permissions": ["admin:policy:read"] }
+        },
+        "identity_mappings": [mapping("acme-writers", json!({
+            "organizations": ["acme"],
+            "grant_roles": ["writer"]
+        }))],
+        "rules": [{
+            "id": "no-admin-writes",
+            "path": "/v1/admin/**",
+            "principal": { "roles": ["admin"] },
+            "action": "deny"
+        }]
+    })));
+    let validation = validate_as(&candidate, &live, &view, &publisher(Some("acme")), None);
+    assert!(!validation.blocks_publication(), "{:?}", codes(&validation));
+    // The same rule over the internal role the mapping does grant refuses it.
+    let candidate = policy(administered_v1(json!({
+        "roles": {
+            "writer": { "permissions": ["admin:policy:read", "admin:policy:write"] }
+        },
+        "identity_mappings": [mapping("acme-writers", json!({
+            "organizations": ["acme"],
+            "grant_roles": ["writer"]
+        }))],
+        "rules": [{
+            "id": "no-writer-writes",
+            "path": "/v1/admin/**",
+            "principal": { "roles": ["writer"] },
+            "action": "deny"
+        }]
+    })));
+    let validation = validate_as(&candidate, &live, &view, &publisher(Some("acme")), None);
+    let lost = finding(&validation, IssueCode::PublisherPolicyWriteLost);
+    assert_eq!(lost.diagnostic.pointer, "/rules/0");
+    assert_eq!(
+        lost.diagnostic.element_id.as_deref(),
+        Some("no-writer-writes")
+    );
+}
+
 #[test]
 fn the_publisher_check_asks_the_http_lane_only_where_rbac_applies() {
     let live = policy(administered(json!({})));

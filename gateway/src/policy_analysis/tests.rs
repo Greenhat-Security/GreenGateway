@@ -30,7 +30,10 @@ use crate::{
         CompiledPolicy, DispatchFacts, HostFact, HttpTarget, PolicyEffect, PolicyEvaluationContext,
         PrincipalFact, PrincipalIdentity, RuleReference, CONTEXT_VERSION,
     },
-    policy_simulation::edits::{apply_edits, parse_edits},
+    policy_simulation::{
+        edits::{apply_edits, parse_edits},
+        request::StoredCandidate,
+    },
     policy_testing::suite::Diagnostics,
     rbac::{
         matcher::path_pattern_matches,
@@ -876,6 +879,7 @@ fn binding<'a>(
         analyzed_etag: etag,
         analyzed_semantic_digest: None,
         edit_count: 0,
+        stored: None,
         mcp_alias_paths: 0,
         resource_snapshot: snapshot,
     }
@@ -883,6 +887,73 @@ fn binding<'a>(
 
 fn no_suppressions(outcome: &AnalysisOutcome) -> SuppressionOutcome {
     SuppressionOutcome::unavailable(outcome.findings.len())
+}
+
+/// A stored candidate is named in both renderings by its identifiers, and
+/// only there: a draft by id and revision, a history version by number.
+#[test]
+fn both_renderings_name_the_stored_candidate_they_analyzed() {
+    let outcome = run(&policy(base(
+        json!([
+            { "path": "/api/**", "action": "allow" },
+            { "path": "/api/admin", "action": "deny" }
+        ]),
+        json!([]),
+    )));
+    let draft = StoredCandidate::Draft {
+        draft_id: "pd_0123456789abcdef0123456789abcdef".to_owned(),
+        revision: 3,
+    };
+    let snapshot = unread_snapshot();
+    let none = no_suppressions(&outcome);
+    let mut drafted = binding("sha256:digest", "\"sha256:etag\"", &snapshot);
+    drafted.source = "draft";
+    drafted.stored = Some(&draft);
+    let json = to_json(&outcome, &drafted, &none).expect("renders");
+    assert_eq!(
+        json["analyzed"],
+        json!({
+            "source": "draft",
+            "etag": "\"sha256:etag\"",
+            "draft_id": "pd_0123456789abcdef0123456789abcdef",
+            "draft_revision": 3
+        })
+    );
+    let sarif = to_sarif(&outcome, &drafted, &none).expect("renders");
+    let properties = &sarif["runs"][0]["properties"];
+    assert_eq!(properties["analyzed_source"], json!("draft"));
+    assert_eq!(
+        properties["analyzed_draft_id"],
+        json!("pd_0123456789abcdef0123456789abcdef")
+    );
+    assert_eq!(properties["analyzed_draft_revision"], json!(3));
+
+    let revision = StoredCandidate::Revision { version: 7 };
+    let mut revised = binding("sha256:digest", "\"sha256:etag\"", &snapshot);
+    revised.source = "revision";
+    revised.stored = Some(&revision);
+    let json = to_json(&outcome, &revised, &none).expect("renders");
+    assert_eq!(
+        json["analyzed"],
+        json!({ "source": "revision", "etag": "\"sha256:etag\"", "version": 7 })
+    );
+    let sarif = to_sarif(&outcome, &revised, &none).expect("renders");
+    assert_eq!(sarif["runs"][0]["properties"]["analyzed_version"], json!(7));
+    assert!(sarif["runs"][0]["properties"]
+        .get("analyzed_draft_id")
+        .is_none());
+
+    // A candidate the request carried has no stored identity to name.
+    let json = to_json(
+        &outcome,
+        &binding("sha256:digest", "\"sha256:etag\"", &snapshot),
+        &none,
+    )
+    .expect("renders");
+    assert_eq!(
+        json["analyzed"],
+        json!({ "source": "active", "etag": "\"sha256:etag\"" })
+    );
 }
 
 #[test]

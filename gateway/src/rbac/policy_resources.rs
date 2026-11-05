@@ -31,18 +31,25 @@
 //! Errors block publication, and only publication: the policy can still be
 //! simulated and tested.
 //!
-//! - `policy_write_unreachable`: the live policy grants `admin:policy:write`
-//!   to some role and the candidate to none, so after publication no
-//!   principal could change the policy through the policy API. A live policy
-//!   that already grants it to nobody is managed some other way -- nobody
-//!   can publish through the API at all -- and its successor is not refused
-//!   for staying that way.
+//! - `policy_write_unreachable`: the live policy lets some principal hold
+//!   `admin:policy:write` and the candidate lets none, so after publication
+//!   no principal could change the policy through the policy API. In
+//!   claimed-role mode a principal can hold any role that grants it; in
+//!   mapped-role mode only a role an identity mapping grants, for an issuer
+//!   and authentication method the role admits. A service token carries no
+//!   issuer, so no mapping grants it a role, and mapped-role mode strips
+//!   every writer that was one. A live policy that already lets nobody write
+//!   is managed some other way -- nobody can publish through the API at all
+//!   -- and its successor is not refused for staying that way.
 //! - `publisher_policy_write_lost`: the principal publishing can replace the
 //!   live policy and could not replace the candidate. Both answers come from
 //!   the shared evaluator: the admin permission check, then the HTTP lane for
 //!   that principal's own `PUT` of the policy route, from the host it used,
-//!   unless the RBAC stage exempts that route. The pointer names what refuses
-//!   it -- the deciding rule or route, the default, or the roles.
+//!   unless the RBAC stage exempts that route. Each is asked with the facts
+//!   the serving lanes capture for the publisher, so in mapped-role mode it
+//!   is judged by the internal roles its identity mappings grant, exactly as
+//!   the admin API and the RBAC stage would judge it. The pointer names what
+//!   refuses it -- the deciding rule or route, the default, or the roles.
 //! - `egress_change_requires_restart`: the egress section differs from the
 //!   live one, which the policy API has always refused with `409`.
 //!
@@ -92,6 +99,7 @@ use crate::{
     },
     rbac::{
         engine::grants_permission,
+        identity_mappings::admitted_auth_methods,
         policy_document::{
             is_valid_element_id, pointer_token, DiagnosticSeverity, IssueCode, PolicyDiagnostic,
         },
@@ -517,26 +525,68 @@ fn sorted_keys<V>(map: &HashMap<String, V>) -> Vec<&String> {
     keys
 }
 
+/// Whether some principal could hold `admin:policy:write` under `policy`.
+///
+/// In claimed-role mode a principal holds whatever roles it claims, so any
+/// role that grants the permission can be held. In mapped-role mode it holds
+/// only the roles an identity mapping grants it, and a role's own `issuers`
+/// and `auth_methods` still decide whether that principal may activate it:
+/// a writer role counts only when some mapping grants it for the mapping's
+/// issuer and an authentication method both admit. A service token carries
+/// no issuer, so no mapping applies to one; a mapping that admits only
+/// service tokens grants nothing.
 fn grants_policy_write(policy: &Policy) -> bool {
-    policy
-        .roles
-        .values()
-        .any(|role| grants_permission(&role.permissions, crate::ADMIN_POLICY_WRITE_PERMISSION))
+    let writes = |role: &crate::rbac::policy::RoleEntry| {
+        grants_permission(&role.permissions, crate::ADMIN_POLICY_WRITE_PERMISSION)
+    };
+    let Some(mappings) = policy.identity_mappings.as_deref() else {
+        return policy.roles.values().any(writes);
+    };
+    mappings.iter().any(|mapping| {
+        mapping.grant_roles.iter().any(|name| {
+            policy.roles.get(name).is_some_and(|role| {
+                writes(role)
+                    && (role.issuers.is_empty() || role.issuers.contains(&mapping.issuer))
+                    && admitted_auth_methods(mapping).any(|method| {
+                        role.auth_methods.is_empty()
+                            || role.auth_methods.iter().any(|allowed| allowed == method)
+                    })
+            })
+        })
+    })
 }
 
 /// The loss of every policy-write principal: a change that takes the
-/// permission from the last role holding it.
+/// permission from the last role holding it, or, in mapped-role mode, from
+/// every principal the identity mappings could grant it to.
 fn check_policy_write_reachable(candidate: &Policy, live: &Policy, findings: &mut Findings) {
     if grants_policy_write(live) && !grants_policy_write(candidate) {
+        let (pointer, detail) = if candidate.identity_mappings.is_some() {
+            (
+                "/identity_mappings",
+                format!(
+                    "no identity mapping grants a role holding {} or \"*\" to a principal \
+                     that role admits, so after this change no principal could change the \
+                     policy through the policy API; in mapped-role mode a service token holds \
+                     no role",
+                    crate::ADMIN_POLICY_WRITE_PERMISSION
+                ),
+            )
+        } else {
+            (
+                "/roles",
+                format!(
+                    "no role grants {} or \"*\", so after this change no principal could \
+                     change the policy through the policy API",
+                    crate::ADMIN_POLICY_WRITE_PERMISSION
+                ),
+            )
+        };
         findings.error(
             IssueCode::PolicyWriteUnreachable,
-            "/roles".to_owned(),
+            pointer.to_owned(),
             None,
-            format!(
-                "no role grants {} or \"*\", so after this change no principal could change the \
-                 policy through the policy API",
-                crate::ADMIN_POLICY_WRITE_PERMISSION
-            ),
+            detail,
         );
     }
 }
@@ -587,7 +637,11 @@ fn policy_write_reach(
             .map_or(HostFact::Absent, HostFact::Present),
         dispatch: None,
     };
-    match policy.evaluate(&context) {
+    // The facts the RBAC stage would read for this publisher: in mapped-role
+    // mode its verified organization, so its internal roles are the ones the
+    // permission check above resolved.
+    let facts = policy.serving_facts(Some(publisher.principal));
+    match policy.evaluate_with_facts(&context, &facts) {
         Ok(evaluation)
             if evaluation.is_complete()
                 && evaluation.logical() != LogicalDecision::Indeterminate =>
@@ -626,6 +680,15 @@ fn check_publisher_keeps_policy_write(
     let route = admin.map_or("the policy route", |admin| admin.policy_route.as_str());
     let (pointer, element, reason) = match reach {
         WriteReach::Reachable => return,
+        WriteReach::NoPermission if candidate.identity_mappings.is_some() => (
+            "/identity_mappings".to_owned(),
+            None,
+            format!(
+                "no role its identity mappings grant would grant {} for its issuer and \
+                 authentication method",
+                crate::ADMIN_POLICY_WRITE_PERMISSION
+            ),
+        ),
         WriteReach::NoPermission => (
             "/roles".to_owned(),
             None,

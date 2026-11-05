@@ -5,8 +5,8 @@
 //! output contract (human, `--format json` reports, SARIF for `validate` and
 //! `diff`), the stable exit codes, shell completion, secure bearer-token
 //! input, the version handshake with a running gateway, and offline bundle
-//! validation, diagnosis and semantic diff with the gateway's own bundle
-//! reader and diff engine (`gateway-config`).
+//! validation, pinning, diagnosis and semantic diff with the gateway's own
+//! bundle reader and diff engine (`gateway-config`).
 //!
 //! `ggctl` reads no configuration file and no environment variable, never
 //! accepts a secret as an argument, and makes no network request unless a
@@ -22,6 +22,7 @@ mod doctor;
 mod help;
 mod init;
 mod output;
+mod pin;
 mod remote;
 mod report;
 mod sarif;

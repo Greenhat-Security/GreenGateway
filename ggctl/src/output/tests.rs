@@ -173,6 +173,104 @@ fn a_destination_without_a_name_or_a_usable_parent_is_unusable() {
     ));
 }
 
+/// A manifest in the parent directory, as `replace_manifest` finds one.
+fn with_manifest(parent: &Parent, bytes: &[u8]) -> PathBuf {
+    let path = parent.root.join(MANIFEST_FILE_NAME);
+    fs::write(&path, bytes).expect("the manifest writes");
+    path
+}
+
+fn failing_rename(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::other("injected"))
+}
+
+#[test]
+fn a_manifest_is_replaced_whole_and_owner_only_and_nothing_else_remains() {
+    let parent = Parent::new();
+    let path = with_manifest(&parent, b"old manifest\n");
+    replace_manifest(&parent.root, b"old manifest\n", b"new manifest\n", rename)
+        .expect("the manifest is replaced");
+    assert_eq!(fs::read(&path).expect("reads"), b"new manifest\n");
+    assert_eq!(parent.entries(), [MANIFEST_FILE_NAME]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+#[test]
+fn a_failed_rename_leaves_the_manifest_and_no_hidden_file() {
+    let parent = Parent::new();
+    let path = with_manifest(&parent, b"old manifest\n");
+    assert_eq!(
+        replace_manifest(
+            &parent.root,
+            b"old manifest\n",
+            b"new manifest\n",
+            failing_rename
+        ),
+        Err(ReplaceError::Unusable)
+    );
+    assert_eq!(fs::read(&path).expect("reads"), b"old manifest\n");
+    assert_eq!(parent.entries(), [MANIFEST_FILE_NAME]);
+}
+
+#[test]
+fn a_manifest_that_changed_or_went_is_not_replaced() {
+    let parent = Parent::new();
+    let path = with_manifest(&parent, b"edited meanwhile\n");
+    assert_eq!(
+        replace_manifest(&parent.root, b"old manifest\n", b"new manifest\n", rename),
+        Err(ReplaceError::Changed)
+    );
+    assert_eq!(fs::read(&path).expect("reads"), b"edited meanwhile\n");
+    assert_eq!(parent.entries(), [MANIFEST_FILE_NAME]);
+
+    fs::remove_file(&path).expect("removes");
+    assert_eq!(
+        replace_manifest(&parent.root, b"old manifest\n", b"new manifest\n", rename),
+        Err(ReplaceError::Changed)
+    );
+    assert!(parent.entries().is_empty());
+    // An absent manifest is left to the reader to report.
+    assert_eq!(check_manifest_entry(&parent.root), Ok(()));
+}
+
+#[test]
+fn a_manifest_that_is_not_a_regular_file_is_never_replaced() {
+    let parent = Parent::new();
+    fs::create_dir(parent.root.join(MANIFEST_FILE_NAME)).expect("a directory");
+    assert_eq!(
+        check_manifest_entry(&parent.root),
+        Err(ReplaceError::NotRegularFile)
+    );
+    assert_eq!(
+        replace_manifest(&parent.root, b"", b"new manifest\n", rename),
+        Err(ReplaceError::NotRegularFile)
+    );
+    assert_eq!(parent.entries(), [MANIFEST_FILE_NAME]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_manifest_is_never_replaced_nor_its_target() {
+    let parent = Parent::new();
+    let target = parent.root.join("elsewhere.yaml");
+    fs::write(&target, b"old manifest\n").expect("writes");
+    std::os::unix::fs::symlink(&target, parent.root.join(MANIFEST_FILE_NAME)).expect("a link");
+    assert_eq!(
+        check_manifest_entry(&parent.root),
+        Err(ReplaceError::NotRegularFile)
+    );
+    assert_eq!(
+        replace_manifest(&parent.root, b"old manifest\n", b"new manifest\n", rename),
+        Err(ReplaceError::NotRegularFile)
+    );
+    assert_eq!(fs::read(&target).expect("reads"), b"old manifest\n");
+}
+
 #[test]
 fn every_error_has_its_own_code() {
     let codes = [
@@ -186,6 +284,21 @@ fn every_error_has_its_own_code() {
             "output.destination_exists",
             "output.destination_unusable",
             "output.permissions_unavailable"
+        ]
+    );
+    let codes = [
+        ReplaceError::NotRegularFile.code(),
+        ReplaceError::Changed.code(),
+        ReplaceError::Unusable.code(),
+        ReplaceError::Permissions.code(),
+    ];
+    assert_eq!(
+        codes.map(Code::as_str),
+        [
+            "pin.manifest_link",
+            "pin.manifest_changed",
+            "pin.write_failed",
+            "pin.permissions_unavailable"
         ]
     );
 }

@@ -20,6 +20,7 @@ use super::{
     AnalysisError, AnalysisOutcome, CandidatePatch, Finding, FindingCode, ProofBasis, Severity,
     ANALYZER_VERSION, MAX_COMPARISONS, MAX_FINDINGS, RESULT_SCHEMA_VERSION,
 };
+use crate::policy_simulation::request::StoredCandidate;
 use crate::{
     policy_eval::{
         tools::{TOOL_CONTEXT_VERSION, TOOL_SEMANTICS_VERSION},
@@ -40,7 +41,7 @@ pub(crate) struct AnalysisBinding<'a> {
     pub(crate) base_etag: &'a str,
     /// Cluster mode: the security revision the base was read at.
     pub(crate) security_revision: Option<i64>,
-    /// `active`, `edits` or `inline`.
+    /// `active`, `edits`, `inline`, `draft` or `revision`.
     pub(crate) source: &'static str,
     /// The ETag of the analyzed document, which every position names.
     pub(crate) analyzed_etag: &'a str,
@@ -48,6 +49,8 @@ pub(crate) struct AnalysisBinding<'a> {
     /// format that has one (policy v1).
     pub(crate) analyzed_semantic_digest: Option<&'a str>,
     pub(crate) edit_count: usize,
+    /// The draft or history version the analyzed document was read as.
+    pub(crate) stored: Option<&'a StoredCandidate>,
     pub(crate) mcp_alias_paths: usize,
     /// The resources the analysis was judged against: what a suppression
     /// binds besides the policy.
@@ -147,8 +150,13 @@ pub(crate) fn to_json(
         base.insert("security_revision".to_owned(), json!(revision));
     }
     let mut analyzed = json!({ "source": binding.source, "etag": binding.analyzed_etag });
-    if let (true, Some(analyzed)) = (binding.source == "edits", analyzed.as_object_mut()) {
-        analyzed.insert("edits".to_owned(), json!(binding.edit_count));
+    if let Some(analyzed) = analyzed.as_object_mut() {
+        if binding.source == "edits" {
+            analyzed.insert("edits".to_owned(), json!(binding.edit_count));
+        }
+        if let Some(stored) = binding.stored {
+            stored.describe("", analyzed);
+        }
     }
     if let (Some(digest), Some(analyzed)) =
         (binding.analyzed_semantic_digest, analyzed.as_object_mut())
@@ -381,6 +389,9 @@ pub(crate) fn to_sarif(
         }
         if let Some(digest) = binding.resource_snapshot.digest() {
             properties.insert("resource_snapshot_digest".to_owned(), json!(digest));
+        }
+        if let Some(stored) = binding.stored {
+            stored.describe("analyzed_", properties);
         }
     }
     Ok(json!({

@@ -6,9 +6,9 @@ that can never decide a request because an earlier element always does,
 elements whose written intent never applies, allows and shadows that match
 every caller on every path, and permissive defaults.
 `POST /v1{ADMIN_PREFIX}/policy/analyses` analyzes the active policy or a
-candidate -- position-aware edits over it, or a complete document you send --
-and answers stable findings, each with an optional advisory patch (issue #243,
-slice 15).
+candidate -- position-aware edits over it, a complete document you send, one of
+your server-side drafts, or a version of the policy history -- and answers
+stable findings, each with an optional advisory patch (issue #243, slice 15).
 
 An analysis is structural. It reads the policy and the gateway's configured
 MCP alias paths, never retained traffic, so it never says anything about what
@@ -48,7 +48,7 @@ the gateway's parser is authoritative.
 | `schema_version` | Exactly `policy-analysis.v1`. |
 | `description` | Optional, at most 1024 bytes. Never repeated in results or audit. |
 | `base_etag` | Required: the ETag of the active policy the request was written against, as `GET /v1{ADMIN_PREFIX}/policy` returns it. A different active ETag is `412` and nothing runs. |
-| `candidate` | Required: `{"source": "active"}`, `{"source": "edits", "edits": [...]}` or `{"source": "inline", "policy": {...}}`, exactly as for a [simulation](policy-simulation.md#candidates), parsed and validated by the same code. |
+| `candidate` | Required: `{"source": "active"}`, `{"source": "edits", "edits": [...]}`, `{"source": "inline", "policy": {...}}`, `{"source": "draft", "draft_id": "pd_...", "draft_etag": "\"sha256:...\""}` or `{"source": "revision", "version": 7}`, exactly as for a [simulation](policy-simulation.md#candidates), parsed, read and validated by the same code. A draft or history version is read, owner-scoped and validated again, and never written, as [a simulation reads one](policy-simulation.md#drafts-and-history-versions). |
 | `format` | `json` (the default) or `sarif`. |
 
 ## Running an analysis
@@ -78,15 +78,21 @@ Content-Type: application/json
 | `200` | -- | The analysis ran. `Cache-Control: no-store`; `application/json`, or `application/sarif+json` for `format: "sarif"`. Check `complete`: an incomplete analysis is still `200`. |
 | `400` | `policy_analysis_request_invalid` | The body is not JSON or repeats a member name anywhere. |
 | `401`, `403` | -- | Not authenticated, or missing either permission. |
-| `404` | -- | No policy is configured. |
+| `404` | -- | No policy is configured, or a `revision` candidate names a deployment with no policy history. |
+| `404` | `policy_draft_not_found`, `policy_revision_not_found` | A `draft` candidate names no draft of yours, or a `revision` candidate a version the history does not hold. |
+| `409` | `policy_draft_base_stale` | A `draft` candidate is pinned to another base than `base_etag`. |
+| `410` | `policy_draft_expired` | A `draft` candidate has expired. |
 | `412` | `policy_analysis_base_stale` | `base_etag` is not the active policy's ETag, which `current_etag` carries. Nothing ran; no rebase is attempted. |
+| `412` | `policy_draft_stale` | A `draft` candidate's `draft_etag` is no longer the draft's ETag. |
 | `413` | -- | The body exceeds `MAX_BODY_SIZE` or 2 MiB, whichever is lower. |
 | `422` | `policy_analysis_invalid` | The request, or an edit applied to the base, is invalid: value-free `diagnostics` with JSON pointers, as for a simulation. |
 | `422` | `policy_candidate_invalid` | The candidate policy does not validate; `errors` are the policy validator's messages. |
+| `422` | `policy_revision_incompatible` | A `revision` candidate is not a policy this build and deployment accept now. |
 | `422` | `policy_analysis_result_too_large` | The rendered result would exceed 8 MiB. Nothing is cut short. |
 | `429` | `policy_analysis_busy` | Two analyses are already running on this replica, or this caller already has one running. Nothing was queued. |
 | `500` | -- | The evaluator refused a question the analyzer built, or an invariant failed. No partial result. |
 | `503` | -- | Cluster mode could not read the active policy. |
+| `503` | `policy_drafts_unavailable`, `policy_history_unavailable` | The drafts store or the policy history a stored candidate names could not be read. |
 
 ## The result
 
@@ -150,7 +156,7 @@ Content-Type: application/json
 
 | Member | Meaning |
 | --- | --- |
-| `base`, `analyzed` | The pinned active policy, and the document analyzed: the base itself, or the candidate, with its own ETag and, for policy v1, its `semantic_digest`. Every position, pointer and patch names the analyzed document. |
+| `base`, `analyzed` | The pinned active policy, and the document analyzed: the base itself, or the candidate, with its own ETag and, for policy v1, its `semantic_digest`. A `draft` adds the `draft_id` and `draft_revision` it was read at, and a `revision` the `version`. Every position, pointer and patch names the analyzed document. SARIF carries the same identity in its run properties, as `analyzed_draft_id` and `analyzed_draft_revision`, or `analyzed_version`, beside `analyzed_semantic_digest` and `resource_snapshot_digest`. |
 | `resources.mcp_alias_paths` | How many MCP alias paths the analysis read from this gateway's static configuration (their values are not repeated). |
 | `resource_snapshot` | The [resource snapshot](configuration.md#policy_file) the analysis was judged against, as `POST .../policy/validate` reports one: its `digest`, whether it is `complete`, and the versions and digests of the resources it read. A suppression binds its `digest`. |
 | `suppressions` | Whether the deployment's [suppression](#suppressions) records were read (`available`) and how many (`records`, ended and unmatched ones included). |
@@ -287,9 +293,9 @@ does not report:
 - a rule with typed `conditions` as covering another element, as broad, as
   masking the default or as bypassing a route: its conditions bound what it
   matches in ways no predicate comparison does (a conditioned rule can still
-  be the covered one). This build validates conditions and identity mappings
-  but accepts no document that uses them yet, so this, and the mapped-role
-  rule below, take effect once they are enforced;
+  be the covered one). This build validates conditions but accepts no
+  document that uses them yet, so this takes effect once they are enforced;
+  identity mappings are enforced, so the mapped-role rule below applies now;
 - anything about traffic: nothing is unused, unobserved or unreachable
   because retained traffic lacks it.
 
@@ -313,7 +319,8 @@ returned. To adopt one:
 1. Simulate it: for an analysis of the active policy, send the patch's `edits`
    as an edits candidate to [`POST .../policy/simulations`](policy-simulation.md)
    with the same `base_etag`; for an edits candidate, append them after the
-   candidate's own edits; for an inline candidate, apply them to that document.
+   candidate's own edits; for an inline, draft or revision candidate, apply them
+   to that document.
 2. Run the [policy tests](policy-tests.md) that guard the change, and analyze
    the result again.
 3. Save the edited document as a [draft](configuration.md#policy_file) and publish it
@@ -497,12 +504,14 @@ out-of-bounds member) is not recorded as a suppression decision.
 Each completed analysis emits one `policy.analysis_run` audit event with the
 acting principal and the request envelope, `request_digest`, `base_etag`,
 `security_revision` (cluster mode), `candidate_source`, `candidate_etag`, the
-number of `edits`, the `format`, `complete`, the `limitations`, the `summary`
-counts (by severity, proof basis, code and suppression state),
-`suppressions_available`, `resource_snapshot_digest` and
-`resource_snapshot_complete`, and the analyzer and evaluator versions. It
-never carries a finding's element, pointer, id or fingerprint, a suppression
-id or reason, a patch, or policy content. A refused request (`4xx`) is not recorded as an
+number of `edits`, for a stored candidate its `candidate_draft_id` and
+`candidate_draft_revision` or its `candidate_version`, the `format`,
+`complete`, the `limitations`, the `summary` counts (by severity, proof basis,
+code and suppression state), `suppressions_available`,
+`resource_snapshot_digest` and `resource_snapshot_complete`, and the analyzer
+and evaluator versions. It never carries a finding's element, pointer, id or
+fingerprint, a suppression id or reason, a patch, or policy content. A refused
+request (`4xx`) is not recorded as an
 analysis.
 
 ## Not part of this slice
@@ -515,6 +524,4 @@ analysis.
   references and administrator lockout (the
   [cross-resource checks](configuration.md#policy_file) run at publication for the last
   two).
-- Drafts and historical revisions as candidate sources (the Policy Studio's
-  Optimize view sends an open draft's text as an inline candidate), and
-  `ggctl` integration.
+- `ggctl` integration.

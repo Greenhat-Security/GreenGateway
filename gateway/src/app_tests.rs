@@ -29,6 +29,8 @@ mod auth_app_tests;
 mod authority_evidence_app_tests;
 #[path = "cluster_app_tests.rs"]
 mod cluster_app_tests;
+#[path = "identity_mapping_app_tests.rs"]
+mod identity_mapping_app_tests;
 #[path = "mcp_app_tests.rs"]
 mod mcp_app_tests;
 #[path = "routing_app_tests.rs"]
@@ -3574,3 +3576,5 @@ mod admin_policy_analyses_tests;
 mod admin_policy_analysis_suppressions_tests;
 #[path = "admin_policy_evidence_tests.rs"]
 mod admin_policy_evidence_tests;
+#[path = "admin_policy_stored_candidates_tests.rs"]
+mod admin_policy_stored_candidates_tests;

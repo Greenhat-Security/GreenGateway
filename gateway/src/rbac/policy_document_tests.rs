@@ -1576,22 +1576,24 @@ fn typed_matcher_v1() -> Value {
 }
 
 #[test]
-fn this_release_validates_typed_matchers_and_refuses_to_serve_them() {
+fn this_release_serves_identity_mappings_and_refuses_to_serve_rule_conditions() {
     let document = typed_matcher_v1();
     let inspection = inspect(&document);
     // Sound in every other respect: the only diagnostic is the refusal,
-    // located at the identity mappings, and nothing is published.
+    // located at the first rule that carries conditions, with the rule's own
+    // id, and nothing is published. The identity mappings are not refused.
     assert_eq!(
         codes_and_pointers(&inspection),
         vec![(
             "typed_matchers_not_enforced",
-            "/identity_mappings".to_owned()
+            "/rules/0/conditions".to_owned()
         )]
     );
     assert!(!inspection.is_valid());
     assert!(inspection.policy().is_none());
     assert_eq!(inspection.semantic_digest(), None);
     let refusal = diagnostic(&inspection, IssueCode::TypedMatchersNotEnforced);
+    assert_eq!(refusal.element_id.as_deref(), Some("staging-reads"));
     assert_eq!(
         refusal.blocks,
         DiagnosticBlocks {
@@ -1601,48 +1603,51 @@ fn this_release_validates_typed_matchers_and_refuses_to_serve_them() {
             evidence: true
         }
     );
-    // Without the mappings, at the first rule that carries conditions, with
-    // the rule's own id.
-    let mut conditions_only = document.clone();
-    conditions_only
-        .as_object_mut()
-        .expect("object")
-        .remove("identity_mappings");
-    let inspection = inspect(&conditions_only);
-    assert_eq!(
-        codes_and_pointers(&inspection),
-        vec![(
-            "typed_matchers_not_enforced",
-            "/rules/0/conditions".to_owned()
-        )]
-    );
-    assert_eq!(
-        diagnostic(&inspection, IssueCode::TypedMatchersNotEnforced)
-            .element_id
-            .as_deref(),
-        Some("staging-reads")
-    );
-    // An empty mapping list is mapped-role mode too, and refused the same way.
-    let mut empty_mappings = conditions_only.clone();
-    empty_mappings["rules"] = json!([]);
-    empty_mappings["identity_mappings"] = json!([]);
-    assert_eq!(
-        codes_and_pointers(&inspect(&empty_mappings)),
-        vec![(
-            "typed_matchers_not_enforced",
-            "/identity_mappings".to_owned()
-        )]
-    );
+    // The message names what is refused and never the mappings it serves.
+    assert!(!refusal.message.contains("identity mapping"));
+    assert!(refusal
+        .remediation
+        .contains("Identity mappings are enforced"));
 
-    // Every loader that admits a policy refuses it: startup and reload,
-    // replacement, and the in-memory validation drafts and bundles use.
+    // Without the conditions, the mappings are a publishable policy: valid,
+    // with a semantic digest, through every loader that admits a policy --
+    // startup and reload, replacement, and the in-memory validation drafts
+    // and bundles use.
+    let mut mappings_only = document.clone();
+    for rule in mappings_only["rules"]
+        .as_array_mut()
+        .expect("rules")
+        .iter_mut()
+    {
+        rule.as_object_mut().expect("rule").remove("conditions");
+    }
+    let inspection = inspect(&mappings_only);
+    assert_eq!(codes_and_pointers(&inspection), Vec::new());
+    assert!(inspection.is_valid());
+    assert!(inspection.semantic_digest().is_some());
+    let source = serde_json::to_vec(&mappings_only).expect("serialize");
+    for policy in [
+        Policy::from_source(&source, None).expect("startup accepts it"),
+        Policy::validate_json_value(mappings_only.clone()).expect("validation accepts it"),
+    ] {
+        let mappings = policy.identity_mappings.as_deref().expect("mappings");
+        assert_eq!(mappings[0].id, "idp-admins");
+        assert_eq!(mappings[0].issuer, "https://idp.example.test");
+    }
+    // An empty mapping list is mapped-role mode too, and accepted the same
+    // way: a policy in which no principal holds any role.
+    let mut empty_mappings = mappings_only.clone();
+    empty_mappings["identity_mappings"] = json!([]);
+    assert!(inspect(&empty_mappings).is_valid());
+
+    // Every loader refuses the conditions, wherever the mappings are.
     let source = serde_json::to_vec(&document).expect("serialize");
     for error in [
         Policy::from_source(&source, None).expect_err("startup refuses it"),
         Policy::validate_json_value(document.clone()).expect_err("validation refuses it"),
     ] {
         assert!(
-            error.to_string().contains("/identity_mappings"),
+            error.to_string().contains("/rules/0/conditions"),
             "unexpected error: {error}"
         );
     }
