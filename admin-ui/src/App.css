@@ -3226,10 +3226,20 @@ textarea:focus-visible {
   margin: 0;
 }
 
-/* Policy Studio suggestions: the discovery suggestions that open into drafts */
+/* Policy Studio suggestions: the discovery suggestions that open into drafts.
+   Suggestions and the review carry server values with no break points (draft
+   and suggestion ids, ETags, URLs, paths): every track is minmax(0, 1fr) and
+   long tokens wrap, so no value widens the page past a phone screen. */
+.policy-studio-suggestions {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .policy-studio-suggestion-list {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--gh-ref-space-4);
+  min-width: 0;
   margin: 0;
   padding: 0;
   list-style: none;
@@ -3238,8 +3248,10 @@ textarea:focus-visible {
 .policy-studio-suggestion,
 .policy-studio-suggestion-review {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--gh-ref-space-3);
   min-width: 0;
+  overflow-wrap: anywhere;
   border: 1px solid var(--gh-sys-border);
   border-radius: var(--gh-ref-radius-md);
   padding: var(--gh-ref-space-4);
@@ -3255,6 +3267,17 @@ textarea:focus-visible {
   flex-wrap: wrap;
   align-items: center;
   gap: var(--gh-ref-space-2);
+  min-width: 0;
+}
+
+/* A badge never wraps elsewhere; here one names a draft id ("In draft
+   pd_..., not published") or a state sentence, so it wraps inside the card. */
+.policy-studio-suggestion .badge,
+.policy-studio-suggestion-review .badge,
+.policy-studio-acceptance .badge {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .policy-studio-suggestion-head h4,
@@ -3274,15 +3297,18 @@ textarea:focus-visible {
 }
 
 .policy-studio-suggestion-facts {
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
   align-items: start;
+  min-width: 0;
 }
 
 .policy-studio-suggestion-facts div {
   align-content: start;
+  min-width: 0;
 }
 
 .policy-studio-suggestion-json {
+  max-width: 100%;
   max-height: 320px;
   margin: var(--gh-ref-space-2) 0 0;
   overflow: auto;
@@ -3301,13 +3327,21 @@ textarea:focus-visible {
   flex-wrap: wrap;
   align-items: end;
   gap: var(--gh-ref-space-4);
+  min-width: 0;
+}
+
+.policy-studio-suggestion-controls > * {
+  min-width: 0;
+  max-width: 100%;
 }
 
 .policy-studio-suggestion-target,
 .policy-studio-acceptance {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--gh-ref-space-2);
   min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .policy-studio-suggestion-choice {
@@ -3320,12 +3354,14 @@ textarea:focus-visible {
 
 .policy-studio-suggestion-alert {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--gh-ref-space-2);
+  min-width: 0;
 }
 
 .policy-studio-suggestion-checks {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
   gap: var(--gh-ref-space-4);
   min-width: 0;
 }
@@ -3333,6 +3369,7 @@ textarea:focus-visible {
 .policy-studio-suggestion-checks section,
 .policy-studio-suggestion-decision {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--gh-ref-space-2);
   min-width: 0;
 }
@@ -3340,7 +3377,7 @@ textarea:focus-visible {
 @media (max-width: 640px) {
   .policy-studio-suggestion-checks,
   .policy-studio-suggestion-facts {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
