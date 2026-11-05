@@ -120,14 +120,19 @@ pub(crate) enum FilePermissions {
     /// credential, which reading discloses.
     OwnerOnly,
     /// Group and other may read the file but not write it (mode `0644` is
-    /// fine, `0664` and `0666` are not), and no other account may change
-    /// what its path resolves to: the file, every directory above it and
-    /// every link on its path must be owned by root or by the account
-    /// running `ggctl`, and group and other may write one of those
-    /// directories only when it has the sticky bit. This is a trust anchor,
-    /// which is public but decides where a credential may be sent, so
-    /// whoever can change or replace it can receive the token.
+    /// fine, `0664` and `0666` are not): a file whose directory another
+    /// check already vouches for, such as the bundle manifest `pin` reads
+    /// again after the bundle reader read it.
     NotWritableByOthers,
+    /// As [`FilePermissions::NotWritableByOthers`], and no other account
+    /// may change what the path resolves to: the file, every directory
+    /// above it and every link on its path must be owned by root or by the
+    /// account running `ggctl`, and group and other may write one of those
+    /// directories only when it has the sticky bit. A trust anchor
+    /// (`--ca-file`, `--answers`) is public but decides where a credential
+    /// may be sent or whom a role trusts, so whoever can change or replace
+    /// it gets that decision.
+    TrustAnchor,
 }
 
 /// Reads a whole regular file of at most `maximum` bytes into memory that is
@@ -181,7 +186,7 @@ fn permissions_are_safe(metadata: &std::fs::Metadata, permissions: FilePermissio
     use std::os::unix::fs::PermissionsExt;
     let forbidden = match permissions {
         FilePermissions::OwnerOnly => 0o077,
-        FilePermissions::NotWritableByOthers => 0o022,
+        FilePermissions::NotWritableByOthers | FilePermissions::TrustAnchor => 0o022,
     };
     metadata.permissions().mode() & forbidden == 0
 }
@@ -199,7 +204,7 @@ fn check_directories(
     checked: &std::fs::Metadata,
     permissions: FilePermissions,
 ) -> Result<(), FileProblem> {
-    if permissions != FilePermissions::NotWritableByOthers {
+    if permissions != FilePermissions::TrustAnchor {
         return Ok(());
     }
     check_resolution(path, checked, running_account())

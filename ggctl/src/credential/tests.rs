@@ -390,3 +390,28 @@ fn a_cycle_of_links_is_refused() {
         Err(FileProblem::Unreadable)
     );
 }
+
+/// Only a trust anchor's path is walked: the manifest `pin` compares is a
+/// file the bundle reader already judged, directory and owner included, so
+/// it is held to its mode alone.
+#[cfg(unix)]
+#[test]
+fn only_a_trust_anchor_path_is_judged_beyond_the_file_mode() {
+    let file = TempFile::new("mode-only", CANARY.as_bytes());
+    let directory = file.0.parent().expect("parent").to_owned();
+    set_mode(&file.0, 0o644);
+    set_mode(&directory, 0o777);
+    assert_eq!(
+        read_regular_file(
+            &file.0,
+            MAX_TOKEN_BYTES,
+            FilePermissions::NotWritableByOthers
+        )
+        .map(|bytes| bytes.len()),
+        Ok(CANARY.len())
+    );
+    assert_eq!(
+        read_regular_file(&file.0, MAX_TOKEN_BYTES, FilePermissions::TrustAnchor).map(|_| ()),
+        Err(FileProblem::UnsafePermissions)
+    );
+}

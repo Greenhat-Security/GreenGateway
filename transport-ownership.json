@@ -15349,9 +15349,9 @@
         "capability-import-or-glob"
       ],
       "scope": "ggctl::credential::permissions_are_safe#1",
-      "sha256": "89ed74d874fd8a97b8e53e21a01d241e093c87470cf01791d988caeb63111e7a",
+      "sha256": "cf13be7114107383518f7daa780dffd53a5a9ba9ada3bc822696e54b4796ec47",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #242 (operator file safety): reads the Unix mode bits of --token-file and --ca-file metadata through PermissionsExt to refuse a credential group or other can access, or a trust anchor they can write. Read-only metadata; no network or process capability."
+      "purpose": "Reviewed for #242 (operator file safety): reads the Unix mode bits of --token-file, --ca-file, --answers and the bundle.yaml ggctl pin compares through PermissionsExt to refuse a credential group or other can access, or another file they can write. Read-only metadata; no network or process capability."
     },
     {
       "file": "ggctl/src/credential.rs",
