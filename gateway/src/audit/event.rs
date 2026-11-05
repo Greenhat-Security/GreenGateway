@@ -26,6 +26,11 @@ pub const SUGGESTION_LIFECYCLE_CHANGED: &str = "suggestion.lifecycle_changed";
 /// A policy test suite was run (issue #243, slice 11). Records the policy
 /// ETag, suite digest and counts of a completed run, never its cases.
 pub const POLICY_TESTS_RUN: &str = "policy.tests_run";
+/// The stored policy test suite was stored or replaced (issue #243). Records
+/// the version, the new and replaced suite digests and case counts, never a
+/// case, a case id or a fixture value. The suite is test input: storing one
+/// changes no enforcement.
+pub const POLICY_TESTS_CHANGED: &str = "policy.tests_changed";
 /// A policy simulation completed (issue #243, slice 10). Records the base
 /// and candidate ETags, the request digest and counts, never its cases.
 pub const POLICY_SIMULATION_RUN: &str = "policy.simulation_run";

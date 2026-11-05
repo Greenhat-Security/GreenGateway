@@ -445,6 +445,109 @@
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
     },
     {
+      "id": "policy_tests_postgres",
+      "operations": [
+        "policy_tests.publish"
+      ],
+      "modes": [
+        "postgres"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_policy_tests.rs",
+          "anchor": "async fn policy_tests_put_endpoint("
+        }
+      ],
+      "boundary": "policy_tests_put_endpoint -> PostgresPolicyTestSuiteStore::commit -> postgres_documents::commit_in over migration 29's policy_test_suite_versions and policy_test_suite_active; active row lock and expected ETag (If-Match, or Initialize for If-None-Match: *) guard; immutable version, shared revision, active pointer, security_outbox (resource_type policy_tests) and one document_change_evidence row commit together. An empty or oversized actor is refused before anything is written; an evidence insert failure rolls the whole commit back.",
+      "record": "Immutable policy_test_suite_versions retain actor subject, a counts-only diff summary, the suite and its ETag (the suite's semantic digest); security_outbox retains the revision and from/to versions. document_change_evidence (widened by migration 29) holds one row per committed write with action policy_tests.publish and resource_type policy_tests, event/operation UUIDs, actor kind/subject/issuer/auth mode, prior/new version and the outbox row's shared revision. A stale ETag, an existing suite under If-None-Match: * and a lost initialize race write none.",
+      "actor": "The handler passes the authenticated principal: subject, issuer (or none) and auth mode, in migration 23's actor vocabulary, as for policy. No keyed safe actor reference yet.",
+      "identity": "Generated event_id and operation_id UUIDs; operation code policy_tests.publish; prior/new suite version and the outbox row's shared security revision; exactly one row per stored version. The proposed event names the suite as a policy resource on its own policy_tests revision axis, since its versions are not policy versions.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "Shared with policy: caller-bound operation identity and keyed safe actor references, and journaling document_change_evidence for dispatch.",
+      "sources": [
+        {
+          "path": "gateway/src/storage/postgres_policy_tests.rs",
+          "anchor": "DocumentAction::PolicyTestsPublish"
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents.rs",
+          "anchor": "INSERT INTO greengateway.document_change_evidence"
+        },
+        {
+          "path": "gateway/src/storage/migrations/0029_policy_test_suites.sql",
+          "anchor": "CREATE TABLE greengateway.policy_test_suite_versions ("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/storage/policy_tests_tests.rs",
+          "anchor": "async fn postgres_commits_record_revision_outbox_and_evidence("
+        },
+        {
+          "path": "gateway/src/storage/policy_tests_tests.rs",
+          "anchor": "async fn postgres_racing_writers_produce_one_winner("
+        },
+        {
+          "path": "gateway/src/admin_policy_app_tests.rs",
+          "anchor": "async fn cluster_policy_tests_commit_through_the_document_transaction("
+        }
+      ],
+      "required_durability_supported": false,
+      "required_mode": "admitted",
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional document evidence. They do not certify the proposed authority-event contract, delivery or retention."
+    },
+    {
+      "id": "policy_tests_standalone",
+      "operations": [
+        "policy_tests.publish"
+      ],
+      "modes": [
+        "standalone"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_policy_tests.rs",
+          "anchor": "async fn policy_tests_put_endpoint("
+        }
+      ],
+      "boundary": "policy_tests_put_endpoint -> SqlitePolicyTestSuiteStore::commit: one IMMEDIATE SQLite transaction in the policy history database reads the newest version, re-checks the precondition and appends the next one.",
+      "record": "policy_test_suite_versions retains the actor subject, creation time, suite, ETag and case count of every version; there is no separate evidence record of who made the change beyond that subject.",
+      "actor": "actor_user_id (subject) on the version row only; no issuer or auth mode.",
+      "identity": "Suite ETag (its semantic digest) and the SQLite version number. No shared revision or operation ID.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "unsupported_future_operation"
+      ],
+      "follow_up": "#242/#425: bind standalone suite writes into the crash-safe standalone revision ledger with the policy writes; keep required-durability suite writes refused until then.",
+      "sources": [
+        {
+          "path": "gateway/src/storage/policy_tests.rs",
+          "anchor": "fn commit_blocking("
+        },
+        {
+          "path": "gateway/src/admin_policy_tests.rs",
+          "anchor": "AuthorityOperation::PolicyTestsPublish"
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/storage/policy_tests_tests.rs",
+          "anchor": "async fn sqlite_versions_are_compare_and_set_and_survive_reopen("
+        },
+        {
+          "path": "gateway/src/admin_policy_tests_tests.rs",
+          "anchor": "async fn required_authority_evidence_refuses_a_standalone_write("
+        }
+      ],
+      "required_durability_supported": false,
+      "required_mode": "refused",
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
       "id": "connection_postgres",
       "operations": [
         "connection.create",

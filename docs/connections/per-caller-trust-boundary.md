@@ -693,3 +693,15 @@ no Google token material reaches the audit trail.
 `gateway/src/security_cluster_delegated_tokens_tests.rs` checks against
 PostgreSQL that a purge on one replica retires another's cached tokens before
 that replica serves again.
+
+`gateway/src/tests/issue_446_acceptance.rs` drives the attested and delegated
+lanes through the composed router, with Connections created through the admin
+API and a real MCP client authenticated to `/mcp` by a JWT: two principals
+reach an internal API with its service bearer and a request-bound assertion
+that verifies against the anonymously fetched JWKS; a delegated catalog
+registered from the Gmail Discovery golden serves a read declared read-only
+and no mutation, each caller with a token of their own; a per-principal deny
+rule and a service token are refused before any byte reaches the issuer or an
+upstream; and no key, token or assertion appears in the captured audit trail
+or logs. Domain-wide delegation
+has no such router-level test: its evidence is the executor-level suite above.
