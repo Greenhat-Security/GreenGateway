@@ -1114,6 +1114,7 @@
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
           "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index",
           "sha2@0.11.1|registry+https://github.com/rust-lang/crates.io-index",
+          "url@2.5.8|registry+https://github.com/rust-lang/crates.io-index",
           "uuid@1.26.1|registry+https://github.com/rust-lang/crates.io-index"
         ]
       },
@@ -6300,6 +6301,17 @@
             "uses_default_features": true,
             "features": [],
             "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "url",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^2.5.7",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
           }
         ],
         "features": {},
@@ -7646,16 +7658,6 @@
       "purpose": "Authentication state or protocol handling; network requests consume the checked EgressClient API."
     },
     {
-      "file": "gateway/src/auth/principal.rs",
-      "reasons": [
-        "capability-import-or-glob"
-      ],
-      "scope": "gateway::auth::principal::provider_issuer#1",
-      "sha256": "b22b620cd109ea40f4aa11b8926ca69e8bc43e7fc90e7705761532ac90bae17d",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
-    },
-    {
       "file": "gateway/src/auth/principal_directory.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -8075,6 +8077,16 @@
       "sha256": "f35344af05310ce62d71cb4418df23165a4f4b7fe61773cdaa9b146fec815541",
       "owner": "GreenGateway maintainers",
       "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the bundle reader's secret-reference, placeholder and decimal value forms, which the field catalog (#242 PR 3) will call; pure parsing of an in-memory tree with no I/O and no transport or process capability."
+    },
+    {
+      "file": "gateway-config/src/inbound_tls.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway_config::inbound_tls::ClientCertMode#1",
+      "sha256": "cb25f41734e29125f71a5af1e3178ad926c9ef75e7f653b0675a7bac52506b4f",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Moved unchanged from gateway::inbound_tls for #242: the listener client-certificate mode the configuration compiler parses. Its only unexpanded input is the `#[default]` variant marker of a standard `Default` derive; a plain enum with no transport, file or process capability."
     },
     {
       "file": "gateway/src/config.rs",
@@ -10386,10 +10398,10 @@
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway::inbound_tls::use std :: { collections :: { HashMap , HashSet } , ffi :: OsString , fmt , fs , io , net :: SocketAddr , path :: { Path , PathBuf } , pin :: Pin , str :: FromStr , sync :: Arc , task :: { Context , Poll } , time :: Duration , }#1",
-      "sha256": "d1c08db6a823a0ee8835cfe318812a5ef2f9a0c16b6f035064bee3181c0c427c",
+      "scope": "gateway::inbound_tls::use std :: { collections :: { HashMap , HashSet } , ffi :: OsString , fmt , fs , io , net :: SocketAddr , path :: { Path , PathBuf } , pin :: Pin , sync :: Arc , task :: { Context , Poll } , time :: Duration , }#1",
+      "sha256": "bc79e991633c257ebb616e62b0ebc1b04d0c6dfe93c32bb0dea1d63fc95157ab",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review. Refreshed for #242: the same import without `str::FromStr`, whose last user moved to gateway-config with TlsMinVersion and ClientCertMode; no capability added."
     },
     {
       "file": "gateway/src/inbound_tls.rs",
@@ -10400,16 +10412,6 @@
       "sha256": "d33c7cad49f59b3c5f82a7349827e7e229fccdc3e3c19fe136d2ef9e3a8d5e99",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
-    },
-    {
-      "file": "gateway/src/inbound_tls.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::inbound_tls::ClientCertMode#1",
-      "sha256": "cb25f41734e29125f71a5af1e3178ad926c9ef75e7f653b0675a7bac52506b4f",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Inbound listener binding, TLS wrapping, admission or lifecycle management under operator configuration."
     },
     {
       "file": "gateway/src/inbound_tls.rs",

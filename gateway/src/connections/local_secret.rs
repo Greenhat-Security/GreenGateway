@@ -17,7 +17,6 @@ use chacha20poly1305::{
     KeyInit, XChaCha20Poly1305, XNonce,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
-use serde::Deserialize;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -28,10 +27,9 @@ use crate::auth::change_actor::ChangeActor;
 use super::{
     model::{MAX_CREDENTIALS, MAX_DISPLAY_NAME_CHARS, MAX_SECRET_ID_BYTES},
     secret::{
-        is_valid_file_key, is_valid_opaque_id, safe_error_alias_id, ResolvedSecret,
-        SecretAliasMetadata, SecretProviderKind, SecretPurpose, SecretResolveError,
-        SecretResolveErrorKind, SecretResolver, SecretRootConfig,
-        MAX_CONCURRENT_SECRET_RESOLUTIONS,
+        is_valid_opaque_id, safe_error_alias_id, ResolvedSecret, SecretAliasMetadata,
+        SecretProviderKind, SecretPurpose, SecretResolveError, SecretResolveErrorKind,
+        SecretResolver, SecretRootConfig, MAX_CONCURRENT_SECRET_RESOLUTIONS,
     },
     store::{
         SqliteConnectionStore, MAX_CHANGE_EVIDENCE_ACTOR_BYTES,
@@ -45,173 +43,17 @@ const LOCAL_SECRET_FIELD_PURPOSE: &str = "material";
 const MASTER_KEY_BYTES: usize = 32;
 const NONCE_BYTES: usize = 24;
 const TAG_BYTES: usize = 16;
-pub const MAX_LOCAL_SECRET_KEYS: usize = 8;
-pub const MAX_LOCAL_SECRET_KEYRING_CONFIG_BYTES: usize = 16 * 1024;
 pub const MAX_MASTER_KEY_ROTATION_BATCH: usize = 64;
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LocalSecretKeyRole {
-    Primary,
-    DecryptOnly,
-}
-
-#[derive(Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LocalSecretKeyConfig {
-    pub id: String,
-    pub file: String,
-    pub role: LocalSecretKeyRole,
-}
-
-impl fmt::Debug for LocalSecretKeyConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("LocalSecretKeyConfig")
-            .field("id", &"<redacted-key-id>")
-            .field("file", &"<redacted-locator>")
-            .field("role", &self.role)
-            .finish()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LocalSecretKeyringConfigError {
-    TooManyKeys { maximum: usize },
-    InvalidKeyId { index: usize },
-    InvalidFileKey { index: usize },
-    DuplicateKeyId { index: usize, previous: usize },
-    DuplicateFileKey { index: usize, previous: usize },
-    PrimaryKeyRequired,
-    MultiplePrimaryKeys,
-    SecretsRootRequired,
-    ManagedStoreRequired,
-    SecretsRootUnavailable,
-    SecretsRootNotDirectory,
-    SecretsRootPermissions,
-    KeyFileUnavailable { index: usize },
-    KeyFileUnsafe { index: usize },
-    KeyFilePermissions { index: usize },
-    InvalidKeyMaterial { index: usize },
-}
-
-impl fmt::Display for LocalSecretKeyringConfigError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooManyKeys { maximum } => {
-                write!(
-                    formatter,
-                    "local secret keyring must contain at most {maximum} keys"
-                )
-            }
-            Self::InvalidKeyId { index } => {
-                write!(
-                    formatter,
-                    "local secret key at index {index} has an invalid key ID"
-                )
-            }
-            Self::InvalidFileKey { index } => write!(
-                formatter,
-                "local secret key at index {index} has an invalid file key"
-            ),
-            Self::DuplicateKeyId { index, previous } => write!(
-                formatter,
-                "local secret key at index {index} duplicates the key ID at index {previous}"
-            ),
-            Self::DuplicateFileKey { index, previous } => write!(
-                formatter,
-                "local secret key at index {index} duplicates the file key at index {previous}"
-            ),
-            Self::PrimaryKeyRequired => {
-                formatter.write_str("local secret keyring requires exactly one primary key")
-            }
-            Self::MultiplePrimaryKeys => {
-                formatter.write_str("local secret keyring must contain only one primary key")
-            }
-            Self::SecretsRootRequired => {
-                formatter.write_str("local secret keyring requires CONNECTION_SECRETS_ROOT")
-            }
-            Self::ManagedStoreRequired => {
-                formatter.write_str("local secret keyring requires CONNECTIONS_SQLITE_PATH")
-            }
-            Self::SecretsRootUnavailable => formatter
-                .write_str("CONNECTION_SECRETS_ROOT is unavailable or cannot be canonicalized"),
-            Self::SecretsRootNotDirectory => {
-                formatter.write_str("CONNECTION_SECRETS_ROOT must be a directory")
-            }
-            Self::SecretsRootPermissions => formatter.write_str(
-                "CONNECTION_SECRETS_ROOT has unsafe write permissions for this platform",
-            ),
-            Self::KeyFileUnavailable { index } => write!(
-                formatter,
-                "local secret key file at index {index} is unavailable"
-            ),
-            Self::KeyFileUnsafe { index } => write!(
-                formatter,
-                "local secret key file at index {index} is not a safe regular file"
-            ),
-            Self::KeyFilePermissions { index } => write!(
-                formatter,
-                "local secret key file at index {index} has unsafe permissions"
-            ),
-            Self::InvalidKeyMaterial { index } => write!(
-                formatter,
-                "local secret key file at index {index} must contain exactly 32 bytes"
-            ),
-        }
-    }
-}
-
-impl Error for LocalSecretKeyringConfigError {}
-
-pub fn validate_local_secret_keyring_config(
-    keys: &[LocalSecretKeyConfig],
-    secrets_root_configured: bool,
-    managed_store_configured: bool,
-) -> Result<(), LocalSecretKeyringConfigError> {
-    if keys.len() > MAX_LOCAL_SECRET_KEYS {
-        return Err(LocalSecretKeyringConfigError::TooManyKeys {
-            maximum: MAX_LOCAL_SECRET_KEYS,
-        });
-    }
-    if keys.is_empty() {
-        return Ok(());
-    }
-    if !secrets_root_configured {
-        return Err(LocalSecretKeyringConfigError::SecretsRootRequired);
-    }
-    if !managed_store_configured {
-        return Err(LocalSecretKeyringConfigError::ManagedStoreRequired);
-    }
-
-    let mut ids = BTreeMap::new();
-    let mut files = BTreeMap::new();
-    let mut primary_count = 0usize;
-    for (index, key) in keys.iter().enumerate() {
-        if !is_valid_opaque_id(&key.id, MAX_SECRET_ID_BYTES) {
-            return Err(LocalSecretKeyringConfigError::InvalidKeyId { index });
-        }
-        if !is_valid_file_key(&key.file) {
-            return Err(LocalSecretKeyringConfigError::InvalidFileKey { index });
-        }
-        if let Some(previous) = ids.insert(key.id.as_str(), index) {
-            return Err(LocalSecretKeyringConfigError::DuplicateKeyId { index, previous });
-        }
-        if let Some(previous) = files.insert(key.file.as_str(), index) {
-            return Err(LocalSecretKeyringConfigError::DuplicateFileKey { index, previous });
-        }
-        if key.role == LocalSecretKeyRole::Primary {
-            primary_count = primary_count.saturating_add(1);
-        }
-    }
-    match primary_count {
-        0 => Err(LocalSecretKeyringConfigError::PrimaryKeyRequired),
-        1 => Ok(()),
-        _ => Err(LocalSecretKeyringConfigError::MultiplePrimaryKeys),
-    }
-}
+// The local keyring document (`CONNECTION_LOCAL_SECRET_KEYRING`) and its
+// validator, shared with `ggctl` through the configuration compiler
+// (issue #242).
+pub(crate) use gateway_config::connections::local_secret::{
+    validate_local_secret_keyring_config, LocalSecretKeyConfig, LocalSecretKeyRole,
+    LocalSecretKeyringConfigError, MAX_LOCAL_SECRET_KEYRING_CONFIG_BYTES,
+};
 
 struct KeyMaterial(Zeroizing<[u8; MASTER_KEY_BYTES]>);
 
@@ -1571,39 +1413,6 @@ mod tests {
 
     fn secret(purpose: SecretPurpose, value: &[u8]) -> ResolvedSecret {
         ResolvedSecret::new(purpose, value.to_vec()).expect("test secret should validate")
-    }
-
-    #[test]
-    fn keyring_validation_is_bounded_unique_and_redacted() {
-        let configs = vec![
-            TestEnvironment::config("primary", "primary.key", LocalSecretKeyRole::Primary),
-            TestEnvironment::config("previous", "previous.key", LocalSecretKeyRole::DecryptOnly),
-        ];
-        validate_local_secret_keyring_config(&configs, true, true)
-            .expect("valid keyring config should pass");
-
-        let duplicate = vec![
-            configs[0].clone(),
-            TestEnvironment::config("primary", "other.key", LocalSecretKeyRole::DecryptOnly),
-        ];
-        assert!(matches!(
-            validate_local_secret_keyring_config(&duplicate, true, true),
-            Err(LocalSecretKeyringConfigError::DuplicateKeyId { .. })
-        ));
-        let traversal = vec![TestEnvironment::config(
-            "primary",
-            "../primary.key",
-            LocalSecretKeyRole::Primary,
-        )];
-        let error = validate_local_secret_keyring_config(&traversal, true, true)
-            .expect_err("traversal must fail");
-        assert!(!error.to_string().contains("../primary.key"));
-
-        let debug = format!("{configs:?}");
-        assert!(!debug.contains("primary.key"));
-        assert!(!debug.contains("previous"));
-        assert!(debug.contains("<redacted-key-id>"));
-        assert!(debug.contains("<redacted-locator>"));
     }
 
     #[test]

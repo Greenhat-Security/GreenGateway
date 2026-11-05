@@ -33,16 +33,21 @@ ON service_tokens(created_at DESC, id ASC);
 
 CREATE INDEX IF NOT EXISTS idx_service_tokens_revoked
 ON service_tokens(revoked_at);
+"#;
 
--- Change evidence (issue #425): one append-only row per committed rotate
--- or revoke, written in the same transaction as the token change, naming
--- who made it. Created on open like the table above, so a database an
--- older binary wrote gains it on the first open by this one and an older
--- binary simply never reads it. No foreign key, so a removed token row
--- leaves its evidence; identifiers and the actor only, never the
--- plaintext, hash, prefix or scopes. The actor bound is the principal
--- subject bound (MAX_TOKEN_CHANGE_ACTOR_BYTES).
-CREATE TABLE IF NOT EXISTS service_token_change_evidence (
+/// The change evidence table (issue #425): one append-only row per committed
+/// issue, rotate or revoke, written in the same transaction as the token
+/// change, naming who made it. Created on open like the token table, so a
+/// database an older binary wrote gains it on the first open by this one and
+/// an older binary simply never reads it. No foreign key, so a removed token
+/// row leaves its evidence; identifiers and the actor only, never the
+/// plaintext, hash, prefix or scopes. The actor bound is the principal
+/// subject bound (MAX_TOKEN_CHANGE_ACTOR_BYTES).
+///
+/// The column list is shared by the create-on-open statement and by the
+/// rebuild that widens an older table's action vocabulary
+/// ([`rebuild_change_evidence_for_issue`]), so both produce the same table.
+const CHANGE_EVIDENCE_COLUMNS_SQL: &str = r#"
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id TEXT NOT NULL UNIQUE CHECK (length(event_id) = 36),
     operation_id TEXT NOT NULL CHECK (length(operation_id) = 36),
@@ -50,16 +55,27 @@ CREATE TABLE IF NOT EXISTS service_token_change_evidence (
         length(CAST(actor_user_id AS BLOB)) BETWEEN 1 AND 4096
     ),
     action TEXT NOT NULL CHECK (
-        action IN ('service_token.rotate', 'service_token.revoke')
+        action IN ('service_token.issue', 'service_token.rotate', 'service_token.revoke')
     ),
     token_id TEXT NOT NULL CHECK (length(CAST(token_id AS BLOB)) BETWEEN 1 AND 128),
     committed_at TEXT NOT NULL,
     UNIQUE (operation_id, action)
-);
+"#;
 
+/// The evidence table's one index: a token's evidence in commit order.
+const CHANGE_EVIDENCE_INDEX_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_service_token_change_evidence_token
 ON service_token_change_evidence(token_id, sequence);
 "#;
+
+/// The name the widened table is built under before it replaces the older
+/// one. It exists only inside the rebuild's transaction.
+const CHANGE_EVIDENCE_REBUILD_TABLE: &str = "service_token_change_evidence_rebuild";
+
+/// Every column of the evidence table once the actor columns are present, in
+/// table order: what the rebuild copies, row for row.
+const CHANGE_EVIDENCE_COPIED_COLUMNS: &str = "sequence, event_id, operation_id, actor_user_id, \
+     action, token_id, committed_at, actor_kind, actor_auth_mode, actor_issuer";
 
 /// How long one statement on a token-store connection waits for a writer on
 /// another connection to the same file before the change is refused with
@@ -116,8 +132,8 @@ const CHANGE_EVIDENCE_ACTOR_COLUMNS: [(&str, &str); 3] = [
     ),
 ];
 
-/// The longest actor a rotate or revoke records as its change evidence, in
-/// both the SQLite table above and PostgreSQL migration 18. It is exactly
+/// The longest actor an issue, rotate or revoke records as its change
+/// evidence, in both the SQLite table above and PostgreSQL migration 18. It is exactly
 /// the principal subject bound authentication enforces, so evidence never
 /// refuses a principal a validator produced; the assertion keeps the SQL
 /// bounds and the Rust bound from drifting apart silently.
@@ -136,7 +152,10 @@ const _: () = assert!(
 /// The closed action vocabulary of service-token change evidence. Values are
 /// the proposed authority-event operation codes
 /// (`docs/schemas/authority_event.v1.schema.json`); both stores' CHECK
-/// constraints refuse anything else.
+/// constraints refuse anything else. An issue is the token's first evidence
+/// row; a token created before issue evidence existed has only its
+/// `created_by`, and nothing is backfilled for it.
+pub(crate) const TOKEN_CHANGE_ACTION_ISSUE: &str = "service_token.issue";
 pub(crate) const TOKEN_CHANGE_ACTION_ROTATE: &str = "service_token.rotate";
 pub(crate) const TOKEN_CHANGE_ACTION_REVOKE: &str = "service_token.revoke";
 
@@ -160,7 +179,13 @@ pub struct SqliteTokenStore {
 }
 
 pub trait TokenStore: Send + Sync {
-    fn create(&self, request: CreateTokenRequest) -> Result<CreatedToken, TokenStoreError>;
+    /// Issue a token on behalf of `actor`, who is recorded as the issue's
+    /// evidence in the same transaction as the token row.
+    fn create(
+        &self,
+        request: CreateTokenRequest,
+        actor: &ChangeActor,
+    ) -> Result<CreatedToken, TokenStoreError>;
 
     fn list(&self, filters: &TokenListFilters) -> Result<TokenPage, TokenStoreError>;
 
@@ -321,7 +346,7 @@ pub enum TokenStoreError {
     RevokedToken {
         id: String,
     },
-    /// A rotate or revoke named no actor, one longer than
+    /// An issue, rotate or revoke named no actor, one longer than
     /// [`MAX_TOKEN_CHANGE_ACTOR_BYTES`], or an issuer evidence cannot record
     /// ([`ChangeActor::is_recordable`]); refused before anything changed.
     InvalidChangeActor,
@@ -434,8 +459,15 @@ impl SqliteTokenStore {
 }
 
 impl TokenStore for SqliteTokenStore {
-    fn create(&self, request: CreateTokenRequest) -> Result<CreatedToken, TokenStoreError> {
+    fn create(
+        &self,
+        request: CreateTokenRequest,
+        actor: &ChangeActor,
+    ) -> Result<CreatedToken, TokenStoreError> {
         validate_optional_timestamp(request.expires_at.as_deref(), "expires_at")?;
+        if !is_valid_change_actor(actor) {
+            return Err(TokenStoreError::InvalidChangeActor);
+        }
 
         let plaintext_token = generate_plaintext_token()?;
         let token_hash = hash_token(&plaintext_token);
@@ -448,8 +480,15 @@ impl TokenStore for SqliteTokenStore {
                 source,
             })?;
 
-        let connection = self.connection_guard();
-        connection
+        let mut connection = self.connection_guard();
+        // One unit, as in `revoke` and `rotate`: the token row and the
+        // evidence of its issue commit together or not at all. An early
+        // return drops the transaction, which rolls it back with nothing
+        // written.
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|source| self.sqlite_error(source))?;
+        transaction
             .execute(
                 r#"
                 INSERT INTO service_tokens (
@@ -474,7 +513,23 @@ impl TokenStore for SqliteTokenStore {
                     request.expires_at.as_deref(),
                 ],
             )
-            .map_err(|source| store_failure(&self.path, source))?;
+            .map_err(|source| self.sqlite_error(source))?;
+        // The issue's commit time is the token's own `created_at`, as a
+        // revoke's is its `revoked_at`. Neither the plaintext nor the hash
+        // is passed: the evidence names the token by its ID alone.
+        record_change_evidence(
+            &transaction,
+            &self.path,
+            &ChangeEvidence {
+                action: TOKEN_CHANGE_ACTION_ISSUE,
+                token_id: &id,
+                actor,
+                committed_at: &created_at,
+            },
+        )?;
+        transaction
+            .commit()
+            .map_err(|source| self.sqlite_error(source))?;
 
         Ok(CreatedToken {
             record: TokenRecord {
@@ -954,7 +1009,92 @@ fn store_failure(path: &Path, source: rusqlite::Error) -> TokenStoreError {
 
 pub fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch(CREATE_SERVICE_TOKEN_SCHEMA_SQL)?;
-    add_change_evidence_actor_columns(connection)
+    connection.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS service_token_change_evidence ({CHANGE_EVIDENCE_COLUMNS_SQL});"
+    ))?;
+    connection.execute_batch(CHANGE_EVIDENCE_INDEX_SQL)?;
+    add_change_evidence_actor_columns(connection)?;
+    rebuild_change_evidence_for_issue(connection)
+}
+
+/// Widen an evidence table created before token issue evidence existed, so it
+/// admits `service_token.issue` (issue #425).
+///
+/// SQLite cannot change a CHECK constraint in place, so the table is rebuilt:
+/// in one IMMEDIATE transaction that looks again under the write lock, a new
+/// table is created from [`CHANGE_EVIDENCE_COLUMNS_SQL`] and gains the actor
+/// columns exactly as a fresh database's table does, every row is copied with
+/// its own `sequence`, the older table is dropped, the new one takes its name
+/// and the index is recreated. Dropping a table forgets its AUTOINCREMENT
+/// high-water mark, so the older table's is carried over: a sequence number
+/// once used is never handed out again. Nothing is backfilled: a token issued
+/// before this table admitted its issue keeps `created_by` as its only record.
+///
+/// The common case -- a table that already admits the issue action, which is
+/// every table this build created -- reads the schema and writes nothing. A
+/// failure leaves the older table as it was; the store then does not open.
+fn rebuild_change_evidence_for_issue(connection: &Connection) -> rusqlite::Result<()> {
+    if change_evidence_admits_issue(connection)? {
+        return Ok(());
+    }
+    let transaction =
+        rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)?;
+    // Another process may have rebuilt it while this one waited for the lock.
+    if change_evidence_admits_issue(&transaction)? {
+        return transaction.commit();
+    }
+    let high_water: Option<i64> = transaction
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'service_token_change_evidence'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    transaction.execute_batch(&format!(
+        "CREATE TABLE {CHANGE_EVIDENCE_REBUILD_TABLE} ({CHANGE_EVIDENCE_COLUMNS_SQL});"
+    ))?;
+    for (name, definition) in CHANGE_EVIDENCE_ACTOR_COLUMNS {
+        transaction.execute(
+            &format!("ALTER TABLE {CHANGE_EVIDENCE_REBUILD_TABLE} ADD COLUMN {name} {definition}"),
+            [],
+        )?;
+    }
+    transaction.execute(
+        &format!(
+            "INSERT INTO {CHANGE_EVIDENCE_REBUILD_TABLE} ({CHANGE_EVIDENCE_COPIED_COLUMNS}) \
+             SELECT {CHANGE_EVIDENCE_COPIED_COLUMNS} FROM service_token_change_evidence \
+             ORDER BY sequence"
+        ),
+        [],
+    )?;
+    transaction.execute_batch(&format!(
+        "DROP TABLE service_token_change_evidence; \
+         ALTER TABLE {CHANGE_EVIDENCE_REBUILD_TABLE} RENAME TO service_token_change_evidence;"
+    ))?;
+    transaction.execute_batch(CHANGE_EVIDENCE_INDEX_SQL)?;
+    if let Some(high_water) = high_water {
+        transaction.execute(
+            "DELETE FROM sqlite_sequence WHERE name = 'service_token_change_evidence'",
+            [],
+        )?;
+        transaction.execute(
+            "INSERT INTO sqlite_sequence (name, seq) \
+             SELECT 'service_token_change_evidence', max(?1, coalesce(max(sequence), 0)) \
+             FROM service_token_change_evidence",
+            [high_water],
+        )?;
+    }
+    transaction.commit()
+}
+
+/// Whether the evidence table's own definition admits the issue action.
+fn change_evidence_admits_issue(connection: &Connection) -> rusqlite::Result<bool> {
+    let definition: String = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'service_token_change_evidence'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(definition.contains(&format!("'{TOKEN_CHANGE_ACTION_ISSUE}'")))
 }
 
 /// Add whichever actor metadata columns the evidence table lacks. The common
@@ -1193,7 +1333,10 @@ mod tests {
         let store = SqliteTokenStore::open(&db.path).expect("token store should open");
 
         let created = store
-            .create(create_request(&["admin"], "creator", None))
+            .create(
+                create_request(&["admin"], "creator", None),
+                &ChangeActor::for_test("creator"),
+            )
             .expect("token should create");
 
         assert!(created.plaintext_token.starts_with("ggw_"));
@@ -1233,7 +1376,10 @@ mod tests {
         let db = TempDb::new("verify-fresh");
         let store = SqliteTokenStore::open(&db.path).expect("token store should open");
         let created = store
-            .create(create_request(&["reader", "writer"], "creator", None))
+            .create(
+                create_request(&["reader", "writer"], "creator", None),
+                &ChangeActor::for_test("creator"),
+            )
             .expect("token should create");
 
         let verification = store
@@ -1260,17 +1406,26 @@ mod tests {
         let db = TempDb::new("verify-failures");
         let store = SqliteTokenStore::open(&db.path).expect("token store should open");
         let active = store
-            .create(create_request(&["reader"], "creator", None))
+            .create(
+                create_request(&["reader"], "creator", None),
+                &ChangeActor::for_test("creator"),
+            )
             .expect("active token should create");
         let revoked = store
-            .create(create_request(&["reader"], "creator", None))
+            .create(
+                create_request(&["reader"], "creator", None),
+                &ChangeActor::for_test("creator"),
+            )
             .expect("revoked token should create");
         let expired = store
-            .create(create_request(
-                &["reader"],
-                "creator",
-                Some(timestamp_after(Duration::seconds(-60))),
-            ))
+            .create(
+                create_request(
+                    &["reader"],
+                    "creator",
+                    Some(timestamp_after(Duration::seconds(-60))),
+                ),
+                &ChangeActor::for_test("creator"),
+            )
             .expect("expired token should create");
 
         assert_eq!(
@@ -1309,7 +1464,10 @@ mod tests {
         let db = TempDb::new("revoke-idempotent");
         let store = SqliteTokenStore::open(&db.path).expect("token store should open");
         let created = store
-            .create(create_request(&["reader"], "creator", None))
+            .create(
+                create_request(&["reader"], "creator", None),
+                &ChangeActor::for_test("creator"),
+            )
             .expect("token should create");
 
         let first = store
@@ -1335,7 +1493,7 @@ mod tests {
     #[test]
     fn change_evidence_actor_bound_matches_both_schemas() {
         let bound = format!("BETWEEN 1 AND {MAX_TOKEN_CHANGE_ACTOR_BYTES}");
-        assert!(CREATE_SERVICE_TOKEN_SCHEMA_SQL
+        assert!(CHANGE_EVIDENCE_COLUMNS_SQL
             .contains(&format!("length(CAST(actor_user_id AS BLOB)) {bound}")));
         let migration =
             include_str!("../storage/migrations/0018_service_token_and_jwt_evidence.sql");
@@ -1379,13 +1537,228 @@ mod tests {
         assert_eq!(squeeze(migration).matches(&pairing).count(), 3, "{pairing}");
     }
 
+    /// The action vocabulary is written three times: the constants, the
+    /// SQLite CHECK here and PostgreSQL migration 27's CHECK. Pin all three to
+    /// each other so the stores cannot disagree about what is recordable.
+    #[test]
+    fn change_evidence_actions_match_both_schemas() {
+        let actions = [
+            TOKEN_CHANGE_ACTION_ISSUE,
+            TOKEN_CHANGE_ACTION_ROTATE,
+            TOKEN_CHANGE_ACTION_REVOKE,
+        ]
+        .map(|action| format!("'{action}'"))
+        .join(", ");
+        let check = format!("action IN ({actions})");
+        assert!(CHANGE_EVIDENCE_COLUMNS_SQL.contains(&check), "{check}");
+        let migration = include_str!("../storage/migrations/0027_service_token_issue_evidence.sql");
+        assert!(migration.contains(&check), "{check}");
+    }
+
+    /// The token database as a build before token issue evidence left it:
+    /// its token table and an evidence table whose action CHECK admits only
+    /// rotate and revoke, created exactly as that build created it.
+    fn create_pre_issue_schema(connection: &Connection) {
+        connection
+            .execute_batch(CREATE_SERVICE_TOKEN_SCHEMA_SQL)
+            .expect("the token table should create");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS service_token_change_evidence (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE CHECK (length(event_id) = 36),
+                    operation_id TEXT NOT NULL CHECK (length(operation_id) = 36),
+                    actor_user_id TEXT NOT NULL CHECK (
+                        length(CAST(actor_user_id AS BLOB)) BETWEEN 1 AND 4096
+                    ),
+                    action TEXT NOT NULL CHECK (
+                        action IN ('service_token.rotate', 'service_token.revoke')
+                    ),
+                    token_id TEXT NOT NULL CHECK (length(CAST(token_id AS BLOB)) BETWEEN 1 AND 128),
+                    committed_at TEXT NOT NULL,
+                    UNIQUE (operation_id, action)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_service_token_change_evidence_token
+                ON service_token_change_evidence(token_id, sequence);
+                "#,
+            )
+            .expect("the older evidence table should create");
+    }
+
+    /// Every evidence row as text, in sequence order.
+    fn evidence_text(connection: &Connection) -> Vec<String> {
+        let mut statement = connection
+            .prepare(
+                "SELECT sequence, event_id, operation_id, actor_user_id, action, token_id, \
+                        committed_at, ifnull(actor_kind, 'NULL'), \
+                        ifnull(actor_auth_mode, 'NULL'), ifnull(actor_issuer, 'NULL') \
+                 FROM service_token_change_evidence ORDER BY sequence",
+            )
+            .expect("evidence query should prepare");
+        statement
+            .query_map([], |row| {
+                Ok(format!(
+                    "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })
+            .expect("evidence query should run")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("evidence rows should decode")
+    }
+
+    /// An evidence table a build before token issue evidence wrote, with or
+    /// without the actor columns, is rebuilt on the first open so it admits
+    /// the issue, and only once. Every row keeps its sequence and every
+    /// column, the AUTOINCREMENT high-water mark survives (a sequence number
+    /// once handed out, even to a row since removed, is never handed out
+    /// again), the index is back, no rebuild table is left, nothing is
+    /// backfilled for the token issued before it, and the table still
+    /// refuses an action outside the vocabulary.
+    #[test]
+    fn an_evidence_table_written_before_issue_evidence_is_rebuilt_once_and_keeps_its_rows() {
+        for with_actor_columns in [false, true] {
+            let db = TempDb::new("evidence-issue-rebuild");
+            let connection = Connection::open(&db.path).expect("database should open");
+            create_pre_issue_schema(&connection);
+            if with_actor_columns {
+                add_change_evidence_actor_columns(&connection)
+                    .expect("the older binary's actor columns should add");
+            }
+            connection
+                .execute(
+                    "INSERT INTO service_tokens \
+                         (id, token_hash, token_prefix, scopes_json, created_by, created_at) \
+                     VALUES ('token_older', ?1, 'ggw_aaaaaaaaaa', '[\"reader\"]', \
+                             'older-creator', '2026-10-01T00:00:00Z')",
+                    [hash_token("older-plaintext")],
+                )
+                .expect("an older binary's token");
+            for (action, committed_at) in [
+                ("service_token.rotate", "2026-10-01T00:00:01Z"),
+                ("service_token.rotate", "2026-10-01T00:00:02Z"),
+                ("service_token.revoke", "2026-10-01T00:00:03Z"),
+            ] {
+                connection
+                    .execute(
+                        "INSERT INTO service_token_change_evidence \
+                             (event_id, operation_id, actor_user_id, action, token_id, \
+                              committed_at) \
+                         VALUES (?1, ?2, 'older-admin', ?3, 'token_older', ?4)",
+                        params![
+                            uuid::Uuid::new_v4().to_string(),
+                            uuid::Uuid::new_v4().to_string(),
+                            action,
+                            committed_at
+                        ],
+                    )
+                    .expect("an older binary's evidence row");
+            }
+            // An operator removed the last row: the high-water mark is above
+            // every remaining sequence.
+            connection
+                .execute(
+                    "DELETE FROM service_token_change_evidence WHERE sequence = 3",
+                    [],
+                )
+                .expect("a row should delete");
+            drop(connection);
+            let before = {
+                let connection = Connection::open(&db.path).expect("database should open");
+                add_change_evidence_actor_columns(&connection).expect("actor columns");
+                evidence_text(&connection)
+            };
+            assert_eq!(before.len(), 2);
+
+            for _ in 0..2 {
+                drop(SqliteTokenStore::open(&db.path).expect("the store should open"));
+            }
+            let connection = Connection::open(&db.path).expect("database should open");
+            assert!(change_evidence_admits_issue(&connection).expect("schema reads"));
+            assert_eq!(
+                evidence_text(&connection),
+                before,
+                "every row keeps its sequence and columns"
+            );
+            let high_water: i64 = connection
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'service_token_change_evidence'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("the high-water mark survives");
+            assert_eq!(high_water, 3);
+            let leftovers: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = ?1",
+                    [CHANGE_EVIDENCE_REBUILD_TABLE],
+                    |row| row.get(0),
+                )
+                .expect("schema reads");
+            assert_eq!(leftovers, 0);
+            let index: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master \
+                     WHERE type = 'index' AND name = 'idx_service_token_change_evidence_token' \
+                       AND tbl_name = 'service_token_change_evidence'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("schema reads");
+            assert_eq!(index, 1);
+            assert!(missing_change_evidence_actor_columns(&connection)
+                .expect("schema reads")
+                .is_empty());
+            drop(connection);
+
+            // The token issued before the rebuild has no issue row; the next
+            // issue is recorded after every sequence ever handed out.
+            let store = SqliteTokenStore::open(&db.path).expect("the store should open");
+            let issued = store
+                .create(
+                    create_request(&["reader"], "creator", None),
+                    &ChangeActor::for_test("creator"),
+                )
+                .expect("a token issues after the rebuild");
+            let connection = Connection::open(&db.path).expect("database should open");
+            let after = evidence_text(&connection);
+            assert_eq!(after.len(), 3);
+            assert_eq!(after[..2], before[..]);
+            assert!(
+                after[2].starts_with("4|")
+                    && after[2].contains(&format!("|service_token.issue|{}|", issued.record.id)),
+                "{after:?}"
+            );
+            let refused = connection.execute(
+                "INSERT INTO service_token_change_evidence \
+                     (event_id, operation_id, actor_user_id, action, token_id, committed_at) \
+                 VALUES (?1, ?2, 'admin', 'service_token.delete', 'token_older', \
+                         '2026-10-01T00:00:04Z')",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    uuid::Uuid::new_v4().to_string()
+                ],
+            );
+            assert!(refused.is_err(), "the vocabulary stays closed");
+        }
+    }
+
     #[test]
     fn an_older_evidence_table_gains_the_actor_columns_once_and_keeps_its_rows() {
         let db = TempDb::new("evidence-actor-columns");
         let connection = Connection::open(&db.path).expect("database should open");
-        connection
-            .execute_batch(CREATE_SERVICE_TOKEN_SCHEMA_SQL)
-            .expect("the older schema should create");
+        create_pre_issue_schema(&connection);
         connection
             .execute(
                 "INSERT INTO service_token_change_evidence \
@@ -1460,19 +1833,23 @@ mod tests {
         }
     }
 
-    /// A rotate or a revoke whose evidence cannot be inserted is refused and
-    /// counted once on the standalone evidence-failure counter under the
-    /// token database; the revoke recorded once evidence can be written
-    /// counts nothing. The rollback itself is pinned by the repository
-    /// contract test `sqlite_failed_evidence_insert_rolls_back_rotate_and_revoke`,
-    /// whose store calls run on blocking threads this thread's recorder does
-    /// not see.
+    /// An issue, a rotate or a revoke whose evidence cannot be inserted is
+    /// refused and counted once on the standalone evidence-failure counter
+    /// under the token database; the revoke recorded once evidence can be
+    /// written counts nothing. The rollback itself is pinned by the repository
+    /// contract tests `sqlite_failed_evidence_insert_rolls_back_rotate_and_revoke`
+    /// and `sqlite_service_token_issue_evidence_satisfies_the_contract`, whose
+    /// store calls run on blocking threads this thread's recorder does not
+    /// see.
     #[test]
     fn a_refused_rotate_or_revoke_counts_one_evidence_failure_each() {
         let db = TempDb::new("evidence-failure-count");
         let store = SqliteTokenStore::open(&db.path).expect("token store should open");
         let created = store
-            .create(create_request(&["admin"], "creator", None))
+            .create(
+                create_request(&["admin"], "creator", None),
+                &ChangeActor::for_test("creator"),
+            )
             .expect("token should create");
         let id = created.record.id;
         // The recorder is this thread's, and the store runs on this thread.
@@ -1506,6 +1883,11 @@ mod tests {
             Err(TokenStoreError::ChangeEvidence { .. })
         ));
         assert_eq!(evidence_failures("service_tokens"), 2);
+        assert!(matches!(
+            store.create(create_request(&["admin"], "creator", None), &faulted),
+            Err(TokenStoreError::ChangeEvidence { .. })
+        ));
+        assert_eq!(evidence_failures("service_tokens"), 3);
         assert_eq!(evidence_failures("connections"), 0);
 
         Connection::open(&db.path)
@@ -1518,7 +1900,7 @@ mod tests {
             .expect("token should exist");
         assert_eq!(
             evidence_failures("service_tokens"),
-            2,
+            3,
             "a recorded change counts nothing"
         );
     }
@@ -1529,11 +1911,10 @@ mod tests {
         let store = SqliteTokenStore::open(&db.path).expect("token store should open");
         let expires_at = timestamp_after(Duration::hours(1));
         let created = store
-            .create(create_request(
-                &["reader", "operator"],
-                "creator",
-                Some(expires_at.clone()),
-            ))
+            .create(
+                create_request(&["reader", "operator"], "creator", Some(expires_at.clone())),
+                &ChangeActor::for_test("creator"),
+            )
             .expect("token should create");
         let original_hash = token_hashes(&db.path)
             .into_iter()
@@ -1577,13 +1958,22 @@ mod tests {
         let db = TempDb::new("list-pagination");
         let store = SqliteTokenStore::open(&db.path).expect("token store should open");
         let first = store
-            .create(create_request(&["one"], "creator", None))
+            .create(
+                create_request(&["one"], "creator", None),
+                &ChangeActor::for_test("creator"),
+            )
             .expect("first token should create");
         let second = store
-            .create(create_request(&["two"], "creator", None))
+            .create(
+                create_request(&["two"], "creator", None),
+                &ChangeActor::for_test("creator"),
+            )
             .expect("second token should create");
         let third = store
-            .create(create_request(&["three"], "creator", None))
+            .create(
+                create_request(&["three"], "creator", None),
+                &ChangeActor::for_test("creator"),
+            )
             .expect("third token should create");
 
         set_created_at(&db.path, &first.record.id, "2024-01-01T00:00:00Z");
@@ -1652,7 +2042,10 @@ mod tests {
         .join();
 
         let created = store
-            .create(create_request(&["reader"], "creator", None))
+            .create(
+                create_request(&["reader"], "creator", None),
+                &ChangeActor::for_test("creator"),
+            )
             .expect("store should recover after poisoned lock");
 
         assert!(created.plaintext_token.starts_with("ggw_"));

@@ -357,6 +357,7 @@ mod tests {
     };
 
     use crate::auth::{
+        change_actor::ChangeActor,
         tokens::{
             CreateTokenRequest, CreatedToken, SqliteTokenStore, TokenListFilters, TokenPage,
             TokenRecord, TokenVerification, TokenVerificationFailure, VerifiedToken,
@@ -370,7 +371,10 @@ mod tests {
         let db = TempDb::new("valid");
         let store = Arc::new(SqliteTokenStore::open(&db.path).expect("token store should open"));
         let created = store
-            .create(create_request(&["admin:tokens:read", "admin:tokens:write"]))
+            .create(
+                create_request(&["admin:tokens:read", "admin:tokens:write"]),
+                &ChangeActor::for_test("issuing-admin"),
+            )
             .await
             .expect("token should create");
         let validator = ServiceTokenValidator::new(store, Duration::from_secs(5));
@@ -403,7 +407,10 @@ mod tests {
         let db = TempDb::new("missing-mcp-scope");
         let store = Arc::new(SqliteTokenStore::open(&db.path).expect("token store should open"));
         let created = store
-            .create(create_request(&["admin:tokens:read"]))
+            .create(
+                create_request(&["admin:tokens:read"]),
+                &ChangeActor::for_test("issuing-admin"),
+            )
             .await
             .expect("token should create");
         let validator = ServiceTokenValidator::new(store, Duration::from_secs(5));
@@ -424,7 +431,10 @@ mod tests {
         let db = TempDb::new("with-mcp-scope");
         let store = Arc::new(SqliteTokenStore::open(&db.path).expect("token store should open"));
         let created = store
-            .create(create_request(&["admin:tokens:read", "mcp:tools"]))
+            .create(
+                create_request(&["admin:tokens:read", "mcp:tools"]),
+                &ChangeActor::for_test("issuing-admin"),
+            )
             .await
             .expect("token should create");
         let validator = ServiceTokenValidator::new(store, Duration::from_secs(5));
@@ -449,7 +459,10 @@ mod tests {
         let db = TempDb::new("non-mcp-no-scope");
         let store = Arc::new(SqliteTokenStore::open(&db.path).expect("token store should open"));
         let created = store
-            .create(create_request(&["admin:tokens:read"]))
+            .create(
+                create_request(&["admin:tokens:read"]),
+                &ChangeActor::for_test("issuing-admin"),
+            )
             .await
             .expect("token should create");
         let validator = ServiceTokenValidator::new(store, Duration::from_secs(5));
@@ -471,7 +484,10 @@ mod tests {
         let db = TempDb::new("invalid-revoked");
         let store = Arc::new(SqliteTokenStore::open(&db.path).expect("token store should open"));
         let revoked = store
-            .create(create_request(&["admin:tokens:read"]))
+            .create(
+                create_request(&["admin:tokens:read"]),
+                &ChangeActor::for_test("issuing-admin"),
+            )
             .await
             .expect("token should create");
         store
@@ -642,11 +658,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let created = store
-            .create(CreateTokenRequest {
-                scopes: scopes.clone(),
-                created_by: "creator".to_owned(),
-                expires_at: None,
-            })
+            .create(
+                CreateTokenRequest {
+                    scopes: scopes.clone(),
+                    created_by: "creator".to_owned(),
+                    expires_at: None,
+                },
+                &ChangeActor::for_test("issuing-admin"),
+            )
             .await
             .expect("token should create");
         let validator = ServiceTokenValidator::new(store, Duration::from_secs(5));
@@ -676,11 +695,14 @@ mod tests {
             // token is written, and the validator does again here so a
             // record written around the admin API is still refused.
             let created = store
-                .create(CreateTokenRequest {
-                    scopes,
-                    created_by: "creator".to_owned(),
-                    expires_at: None,
-                })
+                .create(
+                    CreateTokenRequest {
+                        scopes,
+                        created_by: "creator".to_owned(),
+                        expires_at: None,
+                    },
+                    &ChangeActor::for_test("issuing-admin"),
+                )
                 .await
                 .expect("token should create");
             let validator = ServiceTokenValidator::new(store, Duration::from_secs(5));
@@ -715,6 +737,7 @@ mod tests {
         async fn create(
             &self,
             _request: CreateTokenRequest,
+            _actor: &ChangeActor,
         ) -> Result<CreatedToken, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
@@ -768,6 +791,7 @@ mod tests {
         async fn create(
             &self,
             _request: CreateTokenRequest,
+            _actor: &ChangeActor,
         ) -> Result<CreatedToken, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
@@ -841,6 +865,7 @@ mod tests {
         async fn create(
             &self,
             _request: CreateTokenRequest,
+            _actor: &ChangeActor,
         ) -> Result<CreatedToken, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
@@ -901,6 +926,7 @@ mod tests {
         async fn create(
             &self,
             _request: CreateTokenRequest,
+            _actor: &ChangeActor,
         ) -> Result<CreatedToken, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
@@ -964,6 +990,7 @@ mod tests {
             async fn create(
                 &self,
                 _request: CreateTokenRequest,
+                _actor: &ChangeActor,
             ) -> Result<CreatedToken, RepositoryError> {
                 unimplemented!("not needed by this validator test")
             }
