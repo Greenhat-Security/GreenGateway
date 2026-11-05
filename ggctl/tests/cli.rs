@@ -641,7 +641,9 @@ fn environment_files_are_validated_diagnosed_and_compared_without_echoing_a_valu
     let bundle = Bundle::new("{\"schema_version\": \"0.1.0\", \"default_action\": \"deny\"}\n");
     bundle.write(
         "base.env",
-        &format!("AUTH_ENABLED=true\nTLS_CERT_FILE=/run/tls/a.crt\nTLS_KEY_FILE=/run/{CANARY}/a.key\n"),
+        &format!(
+            "AUTH_ENABLED=true\nTLS_CERT_FILE=/run/tls/a.crt\nTLS_KEY_FILE=/run/{CANARY}/a.key\n"
+        ),
     );
     bundle.write(
         "candidate.env",
@@ -649,35 +651,35 @@ fn environment_files_are_validated_diagnosed_and_compared_without_echoing_a_valu
             "# reviewed\nexport AUTH_ENABLED=false\nTLS_CERT_FILE=/run/tls/a.crt\nTLS_KEY_FILE=/run/{CANARY}/b.key\n{CANARY}={CANARY}\n"
         ),
     );
-    bundle.write("refused.env", &format!("AUTH_MODE={CANARY}\nAUTH_MODE={CANARY}\n"));
-    let path = |name: &str| {
-        bundle
-            .0
-            .join(name)
-            .to_str()
-            .expect("UTF-8")
-            .to_owned()
-    };
+    bundle.write(
+        "refused.env",
+        &format!("AUTH_MODE={CANARY}\nAUTH_MODE={CANARY}\n"),
+    );
+    let path = |name: &str| bundle.0.join(name).to_str().expect("UTF-8").to_owned();
     let (base, candidate, refused) = (path("base.env"), path("candidate.env"), path("refused.env"));
 
     for command in ["validate", "doctor"] {
         let output = ggctl(&[command, "--env", &candidate, "--format", "json"], None);
         assert_eq!(output.status.code(), Some(0), "{command}");
-        let report = report(&output);
-        assert_eq!(report["command"], command);
+        let found = report(&output);
+        assert_eq!(found["command"], command);
         assert_no_canary(&output);
         assert_path_not_echoed(&output, &candidate);
 
         let output = ggctl(&[command, "--env", &refused, "--format", "json"], None);
         assert_eq!(output.status.code(), Some(3), "{command}");
-        let report = report(&output);
-        let codes: Vec<_> = report["diagnostics"]
+        let found = report(&output);
+        let codes: Vec<_> = found["diagnostics"]
             .as_array()
             .expect("diagnostics")
             .iter()
             .map(|diagnostic| diagnostic["code"].as_str().expect("code").to_owned())
             .collect();
-        assert_eq!(codes[..2], ["env.duplicate_key", "config.refused"], "{command}");
+        assert_eq!(
+            codes[..2],
+            ["env.duplicate_key", "config.refused"],
+            "{command}"
+        );
         assert_no_canary(&output);
 
         let output = ggctl(&[command, "--env", &refused], None);
@@ -687,7 +689,12 @@ fn environment_files_are_validated_diagnosed_and_compared_without_echoing_a_valu
         assert_path_not_echoed(&output, &refused);
     }
 
-    let output = ggctl(&["validate", "--env", &refused, "--strict", "--format", "sarif"], None);
+    let output = ggctl(
+        &[
+            "validate", "--env", &refused, "--strict", "--format", "sarif",
+        ],
+        None,
+    );
     assert_eq!(output.status.code(), Some(3));
     let log: Value = serde_json::from_slice(&output.stdout).expect("one SARIF log");
     assert_eq!(log["runs"][0]["results"][0]["ruleId"], "env.duplicate_key");
@@ -695,7 +702,16 @@ fn environment_files_are_validated_diagnosed_and_compared_without_echoing_a_valu
     assert_no_canary(&output);
 
     let output = ggctl(
-        &["diff", "--env", &candidate, "--against-env", &base, "--check", "--format", "json"],
+        &[
+            "diff",
+            "--env",
+            &candidate,
+            "--against-env",
+            &base,
+            "--check",
+            "--format",
+            "json",
+        ],
         None,
     );
     assert_eq!(output.status.code(), Some(4));
@@ -706,7 +722,10 @@ fn environment_files_are_validated_diagnosed_and_compared_without_echoing_a_valu
         .contains(&json!("risk.auth_disabled")));
     assert_no_canary(&output);
 
-    let output = ggctl(&["diff", "--env", &candidate, "--against", bundle.path()], None);
+    let output = ggctl(
+        &["diff", "--env", &candidate, "--against", bundle.path()],
+        None,
+    );
     assert_eq!(output.status.code(), Some(3));
     assert!(text(&output.stderr).contains("diff.not_comparable"));
 

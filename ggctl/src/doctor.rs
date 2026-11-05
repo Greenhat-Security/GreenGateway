@@ -451,12 +451,7 @@ pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
     )
 }
 
-fn human(
-    result: &DoctorResult,
-    title: &str,
-    failed: bool,
-    out: &mut dyn Write,
-) -> io::Result<()> {
+fn human(result: &DoctorResult, title: &str, failed: bool, out: &mut dyn Write) -> io::Result<()> {
     writeln!(out, "{title}: offline checks")?;
     let width = result
         .checks

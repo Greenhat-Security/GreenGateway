@@ -43,7 +43,11 @@ pub(crate) fn read(invocation: &Invocation, strict: bool) -> Option<BundleRead> 
 
 /// Reads the bundle in the directory `path`.
 pub(crate) fn read_path(path: &OsStr, strict: bool) -> BundleRead {
-    bundle::read_bundle(Path::new(path), ReadOptions { strict }, &PublishedSchemasOnly)
+    bundle::read_bundle(
+        Path::new(path),
+        ReadOptions { strict },
+        &PublishedSchemasOnly,
+    )
 }
 
 /// What a command that takes `(BUNDLE | --env FILE)` was given.

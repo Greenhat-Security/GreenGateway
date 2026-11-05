@@ -225,7 +225,10 @@ mod tests {
             Some("/srv/policy-2.json")
         );
         assert_eq!(file.line("POLICY_FILE"), Some(7));
-        assert_eq!(value(&file, "TOOLS_FILE").as_deref(), Some("/srv/tools.json"));
+        assert_eq!(
+            value(&file, "TOOLS_FILE").as_deref(),
+            Some("/srv/tools.json")
+        );
         assert_eq!(value(&file, "BLANK").as_deref(), Some(""));
         assert_eq!(value(&file, "WITH_EQUALS").as_deref(), Some("a=b=c"));
         assert_eq!(file.var("UNSET"), Err(VarError::NotPresent));

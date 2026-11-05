@@ -159,7 +159,10 @@ fn findings_are_located_by_line_and_setting_and_never_carry_a_value() {
     assert_eq!(found["result"]["valid"], false);
     assert_eq!(found["result"]["environment"]["duplicateKeys"], 1);
     let rows = findings(&found);
-    assert_eq!(rows[0], finding("env.malformed_line", "error", Some(3), None, None));
+    assert_eq!(
+        rows[0],
+        finding("env.malformed_line", "error", Some(3), None, None)
+    );
     assert_eq!(
         rows[1],
         finding(
@@ -193,7 +196,10 @@ fn findings_are_located_by_line_and_setting_and_never_carry_a_value() {
         Some("value")
     )));
     let first = &found["diagnostics"][0];
-    assert_eq!(first["location"], serde_json::json!({"argument": 2, "line": 3}));
+    assert_eq!(
+        first["location"],
+        serde_json::json!({"argument": 2, "line": 3})
+    );
     assert_eq!(first["remediation"], "docs/ggctl.md#env-diagnostics");
     assert_no_canary(&captured);
     file.assert_not_echoed(&captured);
@@ -328,16 +334,13 @@ fn the_file_must_be_a_bounded_utf8_regular_file() {
     assert_eq!(exit, Exit::Failure);
     let found = report(&captured);
     assert_eq!(codes(&found), ["env.unreadable"]);
-    assert_eq!(found["diagnostics"][0]["location"], serde_json::json!({"argument": 2}));
+    assert_eq!(
+        found["diagnostics"][0]["location"],
+        serde_json::json!({"argument": 2})
+    );
     assert!(found["result"].get("environment").is_none());
 
-    let (exit, captured) = run(&[
-        "validate",
-        "--env",
-        fixture.path(),
-        "--format",
-        "json",
-    ]);
+    let (exit, captured) = run(&["validate", "--env", fixture.path(), "--format", "json"]);
     assert_eq!(exit, Exit::Invalid);
     assert_eq!(codes(&report(&captured)), ["env.not_regular_file"]);
 
@@ -376,10 +379,24 @@ fn exactly_one_source_is_required_and_usage_errors_write_no_report() {
     for words in [
         &["validate", "--format", "json"][..],
         &["doctor", "--format", "json"],
-        &["validate", bundle.path(), "--env", file.path(), "--format", "json"],
+        &[
+            "validate",
+            bundle.path(),
+            "--env",
+            file.path(),
+            "--format",
+            "json",
+        ],
         &["doctor", bundle.path(), "--env", file.path()],
         &["diff", "--env", file.path(), "--format", "json"],
-        &["diff", bundle.path(), "--env", file.path(), "--against", bundle.path()],
+        &[
+            "diff",
+            bundle.path(),
+            "--env",
+            file.path(),
+            "--against",
+            bundle.path(),
+        ],
         &[
             "diff",
             "--env",
@@ -438,13 +455,38 @@ fn the_doctor_requires_a_compiling_file_and_only_advises_on_the_production_profi
         statuses,
         expected(&[
             ("environment.file", "error", "pass", "doctor.passed"),
-            ("environment.duplicate_keys", "warning", "pass", "doctor.passed"),
+            (
+                "environment.duplicate_keys",
+                "warning",
+                "pass",
+                "doctor.passed"
+            ),
             ("environment.compiler", "error", "pass", "doctor.passed"),
-            ("production.authentication", "warning", "pass", "doctor.passed"),
-            ("production.policy", "warning", "skipped", "doctor.policy_not_read"),
+            (
+                "production.authentication",
+                "warning",
+                "pass",
+                "doctor.passed"
+            ),
+            (
+                "production.policy",
+                "warning",
+                "skipped",
+                "doctor.policy_not_read"
+            ),
             ("production.csrf", "warning", "pass", "doctor.passed"),
-            ("production.private_egress", "warning", "pass", "doctor.passed"),
-            ("production.audit_durability", "warning", "pass", "doctor.passed"),
+            (
+                "production.private_egress",
+                "warning",
+                "pass",
+                "doctor.passed"
+            ),
+            (
+                "production.audit_durability",
+                "warning",
+                "pass",
+                "doctor.passed"
+            ),
             (
                 "production.client_secrets",
                 "warning",
@@ -596,7 +638,9 @@ fn two_files_are_compared_by_their_compiled_plans() {
     assert!(captured
         .stdout()
         .contains("AUTH_ENABLED  modified true -> false, restart, loosened  [risk.auth_disabled]"));
-    assert!(captured.stderr().starts_with("ggctl: error: diff.drift_found: "));
+    assert!(captured
+        .stderr()
+        .starts_with("ggctl: error: diff.drift_found: "));
     assert_no_canary(&captured);
 
     let (exit, captured) = run(&[
@@ -659,8 +703,10 @@ fn an_invalid_file_or_a_bundle_on_the_other_side_is_not_compared() {
         assert_eq!(exit, Exit::Invalid, "{words:?}");
         let found = report(&captured);
         assert_eq!(found["result"]["valid"], false);
-        assert!(found["result"]["environment"].is_object()
-            || found["result"]["againstEnvironment"].is_object());
+        assert!(
+            found["result"]["environment"].is_object()
+                || found["result"]["againstEnvironment"].is_object()
+        );
         assert!(found["result"]["bundle"].is_object() || found["result"]["against"].is_object());
         assert!(found["result"].get("diff").is_none());
         let not_comparable = found["diagnostics"]
@@ -721,7 +767,9 @@ fn every_compiler_rule_is_documented_and_in_the_report_schema() {
         .find("\n### Configuration rules\n")
         .expect("docs/ggctl.md has a `### Configuration rules` section");
     let section = &reference[start + 1..];
-    let section = &section[..section[1..].find("\n#").map_or(section.len(), |end| end + 1)];
+    let section = &section[..section[1..]
+        .find("\n#")
+        .map_or(section.len(), |end| end + 1)];
     let documented: Vec<_> = section
         .lines()
         .filter_map(|line| line.strip_prefix("| `"))

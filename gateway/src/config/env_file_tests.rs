@@ -38,7 +38,10 @@ const PARITY_FIXTURES: &[(&str, &[(&str, &str)])] = &[
         "the admin listener on the data listener's address",
         &[("ADMIN_LISTEN_ADDR", "0.0.0.0:8080")],
     ),
-    ("an unknown authentication mode", &[("AUTH_MODE", "zqcanary")]),
+    (
+        "an unknown authentication mode",
+        &[("AUTH_MODE", "zqcanary")],
+    ),
     (
         "authentication observed, CSRF off and private egress allowed",
         &[
@@ -104,7 +107,10 @@ const PARITY_FIXTURES: &[(&str, &[(&str, &str)])] = &[
     ),
     (
         "an unparseable identity provider document",
-        &[("AUTH_PROVIDERS", "[{\"name\":\"corp\",\"type\":\"zqcanary\"}")],
+        &[(
+            "AUTH_PROVIDERS",
+            "[{\"name\":\"corp\",\"type\":\"zqcanary\"}",
+        )],
     ),
     (
         "proxy headers trusted from no network",
@@ -179,10 +185,7 @@ fn ggctl_reaches_the_gateways_verdict_on_every_parity_fixture() {
     for (name, fixture) in PARITY_FIXTURES {
         let expected = variables(fixture);
         let gateway = Config::from_env_vars(|variable| {
-            expected
-                .get(variable)
-                .cloned()
-                .ok_or(VarError::NotPresent)
+            expected.get(variable).cloned().ok_or(VarError::NotPresent)
         });
         match &gateway {
             Ok(_) => accepted += 1,
@@ -204,7 +207,11 @@ fn ggctl_reaches_the_gateways_verdict_on_every_parity_fixture() {
                 (ggctl, _) => panic!(
                     "{name}: ggctl {} what the gateway {}",
                     if ggctl.is_ok() { "accepts" } else { "refuses" },
-                    if gateway.is_ok() { "accepts" } else { "refuses" },
+                    if gateway.is_ok() {
+                        "accepts"
+                    } else {
+                        "refuses"
+                    },
                 ),
             }
         }

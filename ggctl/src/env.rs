@@ -69,13 +69,13 @@ pub(crate) fn source<'a>(
         }
         (Some(bundle), None) => Ok(Source::Bundle(bundle)),
         (None, Some((argument, path))) => Ok(Source::Env { argument, path }),
-        (None, None) => Err(
-            Diagnostic::new(Code::MissingArgument).with_hint(if option == "--env" {
+        (None, None) => Err(Diagnostic::new(Code::MissingArgument).with_hint(
+            if option == "--env" {
                 HINT_SOURCE
             } else {
                 HINT_BASE
-            }),
-        ),
+            },
+        )),
     }
 }
 

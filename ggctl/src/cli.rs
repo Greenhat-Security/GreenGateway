@@ -373,7 +373,14 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
              could not be read. --format sarif reports each risk code of each change as a result.",
         ],
         arguments: &[BUNDLE_OR_ENV],
-        options: &[ENV, AGAINST, AGAINST_ENV, CHECK, STRICT_OR_ENV, VALIDATE_FORMAT],
+        options: &[
+            ENV,
+            AGAINST,
+            AGAINST_ENV,
+            CHECK,
+            STRICT_OR_ENV,
+            VALIDATE_FORMAT,
+        ],
         run: crate::diff::run,
     },
     CommandSpec {
