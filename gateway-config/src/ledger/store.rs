@@ -190,12 +190,22 @@ fn failure(operation: &'static str) -> impl Fn(rusqlite::Error) -> LedgerError {
     }
 }
 
-fn connect(path: &Path) -> Result<Connection, LedgerError> {
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(failure("open"))?;
+/// How a connection opens the ledger file. Neither creates it.
+#[derive(Clone, Copy)]
+enum Access {
+    ReadWrite,
+    /// SQLite refuses every write through the connection, including a
+    /// journal-mode change and a checkpoint into the database file.
+    ReadOnly,
+}
+
+fn connect(path: &Path, access: Access) -> Result<Connection, LedgerError> {
+    let mode = match access {
+        Access::ReadWrite => OpenFlags::SQLITE_OPEN_READ_WRITE,
+        Access::ReadOnly => OpenFlags::SQLITE_OPEN_READ_ONLY,
+    };
+    let connection = Connection::open_with_flags(path, mode | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .map_err(failure("open"))?;
     // Defensive mode refuses the statements that can corrupt a database
     // file; an untrusted schema may not call functions with side effects.
     connection
@@ -217,7 +227,7 @@ fn connect(path: &Path) -> Result<Connection, LedgerError> {
 /// a ledger is refused before anything changes it, including its journal
 /// mode.
 pub(super) fn open(path: &Path) -> Result<Connection, LedgerError> {
-    let connection = connect(path)?;
+    let connection = connect(path, Access::ReadWrite)?;
     check_header(&connection)?;
     let mode: String = connection
         .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
@@ -230,6 +240,15 @@ pub(super) fn open(path: &Path) -> Result<Connection, LedgerError> {
     Ok(connection)
 }
 
+/// Opens an existing ledger file for reading only: whatever its journal mode,
+/// nothing through this connection changes the file. A file that is not a
+/// ledger is refused before anything else is read.
+pub(super) fn open_read_only(path: &Path) -> Result<Connection, LedgerError> {
+    let connection = connect(path, Access::ReadOnly)?;
+    check_header(&connection)?;
+    Ok(connection)
+}
+
 /// Writes a new ledger into the empty database file at `path`: the header,
 /// the schema, the seed's documents and record, and the pointer, in one
 /// immediate transaction, then closes it. The file stays in rollback-journal
@@ -239,7 +258,7 @@ pub(super) fn initialize(
     pending: Pending,
     files: &[SourceFile],
 ) -> Result<(), LedgerError> {
-    let mut connection = connect(path)?;
+    let mut connection = connect(path, Access::ReadWrite)?;
     if pending.request().is_some() {
         // A seed is an offline operator command and is never requested.
         return Err(LedgerError::Refused(super::Refusal::SeedNotAppendable));

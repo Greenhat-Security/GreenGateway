@@ -117,7 +117,8 @@ impl PolicySchema {
     }
 
     /// The document format major the cluster roster advertises a range of
-    /// (`cluster_membership::DOCUMENT_VERSION_RANGE` in the gateway).
+    /// (`cluster_membership::DOCUMENT_VERSION_RANGE` in the gateway, `0..=1`
+    /// in this build).
     pub const fn document_format_major(self) -> i32 {
         match self {
             Self::V0 => 0,
@@ -413,7 +414,8 @@ impl IssueCode {
                  configuration"
             }
             Self::DocumentFormatUnsupportedInCluster => {
-                "cluster mode does not yet commit documents of this schema_version"
+                "not every live replica of this cluster can be shown to read documents of this \
+                 schema_version, so cluster mode does not commit one yet"
             }
             Self::PolicyFileTooLarge => {
                 "the policy as a policy file holds it would be larger than a policy file may be"
@@ -599,8 +601,8 @@ impl IssueCode {
                  current UPSTREAM_ROUTES."
             }
             Self::DocumentFormatUnsupportedInCluster => {
-                "Keep a cluster deployment on a 0.x document until a release that gates v1 \
-                 documents on every replica's capability."
+                "Finish the rollout so every replica runs a release that serves this document \
+                 format, or wait for departed replicas to go stale, then publish again."
             }
             Self::PolicyFileTooLarge => {
                 "Keep the pretty-printed document, as the gateway writes a policy file, within \

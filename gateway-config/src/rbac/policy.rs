@@ -345,6 +345,14 @@ impl Policy {
         self.roles.values().any(|role| role.description.is_some())
     }
 
+    /// Whether this is a policy v1 document (document format 1), which a
+    /// gateway that does not serve format 1 in cluster mode refuses.
+    /// Cluster-mode writers ask the operation gate before committing one
+    /// (the gateway's `storage::compatibility::POLICY_DOCUMENT_V1`).
+    pub fn is_document_format_v1(&self) -> bool {
+        PolicySchema::of_version(&self.schema_version) == Some(PolicySchema::V1)
+    }
+
     /// The exact bytes the gateway's `persist_to_file` writes: the
     /// pretty-printed document and a final newline. Refused when they exceed
     /// [`MAX_POLICY_FILE_BYTES`], the bound the gateway's `from_file` reads a

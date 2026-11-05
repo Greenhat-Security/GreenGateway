@@ -1038,7 +1038,7 @@ fn a_deployment_refusal_blocks_publication_without_hiding_the_document() {
     inspection.refuse(
         IssueCode::DocumentFormatUnsupportedInCluster,
         "/schema_version",
-        "cluster mode reads only 0.x documents".to_owned(),
+        "a live replica does not read document format 1".to_owned(),
     );
 
     assert!(!inspection.is_valid());
@@ -1056,7 +1056,7 @@ fn a_deployment_refusal_blocks_publication_without_hiding_the_document() {
     );
     assert_eq!(
         inspection.into_policy().expect_err("refused"),
-        vec!["cluster mode reads only 0.x documents".to_owned()]
+        vec!["a live replica does not read document format 1".to_owned()]
     );
 }
 

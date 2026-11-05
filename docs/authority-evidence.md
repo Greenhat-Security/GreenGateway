@@ -90,6 +90,7 @@ or unconfigured individual stores.
 | --- | --- | --- |
 | Policy publish, rollback, rule edits and suggestion acceptance | Immutable document/history, actor subject, action/diff, active pointer, shared revision and outbox, plus one non-cascading `document_change_evidence` row (operation code, event/operation UUIDs, actor kind, subject, issuer and auth mode, prior/new version, the outbox row's shared revision, database-clock time) in the same transaction; suggestion acceptance composes its own state, and so its evidence, in the same transaction | Caller-bound operation identity, safe-reference projection, durable delivery and retention |
 | Tools publication | Shared document transaction plus name reservations and the same `document_change_evidence` row; the first-boot seed and the import's activation are recorded as system actors | Same as policy |
+| Stored policy test suite (`policy_tests.publish`, migration 29) | Shared document transaction over its own versions and active pointer, plus the same `document_change_evidence` row, with resource type `policy_tests` | Same as policy. The proposed event names it as a `policy` resource on its own `policy_tests` revision axis, because its versions are not policy versions. Standalone records only the writer's subject on the version row, so `required` refuses the write there |
 | Connection and credential binding changes | Record, bindings, immutable version, shared revision and outbox, plus since migration 28 a non-cascading `connection_change_evidence` row per committed create (`connection.create`, no prior version and version 1) and replace (`connection.replace`, prior and new specification version), and a `credential.binding_change` row on the credential axis (prior and new credential revision) under the same operation ID and shared revision when a replace advances the credential revision: actor (subject, kind, auth mode, canonical issuer), event/operation UUIDs, the outbox row's shared revision, database-clock time, journaled and delivered in the change's transaction. An identical replace records nothing. No binding, secret ID or locator enters a row. Standalone writes the same rows, without a shared revision, in the Connections database's own transaction ([Standalone evidence](#standalone-evidence)) | A caller-bound operation identity and an issuer-scoped subject reference; Connections created or replaced before migration 28 keep only their cascading version history; standalone evidence is not delivered |
 | Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) and its journal row in the same transaction; delivered with keyed safe references since PR 3; since migration 24 the actor's kind, auth mode and canonical issuer too. Standalone writes the same deletion evidence, without a shared revision, in the Connections database's own transaction | A caller-bound operation identity and an issuer-scoped subject reference, without which the delivered record cannot be `authority_event.v1`; standalone evidence is not delivered |
 | Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox, plus one non-cascading `catalog_change_evidence` row (action derived from the write, event/operation UUIDs, actor subject, catalog revision transition, compiled overlay revision, shared revision, database-clock time) that outlives the replacement and the Connection's deletion | Issuer/auth mode, caller-bound operation identity, journaling for delivery |
@@ -839,8 +840,10 @@ Enforcement:
   naming the inventory operation code and nothing from the request. Every policy
   mutation asks at `commit_policy_mutation`, the commit path they share (so draft
   publication asks as `policy.publish`, and its own `policy.draft_publish_refused`
-  record carries the same reason), and suggestion acceptance asks as
-  `policy.suggestion.accept` before its rule is written. A catalog refresh asks as
+  record carries the same reason), suggestion acceptance asks as
+  `policy.suggestion.accept` before its rule is written, and a stored policy test
+  suite write (`PUT .../policy/tests`) asks as `policy_tests.publish` before its
+  body is read. A catalog refresh asks as
   the MCP or OpenAPI publication its discovery names; an OpenAPI catalog
   registration asks as `catalog.openapi.publish`, an overlay write or removal as
   `catalog.overlay.replace` or `catalog.overlay.delete`. Connection and local-secret
@@ -1012,7 +1015,8 @@ only against the loopback database.
    commit, so suggestion acceptance, which runs it inside its own transaction,
    records its evidence there too. Each handler names its operation explicitly
    (`policy.publish`, `policy.rollback`, `policy.rule.create`/`update`/`delete`/`reorder`,
-   `policy.suggestion.accept`, `tools.publish`), the import's activations are
+   `policy.suggestion.accept`, `tools.publish`, and since migration 29
+   `policy_tests.publish` for the stored policy test suite), the import's activations are
    `configuration.import`, and the actor is recorded as the principal presented it --
    kind, subject, issuer and auth mode, within the principal bounds -- or as the
    gateway (`bootstrap` for the first-boot tools seed, `import-standalone` for the

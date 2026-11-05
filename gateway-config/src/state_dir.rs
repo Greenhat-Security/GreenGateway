@@ -112,6 +112,20 @@ impl StateFile {
         Self::ConfigLedger,
     ];
 
+    /// The store's stable identifier, as a backup manifest names it
+    /// ([`crate::backup`]). Like the file name, it never changes meaning.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Audit => "audit",
+            Self::Discovery => "discovery",
+            Self::Principals => "principals",
+            Self::Connections => "connections",
+            Self::ServiceTokens => "service_tokens",
+            Self::PolicyHistory => "policy_history",
+            Self::ConfigLedger => "config_ledger",
+        }
+    }
+
     /// The file's name beneath the state directory.
     pub const fn file_name(self) -> &'static str {
         match self {

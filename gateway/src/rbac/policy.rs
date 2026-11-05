@@ -103,8 +103,11 @@ pub(crate) trait ClusterDocumentFormat {
     /// Whether a cluster replica of this build reads and writes this
     /// policy's document format: `0` for a 0.x document, `1` for policy v1,
     /// which must lie in `cluster_membership::DOCUMENT_VERSION_RANGE`, the
-    /// range every replica advertises on the roster. A `schema_version` that
-    /// names no schema this build implements is never served.
+    /// range every replica of this build advertises on the roster (`0..=1`).
+    /// A `schema_version` that names no schema this build implements is
+    /// never served. That a replica of this build serves a format is not
+    /// that every live member does: committing a v1 document also asks the
+    /// operation gate.
     fn cluster_serves_document_format(&self) -> bool;
 }
 

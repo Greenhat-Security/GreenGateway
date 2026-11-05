@@ -49,7 +49,9 @@ pub(crate) use gateway_config::auth::MIN_JWKS_KEY_AGE_SECS_LIMIT;
 /// The `exp` leeway the validator grants (jsonwebtoken's default, made
 /// explicit): a token is accepted until `exp + leeway`, so a revocation
 /// keyed on the token's `exp` must stay effective at least that long past
-/// it. The revocation store retains rows for exactly this leeway.
+/// it. The PostgreSQL revocation store retains rows for this leeway plus
+/// its `REVOCATION_RETENTION_MARGIN_SECS`, and a unit test holds the two
+/// together. The same leeway applies to `nbf`.
 pub const JWT_EXP_LEEWAY_SECS: u64 = 60;
 
 /// JWT bearer-token validator configuration.

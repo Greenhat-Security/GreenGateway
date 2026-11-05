@@ -467,7 +467,7 @@ ggctl rollback REVISION --server URL --if-match ETAG --plan PLAN_ID [--acknowled
 ggctl export --server URL --output DIR [--template]
 ggctl ledger seed BUNDLE --state-dir DIR
 ggctl ledger verify --state-dir DIR
-ggctl ledger rollback REVISION --state-dir DIR
+ggctl ledger rollback REVISION --state-dir DIR [--acknowledge RISK_CODE]...
 ggctl backup create --state-dir DIR --output FILE
 ggctl backup verify FILE
 ggctl backup restore FILE --state-dir DIR

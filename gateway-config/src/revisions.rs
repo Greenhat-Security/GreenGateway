@@ -44,6 +44,13 @@
 //!   revision under the same rules. It restores configuration only: never
 //!   database schema, secret material, Connections or revoked credentials,
 //!   none of which a ledger holds.
+//! - **Offline rollback.** [`RevisionService::apply_offline_rollback`] is
+//!   the lockout recovery path of ADR-0008 ("Recovery and lockout"), for
+//!   `ggctl ledger rollback` with the gateway stopped and the state
+//!   directory's lock held: the same rollback plan, held to the head and
+//!   recompiled the same way, with every risk code acknowledged explicitly,
+//!   `risk.admin_access_path_removed` included, and no online request. Only
+//!   a system actor may use it.
 //! - **History and operations.** [`RevisionService::history`] pages the
 //!   ledger newest first, and [`RevisionService::operation`] reads what a
 //!   request with a given idempotency key made, which is what a client reads
@@ -81,9 +88,9 @@ use crate::bundle::{
 };
 use crate::canonical_json;
 use crate::ledger::{
-    is_idempotency_key, ActivationClass, LedgerActor, LedgerError, LedgerState, Operation, PlanId,
-    Proposal, RevisionCodes, RevisionId, RevisionLedger, RevisionRequest, RevisionSummary,
-    MAX_REVISION_PAGE,
+    is_idempotency_key, ActivationClass, ActorKind, LedgerActor, LedgerError, LedgerState,
+    Operation, PlanId, Proposal, RevisionCodes, RevisionId, RevisionLedger, RevisionRequest,
+    RevisionSummary, MAX_REVISION_PAGE,
 };
 use crate::rbac::Policy;
 use crate::semantic_diff::{
@@ -282,6 +289,19 @@ pub struct ApplyRequest {
     pub stage_only: bool,
 }
 
+/// The apply of a rollback plan by an offline operator command
+/// ([`RevisionService::apply_offline_rollback`]).
+#[derive(Clone, Debug)]
+pub struct OfflineRollback {
+    pub plan: PlanId,
+    /// The command's fixed system actor, which must own the plan.
+    pub actor: LedgerActor,
+    /// The rollback target again: what the plan proposed.
+    pub target: RevisionId,
+    /// The risk codes the operator acknowledged, each named on its own.
+    pub acknowledged: Vec<String>,
+}
+
 /// What an apply did.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Applied {
@@ -386,6 +406,9 @@ pub enum RevisionError {
     RestartRequired,
     /// `409`: a restart is pending, so a revision can only be staged.
     RestartPending,
+    /// Never served: an offline apply was asked for by an actor that is not
+    /// a system actor. Only an offline operator command applies offline.
+    OfflineActorRequired,
     /// The ledger refused or failed: `ledger.unavailable` is `503`,
     /// `ledger.corrupt` stops the service, `ledger.full` is `409`.
     Ledger(LedgerError),
@@ -421,6 +444,7 @@ impl RevisionError {
             Self::Forbidden(_) => "apply.permission_denied",
             Self::RestartRequired => "apply.restart_required",
             Self::RestartPending => "apply.restart_pending",
+            Self::OfflineActorRequired => "apply.offline_actor_required",
             Self::Ledger(error) => error.code(),
         }
     }
@@ -496,6 +520,9 @@ impl fmt::Display for RevisionError {
             Self::RestartPending => {
                 "a restart is pending, so a new revision can only be staged"
             }
+            Self::OfflineActorRequired => {
+                "only an offline operator command, as a system actor, applies a revision offline"
+            }
             Self::Ledger(error) => return write!(formatter, "{error}"),
         };
         formatter.write_str(text)
@@ -543,6 +570,19 @@ struct Assessment<P, T> {
     changed_sections: Vec<&'static str>,
     required_permissions: Vec<&'static str>,
     activation: Option<ActivationClass>,
+}
+
+impl<P, T> Assessment<P, T> {
+    /// Whether `plan` still describes this assessment: the same operation,
+    /// digests, risk codes, permissions and activation class.
+    fn describes(&self, plan: &Plan) -> bool {
+        self.operation == plan.operation
+            && self.candidate.bundle.source_digest == plan.source_digest
+            && self.candidate.semantic_digest == plan.semantic_digest
+            && self.risk_codes == plan.risk_codes
+            && self.required_permissions == plan.required_permissions
+            && self.activation == plan.activation
+    }
 }
 
 /// Plans, acknowledgements and conditional applies over one ledger.
@@ -722,13 +762,7 @@ impl<C: PlanCompiler> RevisionService<C> {
             return Err(RevisionError::PlanStale);
         }
         let assessment = self.assess(request.subject, &state.desired)?;
-        if assessment.operation != plan.operation
-            || assessment.candidate.bundle.source_digest != plan.source_digest
-            || assessment.candidate.semantic_digest != plan.semantic_digest
-            || assessment.risk_codes != plan.risk_codes
-            || assessment.required_permissions != plan.required_permissions
-            || assessment.activation != plan.activation
-        {
+        if !assessment.describes(&plan) {
             return Err(RevisionError::PlanStale);
         }
         let activation = assessment.activation.ok_or(RevisionError::NoChange)?;
@@ -815,6 +849,96 @@ impl<C: PlanCompiler> RevisionService<C> {
                     .revision_for_request(&key)?
                     .ok_or(RevisionError::IdempotencyConflict)?;
                 self.replay(earlier, &binding)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Applies a rollback plan for an offline operator command, which has
+    /// stopped the gateway and holds the state directory's lock (ADR-0008,
+    /// "Recovery and lockout").
+    ///
+    /// The plan must be the actor's, made against the current head for this
+    /// target, and it is recompiled and held to the head exactly as
+    /// [`Self::apply`] holds a plan. Its risk codes must be acknowledged
+    /// exactly, no more and no fewer, and each is acknowledgeable here,
+    /// `risk.admin_access_path_removed` included: this is the recovery path
+    /// that code's online refusal points to. There is no online request, so
+    /// no `If-Match` or idempotency key, which the held lock makes needless,
+    /// and no permission check, because whoever can write the state
+    /// directory already controls the deployment. The plan's union of
+    /// permissions is still recorded with the revision.
+    ///
+    /// The revision records no request and is recorded `restart`-class
+    /// whatever its changes are, as a seed is: no gateway is running to
+    /// activate it, so only the desired pointer moves and the next start
+    /// compiles and activates it.
+    ///
+    /// Only a system actor applies offline
+    /// ([`RevisionError::OfflineActorRequired`] otherwise), so an
+    /// authenticated caller cannot reach this path.
+    pub fn apply_offline_rollback(
+        &mut self,
+        rollback: OfflineRollback,
+        now: SystemTime,
+    ) -> Result<Applied, RevisionError> {
+        if rollback.actor.kind() != ActorKind::System {
+            return Err(RevisionError::OfflineActorRequired);
+        }
+        self.expire(now);
+        let plan = self
+            .plans
+            .get(&rollback.plan)
+            .filter(|plan| same_actor(&plan.owner, &rollback.actor))
+            .cloned()
+            .ok_or(RevisionError::PlanUnknown)?;
+        let subject = PlanSubject::Rollback(rollback.target);
+        let state = self.ledger.state()?;
+        if plan.base != state.desired.revision || !subject_matches(&plan.operation, &subject) {
+            return Err(RevisionError::PlanStale);
+        }
+        let assessment = self.assess(subject, &state.desired)?;
+        if !assessment.describes(&plan) {
+            return Err(RevisionError::PlanStale);
+        }
+        if assessment.activation.is_none() {
+            return Err(RevisionError::NoChange);
+        }
+        offline_acknowledgement(&assessment.risk_codes, &rollback.acknowledged)?;
+        let codes = RevisionCodes::new(
+            &assessment.changed_sections,
+            &assessment
+                .risk_codes
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            &assessment.required_permissions,
+        )?;
+        let appended = self.ledger.append(
+            &plan.base,
+            Proposal {
+                bundle: &assessment.candidate.bundle,
+                actor: rollback.actor,
+                operation: assessment.operation,
+                activation: ActivationClass::Restart,
+                codes,
+                request: None,
+                recorded_at: now,
+            },
+        );
+        match appended {
+            Ok(revision) => {
+                self.plans.remove(&plan.id);
+                let state = self.ledger.state()?;
+                Ok(Applied::of(revision, false, &state))
+            }
+            // Another handle in this process moved the head in between: the
+            // ledger compared it again and wrote nothing.
+            Err(LedgerError::Stale { .. }) => {
+                let state = self.ledger.state()?;
+                Err(RevisionError::PreconditionFailed {
+                    current: revision_etag(&state.desired),
+                })
             }
             Err(error) => Err(error.into()),
         }
@@ -932,6 +1056,26 @@ fn unacknowledgeable(risk_codes: &[String]) -> Vec<&'static str> {
         .map(|risk| risk.as_str())
         .filter(|code| risk_codes.iter().any(|risk| risk == code))
         .collect()
+}
+
+/// Whether `acknowledged` names exactly `risk_codes`, as an offline apply
+/// requires. Every code is acknowledgeable offline, but only by name: there
+/// is nothing that acknowledges them all at once.
+fn offline_acknowledgement(
+    risk_codes: &[String],
+    acknowledged: &[String],
+) -> Result<(), RevisionError> {
+    let acknowledged: BTreeSet<&str> = acknowledged.iter().map(String::as_str).collect();
+    let expected: BTreeSet<&str> = risk_codes.iter().map(String::as_str).collect();
+    if acknowledged == expected {
+        Ok(())
+    } else if expected.is_empty() {
+        Err(RevisionError::NothingToAcknowledge)
+    } else if acknowledged.is_empty() {
+        Err(RevisionError::AcknowledgementRequired)
+    } else {
+        Err(RevisionError::AcknowledgementMismatch)
+    }
 }
 
 /// Whether an apply's subject is the one its plan proposed: a bundle for an
