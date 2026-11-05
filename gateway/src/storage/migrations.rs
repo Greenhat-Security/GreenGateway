@@ -4124,6 +4124,16 @@ mod tests {
             .await
             .expect("the probe rows go");
         drop(client);
+        // The migrations after 27 (28, policy analysis suppressions) touch
+        // nothing here; they apply, and then nothing is left.
+        assert_eq!(
+            apply_missing(foundation.pool(), &test_settings())
+                .await
+                .expect("the migrations after 27 apply"),
+            MigrateOutput::Applied {
+                applied: MANIFEST.len() - through_v26 - 1
+            }
+        );
         assert_eq!(
             apply_missing(foundation.pool(), &test_settings())
                 .await
