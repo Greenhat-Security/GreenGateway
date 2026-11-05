@@ -951,8 +951,8 @@ pub const FIELDS: &[Field] = &[
         },
         cloudflare: Cloudflare::Forwarded,
     },
-    // A host path that is neither one of ADR-0008's bootstrap inputs nor a
-    // bundle resource the ADR names.
+    // ADR-0008 makes this host path not representable in `v1alpha1`: managed
+    // Connections provide OpenAPI discovery.
     Field {
         id: "openapi_spec_path",
         environment: "OPENAPI_SPEC_PATH",
@@ -962,7 +962,7 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::HostPath,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Unplaced,
+        bundle: BundleMapping::NotRepresentable,
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1637,7 +1637,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::MayCarrySecret,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/authentication/providers"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1733,7 +1735,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::MayCarrySecret,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/upstream/routes"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
@@ -1745,7 +1749,9 @@ pub const FIELDS: &[Field] = &[
         blank: Blank::Unset,
         sensitivity: Sensitivity::MayCarrySecret,
         state_backends: StateBackends::Both,
-        bundle: BundleMapping::Deployment { path: None },
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/upstream/mcp_servers"),
+        },
         cloudflare: Cloudflare::Forwarded,
     },
     Field {

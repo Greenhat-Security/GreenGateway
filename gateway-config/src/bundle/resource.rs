@@ -18,8 +18,8 @@ use serde_json::Value;
 
 use super::{
     diagnostic::{BundleDiagnostic, Code, Pointer},
-    document::Profile,
     json,
+    profile::ProfileRules,
     source::FileName,
     syntax::{Node, SyntaxError, RESOURCE_LIMITS},
 };
@@ -66,13 +66,14 @@ fn compile(schema: &str) -> Option<jsonschema::Validator> {
 /// Checks a referenced policy document at the bundle boundary and returns
 /// its JSON value for the production validator.
 ///
-/// With the deployment's `profile`, the policy is also held to that
+/// With the deployment's profile, the policy is also held to that
 /// profile's invariants once it has passed its schema. A broken invariant is
-/// reported, and the production validator still runs, so every problem is.
+/// reported, an acknowledged one as a warning, and the production validator
+/// still runs, so every problem is.
 pub(crate) fn policy(
     text: &str,
     schema_version: &str,
-    profile: Option<Profile>,
+    profile: Option<&ProfileRules>,
     file: &FileName,
     diagnostics: &mut Vec<BundleDiagnostic>,
 ) -> Option<Value> {
@@ -96,8 +97,8 @@ pub(crate) fn policy(
         return None;
     }
     let value = published_schema(&POLICY_SCHEMA_VALIDATOR, value, file, diagnostics)?;
-    if let Some(profile) = profile {
-        super::profile::policy(profile, &node, file, diagnostics);
+    if let Some(rules) = profile {
+        super::profile::policy(rules, &node, file, diagnostics);
     }
     Some(value)
 }
