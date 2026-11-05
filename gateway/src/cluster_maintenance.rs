@@ -50,6 +50,16 @@
 //!   and lease rows expired for more than one TTL. A failing job is logged,
 //!   recorded in the ledger with its classified code, and never blocks the
 //!   next one.
+//! - **A step that overruns its budget closes the session.** The budget
+//!   drops the step's future at whatever `await` it had reached, so the
+//!   session's connection may still be running the step's statement and
+//!   may still be inside a transaction the step opened -- the admin session
+//!   prune's holds the authority-event journal's state row, which every
+//!   journaled change on every replica needs. Nothing more runs on that
+//!   connection and it never goes back to the pool: the step is recorded as
+//!   `timeout`, the session is closed (the server rolls the transaction
+//!   back and releases its locks and the advisory lock), and the pass ends
+//!   there. The jobs after it run on the next pass.
 //!
 //! Metrics: `cluster_maintenance_leader` (1 while this replica leads),
 //! `cluster_maintenance_job_runs_total{job,outcome}`, and
@@ -104,9 +114,9 @@ pub(crate) static MAINTENANCE_LOCK_KEY: LazyLock<i64> =
 /// at this; a backlog larger than it is drained one step per interval.
 pub(crate) const JOB_STEP_LIMIT: u32 = 1_000;
 
-/// Wall time one job step may take before it is recorded as `timeout` and
-/// the pass moves on. The database's `statement_timeout` bounds the
-/// statement itself; this bounds the job as the ledger sees it.
+/// Wall time one job step may take before it is recorded as `timeout`, its
+/// session is closed and the pass ends. The database's `statement_timeout`
+/// bounds the statement itself; this bounds the job as the ledger sees it.
 const JOB_BUDGET: Duration = Duration::from_secs(30);
 
 /// The floor under the acquisition backoff, so a tiny test interval does
@@ -520,6 +530,11 @@ pub(crate) enum PassOutcome {
     /// The dedicated session's connection was lost mid-pass; the
     /// remaining jobs did not run.
     ConnectionLost,
+    /// A job step overran its budget. It was recorded as `timeout` and its
+    /// session closed rather than reused or returned to the pool, because
+    /// the step was cut short at a point nobody chose; the remaining jobs
+    /// did not run.
+    TimedOut,
 }
 
 /// How a one-shot `gateway maintenance-run` ended.
@@ -540,6 +555,9 @@ pub(crate) struct MaintenanceRunner {
     jobs: Vec<Arc<dyn MaintenanceJob>>,
     interval: Duration,
     instance_id: Uuid,
+    /// Wall time one job step may take: [`JOB_BUDGET`], or less in a test
+    /// that overruns it on purpose.
+    job_budget: Duration,
     leading: AtomicBool,
     passes_completed: AtomicU64,
 }
@@ -562,9 +580,21 @@ impl MaintenanceRunner {
             jobs,
             interval,
             instance_id,
+            job_budget: JOB_BUDGET,
             leading: AtomicBool::new(false),
             passes_completed: AtomicU64::new(0),
         })
+    }
+
+    /// The same runner with a shorter step budget, so a test can overrun
+    /// it without waiting [`JOB_BUDGET`] out. Call it before the runner is
+    /// shared.
+    #[cfg(test)]
+    pub(crate) fn with_job_budget_for_test(mut self: Arc<Self>, budget: Duration) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("the runner is configured before it is shared")
+            .job_budget = budget;
+        self
     }
 
     /// Whether this replica holds the maintenance lease right now.
@@ -811,9 +841,10 @@ impl MaintenanceRunner {
     /// then for each job in order probe the session, stamp the start,
     /// run the bounded step *on the session's connection* under its
     /// budget, and record the outcome -- stopping at the first fenced
-    /// write the ledger refuses, and cancelling at the first sign the
-    /// session is gone. A pass that stops for any reason but a lost
-    /// session unlocks and returns its connection; a lost one is closed.
+    /// write the ledger refuses, at the first step that overruns its
+    /// budget, and cancelling at the first sign the session is gone. A pass
+    /// that stops for any other reason unlocks and returns its connection;
+    /// a lost session, and one an overrun step was cut short on, is closed.
     pub(crate) async fn run_pass(&self, fence: i64) -> PassOutcome {
         let mut session = match DedicatedSession::acquire(&self.pool, *MAINTENANCE_LOCK_KEY).await {
             Ok(session) => session,
@@ -830,7 +861,10 @@ impl MaintenanceRunner {
             }
         };
         let outcome = self.run_jobs(&mut session, fence).await;
-        if outcome != PassOutcome::ConnectionLost {
+        // A lost session has no connection left to unlock, and `run_jobs`
+        // has already closed the one an overrun step was cut short on:
+        // neither goes back to the pool.
+        if !matches!(outcome, PassOutcome::ConnectionLost | PassOutcome::TimedOut) {
             if let Err(error) = session.release().await {
                 tracing::warn!(error = %error, fence, "maintenance session unlock failed; the connection was closed instead");
             }
@@ -863,8 +897,9 @@ impl MaintenanceRunner {
                 return PassOutcome::ConnectionLost;
             };
             let started = Instant::now();
-            let result = tokio::time::timeout(JOB_BUDGET, job.run_step(client)).await;
+            let result = tokio::time::timeout(self.job_budget, job.run_step(client)).await;
             let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+            let mut overran = false;
             let outcome = match result {
                 Ok(Ok(affected)) => {
                     tracing::debug!(
@@ -891,12 +926,24 @@ impl MaintenanceRunner {
                     }
                 }
                 Err(_) => {
+                    // The budget dropped the step wherever it was parked:
+                    // its statement may still be running on this
+                    // connection, inside a transaction the step opened and
+                    // never ended. The admin session prune's holds the
+                    // authority-event journal's state row. The next job's
+                    // statements would run inside that transaction, and
+                    // the release would hand it to the pool still open, so
+                    // the session is closed now, before anything else is
+                    // awaited: the server rolls the transaction back and
+                    // releases its locks once that statement has ended.
+                    session.close();
+                    overran = true;
                     tracing::warn!(
                         job = name,
+                        fence,
                         duration_ms,
-                        "maintenance job step exceeded its budget"
+                        "maintenance job step exceeded its budget; the session was closed and the pass ends"
                     );
-                    failed_jobs += 1;
                     JobOutcome::Failure {
                         code: "timeout".to_owned(),
                         duration_ms,
@@ -918,6 +965,9 @@ impl MaintenanceRunner {
                 Err(error) => {
                     tracing::warn!(error = %error, job = name, fence, "maintenance job outcome could not be recorded");
                 }
+            }
+            if overran {
+                return PassOutcome::TimedOut;
             }
         }
         PassOutcome::Completed { failed_jobs }

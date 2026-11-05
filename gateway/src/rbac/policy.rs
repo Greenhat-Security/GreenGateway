@@ -300,6 +300,30 @@ pub enum PolicyError {
     EgressReloadRejected,
 }
 
+/// Why [`Policy::persisted_bytes`] produced no bytes.
+#[derive(Debug)]
+pub(crate) enum PersistedPolicyError {
+    Serialize(serde_json::Error),
+    /// The policy file would be `len` bytes, more than
+    /// [`MAX_POLICY_FILE_BYTES`].
+    TooLarge {
+        len: usize,
+    },
+}
+
+impl fmt::Display for PersistedPolicyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Serialize(source) => write!(formatter, "failed to serialize policy: {source}"),
+            Self::TooLarge { len } => write!(
+                formatter,
+                "the policy file would be {len} bytes, more than the maximum size of \
+                 {MAX_POLICY_FILE_BYTES} bytes a policy file is read under"
+            ),
+        }
+    }
+}
+
 impl Policy {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, PolicyError> {
         let path = path.as_ref();
@@ -356,6 +380,25 @@ impl Policy {
             .is_some_and(|schema| (minimum..=maximum).contains(&schema.document_format_major()))
     }
 
+    /// The exact bytes [`Self::persist_to_file`] writes: the pretty-printed
+    /// document and a final newline. Refused when they exceed
+    /// [`MAX_POLICY_FILE_BYTES`], the bound [`Self::from_file`] reads a
+    /// policy file under, so the gateway never writes a policy file it would
+    /// then refuse to read back. The pretty form is larger than the compact
+    /// one a request body or a draft is measured in, so a writer asks this
+    /// before anything is written.
+    pub(crate) fn persisted_bytes(&self) -> Result<Vec<u8>, PersistedPolicyError> {
+        let mut contents =
+            serde_json::to_vec_pretty(self).map_err(PersistedPolicyError::Serialize)?;
+        contents.push(b'\n');
+        if contents.len() as u64 > MAX_POLICY_FILE_BYTES {
+            return Err(PersistedPolicyError::TooLarge {
+                len: contents.len(),
+            });
+        }
+        Ok(contents)
+    }
+
     #[allow(dead_code)]
     pub fn persist_to_file(&self, path: impl AsRef<Path>) -> Result<(), PolicyError> {
         self.persist_to_file_with_rename(path.as_ref(), |temp_path, target_path| {
@@ -368,12 +411,24 @@ impl Policy {
     where
         F: FnOnce(&Path, &Path) -> io::Result<()>,
     {
-        let mut contents =
-            serde_json::to_vec_pretty(self).map_err(|source| PolicyError::Serialize {
-                path: path.to_owned(),
-                source,
-            })?;
-        contents.push(b'\n');
+        // Measured before the temporary file exists: a document too large to
+        // read back is refused with the live file untouched.
+        let contents = match self.persisted_bytes() {
+            Ok(contents) => contents,
+            Err(PersistedPolicyError::Serialize(source)) => {
+                return Err(PolicyError::Serialize {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+            Err(error @ PersistedPolicyError::TooLarge { .. }) => {
+                return Err(policy_write_error(
+                    path,
+                    None,
+                    io::Error::new(io::ErrorKind::InvalidInput, error.to_string()),
+                ));
+            }
+        };
 
         persist_policy_bytes_with_rename(path, &contents, rename)
     }
@@ -2821,6 +2876,99 @@ mod tests {
             !temp_path.exists(),
             "temporary policy file should be removed after rename failure: {}",
             temp_path.display()
+        );
+    }
+
+    /// `policy` with as many small rules as it takes for its policy file --
+    /// pretty-printed, as [`Policy::persist_to_file`] writes it -- to exceed
+    /// [`MAX_POLICY_FILE_BYTES`] while its compact JSON stays under it.
+    fn with_rules_too_large_for_a_policy_file(mut policy: Policy) -> Policy {
+        let mut count = 2_000;
+        loop {
+            policy.rules = (0..count)
+                .map(|index| Rule {
+                    id: Some(format!("rule-{index}")),
+                    enabled: true,
+                    methods: vec!["GET".to_owned()],
+                    path: format!("/large/{index}"),
+                    tool_name: None,
+                    dispatch: None,
+                    principal: PrincipalMatcher::default(),
+                    action: RuleAction::Deny,
+                    conditions: None,
+                })
+                .collect();
+            let pretty = serde_json::to_vec_pretty(&policy)
+                .unwrap_or_else(|err| panic!("policy should serialize: {err}"));
+            if pretty.len() as u64 >= MAX_POLICY_FILE_BYTES {
+                let compact = serde_json::to_vec(&policy)
+                    .unwrap_or_else(|err| panic!("policy should serialize: {err}"));
+                assert!(
+                    (compact.len() as u64) < MAX_POLICY_FILE_BYTES,
+                    "{count} rules are {} bytes compact",
+                    compact.len()
+                );
+                return policy;
+            }
+            count += 500;
+        }
+    }
+
+    #[test]
+    fn persist_to_file_writes_exactly_the_measured_bytes() {
+        let file = TempPolicyFile::new(r#"{ "schema_version": "0.1.0" }"#);
+        let policy = rich_policy();
+        let measured = policy
+            .persisted_bytes()
+            .unwrap_or_else(|err| panic!("a small policy fits a policy file: {err}"));
+
+        policy
+            .persist_to_file(file.path())
+            .expect("policy should persist atomically");
+
+        let written = fs::read(file.path())
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.path().display()));
+        assert_eq!(written, measured);
+    }
+
+    #[test]
+    fn persist_to_file_refuses_a_file_too_large_to_read_back_before_writing_it() {
+        let file = TempPolicyFile::new(r#"{ "schema_version": "0.1.0" }"#);
+        let original_contents = fs::read(file.path())
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.path().display()));
+        let policy = with_rules_too_large_for_a_policy_file(rich_policy());
+
+        assert!(matches!(
+            policy.persisted_bytes(),
+            Err(PersistedPolicyError::TooLarge { len }) if len as u64 > MAX_POLICY_FILE_BYTES
+        ));
+        let error = policy
+            .persist_to_file(file.path())
+            .expect_err("a policy file the gateway cannot read back is never written");
+
+        // Refused before a temporary file was created, with the live file as
+        // it was: written, it would be refused by its own reload and by the
+        // next start.
+        assert!(
+            matches!(
+                error,
+                PolicyError::Write {
+                    temp_path: None,
+                    ..
+                }
+            ),
+            "unexpected persistence error: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("more than the maximum size of 1048576 bytes"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read(file.path())
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.path().display())),
+            original_contents
         );
     }
 
