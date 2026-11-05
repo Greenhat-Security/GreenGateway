@@ -443,3 +443,365 @@ fn the_backup_result_fits_the_published_report_schema_when_refused_too() {
     assert_eq!(refused["result"]["created"], false);
     assert!(out.names().is_empty());
 }
+
+// --- restore ---------------------------------------------------------------------
+
+/// A state directory a restore can put back: a seeded ledger and, as the
+/// Connections store, a copy of the ledger's database with its application
+/// ID cleared, as the gateway's stores carry none.
+fn restorable_state() -> TempDir {
+    let state = state();
+    let connections = state.join(StateFile::Connections.file_name());
+    let mut database = fs::read(&connections).expect("the copy reads");
+    // The header's application ID, at offset 68.
+    database[68..72].copy_from_slice(&[0; 4]);
+    fs::write(&connections, database).expect("the copy writes");
+    fs::remove_file(state.join("connection-master.key")).expect("the key file goes");
+    state
+}
+
+/// `state()`, whose Connections store is the ledger's own database.
+fn state_with_ledger_copy() -> TempDir {
+    let state = state();
+    fs::remove_file(state.join("connection-master.key")).expect("the key file goes");
+    state
+}
+
+/// A backup of `state` in a new directory.
+fn backup_of(state: &TempDir) -> (TempDir, PathBuf) {
+    let out = TempDir::new("out");
+    let archive = out.join("state.ggbk");
+    let (exit, captured) = run(&[
+        "backup",
+        "create",
+        "--state-dir",
+        state.text(),
+        "--output",
+        text(&archive),
+    ]);
+    assert_eq!(exit, Exit::Success, "{}", captured.stderr());
+    (out, archive)
+}
+
+/// `parent/state`: an empty directory to restore into.
+fn empty_target(parent: &TempDir) -> PathBuf {
+    let target = parent.join("state");
+    fs::create_dir(&target).expect("the target creates");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
+            .expect("permissions should set");
+    }
+    target
+}
+
+fn listing(directory: &Path) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(directory)
+        .expect("lists")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("UTF-8")
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn restore_puts_a_backup_in_place_and_reports_it_without_a_path() {
+    let state = restorable_state();
+    let (_out, archive) = backup_of(&state);
+    let parent = TempDir::new("parent");
+    let target = empty_target(&parent);
+    let (exit, captured) = run(&[
+        "backup",
+        "restore",
+        text(&archive),
+        "--state-dir",
+        text(&target),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(exit, Exit::Success, "{}", captured.stdout());
+    let restored = report(&captured);
+    assert_no_canary(&captured);
+    assert_eq!(restored["command"], "backup restore");
+    assert_eq!(restored["result"]["restored"], true);
+    assert_eq!(restored["result"]["replaced"], false);
+    assert!(restored["result"]["restoreId"]
+        .as_str()
+        .is_some_and(|id| id.starts_with("rst-") && id.len() == 36));
+    assert_eq!(restored["result"]["backup"]["entries"], 2);
+    // Restoring the Connections store says its keys must come back too.
+    assert_eq!(codes(&restored), ["restore.secret_keys_required"]);
+    assert_eq!(restored["diagnostics"][0]["severity"], "info");
+    assert_eq!(parent.names(), ["state"], "nothing is left beside it");
+    assert_eq!(
+        listing(&target),
+        [
+            "config-ledger.sqlite3",
+            "connections.sqlite3",
+            "restore-marker.json",
+            "state.lock"
+        ]
+    );
+    let (exit, captured) = run(&["ledger", "verify", "--state-dir", text(&target)]);
+    assert_eq!(exit, Exit::Success, "{}", captured.stderr());
+
+    // Two restores never share their hidden names or their ID.
+    let other = TempDir::new("other");
+    let second = empty_target(&other);
+    let (exit, captured) = run(&[
+        "backup",
+        "restore",
+        text(&archive),
+        "--state-dir",
+        text(&second),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(exit, Exit::Success);
+    assert_ne!(
+        report(&captured)["result"]["restoreId"],
+        restored["result"]["restoreId"]
+    );
+
+    // The human result names the stores and the restore, never a path.
+    let third = TempDir::new("third");
+    let target = empty_target(&third);
+    let (exit, captured) = run(&[
+        "backup",
+        "restore",
+        text(&archive),
+        "--state-dir",
+        text(&target),
+    ]);
+    assert_eq!(exit, Exit::Success);
+    assert!(captured
+        .stdout()
+        .starts_with("restored a backup of 2 stores, created at Unix time "));
+    assert!(captured.stdout().contains("\n  restore rst-"));
+    assert!(captured
+        .stderr()
+        .starts_with("ggctl: info: restore.secret_keys_required: "));
+    assert_no_canary(&captured);
+}
+
+#[test]
+fn restore_replaces_a_stopped_state_directory_only_when_asked() {
+    let state = restorable_state();
+    let (_out, archive) = backup_of(&state);
+    // The source itself is a stopped state directory holding stores.
+    let (exit, captured) = run(&[
+        "backup",
+        "restore",
+        text(&archive),
+        "--state-dir",
+        state.text(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(exit, Exit::Conflict);
+    let refused = report(&captured);
+    assert_eq!(codes(&refused), ["restore.target_not_empty"]);
+    assert_eq!(refused["diagnostics"][0]["location"]["argument"], 4);
+    assert_eq!(refused["result"]["restored"], false);
+    assert_eq!(refused["result"]["targetUnchanged"], true);
+
+    let (exit, captured) = run(&[
+        "backup",
+        "restore",
+        text(&archive),
+        "--state-dir",
+        state.text(),
+        "--replace-existing-state",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(exit, Exit::Success, "{}", captured.stdout());
+    assert_eq!(report(&captured)["result"]["replaced"], true);
+
+    // Anything the layout does not name is never replaced.
+    fs::write(state.join("notes.txt"), CANARY).expect("a foreign file");
+    let (exit, captured) = run(&[
+        "backup",
+        "restore",
+        text(&archive),
+        "--state-dir",
+        state.text(),
+        "--replace-existing-state",
+    ]);
+    assert_eq!(exit, Exit::Invalid);
+    assert!(captured
+        .stderr()
+        .starts_with("ggctl: error: restore.target_not_state_dir: "));
+    assert_eq!(
+        captured.stdout(),
+        "backup restore: nothing was restored; the state directory was left as it was\n"
+    );
+    assert_no_canary(&captured);
+}
+
+#[test]
+fn restore_of_a_corrupt_hostile_or_newer_archive_exits_7_and_changes_nothing() {
+    let state = restorable_state();
+    let (out, archive) = backup_of(&state);
+    let bytes = fs::read(&archive).expect("archive");
+    let name = StateFile::ConfigLedger.file_name().as_bytes();
+    // The ledger's record header: the last occurrence of its name, then its
+    // size.
+    let at = bytes
+        .windows(name.len())
+        .rposition(|window| window == name)
+        .expect("the ledger's record");
+
+    let mut tampered = bytes.clone();
+    let middle = tampered.len() - 4096;
+    tampered[middle] ^= 0x01;
+    let mut traversal = bytes.clone();
+    traversal[at..at + name.len()].copy_from_slice(b"../config-ledger.sqli");
+    let mut bomb = bytes.clone();
+    bomb[at + name.len()..at + name.len() + 8].copy_from_slice(&(1_u64 << 40).to_be_bytes());
+    let mut newer = bytes.clone();
+    newer[8..10].copy_from_slice(&2_u16.to_be_bytes());
+    let truncated = bytes[..bytes.len() / 2].to_vec();
+
+    for (label, candidate, code) in [
+        ("tampered", tampered, "backup.checksum_mismatch"),
+        ("traversal", traversal, "archive.entry_outside_root"),
+        ("bomb", bomb, "archive.entry_too_large"),
+        ("newer", newer, "backup.unsupported_archive_version"),
+        ("truncated", truncated, "archive.truncated"),
+    ] {
+        let path = out.join(&format!("{label}.ggbk"));
+        fs::write(&path, &candidate).expect("the candidate writes");
+        let parent = TempDir::new("parent");
+        let target = empty_target(&parent);
+        let (exit, captured) = run(&[
+            "backup",
+            "restore",
+            text(&path),
+            "--state-dir",
+            text(&target),
+            "--format",
+            "json",
+        ]);
+        assert_eq!(exit, Exit::Integrity, "{label}: {}", captured.stdout());
+        let refused = report(&captured);
+        assert_eq!(codes(&refused), [code], "{label}");
+        assert_eq!(refused["result"]["restored"], false, "{label}");
+        assert_eq!(refused["result"]["targetUnchanged"], true, "{label}");
+        assert!(listing(&target).is_empty(), "{label}");
+        assert_eq!(parent.names(), ["state"], "{label}");
+        assert_no_canary(&captured);
+    }
+
+    // A store claiming another store's identity verifies as a backup, but
+    // is never restored.
+    let (_identity_out, identity) = backup_of(&state_with_ledger_copy());
+    let parent = TempDir::new("parent");
+    let target = empty_target(&parent);
+    let (exit, captured) = run(&[
+        "backup",
+        "restore",
+        text(&identity),
+        "--state-dir",
+        text(&target),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(exit, Exit::Integrity);
+    let refused = report(&captured);
+    assert_eq!(codes(&refused), ["restore.store_identity_mismatch"]);
+    assert_eq!(refused["result"]["store"], "connections");
+    assert_eq!(refused["diagnostics"][0]["location"]["argument"], 3);
+    assert!(listing(&target).is_empty());
+}
+
+#[test]
+fn restore_refuses_a_locked_target_and_a_postgres_dump() {
+    let state = restorable_state();
+    let (out, archive) = backup_of(&state);
+    let parent = TempDir::new("parent");
+    let target = empty_target(&parent);
+    let held = StateDirectory::acquire(&target).expect("another process's lock");
+    let (exit, captured) = run(&[
+        "backup",
+        "restore",
+        text(&archive),
+        "--state-dir",
+        text(&target),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(exit, Exit::Conflict);
+    assert_eq!(codes(&report(&captured)), ["state_dir.locked"]);
+    drop(held);
+
+    let dump = out.join("cluster.dump");
+    fs::write(&dump, b"PGDMP\x01\x0e\x00\x04\x08\x08\x01").expect("a dump");
+    let (exit, captured) = run(&[
+        "backup",
+        "restore",
+        text(&dump),
+        "--state-dir",
+        text(&target),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(exit, Exit::Invalid);
+    let refused = report(&captured);
+    assert_eq!(codes(&refused), ["backup.postgres_unsupported"]);
+    assert_eq!(refused["diagnostics"][0]["location"]["argument"], 3);
+    let (exit, _) = run(&["backup", "verify", text(&dump)]);
+    assert_eq!(exit, Exit::Invalid);
+    assert_eq!(listing(&target), ["state.lock"]);
+
+    // --state-dir is required.
+    let (exit, captured) = run(&["backup", "restore", text(&archive)]);
+    assert_eq!(exit, Exit::Usage);
+    assert!(captured
+        .stderr()
+        .starts_with("ggctl: error: usage.missing_argument: "));
+}
+
+#[test]
+fn every_restore_error_reports_the_code_gateway_config_gives_it() {
+    use gateway_config::state_dir::StateDirError;
+    let errors = [
+        RestoreError::StateDir(StateDirError::Locked),
+        RestoreError::Backup(BackupError::PostgresDump),
+        RestoreError::TargetNotEmpty,
+        RestoreError::TargetNotStateDirectory,
+        RestoreError::TargetMountPoint,
+        RestoreError::TargetUnavailable,
+        RestoreError::StagingUnavailable,
+        RestoreError::PermissionsUnavailable,
+        RestoreError::StoreIdentity {
+            store: StateFile::Audit,
+        },
+        RestoreError::TargetChanged,
+        RestoreError::SwitchFailed,
+        RestoreError::RollbackFailed,
+    ];
+    for error in &errors {
+        let diagnostic = restore_diagnostic(error, 3, 4);
+        assert_eq!(diagnostic.code(), error.code(), "{error:?}");
+        let integrity = matches!(error, RestoreError::StoreIdentity { .. });
+        assert_eq!(diagnostic.exit() == Exit::Integrity, integrity, "{error:?}");
+    }
+    for warning in [
+        RestoreWarning::DirectoryNotFlushed,
+        RestoreWarning::PreviousNotRemoved,
+    ] {
+        let code = warning_code(warning);
+        assert_eq!(code.as_str(), warning.code());
+        assert_eq!(code.exit(), Exit::Success);
+    }
+    // Every nonce is new.
+    assert_ne!(nonce(), nonce());
+}

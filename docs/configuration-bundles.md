@@ -452,9 +452,9 @@ will refuse the variable. No gateway reads `GATEWAY_STATE_DIR` yet, and in
 environment mode every store stays where its variable puts it. The layout, the
 admission rules and the lock are the shared `gateway-config` library's
 `state_dir` module, which the gateway and `ggctl` both use. Today the revision
-ledger, the `ggctl ledger` commands over it and `ggctl backup create`
-([standalone backups](standalone-backup.md)) are the only things that open
-through it.
+ledger, the `ggctl ledger` commands over it, and `ggctl backup create` and
+`ggctl backup restore` ([standalone backups](standalone-backup.md)) are the only
+things that open through it.
 
 | File | Store | Environment-mode variable |
 | --- | --- | --- |
@@ -466,6 +466,7 @@ through it.
 | `policy-history.sqlite3` | Policy publication history | `POLICY_HISTORY_SQLITE_PATH` |
 | `config-ledger.sqlite3` | The [configuration revision ledger](configuration-ledger.md) | none |
 | `state.lock` | The directory's lock file | none |
+| `restore-marker.json` | The [restore marker](standalone-backup.md#the-restore-marker) `ggctl backup restore` leaves for the next gateway start, which records it and removes it | none |
 
 SQLite keeps `-wal`, `-shm` and `-journal` files beside each store; they belong
 to it. A test holds this table to the field catalog: every store the catalog
