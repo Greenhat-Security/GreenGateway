@@ -4932,7 +4932,7 @@ paths:
                 spec,
                 &["list_invoices".to_owned()],
                 &preview.registration_security_selections,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("the converted tool should publish");
@@ -4986,7 +4986,7 @@ paths:
                 &stored.spec,
                 &stored.spec_digest,
                 &earlier_entries,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("the earlier catalog should store");
@@ -5009,7 +5009,11 @@ paths:
         );
 
         let refreshed = upgraded
-            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .refresh(
+                record.id.as_str(),
+                record.etag().as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("refresh should regenerate the stored document");
         assert_eq!(
@@ -5036,7 +5040,11 @@ paths:
         );
 
         let again = upgraded
-            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .refresh(
+                record.id.as_str(),
+                record.etag().as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("a second refresh should succeed");
         assert_eq!(
