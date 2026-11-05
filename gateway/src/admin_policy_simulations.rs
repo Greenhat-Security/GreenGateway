@@ -145,6 +145,27 @@ impl PolicyEvaluationSlot {
         })
         .await
     }
+
+    /// Run one step of a longer evaluation on a blocking thread that owns
+    /// this slot, and hand the slot back with the step's output, so an
+    /// evaluation that alternates awaited reads with blocking work holds one
+    /// slot throughout. As with [`Self::run_blocking`], a request dropped
+    /// mid-step leaves the slot with the step, which gives it back when the
+    /// step ends.
+    pub(super) async fn run_blocking_step<T, F>(
+        self,
+        work: F,
+    ) -> Result<(Self, T), tokio::task::JoinError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || {
+            let output = work();
+            (self, output)
+        })
+        .await
+    }
 }
 
 impl Drop for PolicyEvaluationSlot {
