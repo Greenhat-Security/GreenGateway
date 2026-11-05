@@ -973,6 +973,8 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "hex",
+ "http",
+ "ipnet",
  "jsonschema",
  "proptest",
  "rusqlite",
@@ -980,6 +982,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tracing",
  "url",
  "uuid",
 ]

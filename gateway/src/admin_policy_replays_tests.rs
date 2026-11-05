@@ -779,6 +779,7 @@ fn replay_admin_state(
         history_store: None,
         draft_store: None,
         test_suite_store: None,
+        policy_tests_required: false,
         #[cfg(feature = "postgres")]
         control_plane: None,
         #[cfg(feature = "postgres")]

@@ -1,24 +1,24 @@
 //! The configuration field catalog (issue #242 PR 3, ADR-0008).
 //!
-//! [`FIELDS`] describes every setting the gateway's configuration compiler
-//! reads, in the order the compiler's inventory (`CONFIG_INPUTS` in
-//! `gateway/src/config/inventory.rs`) requests them: its stable identifier and
+//! [`FIELDS`] describes every setting the configuration compiler
+//! ([`crate::compiler`]) reads, in the order the compiler's inventory
+//! (`compiler::inventory::CONFIG_INPUTS`) requests them: its stable identifier and
 //! environment variable, the compiler domain that parses it, its type and
 //! bounds, its default, what a blank value means, how sensitive it is, which
 //! state backend reads it, what becomes of it in a configuration bundle, its
 //! reload class, and whether the Cloudflare wrapper forwards it, with the
 //! reason when it does not.
 //!
-//! The catalog describes the compiler; it is not a second one. The gateway's
-//! compiler stays the one parser and semantic validator, and nothing here is
+//! The catalog describes the compiler; it is not a second one. The compiler
+//! stays the one parser and semantic validator, and nothing here is
 //! consulted at startup. What keeps the description true is a set of parity
 //! checks that fail the build on drift:
 //!
-//! - the gateway's `config::catalog_tests` hold every entry to the compiler
-//!   itself: the inventory and its order, each literal default, each integer
-//!   bound, decimal range and accepted word, and which settings each state
-//!   backend refuses; `config::parity_tests` read the blank-value rules from
-//!   here and prove them, and `config::stage_tests` the compiler domains;
+//! - `compiler::catalog_tests` hold every entry to the compiler itself: the
+//!   inventory and its order, each literal default, each integer bound,
+//!   decimal range and accepted word, and which settings each state backend
+//!   refuses; `compiler::parity_tests` read the blank-value rules from here
+//!   and prove them, and `compiler::stage_tests` the compiler domains;
 //! - the same tests hold `docs/configuration.md` (one entry per field, with
 //!   the catalog's default), `.env.example` (every field, and copying it
 //!   changes nothing), ADR-0008's bootstrap inputs, the compiler contract's

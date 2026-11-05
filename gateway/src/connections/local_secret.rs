@@ -52,7 +52,7 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 // (issue #242).
 pub(crate) use gateway_config::connections::local_secret::{
     validate_local_secret_keyring_config, LocalSecretKeyConfig, LocalSecretKeyRole,
-    LocalSecretKeyringConfigError, MAX_LOCAL_SECRET_KEYRING_CONFIG_BYTES,
+    LocalSecretKeyringConfigError,
 };
 
 struct KeyMaterial(Zeroizing<[u8; MASTER_KEY_BYTES]>);

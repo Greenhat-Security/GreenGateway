@@ -47,6 +47,18 @@
 //!   it only when both readings agree.
 //! - **Egress.** Never recorded: no record names the destination a request
 //!   connected to or what it resolved to. Every context says `not_recorded`.
+//! - **Decision facts.** A record written since the gateway records them
+//!   carries `policy_decision_facts` (`policy-decision.v1`): the policy and
+//!   evaluator that decided, the inputs it had, the routing classification
+//!   and the verdict's reason and element. They are read into the recorded
+//!   result, exactly, and must describe the record they sit on -- its lane,
+//!   its recorded reason and its routing -- or the record is
+//!   `malformed_decision_facts`. Another version is
+//!   `unsupported_decision_facts_version`. The routing classification also
+//!   settles the MCP identity an observation leaves unstated: `contextless`
+//!   is its own identity, and `mcp_alias` an alias of the gateway's
+//!   canonical MCP path, which every alias is. A record without them is read
+//!   as before.
 //! - **Not adapted.** A request that never reached the policy stage
 //!   (`policy_decision: not_evaluated` -- refused by authentication, exempt, or
 //!   a probe) is not a policy question. A rendered tool request's `authz.*`
@@ -58,7 +70,10 @@ use serde_json::{Map, Value};
 use crate::{
     audit::{event, Actor, AuditEvent},
     auth::protected_resource::MCP_RESOURCE_PATH,
-    middleware::rbac::ToolPolicyRefusal,
+    middleware::{
+        decision::{DecisionRouting, POLICY_DECISION_FACTS_MEMBER},
+        rbac::ToolPolicyRefusal,
+    },
     policy_eval::DispatchFacts,
     request_bounds::MAX_REQUEST_PATH_BYTES,
 };
@@ -66,8 +81,9 @@ use crate::{
 use super::{
     auth_method_from_code, check_dispatch, check_host, check_method, check_path, check_principal,
     check_reason_code, check_tool_name, EgressRecord, HostRecord, HttpFacts, McpIdentity,
-    PrincipalRecord, RecordedPolicy, RecordedPrincipal, RecordedResult, ReplayContext, ReplayFacts,
-    ReplaySource, RoutingRecord, ToolFacts, MAX_RECORDED_ELEMENT_BYTES,
+    PrincipalRecord, RecordedDecision, RecordedPolicy, RecordedPrincipal, RecordedResult,
+    ReplayContext, ReplayContextError, ReplayFacts, ReplaySource, RoutingRecord, ToolFacts,
+    MAX_RECORDED_ELEMENT_BYTES,
 };
 
 const HTTP_REQUEST_OBSERVED: &str = "http.request_observed";
@@ -159,6 +175,8 @@ impl DuplicateRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UnsupportedRecord {
     EnvelopeVersion,
+    /// Decision facts of a version this adapter was not written for.
+    DecisionFactsVersion,
     /// A rendered tool request's decision: its path carries tool arguments.
     RenderedToolRequest,
     /// A `tool.invoke_rejected` reason this adapter does not know, so it cannot
@@ -170,6 +188,7 @@ impl UnsupportedRecord {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::EnvelopeVersion => "unsupported_envelope_version",
+            Self::DecisionFactsVersion => "unsupported_decision_facts_version",
             Self::RenderedToolRequest => "unsupported_rendered_tool_request",
             Self::ToolRejectionReason => "unsupported_tool_rejection",
         }
@@ -187,6 +206,8 @@ pub(crate) enum MalformedRecord {
     ToolName,
     PolicyDecision,
     RecordedResult,
+    /// Decision facts out of their bounds, or describing another record.
+    DecisionFacts,
 }
 
 impl MalformedRecord {
@@ -201,6 +222,7 @@ impl MalformedRecord {
             Self::ToolName => "malformed_tool_name",
             Self::PolicyDecision => "malformed_policy_decision",
             Self::RecordedResult => "malformed_recorded_result",
+            Self::DecisionFacts => "malformed_decision_facts",
         }
     }
 }
@@ -293,8 +315,12 @@ fn observation(
         .to_owned();
     let principal = principal_record(actor, envelope)?;
     let (request_host, routing) = observed_routing(payload, &path)?;
-    let recorded = recorded_result(policy, payload, "policy_reason")?;
-    Ok(LegacyRecord::Replayable(Box::new(ReplayContext {
+    let mut recorded = recorded_result(policy, payload, "policy_reason")?;
+    recorded.decision = match decision_facts(payload) {
+        Ok(decision) => decision,
+        Err(record) => return Ok(record),
+    };
+    with_decision_facts(ReplayContext {
         source: ReplaySource::HttpObservation,
         facts: ReplayFacts::Http(HttpFacts {
             method,
@@ -305,7 +331,52 @@ fn observation(
             egress: EgressRecord::NotRecorded,
         }),
         recorded,
-    })))
+    })
+}
+
+/// The decision facts a record carries: `Ok(None)` for a record written
+/// before them, and the record's own answer when they cannot be read.
+fn decision_facts(payload: &Map<String, Value>) -> Result<Option<RecordedDecision>, LegacyRecord> {
+    let Some(value) = payload.get(POLICY_DECISION_FACTS_MEMBER) else {
+        return Ok(None);
+    };
+    RecordedDecision::from_json(value)
+        .map(Some)
+        .map_err(|error| match error {
+            ReplayContextError::UnsupportedSchemaVersion => {
+                LegacyRecord::Unsupported(UnsupportedRecord::DecisionFactsVersion)
+            }
+            _ => LegacyRecord::Malformed(MalformedRecord::DecisionFacts),
+        })
+}
+
+/// The replayable record, once its decision facts -- if it has any -- are
+/// shown to describe it. An observation that leaves its MCP identity
+/// unstated takes it from the routing classification the facts record,
+/// which is the target the evaluator was given.
+fn with_decision_facts(mut context: ReplayContext) -> Result<LegacyRecord, MalformedRecord> {
+    if let (ReplayFacts::Http(facts), Some(decision)) =
+        (&mut context.facts, &context.recorded.decision)
+    {
+        if facts.routing == RoutingRecord::Local(McpIdentity::NotRecorded) {
+            match decision.routing {
+                Some(DecisionRouting::Contextless) => {
+                    facts.routing = RoutingRecord::Local(McpIdentity::Canonical);
+                }
+                Some(DecisionRouting::McpAlias) => {
+                    facts.routing = RoutingRecord::Local(McpIdentity::Alias {
+                        canonical_path: MCP_RESOURCE_PATH.to_owned(),
+                    });
+                }
+                // Left unsettled: the check below refuses the disagreement.
+                _ => {}
+            }
+        }
+    }
+    context
+        .check_decision()
+        .map_err(|_| MalformedRecord::DecisionFacts)?;
+    Ok(LegacyRecord::Replayable(Box::new(context)))
 }
 
 /// The host and routing an observation recorded, read exactly as the
@@ -392,8 +463,12 @@ fn decision(
     }
     let tool_name = tool_name(payload)?;
     let principal = principal_record(event.actor.as_ref(), envelope)?;
-    let recorded = recorded_result(RecordedPolicy::Denied, payload, "reason")?;
-    Ok(LegacyRecord::Replayable(Box::new(ReplayContext {
+    let mut recorded = recorded_result(RecordedPolicy::Denied, payload, "reason")?;
+    recorded.decision = match decision_facts(payload) {
+        Ok(decision) => decision,
+        Err(record) => return Ok(record),
+    };
+    with_decision_facts(ReplayContext {
         source: ReplaySource::ToolRuleDecision,
         facts: ReplayFacts::Tool(ToolFacts {
             tool_name,
@@ -401,7 +476,7 @@ fn decision(
             egress: EgressRecord::NotRecorded,
         }),
         recorded,
-    })))
+    })
 }
 
 /// A `tool.invoke_rejected` event, by the reason it carries.
@@ -443,7 +518,11 @@ fn tool_admission(
     if let Some(reason) = reason {
         check_reason_code(reason).map_err(|_| MalformedRecord::RecordedResult)?;
     }
-    Ok(LegacyRecord::Replayable(Box::new(ReplayContext {
+    let decision = match decision_facts(payload) {
+        Ok(decision) => decision,
+        Err(record) => return Ok(record),
+    };
+    with_decision_facts(ReplayContext {
         source: ReplaySource::ToolAdmission,
         facts: ReplayFacts::Tool(ToolFacts {
             tool_name,
@@ -457,8 +536,9 @@ fn tool_admission(
             permission: None,
             path_prefix: None,
             attribution_omitted: false,
+            decision,
         },
-    })))
+    })
 }
 
 fn tool_name(payload: &Map<String, Value>) -> Result<String, MalformedRecord> {
@@ -527,6 +607,7 @@ fn recorded_result(
         permission,
         path_prefix,
         attribution_omitted,
+        decision: None,
     })
 }
 

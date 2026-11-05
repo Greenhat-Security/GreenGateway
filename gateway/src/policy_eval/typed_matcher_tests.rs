@@ -16,7 +16,7 @@ use super::{
     },
     *,
 };
-use crate::rbac::policy_document::parse_v1_with_typed_matchers;
+use crate::rbac::policy_document::parse_v1;
 
 const ISSUER: &str = "https://idp.example.test";
 /// 2026-01-01T00:00:00Z.
@@ -35,8 +35,8 @@ fn property_config() -> Config {
 }
 
 fn compile(document: Value) -> CompiledPolicy {
-    let policy = parse_v1_with_typed_matchers(&document)
-        .unwrap_or_else(|issues| panic!("fixture should validate: {issues:?}"));
+    let policy =
+        parse_v1(&document).unwrap_or_else(|issues| panic!("fixture should validate: {issues:?}"));
     CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone)
         .expect("a standalone authority is valid")
 }

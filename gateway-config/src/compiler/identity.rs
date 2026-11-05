@@ -2,7 +2,7 @@
 //! providers and CSRF protection -- compiled in pure stages (issue #433,
 //! PR 2).
 //!
-//! `Config::from_env_vars` reads these in four blocks with other domains'
+//! The compiler reads these in four blocks with other domains'
 //! settings between them, and each block is requested where the legacy parser
 //! requested it, so the read order does not move:
 //!
@@ -54,7 +54,7 @@ use super::{
     MAX_PRINCIPAL_ISSUER_BYTES, RBAC_EXEMPT_PATHS, ROLES_CLAIM, SERVICE_TOKEN_CACHE_TTL_MS,
     SERVICE_TOKEN_SQLITE_PATH,
 };
-use crate::auth::admin_session::{AdminSessionConfig, AdminSessionStorage};
+use crate::auth::{AdminSessionConfig, AdminSessionStorage};
 
 /// The admin surface's inputs, as the reader returned them.
 pub(super) struct AdminSurfaceInputs {
@@ -640,40 +640,39 @@ impl ProviderAndCsrfInputs {
 
 /// The validated identity settings.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct IdentityPlan {
-    pub(crate) admin_prefix: String,
-    pub(crate) admin_login_provider: Option<String>,
-    pub(crate) admin_session: Option<AdminSessionConfig>,
-    pub(crate) admin_login_pending_ttl_secs: u64,
-    pub(crate) admin_login_pending_max_entries: usize,
-    pub(crate) admin_login_pending_max_per_ip: usize,
-    pub(crate) gateway_public_url: Option<String>,
-    pub(crate) rbac_exempt_paths: Vec<String>,
-    pub(crate) auth_enabled: bool,
-    pub(crate) auth_mode: AuthMode,
-    pub(crate) auth_cookie_name: String,
-    pub(crate) auth_exempt_paths: Vec<String>,
+pub struct IdentityPlan {
+    pub admin_prefix: String,
+    pub admin_login_provider: Option<String>,
+    pub admin_session: Option<AdminSessionConfig>,
+    pub admin_login_pending_ttl_secs: u64,
+    pub admin_login_pending_max_entries: usize,
+    pub admin_login_pending_max_per_ip: usize,
+    pub gateway_public_url: Option<String>,
+    pub rbac_exempt_paths: Vec<String>,
+    pub auth_enabled: bool,
+    pub auth_mode: AuthMode,
+    pub auth_cookie_name: String,
+    pub auth_exempt_paths: Vec<String>,
     /// `AUTH_PROVIDERS`, or the one provider the legacy `JWT_*` settings
     /// describe when it is unset.
-    pub(crate) auth_providers: Vec<AuthProviderConfig>,
-    pub(crate) jwt_jwks_url: Option<String>,
-    pub(crate) jwt_issuer: Option<String>,
-    pub(crate) jwt_audience: Option<String>,
-    pub(crate) jwt_jwks_timeout_ms: u64,
-    pub(crate) jwt_jwks_max_key_age_secs: u64,
-    pub(crate) jwt_require_jti: bool,
-    pub(crate) roles_claim: String,
-    pub(crate) service_token_sqlite_path: Option<String>,
-    pub(crate) service_token_cache_ttl_ms: u64,
-    pub(crate) csrf_enabled: bool,
-    pub(crate) csrf_cookie_name: String,
-    pub(crate) csrf_header_name: String,
-    pub(crate) csrf_cookie_domain: Option<String>,
-    pub(crate) csrf_exempt_paths: Vec<String>,
+    pub auth_providers: Vec<AuthProviderConfig>,
+    pub jwt_jwks_url: Option<String>,
+    pub jwt_issuer: Option<String>,
+    pub jwt_audience: Option<String>,
+    pub jwt_jwks_timeout_ms: u64,
+    pub jwt_jwks_max_key_age_secs: u64,
+    pub jwt_require_jti: bool,
+    pub roles_claim: String,
+    pub service_token_sqlite_path: Option<String>,
+    pub service_token_cache_ttl_ms: u64,
+    pub csrf_enabled: bool,
+    pub csrf_cookie_name: String,
+    pub csrf_header_name: String,
+    pub csrf_cookie_domain: Option<String>,
+    pub csrf_exempt_paths: Vec<String>,
     /// Where each of the four blocks' inputs came from, in the order they
     /// are read.
-    #[allow(dead_code)] // Read by the stage tests; startup builds from the values alone.
-    pub(crate) provenance: Vec<Provenance>,
+    pub provenance: Vec<Provenance>,
 }
 
 /// The identity providers and CSRF settings, each parsed on its own.

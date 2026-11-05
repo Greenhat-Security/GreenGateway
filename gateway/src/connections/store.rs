@@ -902,6 +902,95 @@ CREATE INDEX idx_connection_local_secret_change_evidence_secret
 ON connection_local_secret_change_evidence(secret_id, sequence);
 "#;
 
+// Migration 13: change evidence for managed catalog and overlay publication
+// (issue #425, PR 4). The MCP and OpenAPI catalogs and the OpenAPI overlay
+// live in this database, so their evidence does too, under migration 12's
+// rules: one append-only row per committed publication, written in the
+// SAME immediate transaction as the catalog it describes and naming who
+// published it. A publication whose evidence cannot be inserted rolls back
+// with it; a refused one -- stale Connection ETag, stale catalog, spec or
+// overlay revision, a bound exceeded, a Connection of the wrong kind --
+// writes nothing. Enum-value refreshes and status observations publish no
+// catalog and write nothing here.
+//
+// - The table mirrors PostgreSQL's greengateway.catalog_change_evidence
+//   (migration 23, with migration 25's actor columns): the same action
+//   vocabulary, revision columns and CHECKs. The action is what the write
+//   did to the overlay -- an overlay put is catalog.overlay.replace, an
+//   overlay delete catalog.overlay.delete, and an MCP publication, an
+//   OpenAPI registration or a refresh (which at most rewrites the overlay's
+//   source reports) catalog.mcp.publish or catalog.openapi.publish.
+// - No foreign key to connection_records or either catalog table: the
+//   evidence outlives the catalog it replaced and the Connection whose
+//   deletion cascades the current catalog.
+// - Identifiers, revisions and the actor only. No specification, digest,
+//   tool or resource name, definition, overlay document, source report,
+//   enum value or endpoint is stored.
+// - The actor is recorded whole, exactly as migration 12 records it, under
+//   the same bounds and the same pairing CHECK.
+// - prior_version/new_version are the catalog revision before and after
+//   the publication; a first catalog (revision 0, nothing stored) has no
+//   prior version. overlay_revision is the overlay revision the published
+//   OpenAPI catalog was compiled from: 0 for none, so always 0 after an
+//   overlay delete and at least 1 after a put. An MCP catalog has no
+//   overlay, so its rows have none.
+// - event_id identifies the row and operation_id the store call; each call
+//   writes one row. sequence is commit order and committed_at the
+//   publication's own process-clock timestamp (the catalog's refreshed_at),
+//   as in migration 12. No gateway path updates or deletes these rows.
+//
+// Every comparison in a row CHECK is guarded by IS NOT NULL or reads a NOT
+// NULL column, because SQLite passes a CHECK whose expression is NULL.
+const MIGRATION_13_SQL: &str = r#"
+CREATE TABLE catalog_change_evidence (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE CHECK (length(event_id) = 36),
+    operation_id TEXT NOT NULL CHECK (length(operation_id) = 36),
+    actor_user_id TEXT NOT NULL CHECK (
+        length(CAST(actor_user_id AS BLOB)) BETWEEN 1 AND 4096
+    ),
+    actor_issuer TEXT CHECK (
+        actor_issuer IS NULL OR length(CAST(actor_issuer AS BLOB)) BETWEEN 1 AND 4096
+    ),
+    actor_kind TEXT NOT NULL,
+    actor_auth_mode TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (
+        action IN (
+            'catalog.mcp.publish', 'catalog.openapi.publish',
+            'catalog.overlay.replace', 'catalog.overlay.delete'
+        )
+    ),
+    connection_id TEXT NOT NULL CHECK (
+        length(CAST(connection_id AS BLOB)) BETWEEN 1 AND 128
+    ),
+    prior_version INTEGER CHECK (prior_version IS NULL OR prior_version >= 1),
+    new_version INTEGER NOT NULL CHECK (new_version >= 1),
+    overlay_revision INTEGER CHECK (overlay_revision IS NULL OR overlay_revision >= 0),
+    committed_at TEXT NOT NULL CHECK (length(CAST(committed_at AS BLOB)) BETWEEN 1 AND 64),
+    UNIQUE (operation_id, action),
+    CHECK (
+        (actor_kind = 'principal'
+            AND actor_auth_mode IN ('bearer_token', 'session_cookie', 'client_certificate'))
+        OR (actor_kind = 'service_token'
+            AND actor_auth_mode = 'service_token' AND actor_issuer IS NULL)
+        OR (actor_kind = 'system' AND actor_auth_mode = 'system' AND actor_issuer IS NULL)
+    ),
+    CHECK (prior_version IS NULL OR new_version > prior_version),
+    CHECK ((action = 'catalog.mcp.publish') = (overlay_revision IS NULL)),
+    CHECK (
+        action <> 'catalog.overlay.replace'
+        OR (overlay_revision IS NOT NULL AND overlay_revision >= 1)
+    ),
+    CHECK (
+        action <> 'catalog.overlay.delete'
+        OR (overlay_revision IS NOT NULL AND overlay_revision = 0)
+    )
+);
+
+CREATE INDEX idx_catalog_change_evidence_connection
+ON catalog_change_evidence(connection_id, sequence);
+"#;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -951,6 +1040,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 12,
         sql: MIGRATION_12_SQL,
     },
+    Migration {
+        version: 13,
+        sql: MIGRATION_13_SQL,
+    },
 ];
 
 pub(crate) const SOURCE_MANAGED: &str = "managed";
@@ -999,7 +1092,22 @@ const EVIDENCE_ACTION_REPLACE: &str = "connection.replace";
 const EVIDENCE_ACTION_CREDENTIAL_CHANGE: &str = "credential.binding_change";
 const EVIDENCE_ACTION_DELETE: &str = "connection.delete";
 
-/// The longest actor subject either evidence table of migration 12 records.
+/// The closed action vocabulary of `catalog_change_evidence` (migration
+/// 13): exactly PostgreSQL migration 23's, in the same proposed
+/// authority-event operation codes; the table's CHECK refuses anything else.
+const CATALOG_EVIDENCE_ACTION_MCP_PUBLISH: &str = "catalog.mcp.publish";
+const CATALOG_EVIDENCE_ACTION_OPENAPI_PUBLISH: &str = "catalog.openapi.publish";
+const CATALOG_EVIDENCE_ACTION_OVERLAY_REPLACE: &str = "catalog.overlay.replace";
+const CATALOG_EVIDENCE_ACTION_OVERLAY_DELETE: &str = "catalog.overlay.delete";
+
+/// The operation labels a failed evidence insert is reported under. A
+/// failure under either is a store failure whatever SQLite class it carries
+/// ([`ConnectionStoreError::is_evidence_append_failure`]).
+const OPERATION_CHANGE_EVIDENCE_APPEND: &str = "change evidence append";
+const OPERATION_CATALOG_CHANGE_EVIDENCE_APPEND: &str = "catalog change evidence append";
+
+/// The longest actor subject the evidence tables of migrations 12 and 13
+/// record.
 /// It is exactly the principal subject bound authentication enforces, so
 /// evidence never refuses a principal a validator produced; the assertion
 /// keeps the SQL bounds and the Rust bound from drifting apart silently.
@@ -1007,7 +1115,8 @@ pub(crate) const MAX_CHANGE_EVIDENCE_ACTOR_BYTES: usize = 4096;
 const _: () =
     assert!(MAX_CHANGE_EVIDENCE_ACTOR_BYTES == crate::auth::principal::MAX_PRINCIPAL_SUBJECT_BYTES);
 
-/// The longest actor issuer either evidence table of migration 12 records:
+/// The longest actor issuer the evidence tables of migrations 12 and 13
+/// record:
 /// exactly the principal issuer bound, for the same reason.
 pub(crate) const MAX_CHANGE_EVIDENCE_ACTOR_ISSUER_BYTES: usize = 4096;
 const _: () = assert!(
@@ -1636,6 +1745,22 @@ pub enum ConnectionStoreError {
     },
 }
 
+impl ConnectionStoreError {
+    /// Whether this is a failed change-evidence insert of this database
+    /// (migrations 12 and 13). Such a failure rolled its change back and is
+    /// a store failure, never a verdict on the change: SQLite may report it
+    /// as a constraint, but retrying the same change once the evidence
+    /// table accepts writes again succeeds.
+    pub(crate) fn is_evidence_append_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite { operation, .. }
+                if *operation == OPERATION_CHANGE_EVIDENCE_APPEND
+                    || *operation == OPERATION_CATALOG_CHANGE_EVIDENCE_APPEND
+        )
+    }
+}
+
 /// The cross-replica half of a create's `If-Match` (issue #241, PR 8).
 ///
 /// The control plane checks the collection ETag against its own runtime
@@ -2169,6 +2294,7 @@ impl SqliteConnectionStore {
         entries: &[StoredMcpCatalogEntry],
         resources: &[StoredMcpResource],
         resource_templates: &[StoredMcpResourceTemplate],
+        actor: &ChangeActor,
     ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
         self.replace_mcp_catalog_expecting(
             id,
@@ -2177,6 +2303,7 @@ impl SqliteConnectionStore {
             resources,
             resource_templates,
             None,
+            actor,
         )
     }
 
@@ -2189,6 +2316,11 @@ impl SqliteConnectionStore {
     /// apart. Standalone mode serializes refreshes per Connection inside
     /// the process, so the check is redundant here -- it exists so both
     /// stores enforce exactly what the cluster path asks for.
+    ///
+    /// The publication commits one `catalog.mcp.publish` row naming `actor`
+    /// in `catalog_change_evidence` (migration 13) in the same transaction,
+    /// as the PostgreSQL store does; an actor the evidence cannot record
+    /// exactly is refused before anything is read.
     #[allow(clippy::too_many_arguments)]
     pub fn replace_mcp_catalog_expecting(
         &self,
@@ -2198,7 +2330,9 @@ impl SqliteConnectionStore {
         resources: &[StoredMcpResource],
         resource_templates: &[StoredMcpResourceTemplate],
         expected_catalog_revision: Option<u64>,
+        actor: &ChangeActor,
     ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
+        validate_change_actor(actor)?;
         let validated = validate_mcp_catalog(id, entries, resources, resource_templates)?;
         let now = utc_timestamp()?;
         let mut connection = self.connection_guard();
@@ -2445,6 +2579,21 @@ impl SqliteConnectionStore {
                 })?;
         }
 
+        // Last before the commit, so the row exists exactly when the
+        // catalog it describes does.
+        record_catalog_change_evidence(
+            &transaction,
+            &self.path,
+            &CatalogChangeEvidence {
+                action: CATALOG_EVIDENCE_ACTION_MCP_PUBLISH,
+                id,
+                prior_version: previous_revision,
+                new_version: catalog_revision,
+                overlay_revision: None,
+                committed_at: &now,
+                actor,
+            },
+        )?;
         transaction
             .commit()
             .map_err(|source| sqlite_error(&self.path, "MCP catalog transaction commit", source))?;
@@ -2758,6 +2907,7 @@ impl SqliteConnectionStore {
         spec: &str,
         spec_digest: &str,
         entries: &[StoredOpenApiCatalogEntry],
+        actor: &ChangeActor,
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
         self.replace_openapi_catalog_with_overlay(
             id,
@@ -2769,8 +2919,7 @@ impl SqliteConnectionStore {
             entries,
             None,
             0,
-            // No overlay is written, so nothing records this actor.
-            &ChangeActor::system("standalone"),
+            actor,
             &[],
         )
     }
@@ -2813,6 +2962,16 @@ impl SqliteConnectionStore {
     /// Catalog/overlay publication including the source values resolved for
     /// that exact compile. The enum rows are committed after the overlay has
     /// pruned superseded rows and before the transaction becomes visible.
+    ///
+    /// Every OpenAPI publication -- a registration, a refresh, and an overlay
+    /// put or delete -- goes through here and commits one
+    /// `catalog_change_evidence` row naming `actor` (migration 13) in the
+    /// same transaction, named by what the write did to the overlay exactly
+    /// as the PostgreSQL store names it: an overlay put is
+    /// `catalog.overlay.replace`, an overlay delete `catalog.overlay.delete`,
+    /// and anything else (no overlay change, or only refreshed source
+    /// reports) `catalog.openapi.publish`. An actor the evidence cannot
+    /// record exactly is refused before anything is read.
     #[allow(clippy::too_many_arguments)]
     pub fn replace_openapi_catalog_with_overlay_and_enum_values(
         &self,
@@ -2829,6 +2988,14 @@ impl SqliteConnectionStore {
         policy_protected_names: &[String],
         enum_values: &[StoredEnumSourceValueWrite],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
+        validate_change_actor(actor)?;
+        let evidence_action = match overlay {
+            Some(StoredOverlayWrite::Put { .. }) => CATALOG_EVIDENCE_ACTION_OVERLAY_REPLACE,
+            Some(StoredOverlayWrite::Delete { .. }) => CATALOG_EVIDENCE_ACTION_OVERLAY_DELETE,
+            Some(StoredOverlayWrite::Reports { .. }) | None => {
+                CATALOG_EVIDENCE_ACTION_OPENAPI_PUBLISH
+            }
+        };
         // Standalone SQLite serializes overlay adoption with local policy
         // swaps before this call. PostgreSQL additionally rechecks these
         // names against its authoritative policy under a shared advisory
@@ -3109,6 +3276,21 @@ impl SqliteConnectionStore {
                 sqlite_error(&self.path, "OpenAPI catalog overlay revision update", source)
             })?;
 
+        // Last before the commit, after every precondition and write above
+        // has succeeded, so the row exists exactly when the publication does.
+        record_catalog_change_evidence(
+            &transaction,
+            &self.path,
+            &CatalogChangeEvidence {
+                action: evidence_action,
+                id,
+                prior_version: previous_catalog_revision,
+                new_version: catalog_revision,
+                overlay_revision: Some(overlay_revision),
+                committed_at: &now,
+                actor,
+            },
+        )?;
         transaction.commit().map_err(|source| {
             sqlite_error(&self.path, "OpenAPI catalog transaction commit", source)
         })?;
@@ -3967,7 +4149,89 @@ fn record_change_evidence(
             crate::storage::record_standalone_evidence_failure(
                 crate::storage::StandaloneEvidenceStore::Connections,
             );
-            sqlite_error(path, "change evidence append", source)
+            sqlite_error(path, OPERATION_CHANGE_EVIDENCE_APPEND, source)
+        })?;
+    Ok(())
+}
+
+/// One committed catalog publication's evidence: identifiers, revisions and
+/// the actor, never specification, overlay, tool definition, endpoint or
+/// secret material.
+struct CatalogChangeEvidence<'a> {
+    action: &'static str,
+    id: &'a ConnectionId,
+    /// The catalog revision the publication replaced; `0` (no catalog of
+    /// this kind yet) is stored as NULL, the authority event's "no prior
+    /// revision".
+    prior_version: u64,
+    new_version: u64,
+    /// The OpenAPI overlay revision the published catalog was compiled
+    /// from (`0` for none); `None` for MCP catalogs, which have no overlay.
+    overlay_revision: Option<u64>,
+    committed_at: &'a str,
+    actor: &'a ChangeActor,
+}
+
+/// Append one catalog evidence row inside the caller's transaction. Its
+/// event and operation IDs are minted here, once: a publication is one
+/// store call and one row. The actor is recorded whole, as
+/// [`record_change_evidence`] records it. Any failure is returned for the
+/// caller to roll back, so the publication it describes never commits
+/// without it, and it is reported as a store failure under its own
+/// operation label ([`ConnectionStoreError::is_evidence_append_failure`])
+/// and counted once on the standalone evidence-failure counter.
+fn record_catalog_change_evidence(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    evidence: &CatalogChangeEvidence<'_>,
+) -> Result<(), ConnectionStoreError> {
+    let prior_version = match evidence.prior_version {
+        0 => None,
+        version => Some(u64_to_i64(evidence.id, version)?),
+    };
+    let new_version = u64_to_i64(evidence.id, evidence.new_version)?;
+    let overlay_revision = evidence
+        .overlay_revision
+        .map(|revision| u64_to_i64(evidence.id, revision))
+        .transpose()?;
+    transaction
+        .execute(
+            r#"
+            INSERT INTO catalog_change_evidence (
+                event_id, operation_id, actor_user_id, actor_issuer, actor_kind,
+                actor_auth_mode, action, connection_id, prior_version, new_version,
+                overlay_revision, committed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "#,
+            params![
+                Uuid::new_v4().to_string(),
+                Uuid::new_v4().to_string(),
+                evidence.actor.subject(),
+                evidence.actor.issuer(),
+                evidence.actor.kind().as_str(),
+                evidence.actor.auth_mode(),
+                evidence.action,
+                evidence.id.as_str(),
+                prior_version,
+                new_version,
+                overlay_revision,
+                evidence.committed_at,
+            ],
+        )
+        .map_err(|source| {
+            crate::storage::record_standalone_evidence_failure(
+                crate::storage::StandaloneEvidenceStore::Connections,
+            );
+            // The catalog services answer with a stable reason only, so the
+            // cause is logged here, once: the file, the operation and the
+            // SQLite error, never a row value.
+            tracing::error!(
+                path = %path.display(),
+                operation = OPERATION_CATALOG_CHANGE_EVIDENCE_APPEND,
+                error = %source,
+                "failed to record catalog change evidence; the publication was rolled back"
+            );
+            sqlite_error(path, OPERATION_CATALOG_CHANGE_EVIDENCE_APPEND, source)
         })?;
     Ok(())
 }
@@ -4050,6 +4314,7 @@ fn validate_schema(connection: &Connection, path: &Path) -> Result<(), Connectio
         "SELECT connection_id, source_id, overlay_revision, source_digest, values_revision, connection_revision, credential_revision, credential_generation_digest, values_json, resolved_at FROM connection_enum_source_values LIMIT 0",
         "SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode, action, connection_id, prior_version, new_version, committed_at FROM connection_change_evidence LIMIT 0",
         "SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode, action, secret_id, prior_version, new_version, reencrypted_count, committed_at FROM connection_local_secret_change_evidence LIMIT 0",
+        "SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode, action, connection_id, prior_version, new_version, overlay_revision, committed_at FROM catalog_change_evidence LIMIT 0",
     ] {
         connection
             .prepare(query)
