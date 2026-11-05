@@ -73,6 +73,7 @@ fn complete_view() -> PolicyResourceView {
         egress: Some(egress(&["api.example.test"], &[])),
         tools: Some(ToolInventory {
             names: BTreeSet::new(),
+            definitions: BTreeMap::new(),
             digest: format!("sha256:{}", "t".repeat(64)),
         }),
         connections: Some(ConnectionInventory {
@@ -739,6 +740,7 @@ fn tool_names_the_registry_does_not_hold_are_reported_only_when_it_was_read() {
     let mut view = complete_view();
     view.tools = Some(ToolInventory {
         names: ["search".to_owned()].into_iter().collect(),
+        definitions: BTreeMap::new(),
         digest: format!("sha256:{}", "1".repeat(64)),
     });
 
@@ -1179,4 +1181,116 @@ fn a_claim_condition_its_issuer_never_captures_blocks_publication() {
         );
         assert!(!refusal.diagnostic.message.contains("department"));
     }
+}
+
+/// A registry holding one tool, `reports.export`, whose input schema has an
+/// eligible `region` and a secret-marked `password`.
+fn export_inventory() -> ToolInventory {
+    let registry = ToolRegistry::from_json_value(json!({
+        "schema_version": "0.1.0",
+        "tools": [{
+            "name": "reports.export",
+            "description": "Exports a report.",
+            "input_json_schema": {
+                "type": "object",
+                "properties": {
+                    "region": { "type": "string" },
+                    "password": { "type": "string", "format": "password" }
+                },
+                "additionalProperties": false
+            },
+            "upstream": {
+                "method": "POST",
+                "path_template": "/v1/exports",
+                "body": { "mode": "whole_args_json" }
+            }
+        }]
+    }))
+    .expect("the export tool loads");
+    tool_inventory(&registry).expect("the registry serializes")
+}
+
+#[test]
+fn a_tool_argument_pointer_the_tool_schema_does_not_make_eligible_blocks_publication() {
+    let live = policy(administered(json!({})));
+    let candidate = policy(json!({
+        "schema_version": "1.0.0",
+        "default_action": "deny",
+        "roles": {
+            "admin": { "permissions": ["admin:policy:read", "admin:policy:write"] }
+        },
+        "routes": [{
+            "id": "policy-write",
+            "methods": ["PUT"],
+            "path_prefix": POLICY_ROUTE,
+            "permission": "admin:policy:write"
+        }],
+        "tools": { "reports.export": {} },
+        "rules": [
+            {
+                "id": "eligible",
+                "tool_name": "reports.export",
+                "action": "deny",
+                "conditions": { "tool_argument": { "pointer": "/region", "in": ["eu"] } }
+            },
+            {
+                "id": "secret",
+                "tool_name": "reports.export",
+                "action": "deny",
+                "conditions": { "any": [
+                    { "tool_argument": { "pointer": "/password", "in": ["x"] } },
+                    { "not": { "tool_argument": { "pointer": "/undeclared", "in": ["x"] } } }
+                ] }
+            },
+            {
+                "id": "unregistered",
+                "tool_name": "reports.purge",
+                "action": "deny",
+                "conditions": { "tool_argument": { "pointer": "/anything", "in": ["x"] } }
+            }
+        ]
+    }));
+    let mut view = complete_view();
+    view.tools = Some(export_inventory());
+
+    let validation = validate(&candidate, &live, &view);
+    let ineligible: Vec<&ResourceFinding> = validation
+        .findings()
+        .iter()
+        .filter(|finding| finding.diagnostic.code == "condition_pointer_ineligible")
+        .collect();
+    assert_eq!(
+        ineligible
+            .iter()
+            .map(|finding| finding.diagnostic.pointer.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "/rules/1/conditions/any/0/tool_argument/pointer",
+            "/rules/1/conditions/any/1/not/tool_argument/pointer",
+        ]
+    );
+    for finding in &ineligible {
+        assert_eq!(finding.diagnostic.element_id.as_deref(), Some("secret"));
+        assert_eq!(finding.diagnostic.severity, DiagnosticSeverity::Error);
+        // Publication only: the policy can still be simulated and tested.
+        assert_eq!(finding.diagnostic.blocks, PUBLICATION_ONLY);
+        assert!(finding
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("reports.export")));
+    }
+    assert!(validation.blocks_publication());
+    assert!(validation
+        .blocking_codes()
+        .contains(&"condition_pointer_ineligible"));
+    // The tool the registry does not hold is a warning about the name, and
+    // its pointer is not judged against a schema nobody has.
+    assert!(codes(&validation).contains(&("tool_not_registered", "/rules/2/tool_name".to_owned())));
+
+    // An unread registry judges no pointer.
+    view.tools = None;
+    assert!(!has(
+        &validate(&candidate, &live, &view),
+        IssueCode::ConditionPointerIneligible
+    ));
 }

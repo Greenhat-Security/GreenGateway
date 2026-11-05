@@ -493,7 +493,7 @@ fn the_tool_lanes_decide_scope_conditions_as_the_kernel() {
                 ToolOperation::Visibility => {
                     state.tool_visible("reports.export", Some(&principal), None)
                 }
-                _ => state.evaluate_tool_authorization(
+                _ => state.evaluate_tool_authorization_without_arguments(
                     "reports.export",
                     Some(&principal),
                     None,

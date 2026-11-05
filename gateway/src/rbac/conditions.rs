@@ -34,7 +34,8 @@
 //!   parameter, from an explicit name the gateway checks is not one that can
 //!   carry credentials, identity or hop-by-hop routing.
 //! - `tool_argument`: one scalar of a tool call's schema-validated arguments,
-//!   by bounded JSON Pointer.
+//!   by bounded JSON Pointer, and only one the tool's input schema makes
+//!   eligible ([`tool_argument_pointer_eligible`]).
 //! - `time_window`: a half-open UTC interval over an injected clock.
 //!
 //! An HTTP path rule may read every leaf but `tool_argument`; a tool-name rule
@@ -47,7 +48,27 @@
 //! whatever it carries. A scope or claim the principal's authentication did
 //! not capture -- a method that verifies none, a claim its provider does not
 //! allowlist, a value past the capture bounds -- is unknown, never absent.
+//!
+//! ## Which tool arguments a leaf may read
+//!
+//! A `tool_argument` pointer is eligible for a tool only when it resolves
+//! through the tool's input schema by declared `properties` alone: every
+//! schema it passes through has `"type": "object"` and declares the next
+//! token under `properties`, and the schema it ends at has a `type` of
+//! exactly `"string"`, `"integer"`, `"number"` or `"boolean"`. No schema on
+//! the way may be `writeOnly` (anything but `false`), have `format`
+//! `"password"`, or compose or reference others (`$ref`, `$dynamicRef`,
+//! `allOf`, `anyOf`, `oneOf`, `not`, `if`, `then`, `else`,
+//! `dependentSchemas`, `patternProperties`), since a schema elsewhere could
+//! then mark the field secret or widen what it accepts. Anything else -- an
+//! array index, an undeclared or additional property, a `$ref` -- is
+//! ineligible. Publication refuses a rule that reads an ineligible pointer of
+//! a registered tool (`condition_pointer_ineligible`), and a tool lane whose
+//! tool's schema has since made one ineligible captures no arguments at all,
+//! so a rule that reads them is undetermined and refused rather than decided
+//! without a value the schema calls secret.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use ipnet::IpNet;
@@ -293,24 +314,38 @@ pub(crate) fn query_name_is_readable(name: &str) -> bool {
 }
 
 impl Condition {
-    /// Whether any leaf of the tree reads a tool call's arguments: the one
-    /// leaf no serving lane captures a fact for yet, because the arguments a
-    /// leaf may read are the schema-validated ones and admission decides
-    /// before it validates them.
-    pub(crate) fn reads_tool_arguments(&self) -> bool {
+    /// Every `tool_argument` leaf of the tree, in document order: the RFC
+    /// 6901 location of its `pointer` member below `location`, the tree's own
+    /// location (`/rules/{index}/conditions`), and the argument pointer it
+    /// reads.
+    pub(crate) fn tool_argument_leaves<'a>(
+        &'a self,
+        location: &str,
+        leaves: &mut Vec<(String, &'a str)>,
+    ) {
         match self {
             Self::All(operands) | Self::Any(operands) => {
-                operands.iter().any(Self::reads_tool_arguments)
+                let operator = if matches!(self, Self::All(_)) {
+                    "all"
+                } else {
+                    "any"
+                };
+                for (index, operand) in operands.iter().enumerate() {
+                    operand.tool_argument_leaves(&format!("{location}/{operator}/{index}"), leaves);
+                }
             }
-            Self::Not(operand) => operand.reads_tool_arguments(),
-            Self::ToolArgument(_) => true,
+            Self::Not(operand) => operand.tool_argument_leaves(&format!("{location}/not"), leaves),
+            Self::ToolArgument(leaf) => leaves.push((
+                format!("{location}/tool_argument/pointer"),
+                leaf.pointer.as_str(),
+            )),
             Self::Organization(_)
             | Self::Scope(_)
             | Self::Claim(_)
             | Self::SourceNetwork(_)
             | Self::Header(_)
             | Self::Query(_)
-            | Self::TimeWindow(_) => false,
+            | Self::TimeWindow(_) => {}
         }
     }
 
@@ -367,8 +402,11 @@ pub(crate) struct FactNeeds {
     pub(crate) headers: Vec<String>,
     /// The query parameter names `query` leaves read, sorted and unique.
     pub(crate) query: Vec<String>,
-    /// A `tool_argument` leaf reads the call's validated arguments.
-    pub(crate) tool_arguments: bool,
+    /// The argument pointers `tool_argument` leaves read, by the tool their
+    /// tool-name rule names, each list sorted and unique. A tool lane
+    /// validates a call's arguments before it decides a rule that reads one,
+    /// and captures the values at these pointers and no others.
+    pub(crate) tool_arguments: BTreeMap<String, Vec<String>>,
     /// A `time_window` leaf reads the evaluation instant.
     pub(crate) now: bool,
 }
@@ -386,33 +424,59 @@ impl FactNeeds {
                 .is_some_and(|mappings| mappings.iter().any(|mapping| !mapping.scopes.is_empty())),
             ..Self::default()
         };
-        for conditions in rules.iter().filter_map(|rule| rule.conditions.as_ref()) {
-            needs.add(conditions);
+        for rule in rules {
+            if let Some(conditions) = &rule.conditions {
+                needs.add(conditions, rule.tool_name.as_deref());
+            }
         }
         for names in [&mut needs.headers, &mut needs.query, &mut needs.claims] {
             names.sort_unstable();
             names.dedup();
         }
+        for pointers in needs.tool_arguments.values_mut() {
+            pointers.sort_unstable();
+            pointers.dedup();
+        }
         needs
     }
 
-    fn add(&mut self, condition: &Condition) {
+    /// `tool_name` is the tool the condition's rule names. Validation admits
+    /// a `tool_argument` leaf only in a tool-name rule, so one anywhere else
+    /// -- only in a policy assembled in memory -- reads nothing a lane
+    /// captures, and stays undetermined.
+    fn add(&mut self, condition: &Condition, tool_name: Option<&str>) {
         match condition {
             Condition::All(operands) | Condition::Any(operands) => {
                 for operand in operands {
-                    self.add(operand);
+                    self.add(operand, tool_name);
                 }
             }
-            Condition::Not(operand) => self.add(operand),
+            Condition::Not(operand) => self.add(operand, tool_name),
             Condition::Organization(_) => self.organization = true,
             Condition::Scope(_) => self.scopes = true,
             Condition::Claim(leaf) => self.claims.push(leaf.name.clone()),
             Condition::SourceNetwork(_) => self.source_ip = true,
             Condition::Header(leaf) => self.headers.push(leaf.name.to_ascii_lowercase()),
             Condition::Query(leaf) => self.query.push(leaf.name.clone()),
-            Condition::ToolArgument(_) => self.tool_arguments = true,
+            Condition::ToolArgument(leaf) => {
+                if let Some(tool_name) = tool_name {
+                    self.tool_arguments
+                        .entry(tool_name.to_owned())
+                        .or_default()
+                        .push(leaf.pointer.clone());
+                }
+            }
             Condition::TimeWindow(_) => self.now = true,
         }
+    }
+
+    /// The argument pointers the tool-name rules for `tool_name` read, sorted
+    /// and unique. Empty when none reads one, so a call to that tool is
+    /// decided exactly as it was before arguments were served.
+    pub(crate) fn tool_argument_pointers(&self, tool_name: &str) -> &[String] {
+        self.tool_arguments
+            .get(tool_name)
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Whether a request fact -- anything beyond the organization, scopes and
@@ -421,7 +485,7 @@ impl FactNeeds {
         self.source_ip
             || !self.headers.is_empty()
             || !self.query.is_empty()
-            || self.tool_arguments
+            || !self.tool_arguments.is_empty()
             || self.now
     }
 }
@@ -902,6 +966,117 @@ fn is_bounded_json_pointer(pointer: &str) -> bool {
     count <= MAX_TOOL_ARGUMENT_POINTER_TOKENS
 }
 
+/// Schema keywords that compose or reference other schemas. A schema on a
+/// pointer's path that carries one is also judged by schemas the path does
+/// not show, which could mark the field secret or widen what it accepts.
+const COMPOSING_SCHEMA_KEYWORDS: &[&str] = &[
+    "$ref",
+    "$dynamicRef",
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "dependentSchemas",
+    "patternProperties",
+];
+
+/// Whether a `tool_argument` leaf may read `pointer` of a tool whose input
+/// schema is `schema`: the pointer resolves through declared `properties` of
+/// object schemas to a schema of one scalar `type`, and no schema on the way
+/// is secret-marked or composed (see the module documentation). Every other
+/// pointer is ineligible, the empty one included.
+pub(crate) fn tool_argument_pointer_eligible(schema: &Value, pointer: &str) -> bool {
+    let Some(tokens) = pointer.strip_prefix('/') else {
+        return false;
+    };
+    let mut node = schema;
+    for token in tokens.split('/') {
+        if !plain_schema(node) || node.get("type").and_then(Value::as_str) != Some("object") {
+            return false;
+        }
+        let token = token.replace("~1", "/").replace("~0", "~");
+        match node
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get(&token))
+        {
+            Some(next) => node = next,
+            None => return false,
+        }
+    }
+    plain_schema(node)
+        && matches!(
+            node.get("type").and_then(Value::as_str),
+            Some("string" | "integer" | "number" | "boolean")
+        )
+}
+
+/// The scalars of `arguments` at `pointers`, each at the same place in a
+/// fresh object, and nothing else: the argument fact a `tool_argument` leaf
+/// reads. A pointer the arguments do not reach, or that reaches an array or
+/// an object, contributes nothing, so a leaf over it does not match -- as a
+/// leaf over an argument the call did not pass does not.
+pub(crate) fn referenced_tool_arguments(arguments: &Value, pointers: &[String]) -> Value {
+    let mut referenced = serde_json::Map::new();
+    for pointer in pointers {
+        let Some(scalar) = arguments
+            .pointer(pointer)
+            .filter(|value| matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_)))
+        else {
+            continue;
+        };
+        let Some(tokens) = pointer.strip_prefix('/') else {
+            continue;
+        };
+        let tokens: Vec<String> = tokens
+            .split('/')
+            .map(|token| token.replace("~1", "/").replace("~0", "~"))
+            .collect();
+        insert_scalar(&mut referenced, &tokens, scalar);
+    }
+    Value::Object(referenced)
+}
+
+/// Places `scalar` at `tokens` below `object`, making the objects on the way.
+/// Nothing is placed where a scalar already sits on the way, which the
+/// pointer that reached `scalar` could not have walked through.
+fn insert_scalar(object: &mut serde_json::Map<String, Value>, tokens: &[String], scalar: &Value) {
+    match tokens {
+        [] => {}
+        [last] => {
+            object.insert(last.clone(), scalar.clone());
+        }
+        [first, rest @ ..] => {
+            if let Value::Object(next) = object
+                .entry(first.clone())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            {
+                insert_scalar(next, rest, scalar);
+            }
+        }
+    }
+}
+
+/// An object schema that is not secret-marked and composes no other.
+fn plain_schema(node: &Value) -> bool {
+    let Some(schema) = node.as_object() else {
+        return false;
+    };
+    schema
+        .get("writeOnly")
+        .is_none_or(|write_only| *write_only == Value::Bool(false))
+        && !schema
+            .get("format")
+            .and_then(Value::as_str)
+            .is_some_and(|format| format.eq_ignore_ascii_case("password"))
+        && !COMPOSING_SCHEMA_KEYWORDS
+            .iter()
+            .any(|keyword| schema.contains_key(*keyword))
+}
+
 /// Seconds since the Unix epoch of an RFC 3339 instant written in its one
 /// accepted spelling: `YYYY-MM-DDTHH:MM:SSZ`, UTC, no fraction and no offset.
 /// UTC has no daylight-saving transitions, so every instant has exactly one
@@ -953,8 +1128,10 @@ pub(crate) struct PolicyFacts {
     pub(crate) headers: Fact<Vec<(String, String)>>,
     /// Decoded query parameters, one entry per occurrence, in request order.
     pub(crate) query: Fact<Vec<(String, String)>>,
-    /// The tool call's schema-validated arguments, secret-marked fields
-    /// already removed.
+    /// The tool call's schema-validated arguments, reduced to the eligible
+    /// scalars the policy's `tool_argument` leaves read for that tool: every
+    /// other field, a secret-marked one included, is removed before the
+    /// kernel sees them (`middleware::policy_facts::tool_argument_facts`).
     pub(crate) tool_arguments: Fact<Value>,
     /// The evaluation instant, in whole seconds since the Unix epoch.
     pub(crate) now: Fact<i64>,

@@ -80,6 +80,11 @@
 //! ([`POLICY_RULE_CONDITIONS`]): a gateway that serves format 1 but not
 //! rule conditions refuses the whole document, so the write also waits
 //! until every live member advertises [`Capability::PolicyRuleConditions`].
+//! The seventh (issue #243) is committing one whose conditions contain a
+//! `tool_argument` leaf ([`POLICY_TOOL_ARGUMENT_CONDITIONS`]): a gateway
+//! that enforces the other conditions but not that leaf refuses the whole
+//! document, so the write also waits until every live member advertises
+//! [`Capability::PolicyToolArgumentConditions`].
 //! No operation changes the schema: migration 25, the one step that rolls,
 //! adds columns nothing writes yet, and the approved-extension list in
 //! `migrations.rs` is empty. Every other operation this binary performs
@@ -148,11 +153,17 @@ pub(crate) enum Capability {
     /// parameters and time windows (issue #243). A member without it
     /// refuses such a document, so [`POLICY_RULE_CONDITIONS`] waits for it.
     PolicyRuleConditions,
+    /// The member reads, validates and enforces a policy v1 document whose
+    /// rule conditions contain a `tool_argument` leaf, deciding it on tool
+    /// invocation admission after the call's arguments are validated (issue
+    /// #243). A member without it refuses such a document, so
+    /// [`POLICY_TOOL_ARGUMENT_CONDITIONS`] waits for it.
+    PolicyToolArgumentConditions,
 }
 
 impl Capability {
     /// Every capability, in name order.
-    pub(crate) const KNOWN: [Self; 7] = [
+    pub(crate) const KNOWN: [Self; 8] = [
         Self::DelegatedTokenPurges,
         Self::OpenApiDiscoveryCatalogs,
         Self::OpenApiSwagger2Catalogs,
@@ -160,6 +171,7 @@ impl Capability {
         Self::PolicyDocumentV1,
         Self::PolicyRoleDescriptions,
         Self::PolicyRuleConditions,
+        Self::PolicyToolArgumentConditions,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -171,6 +183,7 @@ impl Capability {
             Self::PolicyDocumentV1 => "policy_document_v1",
             Self::PolicyRoleDescriptions => "policy_role_descriptions",
             Self::PolicyRuleConditions => "policy_rule_conditions",
+            Self::PolicyToolArgumentConditions => "policy_tool_argument_conditions",
         }
     }
 
@@ -190,6 +203,7 @@ pub(crate) const BINARY_CAPABILITIES: &[Capability] = &[
     Capability::PolicyDocumentV1,
     Capability::PolicyRoleDescriptions,
     Capability::PolicyRuleConditions,
+    Capability::PolicyToolArgumentConditions,
 ];
 
 /// The roster column's value for a capability set: the names sorted,
@@ -270,6 +284,7 @@ pub(crate) use gate::{
     OperationAdmission, OperationRefusal, OperationRequirement, DELEGATED_TOKEN_PURGES,
     OPENAPI_DISCOVERY_CATALOGS, OPENAPI_SWAGGER2_CATALOGS, OPERATION_REQUIREMENTS,
     POLICY_DOCUMENT_V1, POLICY_ROLE_DESCRIPTIONS, POLICY_RULE_CONDITIONS,
+    POLICY_TOOL_ARGUMENT_CONDITIONS,
 };
 
 #[cfg(feature = "postgres")]
@@ -473,9 +488,10 @@ mod gate {
     /// is enough ([`Activation::LiveMembers`]), for the same reason as
     /// [`POLICY_DOCUMENT_V1`]: raising the durable fence would forbid every
     /// earlier build from rejoining even after a document without
-    /// conditions is active again. A `tool_argument` condition is still
-    /// refused by this build too, before the gate is asked. The document
-    /// lives in the policy tables, so no schema object is added, and
+    /// conditions is active again. A document whose conditions contain a
+    /// `tool_argument` leaf is also [`POLICY_TOOL_ARGUMENT_CONDITIONS`],
+    /// which a build that enforces only the other leaves refuses. The
+    /// document lives in the policy tables, so no schema object is added, and
     /// `minimum_schema` is 17 for the same reason as
     /// [`POLICY_ROLE_DESCRIPTIONS`].
     pub(crate) const POLICY_RULE_CONDITIONS: OperationRequirement = OperationRequirement {
@@ -483,6 +499,28 @@ mod gate {
         minimum_schema: 17,
         document_format: Some(1),
         capability: Capability::PolicyRuleConditions,
+        backfill: Backfill::NotRequired,
+        activation: Activation::LiveMembers,
+    };
+
+    /// Committing a policy v1 document whose rule conditions contain a
+    /// `tool_argument` leaf anywhere (issue #243): through the same writes
+    /// as [`POLICY_RULE_CONDITIONS`], which such a commit also asks first.
+    ///
+    /// A gateway that enforces the other condition leaves but predates
+    /// tool-argument conditions validates the leaf and refuses the whole
+    /// document (`typed_matchers_not_enforced`); none reads it without the
+    /// leaf. Like [`POLICY_RULE_CONDITIONS`] that fails closed, never a
+    /// misreading, so live-roster agreement is enough
+    /// ([`Activation::LiveMembers`]) and the durable fence is not raised.
+    /// The document lives in the policy tables, so no schema object is
+    /// added, and `minimum_schema` is 17 for the same reason as
+    /// [`POLICY_ROLE_DESCRIPTIONS`].
+    pub(crate) const POLICY_TOOL_ARGUMENT_CONDITIONS: OperationRequirement = OperationRequirement {
+        operation: "policy.tool_argument_conditions",
+        minimum_schema: 17,
+        document_format: Some(1),
+        capability: Capability::PolicyToolArgumentConditions,
         backfill: Backfill::NotRequired,
         activation: Activation::LiveMembers,
     };
@@ -497,6 +535,7 @@ mod gate {
         DELEGATED_TOKEN_PURGES,
         POLICY_DOCUMENT_V1,
         POLICY_RULE_CONDITIONS,
+        POLICY_TOOL_ARGUMENT_CONDITIONS,
     ];
 
     /// What this binary serves and advertises: the left-hand side of every

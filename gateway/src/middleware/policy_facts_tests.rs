@@ -418,3 +418,44 @@ fn a_tool_call_captures_the_organization_address_and_instant_only() {
     );
     assert_eq!(internal.source_ip, Fact::Uncaptured);
 }
+
+/// The argument fact is the eligible scalars the pointers read and nothing
+/// else; one ineligible pointer captures none at all.
+#[test]
+fn tool_argument_facts_carry_only_eligible_referenced_scalars() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "region": { "type": "string" },
+            "limit": { "type": "integer" },
+            "password": { "type": "string", "format": "password" },
+            "note": { "type": "string" }
+        }
+    });
+    let arguments = json!({
+        "region": "eu",
+        "limit": 10,
+        "password": "fact-password-canary",
+        "note": "fact-note-canary"
+    });
+    let eligible = ["/limit".to_owned(), "/region".to_owned()];
+    assert_eq!(
+        tool_argument_facts(&schema, &arguments, &eligible),
+        Fact::Captured(json!({ "region": "eu", "limit": 10 }))
+    );
+    // An argument the call did not pass is simply absent from the fact.
+    assert_eq!(
+        tool_argument_facts(&schema, &json!({ "limit": 10 }), &eligible),
+        Fact::Captured(json!({ "limit": 10 }))
+    );
+    // A secret-marked or undeclared pointer makes the whole fact uncaptured,
+    // so a rule over it is undetermined rather than a no-match.
+    for ineligible in ["/password", "/undeclared"] {
+        let pointers = ["/region".to_owned(), ineligible.to_owned()];
+        assert_eq!(
+            tool_argument_facts(&schema, &arguments, &pointers),
+            Fact::Uncaptured,
+            "{ineligible}"
+        );
+    }
+}

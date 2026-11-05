@@ -34,6 +34,8 @@ use crate::{
         openapi::OpenApiConnectionCatalogRuntime,
     },
     egress::{EgressClient, EgressError, EgressRequestBody, EgressResponse},
+    middleware::policy_facts::tool_argument_facts,
+    policy_eval::Fact,
     tools::{
         composite::{
             resolve_arguments, resolve_binding, resolve_for_each, status_is_ambiguous,
@@ -1069,10 +1071,16 @@ impl ToolExecutor {
         let runtime_tool_name = tool_name.to_owned();
         let work_tool_name = runtime_tool_name.clone();
         let observation_context = context.clone();
+        let argument_context = context.clone();
         let work_cancel = cancel.clone();
         let work_started = Arc::new(AtomicBool::new(false));
         let work_started_for_closure = Arc::clone(&work_started);
         let executor = self.clone();
+        // Admission reads the arguments only when a tool-name rule does, and
+        // is done with them before the work starts, so the work takes them
+        // back without a copy.
+        let args = Arc::new(args);
+        let admission_args = Arc::clone(&args);
 
         let result = self
             .runtime
@@ -1082,6 +1090,7 @@ impl ToolExecutor {
                 cancel,
                 move |work_context| async move {
                     work_started_for_closure.store(true, Ordering::SeqCst);
+                    let args = Arc::unwrap_or_clone(args);
                     executor
                         .execute_inner(
                             &work_tool_name,
@@ -1094,6 +1103,14 @@ impl ToolExecutor {
                 },
                 executor_work_error_disposition,
                 ToolExecutionResult::application_failure_reason,
+                Some(move |pointers: &[String]| {
+                    self.admission_arguments(
+                        tool_name,
+                        &admission_args,
+                        &argument_context,
+                        pointers,
+                    )
+                }),
             )
             .await;
 
@@ -1225,35 +1242,71 @@ impl ToolExecutor {
         result
     }
 
-    async fn execute_inner(
+    /// The argument stage of admission (issue #243): asked only when a
+    /// tool-name rule for `tool_name` reads the call's arguments and nothing
+    /// else has decided the call, before any permit or lease is taken.
+    ///
+    /// The arguments are validated exactly as the work validates them --
+    /// the served definition, its enum sources, the cached validator --
+    /// with the same observations, so an invalid call is refused as invalid
+    /// before the policy reads any of it. A valid call answers with the
+    /// eligible scalars at `pointers` and nothing else
+    /// ([`tool_argument_facts`]); none at all when the served schema makes
+    /// one of them ineligible, which leaves the rule undetermined and the
+    /// call refused. The work validates the arguments again against the
+    /// definition it then serves.
+    fn admission_arguments(
         &self,
         tool_name: &str,
-        args: Value,
+        args: &Value,
         context: &ToolInvocationContext,
-        cancel: &CancellationToken,
-        precondition: Option<&ToolExecutionPrecondition>,
-    ) -> Result<ToolExecutionResult, ToolExecutorError> {
+        pointers: &[String],
+    ) -> Result<Fact<Value>, ToolExecutorError> {
+        let tool = self.registered_tool(tool_name, context)?;
+        let served = self.validate_call(&tool, args, context)?;
+        Ok(tool_argument_facts(
+            &served.definition.input_schema,
+            args,
+            pointers,
+        ))
+    }
+
+    fn registered_tool(
+        &self,
+        tool_name: &str,
+        context: &ToolInvocationContext,
+    ) -> Result<Arc<ToolDefinition>, ToolExecutorError> {
         let lookup_started = Instant::now();
-        let tool = match self.registry.get(tool_name) {
-            Some(tool) => tool,
+        match self.registry.get(tool_name) {
+            Some(tool) => Ok(tool),
             None => {
                 self.emit_unknown_tool_observation(
                     context,
                     tool_name,
                     duration_millis(lookup_started.elapsed()),
                 );
-                return Err(ToolExecutorError::UnknownTool {
+                Err(ToolExecutorError::UnknownTool {
                     tool_name: tool_name.to_owned(),
-                });
+                })
             }
-        };
+        }
+    }
+
+    /// Validate `args` against the definition `tool` is served as, observing
+    /// a failure as the call's outcome, and hand that definition back.
+    fn validate_call<'a>(
+        &self,
+        tool: &'a ToolDefinition,
+        args: &Value,
+        context: &ToolInvocationContext,
+    ) -> Result<ServedToolDefinition<'a>, ToolExecutorError> {
         let validation_started = Instant::now();
-        let served = match self.served_definition(tool.as_ref()) {
+        let served = match self.served_definition(tool) {
             Ok(served) => served,
             Err(error) => {
                 self.emit_executor_failure_observation(
                     context,
-                    &tool,
+                    tool,
                     duration_millis(validation_started.elapsed()),
                     &error,
                 );
@@ -1267,7 +1320,7 @@ impl ToolExecutor {
             };
             self.emit_executor_failure_observation(
                 context,
-                &tool,
+                tool,
                 duration_millis(validation_started.elapsed()),
                 &error,
             );
@@ -1278,24 +1331,38 @@ impl ToolExecutor {
             Err(error) => {
                 self.emit_executor_failure_observation(
                     context,
-                    &tool,
+                    tool,
                     duration_millis(validation_started.elapsed()),
                     &error,
                 );
                 return Err(error);
             }
         };
-        if let Err(error) = validate_args(served.definition.as_ref(), &validator, &args) {
+        if let Err(error) = validate_args(served.definition.as_ref(), &validator, args) {
             if let ToolExecutorError::InputValidation { problems, .. } = &error {
                 self.emit_input_validation_observation(
                     context,
-                    &tool,
+                    tool,
                     duration_millis(validation_started.elapsed()),
                     problems,
                 );
             }
             return Err(error);
         }
+        Ok(served)
+    }
+
+    async fn execute_inner(
+        &self,
+        tool_name: &str,
+        args: Value,
+        context: &ToolInvocationContext,
+        cancel: &CancellationToken,
+        precondition: Option<&ToolExecutionPrecondition>,
+    ) -> Result<ToolExecutionResult, ToolExecutorError> {
+        let tool = self.registered_tool(tool_name, context)?;
+        let validation_started = Instant::now();
+        self.validate_call(&tool, &args, context)?;
 
         if let Some(composite) = tool.composite.as_ref() {
             let connection_id = match (&tool.target, &tool.source) {

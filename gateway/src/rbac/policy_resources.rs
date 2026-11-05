@@ -58,6 +58,15 @@
 //!   and every request the condition decides would be refused as
 //!   undetermined. The allowlists are static configuration, identified by
 //!   the configuration fingerprint the snapshot already binds.
+//! - `condition_pointer_ineligible`: a tool-name rule's `tool_argument`
+//!   condition reads a pointer the named tool's registered input schema does
+//!   not make eligible (`rbac::conditions::tool_argument_pointer_eligible`):
+//!   one that does not resolve through declared `properties` to a scalar, or
+//!   resolves to a secret-marked one. A tool lane captures no arguments for
+//!   such a call, so the rule could only ever refuse it as undetermined.
+//!   A rule for a tool the registry does not hold is not judged here; it is
+//!   the `tool_not_registered` warning below, and a tool registered later
+//!   with such a schema has its calls refused, never decided on the field.
 //!
 //! Warnings block nothing; each is a reference another resource contradicts:
 //! a role that no `roles` entry defines, a route permission no role grants, a
@@ -105,6 +114,7 @@ use crate::{
         HTTP_SEMANTICS_VERSION,
     },
     rbac::{
+        conditions::tool_argument_pointer_eligible,
         engine::grants_permission,
         identity_mappings::admitted_auth_methods,
         policy_document::{
@@ -112,7 +122,7 @@ use crate::{
         },
         DefaultAction, EnforcementMode, Policy,
     },
-    tools::definitions::ToolRegistry,
+    tools::definitions::{ToolDefinition, ToolRegistry},
 };
 
 /// The exact schema version of a [`PolicyResourceSnapshot`].
@@ -235,10 +245,14 @@ impl ClaimAllowlists {
     }
 }
 
-/// The registered tools: their names, and a digest over their definitions.
+/// The registered tools: their names, their definitions, and a digest over
+/// those definitions.
 #[derive(Clone, Debug)]
 pub(crate) struct ToolInventory {
     pub(crate) names: BTreeSet<String>,
+    /// Each registered definition by name, for the input schema a
+    /// `tool_argument` pointer is judged against.
+    pub(crate) definitions: BTreeMap<String, Arc<ToolDefinition>>,
     pub(crate) digest: String,
 }
 
@@ -271,6 +285,10 @@ fn tool_inventory(registry: &ToolRegistry) -> Option<ToolInventory> {
     let bytes = serde_json::to_vec(&by_name).ok()?;
     Some(ToolInventory {
         names: by_name.keys().map(|name| (*name).to_owned()).collect(),
+        definitions: definitions
+            .iter()
+            .map(|definition| (definition.name.clone(), Arc::clone(definition)))
+            .collect(),
         digest: digest_text(framed_digest(
             TOOL_REGISTRY_DIGEST_KIND,
             "application/json",
@@ -526,6 +544,7 @@ pub(crate) fn validate_resources(
     check_tool_rules(candidate, &mut findings);
     if let Some(tools) = view.tools.as_ref() {
         check_tool_registration(candidate, tools, &mut findings);
+        check_tool_argument_pointers(candidate, tools, &mut findings);
     }
     if let (Some(egress), Some(connections)) = (view.egress.as_ref(), view.connections.as_ref()) {
         check_connection_endpoints(egress, connections, &mut findings);
@@ -924,6 +943,43 @@ fn check_claims_captured(
                 );
             },
         );
+    }
+}
+
+/// Every `tool_argument` pointer a tool-name rule reads that the named
+/// tool's registered input schema does not make eligible, located at the
+/// leaf's `pointer` member. A tool the registry does not hold has no schema
+/// to judge the pointer by, and is left to [`check_tool_registration`].
+fn check_tool_argument_pointers(
+    candidate: &Policy,
+    tools: &ToolInventory,
+    findings: &mut Findings,
+) {
+    for (index, rule) in candidate.rules.iter().enumerate() {
+        let (Some(tool_name), Some(conditions)) =
+            (rule.tool_name.as_deref(), rule.conditions.as_ref())
+        else {
+            continue;
+        };
+        let Some(definition) = tools.definitions.get(tool_name) else {
+            continue;
+        };
+        let mut leaves = Vec::new();
+        conditions.tool_argument_leaves(&format!("/rules/{index}/conditions"), &mut leaves);
+        for (location, pointer) in leaves {
+            if !tool_argument_pointer_eligible(&definition.input_schema, pointer) {
+                findings.error(
+                    IssueCode::ConditionPointerIneligible,
+                    location,
+                    element_id(rule.id.as_deref()),
+                    format!(
+                        "rules[{index}] reads tool argument '{pointer}' of tool '{tool_name}', \
+                         which its input schema does not declare as a string, integer, number \
+                         or boolean property a condition may read"
+                    ),
+                );
+            }
+        }
     }
 }
 

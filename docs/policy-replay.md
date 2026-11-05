@@ -244,10 +244,13 @@ them; and the client address, the referenced headers, the referenced query
 parameters and the clock (`128`, `256`, `512`, `2048`) when a v1 rule
 condition reads them. The client
 address bit is clear when the request or call had no address to capture,
-and a tool call never has headers or a query. No serving lane captures tool
-arguments, so that bit stays clear. The bits never carry the values: an
-address, header, query value, scope, claim or instant the evaluator read is
-not in the facts.
+and a tool call never has headers or a query. Tool invocation admission
+captures the tool arguments (`1024`) only when a `tool_argument` condition
+of a rule for the invoked tool reads them, every earlier stage left the
+call to the rules, and the arguments passed the tool's input schema; the
+HTTP lane never does. The bits never carry the values: an address, header,
+query value, argument, scope, claim or instant the evaluator read is not in
+the facts.
 
 A request the policy stage refused to answer -- an unsafe path, an
 incomplete or failed evaluation, a failed revision check, an audit outage --
@@ -380,7 +383,7 @@ an allow.
 | egress `destination` | the destination with no resolution facts |
 | organization (never recorded) | not recorded: an identity mapping that tests `organizations` is `missing_matcher_fact` |
 | scopes, verified claims (never recorded) | not recorded: a `scope` or `claim` condition, and an identity mapping that tests `scopes`, is `missing_matcher_fact` |
-| source address, headers, query values, clock (never recorded as condition facts) | not recorded: a rule condition that reads one is `missing_matcher_fact` |
+| source address, headers, query values, clock, tool arguments (never recorded as condition facts) | not recorded: a rule condition that reads one is `missing_matcher_fact` |
 
 **MCP identity.** A record that does not say whether its path was an MCP
 alias is decided under both readings, contextless and alias, and answers
@@ -400,8 +403,12 @@ are served.
 
 **Rule conditions.** Replay captures no condition fact: not the
 organization, the scopes or verified claims, the source address a record
-carries for audit, the headers, the query values or the instant of the
-original decision. A condition that
+carries for audit, the headers, the query values, the tool arguments or the
+instant of the original decision. A tool call whose arguments failed the
+input schema at admission, before an argument rule decided it, is recorded
+as a `tool.invoke_rejected` whose reason (`invalid_params` and the like) is
+no policy result, and is counted as `unsupported_tool_rejection`. A
+condition that
 reads one is unknown, so a decision that turns on it is `indeterminate` with
 `missing_matcher_fact`, never a guessed match or no-match; a condition
 decided without one (an `organization` leaf bound to another issuer, say)

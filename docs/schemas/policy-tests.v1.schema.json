@@ -256,8 +256,23 @@
         "now": { "$ref": "#/$defs/instant" }
       }
     },
+    "invocation_facts": {
+      "description": "The facts a tool case states: a source address, an instant and, for the invocation operation only, the call's arguments (fact_not_applicable for a visibility or eligibility preview, which never has a call's arguments). No headers or query: a tool call has none of its own.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source_ip": { "$ref": "#/$defs/source_ip" },
+        "now": { "$ref": "#/$defs/instant" },
+        "arguments": { "$ref": "#/$defs/tool_arguments" }
+      }
+    },
+    "tool_arguments": {
+      "description": "A tool invocation's arguments as they stand once the tool's input schema has accepted them: one JSON object nested at most 8 levels deep, of at most 128 values (too_many_facts) with member names of at most 256 bytes and strings of at most 8192 bytes. Only the scalars at the pointers the tool's tool_argument conditions read are evaluated, as on the live lane; no value is ever repeated. The tool's schema is not consulted, so pointer eligibility is not judged here.",
+      "type": "object",
+      "propertyNames": { "maxLength": 256 }
+    },
     "call_facts": {
-      "description": "The facts a tool or tool_http case states: a tool call has a source address and an instant, but no headers or query of its own (fact_not_applicable).",
+      "description": "The facts a tool_http case states: a rendered tool request has a source address and an instant, but no headers or query of its own (fact_not_applicable).",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -333,7 +348,7 @@
                 "operation": { "enum": ["invocation", "visibility", "eligibility"] }
               }
             },
-            "facts": { "$ref": "#/$defs/call_facts" },
+            "facts": { "$ref": "#/$defs/invocation_facts" },
             "expect": { "$ref": "#/$defs/tool_expect" }
           }
         },

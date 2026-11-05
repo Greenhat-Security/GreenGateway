@@ -2266,3 +2266,214 @@ fn the_published_schema_lists_exactly_the_egress_reason_codes() {
         .collect();
     assert_eq!(listed, super::suite::EGRESS_REASONS);
 }
+
+fn argument_policy() -> Policy {
+    Policy::validate_json_value(json!({
+        "schema_version": "1.0.0",
+        "rules": [
+            {
+                "id": "no-eu-exports",
+                "tool_name": "reports.export",
+                "action": "deny",
+                "conditions": { "tool_argument": { "pointer": "/scope/region", "in": ["eu"] } }
+            },
+            {
+                "id": "small-exports",
+                "tool_name": "reports.export",
+                "action": "allow",
+                "conditions": { "tool_argument": { "pointer": "/limit", "in": [10, 100] } }
+            },
+            { "id": "exports-closed", "tool_name": "reports.export", "action": "deny" }
+        ],
+        "tools": { "reports.export": {} }
+    }))
+    .expect("the argument policy is valid")
+}
+
+fn tool_invocation(id: &str, arguments: Option<Value>, logical: &str, rule: &str) -> Value {
+    let mut case = json!({
+        "id": id,
+        "kind": "tool",
+        "tool": { "name": "reports.export" },
+        "principal": "anonymous",
+        "expect": { "logical": logical, "matched": { "rule": rule } }
+    });
+    if let Some(arguments) = arguments {
+        case["facts"] = json!({ "arguments": arguments });
+    }
+    case
+}
+
+fn run_arguments(document: &Value) -> RunReport {
+    let parsed = parse_suite(document).expect("the suite is valid");
+    let digest = parsed.digest.clone();
+    let outcome = run_against_policy(
+        argument_policy(),
+        PolicyAuthority::Standalone,
+        &parsed,
+        &resources(),
+        far_deadline(),
+    )
+    .expect("policy compiles and the run finishes");
+    RunReport::new(digest, binding(), outcome)
+}
+
+/// An invocation case states the arguments a validated call carried and is
+/// decided by the scalars the rules read; one that states none leaves a rule
+/// over them undetermined, never passed. No argument value is repeated.
+#[test]
+fn case_arguments_decide_tool_argument_conditions_and_are_never_echoed() {
+    const ARGUMENT_CANARY: &str = "argument-canary-61d4";
+    let report = run_arguments(&suite(vec![
+        tool_invocation(
+            "eu-export",
+            Some(json!({ "scope": { "region": "eu" }, "limit": 10 })),
+            "deny",
+            "no-eu-exports",
+        ),
+        tool_invocation(
+            "small-export",
+            Some(json!({ "scope": { "region": ARGUMENT_CANARY }, "limit": 10.0 })),
+            "allow",
+            "small-exports",
+        ),
+        tool_invocation(
+            "large-export",
+            Some(json!({ "scope": { "region": "us" }, "limit": 5000, "note": ARGUMENT_CANARY })),
+            "deny",
+            "exports-closed",
+        ),
+        // A string is never the number a condition lists, nor an array the
+        // scalar it lists.
+        tool_invocation(
+            "typed",
+            Some(json!({ "scope": { "region": ["eu"] }, "limit": "10" })),
+            "deny",
+            "exports-closed",
+        ),
+    ]));
+    let failures: Vec<_> = report
+        .cases
+        .iter()
+        .filter(|case| case.status != CaseStatus::Passed)
+        .map(|case| (case.id.clone(), case.status, case.actual.clone()))
+        .collect();
+    assert!(failures.is_empty(), "unexpected outcomes: {failures:?}");
+    let json_text = serde_json::to_string(&report::to_json(&report).expect("json")).expect("text");
+    let sarif = serde_json::to_string(&report::to_sarif(&report)).expect("sarif");
+    let junit = report::to_junit(&report);
+    for rendering in [&json_text, &sarif, &junit] {
+        assert!(!rendering.contains(ARGUMENT_CANARY), "{rendering}");
+    }
+
+    // Without the arguments the rules cannot be decided: incomplete.
+    let report = run_arguments(&suite(vec![tool_invocation(
+        "unstated",
+        None,
+        "deny",
+        "no-eu-exports",
+    )]));
+    assert_eq!(report.status, RunStatus::Incomplete);
+    let case = &report.cases[0];
+    assert_eq!(case.status, CaseStatus::Incomplete);
+    let actual = case.actual.as_ref().expect("an indeterminate answer");
+    assert_eq!(actual.limitation, Some("missing_matcher_fact"));
+}
+
+/// Only an invocation has arguments, and they are bounded; a refusal names
+/// where and never what.
+#[test]
+fn case_arguments_apply_only_to_invocations_and_are_bounded() {
+    const CANARY: &str = "argument-canary-a07e";
+    for operation in ["visibility", "eligibility"] {
+        let preview = json!({
+            "id": "preview",
+            "kind": "tool",
+            "tool": { "name": "reports.export", "operation": operation },
+            "principal": reader(),
+            "facts": { "arguments": { "region": CANARY } },
+            "expect": { "logical": "allow" }
+        });
+        assert_eq!(
+            codes(&refused(&suite(vec![preview]))),
+            [("fact_not_applicable", "/cases/0/facts/arguments".to_owned())],
+            "{operation}"
+        );
+    }
+    let diagnostics = refused(&suite(vec![
+        json!({
+            "id": "http",
+            "kind": "http",
+            "request": { "method": "GET", "path": "/orders/1" },
+            "principal": "anonymous",
+            "facts": { "arguments": { "region": CANARY } },
+            "expect": { "logical": "allow" }
+        }),
+        json!({
+            "id": "rendered",
+            "kind": "tool_http",
+            "tool": { "name": "reports.export" },
+            "request": { "method": "GET", "path": "/exports/1" },
+            "principal": "anonymous",
+            "facts": { "arguments": { "region": CANARY } },
+            "expect": { "logical": "allow" }
+        }),
+    ]));
+    assert_eq!(
+        codes(&diagnostics),
+        [
+            ("fact_not_applicable", "/cases/0/facts/arguments".to_owned()),
+            ("fact_not_applicable", "/cases/1/facts/arguments".to_owned()),
+        ]
+    );
+
+    let mut deep = json!(CANARY);
+    for _ in 0..9 {
+        deep = json!({ "next": deep });
+    }
+    let many: serde_json::Map<String, Value> = (0..129)
+        .map(|index| (format!("field{index}"), json!(CANARY)))
+        .collect();
+    for (arguments, expected) in [
+        (json!([CANARY]), "invalid_type"),
+        (json!(CANARY), "invalid_type"),
+        (deep, "invalid_value"),
+        (json!({ "region": CANARY.repeat(1024) }), "invalid_value"),
+        (Value::Object(many), "too_many_facts"),
+    ] {
+        let diagnostics = refused(&suite(vec![tool_invocation(
+            "bounded",
+            Some(arguments),
+            "allow",
+            "small-exports",
+        )]));
+        assert_eq!(
+            codes(&diagnostics),
+            [(expected, "/cases/0/facts/arguments".to_owned())]
+        );
+        let rendered = serde_json::to_string(&diagnostics).expect("diagnostics serialize");
+        assert!(!rendered.contains(CANARY), "{rendered}");
+    }
+
+    // The published schema reads arguments as the parser does.
+    let schema = suite_schema();
+    let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
+    let accepted = suite(vec![tool_invocation(
+        "schema",
+        Some(json!({ "scope": { "region": "eu" }, "labels": ["a"], "limit": 10 })),
+        "allow",
+        "small-exports",
+    )]);
+    assert!(parse_suite(&accepted).is_ok());
+    if let Err(error) = validator.validate(&accepted) {
+        panic!("the schema refuses a suite the parser accepts: {error}");
+    }
+    let refused_by_both = suite(vec![tool_invocation(
+        "schema",
+        Some(json!(["eu"])),
+        "allow",
+        "small-exports",
+    )]);
+    assert!(parse_suite(&refused_by_both).is_err());
+    assert!(!validator.is_valid(&refused_by_both));
+}
