@@ -52,6 +52,13 @@ pub(super) const POLICY_EVIDENCE_ADMIN_ROUTE: &str = "/v1/admin/policy/evidence"
 /// Analyze the structure of the active policy or a candidate (issue #243,
 /// slice 15).
 pub(super) const POLICY_ANALYSES_ADMIN_ROUTE: &str = "/v1/admin/policy/analyses";
+/// List and create suppressions of analyzer findings (issue #243, slice
+/// 15).
+pub(super) const POLICY_ANALYSIS_SUPPRESSIONS_ADMIN_ROUTE: &str =
+    "/v1/admin/policy/analyses/suppressions";
+/// End one suppression before its expiry.
+pub(super) const POLICY_ANALYSIS_SUPPRESSION_ADMIN_ROUTE: &str =
+    "/v1/admin/policy/analyses/suppressions/{id}";
 pub(super) const POLICY_RULES_ADMIN_ROUTE: &str = "/v1/admin/policy/rules";
 pub(super) const POLICY_RULE_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/{id}";
 pub(super) const POLICY_RULES_ORDER_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/order";
@@ -280,6 +287,8 @@ pub(super) struct AdminRoutes {
     pub(super) policy_simulations_route: String,
     pub(super) policy_replays_route: String,
     pub(super) policy_analyses_route: String,
+    pub(super) policy_analysis_suppressions_route: String,
+    pub(super) policy_analysis_suppression_route: String,
     pub(super) policy_replay_route: String,
     pub(super) policy_evidence_route: String,
     pub(super) policy_rules_route: String,
@@ -397,6 +406,12 @@ impl AdminRoutes {
             policy_simulations_route: format!("{api_prefix}/policy/simulations"),
             policy_replays_route: format!("{api_prefix}/policy/replays"),
             policy_analyses_route: format!("{api_prefix}/policy/analyses"),
+            policy_analysis_suppressions_route: format!(
+                "{api_prefix}/policy/analyses/suppressions"
+            ),
+            policy_analysis_suppression_route: format!(
+                "{api_prefix}/policy/analyses/suppressions/{{id}}"
+            ),
             policy_replay_route: format!("{api_prefix}/policy/replays/{{id}}"),
             policy_evidence_route: format!("{api_prefix}/policy/evidence"),
             policy_rules_route: format!("{api_prefix}/policy/rules"),
@@ -523,6 +538,11 @@ pub(super) struct PolicyAdminState {
     /// `None` leaves the suite routes, and every run or evidence package
     /// that names the stored suite, answering `503`.
     pub(super) test_suite_store: Option<Arc<dyn storage::PolicyTestSuiteStore>>,
+    /// Analyzer finding suppressions (issue #243, slice 15): a table in the
+    /// policy history database standalone, migration 31's table in cluster
+    /// mode. `None` leaves the suppression routes answering `503` and every
+    /// analysis reporting its suppressions unavailable.
+    pub(super) analysis_suppression_store: Option<Arc<dyn storage::AnalysisSuppressionStore>>,
     /// `POLICY_TESTS_REQUIRED`: every policy publication must first pass
     /// the stored suite (`admin_policy_test_gate`). With no `test_suite_store`
     /// it is refused instead.
@@ -538,6 +558,11 @@ pub(super) struct PolicyAdminState {
     /// refuses every gated write.
     #[cfg(feature = "postgres")]
     pub(super) membership: Option<Arc<cluster_membership::ClusterMembership>>,
+    /// Cluster mode's durable replay jobs (issue #243): migration 30's job
+    /// table and the audit stream they read. Present in cluster mode; a
+    /// cluster without it answers every replay route `503`.
+    #[cfg(feature = "postgres")]
+    pub(super) replay_cluster: Option<Arc<ClusterPolicyReplays>>,
     pub(super) event_store: Option<Arc<dyn storage::AuditEventStore>>,
     pub(super) query_store: Option<Arc<storage::SqliteAuditEventStore>>,
     /// Asked before every policy mutation (issue #425, PR 4): standalone

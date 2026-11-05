@@ -464,11 +464,14 @@ fn limited_router(
             history_store: None,
             draft_store: None,
             test_suite_store: None,
+            analysis_suppression_store: None,
             policy_tests_required: false,
             #[cfg(feature = "postgres")]
             control_plane: None,
             #[cfg(feature = "postgres")]
             membership: None,
+            #[cfg(feature = "postgres")]
+            replay_cluster: None,
             event_store: None,
             query_store: None,
             authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(),

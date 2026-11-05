@@ -321,6 +321,26 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
             .map(storage::SqlitePolicyTestSuiteStore::open)
             .transpose()?
             .map(|store| Arc::new(store) as Arc<dyn storage::PolicyTestSuiteStore>);
+
+    // Analyzer finding suppressions (issue #243, slice 15) live where drafts
+    // do: migration 31's table in cluster mode, and a
+    // `policy_analysis_suppressions` table in the policy history database in
+    // standalone mode. A database that cannot be opened fails startup.
+    #[cfg(feature = "postgres")]
+    let analysis_suppression_store: Option<Arc<dyn storage::AnalysisSuppressionStore>> =
+        match build_overrides.pg_policy.as_ref() {
+            Some(seed) => Some(Arc::new(seed.store.analysis_suppression_store())),
+            None => policy_history_sqlite_path(&config)
+                .map(storage::SqliteAnalysisSuppressionStore::open)
+                .transpose()?
+                .map(|store| Arc::new(store) as Arc<dyn storage::AnalysisSuppressionStore>),
+        };
+    #[cfg(not(feature = "postgres"))]
+    let analysis_suppression_store: Option<Arc<dyn storage::AnalysisSuppressionStore>> =
+        policy_history_sqlite_path(&config)
+            .map(storage::SqliteAnalysisSuppressionStore::open)
+            .transpose()?
+            .map(|store| Arc::new(store) as Arc<dyn storage::AnalysisSuppressionStore>);
     let observation_state =
         middleware::observation::ObservationState::from_config(&config, audit_log.clone())
             .with_conformance(schema_conformance_state);
@@ -1158,17 +1178,29 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
             .flatten(),
         process_started_at,
     };
+    #[cfg(feature = "postgres")]
+    let replay_cluster = cluster_policy_replays(
+        &config,
+        &build_overrides,
+        policy_control_plane.is_some(),
+        &lifecycle,
+        cluster_readiness.clone(),
+        &audit_log,
+    );
     let policy_admin_state = PolicyAdminState {
         policy_file: config.policy_file.as_ref().map(PathBuf::from),
         rbac_state: rbac_state.clone(),
         history_store: policy_history_store,
         draft_store: policy_draft_store,
         test_suite_store: policy_test_suite_store,
+        analysis_suppression_store,
         policy_tests_required: config.policy_tests_required,
         #[cfg(feature = "postgres")]
         control_plane: policy_control_plane,
         #[cfg(feature = "postgres")]
         membership: build_overrides.pg_membership.clone(),
+        #[cfg(feature = "postgres")]
+        replay_cluster,
         event_store: audit_event_store.clone(),
         query_store: audit_query_store.clone(),
         authority_evidence,
@@ -1475,6 +1507,34 @@ fn authority_event_startup(
         holder: seed.instance_id,
         readiness: membership.readiness(),
     })
+}
+
+/// Cluster mode's durable replay jobs (issue #243): the job store over the
+/// deployment's pool, and this replica's worker, started here so it claims
+/// jobs for the life of the process and stops with the lifecycle's
+/// background tasks. `None` in standalone mode. Out of line for the same
+/// stack-frame reason as [`authority_event_startup`].
+#[cfg(feature = "postgres")]
+#[inline(never)]
+fn cluster_policy_replays(
+    config: &config::Config,
+    build_overrides: &GatewayAppBuildOverrides,
+    cluster_policy: bool,
+    lifecycle: &GatewayLifecycle,
+    readiness: Option<Arc<ha::ClusterReadiness>>,
+    audit_log: &audit::AuditLog,
+) -> Option<Arc<ClusterPolicyReplays>> {
+    if !cluster_policy {
+        return None;
+    }
+    let seed = build_overrides.pg_limits.as_ref()?;
+    let replays = Arc::new(ClusterPolicyReplays::new(
+        seed.pool.clone(),
+        &config.database,
+        seed.instance_id,
+    ));
+    replays.spawn_worker(lifecycle, readiness, audit_log.clone());
+    Some(replays)
 }
 
 pub(crate) fn policy_history_sqlite_path(config: &config::Config) -> Option<PathBuf> {

@@ -80,6 +80,7 @@
     )
 )]
 
+pub(crate) mod checkpoint;
 pub(crate) mod evaluate;
 pub(crate) mod impact;
 #[cfg(test)]
