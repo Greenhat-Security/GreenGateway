@@ -94,6 +94,18 @@ pub(crate) struct PolicyBinding {
 pub(crate) struct SuiteBinding {
     pub(crate) schema_version: &'static str,
     pub(crate) digest: String,
+    /// Present when the run decided the stored suite rather than one it was
+    /// sent: which stored version, under which strong ETag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stored: Option<StoredSuiteBinding>,
+}
+
+/// The stored suite version a run decided (issue #243). Its ETag is the
+/// suite digest in quotes; both are given so a reader can pin either.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct StoredSuiteBinding {
+    pub(crate) version: i64,
+    pub(crate) etag: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -147,6 +159,7 @@ impl RunReport {
             suite: SuiteBinding {
                 schema_version: SUITE_SCHEMA_VERSION,
                 digest: suite_digest,
+                stored: None,
             },
             policy,
             evaluator: EvaluatorBinding::current(),
@@ -156,6 +169,13 @@ impl RunReport {
             summary: outcome.summary,
             cases: outcome.cases,
         }
+    }
+
+    /// The report of a run of the stored suite version `stored`, when it was
+    /// one. A run of a suite it was sent stays as [`Self::new`] made it.
+    pub(crate) fn with_stored_suite(mut self, stored: Option<StoredSuiteBinding>) -> Self {
+        self.suite.stored = stored;
+        self
     }
 }
 

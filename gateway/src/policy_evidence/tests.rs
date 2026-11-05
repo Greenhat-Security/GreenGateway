@@ -11,7 +11,7 @@ use super::{
         assemble, EvidenceInputs, PackageError, PolicyIdentity, PredecessorRecord,
         PublicationRecord, ReplayEvidence, SimulationEvidence, ValidationOutcome,
     },
-    request::{parse_request, EvidenceRequest},
+    request::{parse_request, EvidenceRequest, SuiteSelection},
     LIMITATION_CODES, MAX_EVIDENCE_DIAGNOSTICS, PACKAGE_SCHEMA_VERSION, REDACTION_PROFILE,
     REPORT_MEDIA_TYPE, REPORT_SCHEMA_VERSION, REQUEST_SCHEMA_VERSION, TRUST_STATEMENT,
 };
@@ -158,10 +158,10 @@ fn a_full_request_parses_and_its_digest_ignores_representation() {
     let request = parsed(&full_request());
     assert_eq!(request.publication.version, 12);
     assert_eq!(request.publication.etag.as_deref(), Some(PUBLICATION_ETAG));
-    assert_eq!(
-        request.suite.as_ref().map(|suite| suite.cases.len()),
-        Some(2)
-    );
+    assert!(matches!(
+        request.suite.as_ref(),
+        Some(SuiteSelection::Inline(suite)) if suite.cases.len() == 2
+    ));
     let simulation = request.simulation.as_ref().expect("simulation section");
     assert_eq!(simulation.trace, TraceLevel::Matched);
     assert_eq!(
@@ -184,6 +184,58 @@ fn a_full_request_parses_and_its_digest_ignores_representation() {
     let mut changed = full_request();
     changed["publication"]["version"] = json!(13);
     assert_ne!(parsed(&changed).digest, request.digest);
+}
+
+/// A suite may instead be the stored one, pinned to the ETag the caller
+/// reviewed. The pin is required, the reference strict, and the request's
+/// digest covers the pin, so two packages naming one stored version name the
+/// same inputs.
+#[test]
+fn a_suite_may_be_the_stored_suite_pinned_by_its_etag() {
+    let mut request = full_request();
+    request["suite"] = json!({ "source": "stored", "etag": OTHER_ETAG });
+    let accepted = parsed(&request);
+    assert!(matches!(
+        accepted.suite.as_ref(),
+        Some(SuiteSelection::Stored { etag }) if etag == OTHER_ETAG
+    ));
+    assert!(accepted.evaluates_synthetic_cases());
+    let mut repinned = request.clone();
+    repinned["suite"]["etag"] = json!(PREDECESSOR_ETAG);
+    assert_ne!(parsed(&repinned).digest, accepted.digest);
+
+    for (suite, code, pointer) in [
+        (
+            json!({ "source": "stored" }),
+            "missing_field",
+            "/suite/etag",
+        ),
+        (
+            json!({ "source": "inline", "etag": OTHER_ETAG }),
+            "invalid_value",
+            "/suite/source",
+        ),
+        (
+            json!({ "source": "stored", "etag": "" }),
+            "invalid_value",
+            "/suite/etag",
+        ),
+        (
+            json!({ "source": "stored", "etag": OTHER_ETAG, "version": 3 }),
+            "unknown_field",
+            "/suite/version",
+        ),
+        (
+            json!({ "source": "stored", "etag": OTHER_ETAG, "token": "abc" }),
+            "forbidden_field",
+            "/suite/token",
+        ),
+    ] {
+        let mut request = full_request();
+        request["suite"] = suite.clone();
+        let diagnostics = refused(&request);
+        assert!(has(&diagnostics, code, pointer), "{suite}: {diagnostics:?}");
+    }
 }
 
 #[test]
@@ -914,7 +966,9 @@ fn the_published_request_schema_agrees_with_the_parser() {
     });
     let mut cases_only = minimal.clone();
     cases_only["simulation"] = json!({ "cases": simulation_cases() });
-    for request in [full_request(), minimal.clone(), cases_only] {
+    let mut stored_suite = full_request();
+    stored_suite["suite"] = json!({ "source": "stored", "etag": OTHER_ETAG });
+    for request in [full_request(), minimal.clone(), cases_only, stored_suite] {
         parsed(&request);
         if let Err(error) = validator.validate(&request) {
             panic!("the schema refuses an accepted request: {error}\n{request}");
@@ -945,6 +999,12 @@ fn the_published_request_schema_agrees_with_the_parser() {
     variant(&|request| request["simulation"]["cases"] = json!([]));
     variant(&|request| request["simulation"]["base_etag"] = json!(OTHER_ETAG));
     variant(&|request| request["suite"] = Value::Null);
+    variant(&|request| request["suite"] = json!({ "source": "stored" }));
+    variant(&|request| request["suite"] = json!({ "source": "inline", "etag": OTHER_ETAG }));
+    variant(&|request| {
+        request["suite"] = json!({ "source": "stored", "etag": OTHER_ETAG, "version": 2 });
+    });
+    variant(&|request| request["suite"]["source"] = json!("stored"));
     variant(&|request| request["replay_job_id"] = json!(""));
     variant(&|request| request["replay_job_id"] = json!("r".repeat(65)));
     for request in refusals {
