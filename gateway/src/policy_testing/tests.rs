@@ -1084,7 +1084,7 @@ fn tool_cases_agree_with_the_live_tool_adapters() {
                 "principal": principal,
                 "expect": { "logical": "allow" }
             }));
-            expected.push(Ok(live.tool_visible(tool, live_principal.as_ref())));
+            expected.push(Ok(live.tool_visible(tool, live_principal.as_ref(), None)));
         }
         for (method, path) in rendered {
             cases.push(json!({
@@ -1096,7 +1096,13 @@ fn tool_cases_agree_with_the_live_tool_adapters() {
                 "expect": { "logical": "allow" }
             }));
             expected.push(Err(live
-                .evaluate_tool_http_rule("reports.export", method, path, live_principal.as_ref())
+                .evaluate_tool_http_rule(
+                    "reports.export",
+                    method,
+                    path,
+                    live_principal.as_ref(),
+                    None,
+                )
                 .expect("the live adapter decides every rendered request here")));
         }
     }
@@ -1126,5 +1132,373 @@ fn tool_cases_agree_with_the_live_tool_adapters() {
                 assert_eq!(actual.effect, Some(effect), "{}", case.id);
             }
         }
+    }
+}
+
+/// A policy whose rules carry request conditions, for the `facts` tests.
+fn conditioned_policy() -> Policy {
+    Policy::validate_json_value(json!({
+        "schema_version": "1.0.0",
+        "default_action": "allow",
+        "rules": [
+            {
+                "id": "canary-only",
+                "path": "/canary/**",
+                "action": "deny",
+                "conditions": { "not": { "header": { "name": "x-environment", "in": ["canary"] } } }
+            },
+            {
+                "id": "office-csv-exports",
+                "path": "/exports/**",
+                "action": "allow",
+                "conditions": { "all": [
+                    { "source_network": { "cidrs": ["10.0.0.0/8"] } },
+                    { "query": { "name": "format", "in": ["csv"] } }
+                ] }
+            },
+            { "id": "exports-closed", "path": "/exports/**", "action": "deny" },
+            {
+                "id": "maintenance",
+                "path": "/maintenance/**",
+                "action": "deny",
+                "conditions": { "time_window": {
+                    "from": "2026-06-01T00:00:00Z",
+                    "until": "2026-06-01T02:00:00Z"
+                } }
+            },
+            {
+                "id": "exports-from-the-office",
+                "tool_name": "reports.export",
+                "action": "deny",
+                "conditions": { "not": { "source_network": { "cidrs": ["10.0.0.0/8"] } } }
+            }
+        ],
+        "tools": { "reports.export": { "allowed_roles": [] } }
+    }))
+    .expect("the conditioned policy is valid")
+}
+
+fn run_conditioned(document: &Value) -> RunReport {
+    let suite = parse_suite(document).expect("the suite is valid");
+    let digest = suite.digest.clone();
+    let outcome = run_against_policy(
+        conditioned_policy(),
+        PolicyAuthority::Standalone,
+        &suite,
+        far_deadline(),
+    )
+    .expect("policy compiles and the run finishes");
+    RunReport::new(digest, binding(), outcome)
+}
+
+fn conditioned_http_case(id: &str, path: &str, facts: Value, logical: &str, rule: &str) -> Value {
+    let matched = if rule == "none" {
+        json!("none")
+    } else {
+        json!({ "rule": rule })
+    };
+    json!({
+        "id": id,
+        "kind": "http",
+        "request": { "method": "GET", "path": path },
+        "principal": "anonymous",
+        "facts": facts,
+        "expect": { "logical": logical, "matched": matched }
+    })
+}
+
+/// A case states the request facts a condition reads, and decides by them
+/// exactly as the live lane would; a fact the case does not state leaves the
+/// case incomplete, never passed, whatever it expected.
+#[test]
+fn case_facts_decide_request_conditions_and_a_missing_fact_is_never_a_pass() {
+    const HEADER_CANARY: &str = "header-canary-77d1";
+    const QUERY_CANARY: &str = "query-canary-3b8e";
+    let report = run_conditioned(&suite(vec![
+        conditioned_http_case(
+            "canary",
+            "/canary/x",
+            json!({ "headers": { "x-environment": ["canary"] } }),
+            "allow",
+            "none",
+        ),
+        conditioned_http_case(
+            "canary-second-line",
+            "/canary/x",
+            json!({ "headers": { "x-environment": ["prod", "canary"] } }),
+            "allow",
+            "none",
+        ),
+        conditioned_http_case(
+            "canary-one-line",
+            "/canary/x",
+            json!({ "headers": { "x-environment": ["prod, canary"] } }),
+            "deny",
+            "canary-only",
+        ),
+        conditioned_http_case(
+            "no-headers",
+            "/canary/x",
+            json!({ "headers": {} }),
+            "deny",
+            "canary-only",
+        ),
+        conditioned_http_case(
+            "unread-header-value",
+            "/canary/x",
+            json!({ "headers": { "x-environment": [HEADER_CANARY] } }),
+            "deny",
+            "canary-only",
+        ),
+        conditioned_http_case(
+            "office-csv",
+            "/exports/x",
+            json!({ "source_ip": "10.1.2.3", "query": { "format": ["pdf", "csv"] } }),
+            "allow",
+            "office-csv-exports",
+        ),
+        conditioned_http_case(
+            "mapped-office",
+            "/exports/x",
+            json!({ "source_ip": "::ffff:10.1.2.3", "query": { "format": ["csv"] } }),
+            "allow",
+            "office-csv-exports",
+        ),
+        conditioned_http_case(
+            "outside",
+            "/exports/x",
+            json!({ "source_ip": "203.0.113.9", "query": { "format": [QUERY_CANARY] } }),
+            "deny",
+            "exports-closed",
+        ),
+        conditioned_http_case(
+            "window-opens",
+            "/maintenance/x",
+            json!({ "now": "2026-06-01T00:00:00Z" }),
+            "deny",
+            "maintenance",
+        ),
+        conditioned_http_case(
+            "window-shut",
+            "/maintenance/x",
+            json!({ "now": "2026-06-01T02:00:00Z" }),
+            "allow",
+            "none",
+        ),
+        json!({
+            "id": "tool-from-the-office",
+            "kind": "tool",
+            "tool": { "name": "reports.export" },
+            "principal": reader(),
+            "facts": { "source_ip": "10.1.2.3" },
+            "expect": { "logical": "allow", "reason": "allowed" }
+        }),
+        json!({
+            "id": "tool-from-outside",
+            "kind": "tool",
+            "tool": { "name": "reports.export" },
+            "principal": reader(),
+            "facts": { "source_ip": "203.0.113.9" },
+            "expect": { "logical": "deny", "matched": { "rule": "exports-from-the-office" } }
+        }),
+    ]));
+    let failures: Vec<_> = report
+        .cases
+        .iter()
+        .filter(|case| case.status != CaseStatus::Passed)
+        .map(|case| (case.id.clone(), case.status, case.actual.clone()))
+        .collect();
+    assert!(failures.is_empty(), "unexpected outcomes: {failures:?}");
+    let rendered = serde_json::to_string(&report::to_json(&report).expect("json")).expect("text");
+    assert!(!rendered.contains(HEADER_CANARY));
+    assert!(!rendered.contains(QUERY_CANARY));
+    assert!(!rendered.contains("10.1.2.3"));
+
+    // The same questions without the facts they read: incomplete, never a
+    // pass, under `not` as much as anywhere, and the limitation says why.
+    let report = run_conditioned(&suite(vec![
+        json!({
+            "id": "canary-unstated",
+            "kind": "http",
+            "request": { "method": "GET", "path": "/canary/x" },
+            "principal": "anonymous",
+            "expect": { "logical": "allow" }
+        }),
+        json!({
+            "id": "office-unstated",
+            "kind": "http",
+            "request": { "method": "GET", "path": "/exports/x" },
+            "principal": "anonymous",
+            "facts": { "query": { "format": ["csv"] } },
+            "expect": { "logical": "allow" }
+        }),
+        json!({
+            "id": "window-unstated",
+            "kind": "http",
+            "request": { "method": "GET", "path": "/maintenance/x" },
+            "principal": "anonymous",
+            "facts": { "source_ip": "10.1.2.3" },
+            "expect": { "logical": "allow" }
+        }),
+        json!({
+            "id": "tool-unstated",
+            "kind": "tool",
+            "tool": { "name": "reports.export" },
+            "principal": reader(),
+            "expect": { "logical": "allow" }
+        }),
+    ]));
+    assert_eq!(report.status, RunStatus::Incomplete);
+    for case in &report.cases {
+        assert_eq!(case.status, CaseStatus::Incomplete, "{}", case.id);
+        let actual = case.actual.as_ref().expect("an indeterminate answer");
+        assert_eq!(actual.logical, Some("indeterminate"), "{}", case.id);
+        assert_eq!(
+            actual.limitation,
+            Some("missing_matcher_fact"),
+            "{}",
+            case.id
+        );
+    }
+}
+
+/// Facts are typed and bounded, header and query names are held to the rule
+/// conditions' credential check, and no refused value is ever repeated.
+#[test]
+fn case_facts_refuse_credential_names_and_malformed_values_without_echoing_them() {
+    const CANARY: &str = "fact-canary-0f0f";
+    let http = |facts: Value| {
+        json!({
+            "id": "http",
+            "kind": "http",
+            "request": { "method": "GET", "path": "/canary/x" },
+            "principal": "anonymous",
+            "facts": facts,
+            "expect": { "logical": "allow" }
+        })
+    };
+    let refusals = [
+        (
+            json!({ "headers": { "authorization": [CANARY] } }),
+            ("forbidden_field", "/cases/0/facts/headers/authorization"),
+        ),
+        (
+            json!({ "headers": { "Cookie": [CANARY] } }),
+            ("forbidden_field", "/cases/0/facts/headers/Cookie"),
+        ),
+        (
+            json!({ "headers": { "x-forwarded-for": ["10.1.2.3"] } }),
+            ("forbidden_field", "/cases/0/facts/headers/x-forwarded-for"),
+        ),
+        (
+            json!({ "headers": { "x-api-key": [CANARY] } }),
+            ("forbidden_field", "/cases/0/facts/headers/x-api-key"),
+        ),
+        (
+            json!({ "headers": { "connection": ["close"] } }),
+            ("forbidden_field", "/cases/0/facts/headers/connection"),
+        ),
+        (
+            json!({ "query": { "access_token": [CANARY] } }),
+            ("forbidden_field", "/cases/0/facts/query/access_token"),
+        ),
+        (
+            json!({ "query": { "State": [CANARY] } }),
+            ("forbidden_field", "/cases/0/facts/query/State"),
+        ),
+        (
+            json!({ "token": CANARY }),
+            ("forbidden_field", "/cases/0/facts/token"),
+        ),
+        (
+            json!({ "headers": { "X-Environment": [CANARY] } }),
+            ("invalid_value", "/cases/0/facts/headers/X-Environment"),
+        ),
+        (
+            json!({ "headers": { "x-environment": [] } }),
+            ("invalid_value", "/cases/0/facts/headers/x-environment"),
+        ),
+        (
+            json!({ "headers": { "x-environment": CANARY } }),
+            ("invalid_type", "/cases/0/facts/headers/x-environment"),
+        ),
+        (
+            json!({ "headers": { "x-environment": [format!("{CANARY}\n")] } }),
+            ("invalid_value", "/cases/0/facts/headers/x-environment/0"),
+        ),
+        (
+            json!({ "source_ip": format!("10.1.2.3:{CANARY}") }),
+            ("invalid_value", "/cases/0/facts/source_ip"),
+        ),
+        (
+            json!({ "now": format!("2026-06-01T00:00:00+00:00{CANARY}") }),
+            ("invalid_value", "/cases/0/facts/now"),
+        ),
+        (
+            json!({ "query": { "format": vec!["csv"; crate::policy_eval::MAX_FACT_ENTRIES + 1] } }),
+            ("too_many_facts", "/cases/0/facts/query"),
+        ),
+    ];
+    for (facts, expected) in refusals {
+        let diagnostics = refused(&suite(vec![http(facts.clone())]));
+        assert_eq!(
+            codes(&diagnostics),
+            [(expected.0, expected.1.to_owned())],
+            "{facts}"
+        );
+        let rendered = serde_json::to_string(&diagnostics).expect("diagnostics serialize");
+        assert!(!rendered.contains(CANARY), "{rendered}");
+    }
+
+    // A tool call has no headers or query; a rate override reads no fact.
+    let diagnostics = refused(&suite(vec![
+        json!({
+            "id": "tool",
+            "kind": "tool",
+            "tool": { "name": "reports.export" },
+            "principal": "anonymous",
+            "facts": { "headers": { "x-environment": ["prod"] }, "query": { "format": ["csv"] } },
+            "expect": { "logical": "allow" }
+        }),
+        json!({
+            "id": "rate",
+            "kind": "rate",
+            "request": { "method": "GET", "path": "/orders/1" },
+            "principal": "anonymous",
+            "facts": { "now": "2026-06-01T00:00:00Z" },
+            "expect": { "rate_override": null }
+        }),
+    ]));
+    assert_eq!(
+        codes(&diagnostics),
+        [
+            ("fact_not_applicable", "/cases/0/facts/headers".to_owned()),
+            ("fact_not_applicable", "/cases/0/facts/query".to_owned()),
+            ("unknown_field", "/cases/1/facts".to_owned()),
+        ]
+    );
+
+    // The published schema reads facts as the parser does.
+    let schema = suite_schema();
+    let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
+    let accepted = suite(vec![http(json!({
+        "source_ip": "fd00::7",
+        "headers": { "x-environment": ["prod", "canary"] },
+        "query": { "format": ["", "csv"] },
+        "now": "2026-06-01T00:00:00Z"
+    }))]);
+    assert!(parse_suite(&accepted).is_ok());
+    if let Err(error) = validator.validate(&accepted) {
+        panic!("the schema refuses a suite the parser accepts: {error}");
+    }
+    for facts in [
+        json!({ "headers": { "X-Environment": ["prod"] } }),
+        json!({ "headers": { "x-environment": [] } }),
+        json!({ "now": "2026-06-01T00:00:00.5Z" }),
+        json!({ "cookie": "x" }),
+    ] {
+        let document = suite(vec![http(facts.clone())]);
+        assert!(parse_suite(&document).is_err(), "parser: {facts}");
+        assert!(!validator.is_valid(&document), "schema: {facts}");
     }
 }

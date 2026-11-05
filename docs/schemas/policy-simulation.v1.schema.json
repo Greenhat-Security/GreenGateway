@@ -49,7 +49,7 @@
               "enum": ["bearer_token", "session_cookie", "service_token", "client_certificate"]
             },
             "organization": {
-              "description": "The organization authentication verified for the principal, which an identity mapping may test. Omitted, the principal has none, exactly as a principal whose provider verified none. It is read only in mapped-role mode, as on the live lanes.",
+              "description": "The organization authentication verified for the principal, which an identity mapping or an organization condition may test. Omitted, the principal has none, exactly as a principal whose provider verified none. It is read only when a mapping or condition reads it, as on the live lanes.",
               "type": "string",
               "minLength": 1,
               "maxLength": 8192
@@ -225,6 +225,51 @@
         }
       ]
     },
+    "fact_values": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": {"type": "string", "maxLength": 8192}
+    },
+    "request_facts": {
+      "description": "The request facts an http case states for the rule conditions a policy may carry. A member omitted is a fact the case does not state: a condition that reads it is indeterminate, never a guessed match. An empty headers or query object states a request that carried none. Header names are lowercase; a header or query name that can carry a credential, an identity or hop-by-hop routing is refused (forbidden_field). At most 128 occurrences each.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source_ip": {"$ref": "#/$defs/source_ip"},
+        "headers": {
+          "type": "object",
+          "propertyNames": {"pattern": "^[a-z0-9!#$%&'*+.^_`|~-]{1,256}$"},
+          "additionalProperties": {"$ref": "#/$defs/fact_values"}
+        },
+        "query": {
+          "type": "object",
+          "propertyNames": {"minLength": 1, "maxLength": 256},
+          "additionalProperties": {"$ref": "#/$defs/fact_values"}
+        },
+        "now": {"$ref": "#/$defs/instant"}
+      }
+    },
+    "call_facts": {
+      "description": "The facts a tool or tool_http case states: a tool call has a source address and an instant, but no headers or query of its own (fact_not_applicable).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source_ip": {"$ref": "#/$defs/source_ip"},
+        "now": {"$ref": "#/$defs/instant"}
+      }
+    },
+    "source_ip": {
+      "description": "The canonical client address the gateway derives after trusted-proxy processing: an IPv4 or IPv6 address without a port.",
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 45
+    },
+    "instant": {
+      "description": "The evaluation instant, an RFC 3339 UTC instant written YYYY-MM-DDTHH:MM:SSZ.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
     "case": {
       "type": "object",
       "required": ["id", "kind", "principal"],
@@ -237,7 +282,8 @@
             "description": {"$ref": "#/$defs/description"},
             "kind": {"const": "http"},
             "principal": {"$ref": "#/$defs/principal"},
-            "request": {"$ref": "#/$defs/http_request"}
+            "request": {"$ref": "#/$defs/http_request"},
+            "facts": {"$ref": "#/$defs/request_facts"}
           }
         },
         {
@@ -256,7 +302,8 @@
                 "name": {"$ref": "#/$defs/tool_name"},
                 "operation": {"enum": ["invocation", "visibility", "eligibility"]}
               }
-            }
+            },
+            "facts": {"$ref": "#/$defs/call_facts"}
           }
         },
         {
@@ -273,7 +320,8 @@
               "required": ["name"],
               "properties": {"name": {"$ref": "#/$defs/tool_name"}}
             },
-            "request": {"$ref": "#/$defs/method_and_path"}
+            "request": {"$ref": "#/$defs/method_and_path"},
+            "facts": {"$ref": "#/$defs/call_facts"}
           }
         },
         {

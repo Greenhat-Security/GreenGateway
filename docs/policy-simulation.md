@@ -56,8 +56,12 @@ audit, bucket and upstream against the live path afterwards
 
 A request is a `policy-simulation.v1` document. The version is dispatched
 exactly, every object refuses unknown members, and a member named like a
-credential (`token`, `authorization`, `cookie`, `headers` and similar) is
-refused with `forbidden_field`. The published schema is
+credential (`token`, `authorization`, `cookie` and similar) is refused with
+`forbidden_field`. A case may state the request facts a rule condition
+reads in an optional `facts` member, exactly as a
+[policy test case](policy-tests.md#request-facts) does; a fact a condition
+reads that the case omits is `indeterminate`, and the simulator never reads
+the clock. The published schema is
 [`docs/schemas/policy-simulation.v1.schema.json`](schemas/policy-simulation.v1.schema.json);
 the gateway's parser is authoritative and additionally checks path, host and
 origin syntax, identity bounds, unique case ids and byte lengths.

@@ -4,7 +4,8 @@
 //! the same [`CompiledPolicy`] methods: `evaluate_with_facts` for HTTP,
 //! `evaluate_tool_with_facts` for the tool lane and rendered tool requests, and
 //! `select_rate_lane_with_facts` for rate overrides, each with the facts a live
-//! lane captures for the case's principal ([`case_facts`]). It never matches a
+//! lane captures for the case's principal and the request facts it states
+//! ([`case_facts`]). It never matches a
 //! rule itself, so a test can only ever report what production decides for
 //! the same facts.
 //!
@@ -22,7 +23,7 @@ use serde::Serialize;
 use http::Method;
 
 use super::suite::{
-    Case, CaseInput, CaseKind, DecisionExpectation, HttpRequest, MatchedExpectation,
+    Case, CaseFacts, CaseInput, CaseKind, DecisionExpectation, HttpRequest, MatchedExpectation,
     RateExpectation, Suite, SyntheticPrincipal, SyntheticTarget,
 };
 use crate::{
@@ -30,7 +31,7 @@ use crate::{
         tools::{
             ToolEvaluationContext, ToolLimitation, ToolOperation, ToolReason, TOOL_CONTEXT_VERSION,
         },
-        CompiledPolicy, EvaluationError, HostFact, HttpTarget, Limitation, LogicalDecision,
+        CompiledPolicy, EvaluationError, Fact, HostFact, HttpTarget, Limitation, LogicalDecision,
         PolicyEffect, PolicyEvaluationContext, PolicyFacts, PrincipalFact, PrincipalIdentity,
         RateLaneOutcome, Reason, ResourceSnapshot, RuleReference, CONTEXT_VERSION,
     },
@@ -253,12 +254,52 @@ fn principal_fact(principal: &SyntheticPrincipal) -> PrincipalFact {
     }
 }
 
-/// The facts a live lane captures for a case's principal under `compiled`
-/// ([`CompiledPolicy::serving_facts`]): in mapped-role mode the organization
-/// the case states, and none when it states none. Shared with the simulator,
-/// so a case decides by exactly the facts a served request would.
-pub(crate) fn case_facts(compiled: &CompiledPolicy, principal: &SyntheticPrincipal) -> PolicyFacts {
-    compiled.serving_facts(principal.principal())
+/// The facts a live lane captures for a case under `compiled`: the
+/// organization the case's principal states when the policy reads one
+/// ([`CompiledPolicy::serving_facts`]), and each request fact the case states
+/// that the policy's conditions read ([`CompiledPolicy::fact_needs`]), the
+/// headers and query parameters filtered to the names they read, as the live
+/// fact builder copies them. A fact the policy reads and the case does not
+/// state stays uncaptured, so a condition over it is indeterminate. Shared
+/// with the simulator, so a case decides by exactly the facts a served
+/// request would.
+pub(crate) fn case_facts(
+    compiled: &CompiledPolicy,
+    principal: &SyntheticPrincipal,
+    stated: &CaseFacts,
+) -> PolicyFacts {
+    let mut facts = compiled.serving_facts(principal.principal());
+    let needs = compiled.fact_needs();
+    if needs.source_ip {
+        if let Some(address) = stated.source_ip {
+            facts.source_ip = Fact::Captured(address);
+        }
+    }
+    if !needs.headers.is_empty() {
+        if let Some(headers) = &stated.headers {
+            facts.headers = Fact::Captured(referenced(headers, &needs.headers));
+        }
+    }
+    if !needs.query.is_empty() {
+        if let Some(query) = &stated.query {
+            facts.query = Fact::Captured(referenced(query, &needs.query));
+        }
+    }
+    if needs.now {
+        if let Some(now) = stated.now {
+            facts.now = Fact::Captured(now);
+        }
+    }
+    facts
+}
+
+/// The entries whose name is one of `names`, in their stated order.
+fn referenced(entries: &[(String, String)], names: &[String]) -> Vec<(String, String)> {
+    entries
+        .iter()
+        .filter(|(name, _)| names.contains(name))
+        .cloned()
+        .collect()
 }
 
 /// The context the live HTTP adapter builds for a synthetic request.
@@ -349,7 +390,9 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
         } => {
             let context = http_context(compiled.snapshot(), request, principal);
             let expected = expected_decision(expect, Reason::as_str);
-            match compiled.evaluate_with_facts(&context, &case_facts(compiled, principal)) {
+            match compiled
+                .evaluate_with_facts(&context, &case_facts(compiled, principal, &case.facts))
+            {
                 Ok(evaluation) => {
                     let matched = matched_view(policy, evaluation.matched());
                     let mismatches = compare_decision(
@@ -390,7 +433,7 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
             policy,
             case,
             tool_context(compiled.snapshot(), *operation, tool_name, principal, None),
-            &case_facts(compiled, principal),
+            &case_facts(compiled, principal, &case.facts),
             expect,
         ),
         CaseInput::ToolHttp {
@@ -409,7 +452,7 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
                 principal,
                 Some((method, path)),
             ),
-            &case_facts(compiled, principal),
+            &case_facts(compiled, principal, &case.facts),
             expect,
         ),
         CaseInput::Rate {
@@ -430,7 +473,10 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
                 matched: None,
                 rate_override: Some(expected_override),
             };
-            match compiled.select_rate_lane_with_facts(&context, &case_facts(compiled, principal)) {
+            match compiled.select_rate_lane_with_facts(
+                &context,
+                &case_facts(compiled, principal, &case.facts),
+            ) {
                 Ok(selection) => {
                     let (selected, limitation) = match selection.outcome() {
                         RateLaneOutcome::NoOverride => (Some(None), None),
