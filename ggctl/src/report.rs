@@ -20,6 +20,7 @@ use std::{
 };
 
 use gateway_config::{
+    archive::{ArchiveCode, ArchiveRefusal},
     bundle::{self, BundleDiagnostic},
     documents::{API_VERSION_V1ALPHA1, REPORT_KIND},
 };
@@ -33,6 +34,8 @@ use crate::{
 
 /// Where `docs/configuration-bundles.md` explains every bundle reader code.
 pub(crate) const BUNDLE_REMEDIATION: &str = "docs/configuration-bundles.md#diagnostics";
+/// Where `docs/archive-admission.md` explains every archive admission code.
+pub(crate) const ARCHIVE_REMEDIATION: &str = "docs/archive-admission.md#codes";
 
 /// The process's standard streams.
 pub(crate) struct Io<'a> {
@@ -76,6 +79,9 @@ pub(crate) enum ReportDiagnostic {
         argument: usize,
         diagnostic: BundleDiagnostic,
     },
+    /// The shared archive admission rules refused a backup archive, located
+    /// by the position of the entry they refused.
+    Archive(ArchiveRefusal),
 }
 
 impl ReportDiagnostic {
@@ -85,6 +91,7 @@ impl ReportDiagnostic {
             Self::Bundle(diagnostic) | Self::Document { diagnostic, .. } => {
                 diagnostic.code.as_str()
             }
+            Self::Archive(refusal) => refusal.code.as_str(),
         }
     }
 
@@ -94,6 +101,7 @@ impl ReportDiagnostic {
             Self::Bundle(diagnostic) | Self::Document { diagnostic, .. } => {
                 diagnostic.severity.as_str()
             }
+            Self::Archive(_) => "error",
         }
     }
 
@@ -103,13 +111,14 @@ impl ReportDiagnostic {
             Self::Bundle(diagnostic) | Self::Document { diagnostic, .. } => {
                 diagnostic.code.message()
             }
+            Self::Archive(refusal) => refusal.code.message(),
         }
     }
 
     pub(crate) fn hint(&self) -> Option<&'static str> {
         match self {
             Self::Ggctl(diagnostic) => diagnostic.hint,
-            Self::Bundle(_) | Self::Document { .. } => None,
+            Self::Bundle(_) | Self::Document { .. } | Self::Archive(_) => None,
         }
     }
 
@@ -117,6 +126,7 @@ impl ReportDiagnostic {
         match self {
             Self::Ggctl(diagnostic) => diagnostic.code.remediation(),
             Self::Bundle(_) | Self::Document { .. } => BUNDLE_REMEDIATION,
+            Self::Archive(_) => ARCHIVE_REMEDIATION,
         }
     }
 
@@ -125,6 +135,7 @@ impl ReportDiagnostic {
         match self {
             Self::Ggctl(diagnostic) => diagnostic.code.exit(),
             Self::Bundle(diagnostic) | Self::Document { diagnostic, .. } => bundle_exit(diagnostic),
+            Self::Archive(refusal) => archive_exit(refusal),
         }
     }
 
@@ -148,7 +159,20 @@ impl ReportDiagnostic {
                 line: diagnostic.position.map(|position| position.line),
                 column: diagnostic.position.map(|position| position.column),
             }),
+            Self::Archive(refusal) => refusal.entry.map(|entry| LocationRecord::Entry {
+                entry,
+                conflicts_with: refusal.conflicts_with,
+            }),
         }
+    }
+}
+
+/// The exit code an archive refusal produces: an integrity failure, unless
+/// the archive or the staging copy could not be read or written at all.
+fn archive_exit(refusal: &ArchiveRefusal) -> Exit {
+    match refusal.code {
+        ArchiveCode::ReadFailed | ArchiveCode::WriteFailed => Exit::Failure,
+        _ => Exit::Integrity,
     }
 }
 
@@ -184,6 +208,22 @@ impl fmt::Display for ReportDiagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (diagnostic, argument) = match self {
             Self::Ggctl(diagnostic) => return diagnostic.fmt(formatter),
+            Self::Archive(refusal) => {
+                write!(
+                    formatter,
+                    "ggctl: {}: {}: {}",
+                    self.severity(),
+                    self.code(),
+                    self.message()
+                )?;
+                if let Some(entry) = refusal.entry {
+                    write!(formatter, "\n  at: archive entry {entry}")?;
+                }
+                if let Some(earlier) = refusal.conflicts_with {
+                    write!(formatter, " (conflicts with entry {earlier})")?;
+                }
+                return write!(formatter, "\n  see: {}", self.remediation());
+            }
             Self::Bundle(diagnostic) => (diagnostic, None),
             Self::Document {
                 argument,
@@ -268,6 +308,13 @@ pub(crate) enum LocationRecord {
         line: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         column: Option<u32>,
+    },
+    /// The 1-based position of a backup archive's entry and, for a
+    /// duplicate or a collision, of the earlier entry it clashes with.
+    Entry {
+        entry: usize,
+        #[serde(rename = "conflictsWith", skip_serializing_if = "Option::is_none")]
+        conflicts_with: Option<usize>,
     },
 }
 

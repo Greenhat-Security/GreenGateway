@@ -7,14 +7,16 @@
 //! input, the version handshake with a running gateway, offline bundle
 //! validation, pinning, diagnosis and semantic diff with the gateway's own
 //! bundle reader and diff engine (`gateway-config`), the offline commands
-//! over a standalone revision ledger (`ggctl ledger`), the policy commands,
-//! which ask a gateway's own validator and evaluator (`ggctl policy`), and
-//! offline evidence package verification (`ggctl evidence verify`).
+//! over a standalone revision ledger (`ggctl ledger`), offline backups of a
+//! standalone state directory (`ggctl backup`), the policy commands, which
+//! ask a gateway's own validator and evaluator (`ggctl policy`), and offline
+//! evidence package verification (`ggctl evidence verify`).
 //!
 //! `ggctl` reads no configuration file and no environment variable, never
 //! accepts a secret as an argument, and makes no network request unless a
 //! command is given `--server`. The command reference is `docs/ggctl.md`.
 
+mod backup;
 mod cli;
 mod completion;
 mod convert;
@@ -143,7 +145,8 @@ mod tests {
              greengateway.dev/v1alpha1  GatewayDeployment\n\
              greengateway.dev/v1alpha1  GatewayInitAnswers\n\
              greengateway.dev/v1alpha1  GatewayCapabilities\n\
-             greengateway.dev/v1alpha1  GgctlReport\n"
+             greengateway.dev/v1alpha1  GgctlReport\n\
+             greengateway.dev/v1alpha1  GatewayBackup\n"
         );
 
         let (exit, captured) = run_words(&[

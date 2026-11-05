@@ -61,22 +61,22 @@ fn positional_choices(command: &CommandSpec) -> &'static [&'static str] {
     }
 }
 
-/// Whether the command's positional argument is a path, which completes
-/// directory names: every such argument is a bundle directory.
+/// Whether the command's positional argument is a bundle directory, which
+/// completes directory names.
 fn takes_a_directory(command: &CommandSpec) -> bool {
     command
         .arguments
         .first()
-        .is_some_and(|argument| argument.kind == ValueKind::Path)
+        .is_some_and(|argument| argument.kind == ValueKind::Path && argument.name == "BUNDLE")
 }
 
-/// Whether the command's positional argument is a document file, which
-/// completes file names.
+/// Whether the command's positional argument is a file, which completes file
+/// names: a document, or a path that is not a bundle directory (a backup
+/// archive).
 fn takes_a_file(command: &CommandSpec) -> bool {
-    command
-        .arguments
-        .first()
-        .is_some_and(|argument| argument.kind == ValueKind::File)
+    command.arguments.first().is_some_and(|argument| {
+        argument.kind == ValueKind::File || argument.kind == ValueKind::Path
+    }) && !takes_a_directory(command)
 }
 
 /// Whether an option's value completes file names.
@@ -455,7 +455,8 @@ fn powershell() -> String {
         .collect();
     path_options.sort_unstable();
     path_options.dedup();
-    // A bundle directory or a document: PowerShell completes either path.
+    // A bundle directory, a document or an archive: PowerShell's own path
+    // completion takes over for a path argument.
     let directory_commands: Vec<_> = COMMANDS
         .iter()
         .filter(|command| takes_a_directory(command) || takes_a_file(command))
@@ -583,7 +584,7 @@ mod tests {
             "complete -c ggctl -n '__fish_seen_subcommand_from policy; and __fish_seen_subcommand_from lint' -F\n"
         ));
         assert!(powershell.contains(
-            "$command -in @('validate', 'pin', 'convert', 'doctor', 'diff', 'ledger seed', 'policy lint', 'policy test', 'policy explain', 'evidence verify')"
+            "$command -in @('validate', 'pin', 'convert', 'doctor', 'diff', 'ledger seed', 'backup verify', 'policy lint', 'policy test', 'policy explain', 'evidence verify')"
         ));
         for script in [&bash, &zsh, &fish] {
             // Single quotes pair up once escaped quotes are removed.
@@ -596,7 +597,7 @@ mod tests {
     fn a_family_completes_its_commands_then_each_commands_options() {
         let [bash, zsh, fish, powershell] = scripts().map(|(_, script)| script);
         // The family's name is offered first; its commands after it.
-        assert!(bash.contains("compgen -W 'version schema init validate pin convert doctor diff ledger policy evidence completion help'"));
+        assert!(bash.contains("compgen -W 'version schema init validate pin convert doctor diff ledger backup policy evidence completion help'"));
         assert!(bash.contains(
             "        ledger)\n            if [ \"$COMP_CWORD\" -eq 2 ]; then\n                COMPREPLY=($(compgen -W 'seed verify rollback --help -h' -- \"$cur\"))"
         ));
@@ -644,5 +645,39 @@ mod tests {
             "compgen -W 'version schema init validate pin convert doctor diff ledger seed"
         ));
         assert!(!bash.contains("policy evidence completion help policy lint"));
+    }
+
+    #[test]
+    fn a_second_family_completes_its_commands_too() {
+        let [bash, zsh, fish, powershell] = scripts().map(|(_, script)| script);
+        assert!(bash.contains("compgen -W 'version schema init validate pin convert doctor diff ledger backup policy evidence completion help'"));
+        assert!(bash.contains(
+            "        backup)\n            if [ \"$COMP_CWORD\" -eq 2 ]; then\n                COMPREPLY=($(compgen -W 'create verify --help -h' -- \"$cur\"))"
+        ));
+        assert!(bash.contains("            command=\"$command ${COMP_WORDS[2]}\"\n"));
+        assert!(bash.contains("        'backup create')\n"));
+        assert!(bash.contains("        'backup create')\n            case \"$prev\" in\n                --state-dir) COMPREPLY=($(compgen -f -- \"$cur\")); return 0 ;;\n                --output) COMPREPLY=($(compgen -f -- \"$cur\")); return 0 ;;\n"));
+        // An archive argument completes file names, a bundle directory names.
+        assert!(bash.contains("            COMPREPLY=($(compgen -f -- \"$cur\") $(compgen -W '--format --help -h' -- \"$cur\"))"));
+        assert!(zsh.contains("'1:FILE:_files' \\"));
+        assert!(fish.contains("complete -c ggctl -n '__fish_seen_subcommand_from backup; and __fish_seen_subcommand_from verify' -F\n"));
+        assert!(zsh.contains("    'backup:Back up a standalone state directory"));
+        assert!(zsh.contains("        'create:Back up a stopped standalone state directory"));
+        assert!(zsh.contains("      command=\"$command ${words[2]}\"\n"));
+        assert!(zsh.contains("    'backup create')\n      _arguments \\\n        '--state-dir["));
+        assert!(fish.contains(
+            "complete -c ggctl -n '__fish_seen_subcommand_from backup; and not __fish_seen_subcommand_from create verify' -a verify -d "
+        ));
+        assert!(fish.contains(
+            "complete -c ggctl -n '__fish_seen_subcommand_from backup; and __fish_seen_subcommand_from create' -l state-dir -r -F"
+        ));
+        assert!(powershell.contains("        'backup' = @('create', 'verify', '--help', '-h')\n"));
+        assert!(powershell.contains(
+            "        'backup create' = @('--state-dir', '--output', '--format', '--help', '-h')\n"
+        ));
+        // No family command is offered as a first word.
+        assert!(!bash.contains(
+            "compgen -W 'version schema init validate pin convert doctor diff backup create"
+        ));
     }
 }

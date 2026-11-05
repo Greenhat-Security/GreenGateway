@@ -299,6 +299,94 @@ fn a_family_and_its_commands_have_help() {
 }
 
 #[test]
+fn a_backup_command_is_its_family_and_a_second_word() {
+    let invocation = runnable(&[
+        "backup",
+        "create",
+        "--output",
+        "/backups/state.ggbk",
+        "--state-dir",
+        "/state",
+    ]);
+    assert_eq!(invocation.command.name, "backup create");
+    assert_eq!(invocation.text("--state-dir"), Some((5, "/state")));
+    assert_eq!(
+        invocation.text("--output"),
+        Some((3, "/backups/state.ggbk"))
+    );
+    let invocation = runnable(&["backup", "verify", "/backups/state.ggbk"]);
+    assert_eq!(invocation.command.name, "backup verify");
+    assert_eq!(invocation.positional(0), Some((3, "/backups/state.ggbk")));
+
+    for (words, code, position) in [
+        (&["backup"][..], Code::MissingCommand, None),
+        (&["backup", "frobnicate"], Code::UnknownCommand, Some(2)),
+        (&["backup", "--state-dir"], Code::UnknownCommand, Some(2)),
+        (
+            &["backup create", "--state-dir"],
+            Code::UnknownCommand,
+            Some(1),
+        ),
+        (&["create"], Code::UnknownCommand, Some(1)),
+        (&["backup", "verify"], Code::MissingArgument, None),
+        (
+            &["backup", "verify", "/a.ggbk", "extra"],
+            Code::UnexpectedArgument,
+            Some(4),
+        ),
+        (
+            &["backup", "create", "--state-dir", "/a", "--state-dir", "/b"],
+            Code::DuplicateOption,
+            Some(5),
+        ),
+        (
+            &["help", "backup", "frobnicate"],
+            Code::InvalidValue,
+            Some(3),
+        ),
+        (
+            &["help", "version", "create"],
+            Code::UnexpectedArgument,
+            Some(3),
+        ),
+    ] {
+        let diagnostic = refused(words);
+        assert_eq!(diagnostic.code, code, "{words:?}");
+        assert_eq!(diagnostic.argument, position, "{words:?}");
+    }
+    let alone = refused(&["backup"]);
+    assert!(alone
+        .hint
+        .is_some_and(|hint| hint.contains("ggctl help backup")));
+}
+
+#[test]
+fn the_backup_family_and_its_commands_have_help() {
+    for words in [
+        &["backup", "--help"][..],
+        &["backup", "-h"],
+        &["help", "backup"],
+    ] {
+        match parsed(words) {
+            Ok(Parsed::Help(HelpTopic::Family(family))) => assert_eq!(family.name, "backup"),
+            other => panic!("{words:?}: {other:?}"),
+        }
+    }
+    for words in [
+        &["backup", "create", "--help"][..],
+        &["help", "backup", "create"],
+        &["backup", "create", "--state-dir", "/state", "-h"],
+    ] {
+        match parsed(words) {
+            Ok(Parsed::Help(HelpTopic::Spec(command))) => {
+                assert_eq!(command.name, "backup create")
+            }
+            other => panic!("{words:?}: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn commands_options_and_values_parse_in_every_spelling() {
     let invocation = runnable(&[
         "version",
