@@ -9,15 +9,16 @@
 //!
 //! What a case can say is deliberately narrow. Identity is a typed set of
 //! policy facts -- subject, issuer, roles, authentication method and the
-//! organization authentication verified -- and never a token, cookie or
-//! credential: there is no field to put one in, and a member named like one
-//! is refused with its own code rather than as an ordinary typo. The request
-//! facts a rule condition reads -- source address, headers, query parameters,
-//! the evaluation instant and a tool invocation's arguments -- are an
-//! optional typed `facts` member, whose header and query names are held to
-//! the same rule conditions are: a name that can carry a credential, an
-//! identity or hop-by-hop routing is refused with `forbidden_field`. No fact
-//! value, an argument least of all, is ever quoted back.
+//! organization, OAuth scopes and allowlisted claims authentication verified
+//! -- and never a token, cookie or credential: there is no field to put one
+//! in, and a member named like one is refused with its own code rather than
+//! as an ordinary typo. The request facts a rule condition reads -- source
+//! address, headers, query parameters, the evaluation instant and a tool
+//! invocation's arguments -- are an optional typed `facts` member, whose
+//! header and query names are held to the same rule conditions are: a name
+//! that can carry a credential, an identity or hop-by-hop routing is refused
+//! with `forbidden_field`. No fact value, an argument least of all, is ever
+//! quoted back.
 
 use std::net::IpAddr;
 
@@ -28,8 +29,12 @@ use url::Url;
 
 use crate::{
     auth::{
-        principal::{canonical_issuer, check_principal_shape, MAX_PRINCIPAL_ISSUER_BYTES},
-        AuthMethod, Principal,
+        claims::{is_scope_token, is_verified_claim_text, verified_claim_name_problem},
+        principal::{
+            canonical_issuer, check_principal_shape, MAX_PRINCIPAL_ISSUER_BYTES,
+            MAX_PRINCIPAL_SCOPES, MAX_VERIFIED_CLAIMS, MAX_VERIFIED_CLAIM_VALUES,
+        },
+        AuthMethod, Principal, VerifiedClaim,
     },
     canonical_json,
     policy_eval::{
@@ -1492,7 +1497,15 @@ fn parse_principal(
     check_members(
         map,
         pointer,
-        &["subject", "issuer", "roles", "auth_method", "organization"],
+        &[
+            "subject",
+            "issuer",
+            "roles",
+            "auth_method",
+            "organization",
+            "scopes",
+            "claims",
+        ],
         diagnostics,
     );
     let subject = required(map, "subject", pointer, diagnostics).and_then(|value| {
@@ -1582,8 +1595,23 @@ fn parse_principal(
         )
         .map(Some),
     };
-    let (subject, issuer, roles, auth_method, organization) =
-        (subject?, issuer?, roles?, auth_method?, organization?);
+    let scopes = match map.get("scopes") {
+        None => Some(None),
+        Some(value) => parse_scopes(value, &format!("{pointer}/scopes"), diagnostics).map(Some),
+    };
+    let verified_claims = match map.get("claims") {
+        None => Some(Vec::new()),
+        Some(value) => parse_claims(value, &format!("{pointer}/claims"), diagnostics),
+    };
+    let (subject, issuer, roles, auth_method, organization, scopes, verified_claims) = (
+        subject?,
+        issuer?,
+        roles?,
+        auth_method?,
+        organization?,
+        scopes?,
+        verified_claims?,
+    );
     // The predicate authentication applies before any principal exists, so a
     // case cannot describe an identity no credential could produce.
     if let Err(problem) = check_principal_shape(&subject, issuer.as_deref(), &roles) {
@@ -1604,7 +1632,126 @@ fn parse_principal(
         roles,
         session_id: String::new(),
         auth_method,
+        scopes,
+        verified_claims,
     }))
+}
+
+/// A principal's `scopes`: the OAuth scopes its authentication verified, as
+/// JWT validation captures them -- each a scope token, at most
+/// [`MAX_PRINCIPAL_SCOPES`], kept sorted and unique. Omitted, the case states
+/// no scope fact, so a matcher that reads scopes is indeterminate; `[]` is a
+/// token that granted none.
+fn parse_scopes(
+    value: &Value,
+    pointer: &str,
+    diagnostics: &mut Diagnostics,
+) -> Option<Vec<String>> {
+    let Value::Array(items) = value else {
+        diagnostics.push(
+            "invalid_type",
+            pointer,
+            "scopes must be an array of strings",
+        );
+        return None;
+    };
+    if items.len() > MAX_PRINCIPAL_SCOPES {
+        diagnostics.push(
+            "too_many_facts",
+            pointer,
+            format!("at most {MAX_PRINCIPAL_SCOPES} scopes may be stated"),
+        );
+        return None;
+    }
+    let mut scopes = Vec::with_capacity(items.len());
+    let mut valid = true;
+    for (index, item) in items.iter().enumerate() {
+        match item.as_str() {
+            Some(scope) if is_scope_token(scope) => scopes.push(scope.to_owned()),
+            Some(_) => {
+                diagnostics.push(
+                    "invalid_value",
+                    &format!("{pointer}/{index}"),
+                    "a scope is an OAuth scope token: 1 to 256 bytes of visible ASCII without a space, a quote or a backslash",
+                );
+                valid = false;
+            }
+            None => {
+                diagnostics.push(
+                    "invalid_type",
+                    &format!("{pointer}/{index}"),
+                    "expected a string",
+                );
+                valid = false;
+            }
+        }
+    }
+    scopes.sort_unstable();
+    scopes.dedup();
+    valid.then_some(scopes)
+}
+
+/// A principal's `claims`: an object from each allowlisted claim name its
+/// JWT validation verified to what it carried -- a string, boolean or
+/// number, or a list of at most [`MAX_VERIFIED_CLAIM_VALUES`] strings, `[]`
+/// being a claim the token did not carry. A name it omits was not captured,
+/// so a `claim` condition that reads it is indeterminate. Names are held to
+/// the rule an allowlist is; values are never quoted in a diagnostic.
+fn parse_claims(
+    value: &Value,
+    pointer: &str,
+    diagnostics: &mut Diagnostics,
+) -> Option<Vec<VerifiedClaim>> {
+    let map = object(value, pointer, diagnostics)?;
+    if map.len() > MAX_VERIFIED_CLAIMS {
+        diagnostics.push(
+            "too_many_facts",
+            pointer,
+            format!("at most {MAX_VERIFIED_CLAIMS} claims may be stated"),
+        );
+        return None;
+    }
+    let mut claims = Vec::with_capacity(map.len());
+    let mut valid = true;
+    for (name, value) in map {
+        let member = member_pointer(pointer, name);
+        if verified_claim_name_problem(name).is_some() {
+            diagnostics.push(
+                "forbidden_field",
+                &member,
+                "a claim is one a verified_claims allowlist may list: 1 to 256 bytes, and never the issuer, subject, audience, scopes, email or credential metadata",
+            );
+            valid = false;
+            continue;
+        }
+        let values = match value {
+            Value::String(text) if is_verified_claim_text(text) => vec![value.clone()],
+            Value::Bool(_) | Value::Number(_) => vec![value.clone()],
+            Value::Array(items)
+                if items.len() <= MAX_VERIFIED_CLAIM_VALUES
+                    && items
+                        .iter()
+                        .all(|item| item.as_str().is_some_and(is_verified_claim_text)) =>
+            {
+                items.clone()
+            }
+            _ => {
+                diagnostics.push(
+                    "invalid_value",
+                    &member,
+                    "a claim is a string of at most 256 bytes without control characters, a boolean, a number, or a list of at most 32 such strings",
+                );
+                valid = false;
+                continue;
+            }
+        };
+        claims.push(VerifiedClaim {
+            name: name.clone(),
+            values,
+        });
+    }
+    claims.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    valid.then_some(claims)
 }
 
 fn parse_http_request(

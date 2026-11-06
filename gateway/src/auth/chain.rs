@@ -333,6 +333,8 @@ mod tests {
             roles: vec!["member".to_owned()],
             session_id: format!("{user_id}-session"),
             auth_method: AuthMethod::Bearer,
+            scopes: None,
+            verified_claims: Vec::new(),
         }
     }
 }

@@ -931,6 +931,12 @@
         "org_claim": {
           "$ref": "#/$defs/text"
         },
+        "verified_claims": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/text"
+          }
+        },
         "introspection_url": {
           "$ref": "#/$defs/text"
         },

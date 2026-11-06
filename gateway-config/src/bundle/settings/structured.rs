@@ -185,6 +185,7 @@ pub(crate) static AUTH_PROVIDER: Form = Form {
         optional("roles_claim", Kind::Text),
         optional("roles_claim_delimiter", Kind::Exact),
         optional("org_claim", Kind::Text),
+        optional("verified_claims", Kind::TextList),
         optional("introspection_url", Kind::Text),
         optional("introspection_timeout_ms", Kind::Integer(U64)),
         optional("cache_ttl_ms", Kind::Integer(U64)),

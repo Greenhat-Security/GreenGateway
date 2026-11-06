@@ -233,7 +233,7 @@
         "policy_semantic_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
         "semantics_version": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9_.-]+$"},
         "context_version": {"type": "integer", "minimum": 1, "maximum": 65535},
-        "facts_available": {"type": "integer", "minimum": 0, "maximum": 4095},
+        "facts_available": {"type": "integer", "minimum": 0, "maximum": 16383},
         "routing": {"enum": ["unclassified", "contextless", "mcp_alias", "proxy_dispatch"]},
         "reason": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9_.-]+$"},
         "element": {"$ref": "#/$defs/decision_element"}

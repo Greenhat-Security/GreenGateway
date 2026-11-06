@@ -290,6 +290,8 @@ impl CachedVerification {
                     roles: valid.scopes,
                     session_id: valid.id,
                     auth_method: AuthMethod::ServiceToken,
+                    scopes: None,
+                    verified_claims: Vec::new(),
                 };
                 // Scopes are bounded when written through the admin API. A
                 // record that predates the bound, or was written around it,

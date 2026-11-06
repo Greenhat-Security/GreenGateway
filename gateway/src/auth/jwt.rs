@@ -23,7 +23,7 @@ use crate::{
 };
 
 use super::{
-    claims::{extract_roles, extract_string_claim},
+    claims::{extract_roles, extract_scopes, extract_string_claim, extract_verified_claims},
     oidc,
     principal::provider_issuer,
     AuthError, AuthMethod, Principal, SessionCredential, SessionValidator,
@@ -86,6 +86,10 @@ pub struct JwtAuthConfig {
     pub roles_claim_delimiter: Option<String>,
     /// Optional literal claim key or dotted nested claim path used to extract an organization ID.
     pub org_claim: Option<String>,
+    /// The claim names, or dotted claim paths, whose verified values a typed
+    /// policy matcher may read (`Principal::verified_claims`): validated,
+    /// sorted and unique. Empty captures none.
+    pub verified_claims: Vec<String>,
 }
 
 impl JwtAuthConfig {
@@ -101,6 +105,7 @@ impl JwtAuthConfig {
             roles_claim: config.roles_claim.clone(),
             roles_claim_delimiter: None,
             org_claim: None,
+            verified_claims: Vec::new(),
         })
     }
 
@@ -115,6 +120,7 @@ impl JwtAuthConfig {
             roles_claim: config.roles_claim.clone(),
             roles_claim_delimiter: config.roles_claim_delimiter.clone(),
             org_claim: config.org_claim.clone(),
+            verified_claims: config.verified_claims.clone(),
         }
     }
 }
@@ -181,6 +187,7 @@ impl fmt::Debug for JwtValidator {
             .field("roles_claim", &self.cfg.roles_claim)
             .field("roles_claim_delimiter", &self.cfg.roles_claim_delimiter)
             .field("org_claim", &self.cfg.org_claim)
+            .field("verified_claims", &self.cfg.verified_claims)
             .finish_non_exhaustive()
     }
 }
@@ -608,6 +615,11 @@ impl JwtValidator {
             .filter(|email| !email.is_empty())
             .map(str::to_ascii_lowercase);
         let org_id = extract_string_claim(&claims.extra, self.cfg.org_claim.as_deref());
+        // Policy facts a typed matcher reads, verified with the signature
+        // above and bound to this validator's issuer. Neither is a role, and
+        // neither is ever read from a request header.
+        let scopes = extract_scopes(&claims.extra);
+        let verified_claims = extract_verified_claims(&claims.extra, &self.cfg.verified_claims);
         let session_id = jti.unwrap_or("-").to_owned();
 
         Ok(Principal {
@@ -618,6 +630,8 @@ impl JwtValidator {
             roles,
             session_id,
             auth_method: AuthMethod::Bearer,
+            scopes,
+            verified_claims,
         })
     }
 

@@ -84,6 +84,8 @@ fn principal(user_id: &str, issuer: &str, roles: &[&str], auth_method: AuthMetho
         roles: roles.iter().map(|role| (*role).to_owned()).collect(),
         session_id: "synthetic-session".to_owned(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 

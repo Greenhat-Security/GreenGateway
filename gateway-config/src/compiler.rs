@@ -35,8 +35,8 @@ use serde::Deserialize;
 
 use crate::{
     auth::{
-        canonical_issuer, provider_issuer, ClientCertIdentitySource, MAX_PRINCIPAL_ISSUER_BYTES,
-        PROVIDER_ISSUER_PREFIX,
+        canonical_issuer, provider_issuer, verified_claim_name_problem, ClientCertIdentitySource,
+        MAX_PRINCIPAL_ISSUER_BYTES, MAX_VERIFIED_CLAIMS, PROVIDER_ISSUER_PREFIX,
     },
     connections::{
         aws_secret::{AwsProviderConfig, MAX_AWS_PROVIDER_CONFIG_BYTES},
@@ -1171,6 +1171,11 @@ pub struct AuthProviderConfig {
     pub roles_claim: String,
     pub roles_claim_delimiter: Option<String>,
     pub org_claim: Option<String>,
+    /// The claims, by name or dotted path, a JWT provider's validation
+    /// captures as verified facts for typed policy matchers: validated,
+    /// sorted and unique. Empty for a cookie-session provider, which
+    /// refuses the member.
+    pub verified_claims: Vec<String>,
     pub introspection_url: Option<String>,
     pub introspection_timeout_ms: u64,
     pub cache_ttl_ms: u64,
@@ -1197,6 +1202,7 @@ impl fmt::Debug for AuthProviderConfig {
             .field("roles_claim", &self.roles_claim)
             .field("roles_claim_delimiter", &self.roles_claim_delimiter)
             .field("org_claim", &self.org_claim)
+            .field("verified_claims", &self.verified_claims)
             .field("introspection_url", &self.introspection_url)
             .field("introspection_timeout_ms", &self.introspection_timeout_ms)
             .field("cache_ttl_ms", &self.cache_ttl_ms)
@@ -1243,6 +1249,8 @@ pub(crate) struct RawAuthProviderConfig {
     #[serde(default)]
     org_claim: Option<String>,
     #[serde(default)]
+    verified_claims: Option<Vec<String>>,
+    #[serde(default)]
     introspection_url: Option<String>,
     #[serde(default)]
     introspection_timeout_ms: Option<u64>,
@@ -1276,6 +1284,7 @@ impl fmt::Debug for RawAuthProviderConfig {
             .field("roles_claim", &self.roles_claim)
             .field("roles_claim_delimiter", &self.roles_claim_delimiter)
             .field("org_claim", &self.org_claim)
+            .field("verified_claims", &self.verified_claims)
             .field("introspection_url", &self.introspection_url)
             .field("introspection_timeout_ms", &self.introspection_timeout_ms)
             .field("cache_ttl_ms", &self.cache_ttl_ms)
@@ -2049,6 +2058,12 @@ fn validate_auth_providers(
         let roles_claim_delimiter =
             normalize_auth_provider_roles_claim_delimiter(provider.roles_claim_delimiter);
         let org_claim = normalize_optional_config_string(provider.org_claim);
+        let verified_claims = validate_auth_provider_verified_claims(
+            &format!("{provider_name}.verified_claims"),
+            provider.verified_claims,
+            provider_type,
+            problems,
+        );
 
         let mut jwks_url = None;
         let mut issuer = None;
@@ -2144,6 +2159,7 @@ fn validate_auth_providers(
             roles_claim,
             roles_claim_delimiter,
             org_claim,
+            verified_claims,
             introspection_url,
             introspection_timeout_ms,
             cache_ttl_ms,
@@ -2260,6 +2276,50 @@ fn normalize_auth_provider_roles_claim_delimiter(value: Option<String>) -> Optio
     value.filter(|value| !value.is_empty())
 }
 
+/// A provider's `verified_claims` allowlist (issue #243): the claims, by name
+/// or dotted path, its JWT validation captures for typed policy matchers.
+/// Each name is trimmed and must be one a claim condition may read; the list
+/// is sorted and holds no duplicate. Only a JWT provider captures claims, so
+/// a cookie-session provider that lists any is refused rather than silently
+/// capturing none.
+fn validate_auth_provider_verified_claims(
+    name: &str,
+    value: Option<Vec<String>>,
+    provider_type: AuthProviderType,
+    problems: &mut Vec<String>,
+) -> Vec<String> {
+    let Some(raw) = value.filter(|raw| !raw.is_empty()) else {
+        return Vec::new();
+    };
+    if provider_type != AuthProviderType::Jwt {
+        problems.push(format!(
+            "{name} is supported only by type 'jwt' providers, which verify the claims they capture"
+        ));
+        return Vec::new();
+    }
+    if raw.len() > MAX_VERIFIED_CLAIMS {
+        problems.push(format!(
+            "{name} must list at most {MAX_VERIFIED_CLAIMS} claims"
+        ));
+        return Vec::new();
+    }
+    let mut claims = Vec::with_capacity(raw.len());
+    for (index, claim) in raw.into_iter().enumerate() {
+        let claim = claim.trim().to_owned();
+        if let Some(problem) = verified_claim_name_problem(&claim) {
+            problems.push(format!("{name}[{index}] {problem}"));
+            continue;
+        }
+        if claims.contains(&claim) {
+            problems.push(format!("{name}[{index}] duplicates an earlier entry"));
+            continue;
+        }
+        claims.push(claim);
+    }
+    claims.sort_unstable();
+    claims
+}
+
 fn normalize_required_auth_provider_string(
     name: &str,
     value: Option<String>,
@@ -2319,6 +2379,7 @@ fn legacy_auth_providers(
         roles_claim: roles_claim.to_owned(),
         roles_claim_delimiter: None,
         org_claim: None,
+        verified_claims: Vec::new(),
         introspection_url: None,
         introspection_timeout_ms: DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
         cache_ttl_ms: DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,

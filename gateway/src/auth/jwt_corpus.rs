@@ -98,6 +98,7 @@ impl CorpusHarness {
                 roles_claim: "roles".to_owned(),
                 roles_claim_delimiter: None,
                 org_claim: None,
+                verified_claims: Vec::new(),
             },
             Arc::new(egress),
             Arc::new(NoRevocation(Arc::clone(&revocation_calls))),

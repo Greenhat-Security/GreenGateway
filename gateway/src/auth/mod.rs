@@ -31,7 +31,7 @@ pub use jwt::{
 #[allow(unused_imports)] // Public OIDC-login API is wired by gateway startup.
 pub use oidc_login::{OidcLoginConfig, OidcLoginState, PendingLoginLimits};
 #[allow(unused_imports)] // Public auth API re-export reserved for later identity integration.
-pub use principal::{actor_from_principal, AuthMethod, Principal};
+pub use principal::{actor_from_principal, AuthMethod, Principal, VerifiedClaim};
 #[allow(unused_imports)] // Public principal directory handle is wired by gateway startup.
 pub use principal_directory::PrincipalDirectory;
 pub use reauthentication::{CredentialJudge, Reauthentication};

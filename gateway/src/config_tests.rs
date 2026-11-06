@@ -2410,6 +2410,7 @@ fn auth_providers_parse_ordered_jwt_list() {
                 client_id: None,
                 client_secret: None,
                 redirect_uri: None,
+                verified_claims: Vec::new(),
             },
             AuthProviderConfig {
                 name: "secondary".to_owned(),
@@ -2431,6 +2432,7 @@ fn auth_providers_parse_ordered_jwt_list() {
                 client_id: None,
                 client_secret: None,
                 redirect_uri: None,
+                verified_claims: Vec::new(),
             },
         ]
     );
@@ -2914,6 +2916,7 @@ fn auth_providers_treat_empty_optional_claim_mapping_fields_as_unset() {
             client_id: None,
             client_secret: None,
             redirect_uri: None,
+            verified_claims: Vec::new(),
         }]
     );
 }
@@ -2960,6 +2963,7 @@ fn auth_providers_parse_cookie_session_provider() {
             client_id: None,
             client_secret: None,
             redirect_uri: None,
+            verified_claims: Vec::new(),
         }]
     );
 }
@@ -2983,6 +2987,73 @@ fn auth_providers_reject_cookie_session_provider_without_required_fields() {
     assert!(message.contains("AUTH_PROVIDERS[0].user_id_claim must be a non-empty string"));
     assert!(message.contains("AUTH_PROVIDERS[0].cache_ttl_ms must be greater than 0"));
     assert_eq!(error.problems().len(), 3);
+}
+
+#[test]
+fn auth_providers_parse_a_trimmed_sorted_verified_claims_allowlist() {
+    let config = Config::from_env_vars(|name| match name {
+        "AUTH_PROVIDERS" => Ok(r#"[{
+                    "name": "corp",
+                    "type": "jwt",
+                    "issuer": "https://idp.example.test",
+                    "verified_claims": [" department ", "amr", "realm_access.roles"]
+                }]"#
+        .to_owned()),
+        _ => Err(VarError::NotPresent),
+    })
+    .expect("an allowlist of readable claims should parse");
+
+    assert_eq!(
+        config.auth_providers[0].verified_claims,
+        vec!["amr", "department", "realm_access.roles"]
+    );
+}
+
+/// The allowlist names only claims a condition may read, once each, within
+/// the bound; and only a JWT provider, which verifies what it captures, may
+/// set one.
+#[test]
+fn auth_providers_reject_an_allowlist_no_claim_condition_could_read() {
+    for (provider, expected) in [
+        (
+            r#"{"name":"corp","type":"jwt","issuer":"https://idp.example.test","verified_claims":["sub"]}"#,
+            "AUTH_PROVIDERS[0].verified_claims[0] names a claim",
+        ),
+        (
+            r#"{"name":"corp","type":"jwt","issuer":"https://idp.example.test","verified_claims":["refresh_token"]}"#,
+            "AUTH_PROVIDERS[0].verified_claims[0] names a claim",
+        ),
+        (
+            r#"{"name":"corp","type":"jwt","issuer":"https://idp.example.test","verified_claims":["amr","  "]}"#,
+            "AUTH_PROVIDERS[0].verified_claims[1] must be 1 to 256 bytes",
+        ),
+        (
+            r#"{"name":"corp","type":"jwt","issuer":"https://idp.example.test","verified_claims":["amr"," amr"]}"#,
+            "AUTH_PROVIDERS[0].verified_claims[1] duplicates an earlier entry",
+        ),
+        (
+            r#"{"name":"corp","type":"jwt","issuer":"https://idp.example.test","verified_claims":["c0","c1","c2","c3","c4","c5","c6","c7","c8","c9","c10","c11","c12","c13","c14","c15","c16"]}"#,
+            "AUTH_PROVIDERS[0].verified_claims must list at most 16 claims",
+        ),
+        (
+            r#"{"name":"app","type":"cookie_session","introspection_url":"https://app.example.test/introspect","user_id_claim":"id","verified_claims":["department"]}"#,
+            "AUTH_PROVIDERS[0].verified_claims is supported only by type 'jwt' providers",
+        ),
+    ] {
+        let error = Config::from_env_vars(|name| match name {
+            "AUTH_PROVIDERS" => Ok(format!("[{provider}]")),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("the allowlist should be refused");
+        assert!(error.to_string().contains(expected), "{provider}: {error}");
+    }
+    // An empty allowlist is no allowlist, for either provider type.
+    let config = Config::from_env_vars(|name| match name {
+        "AUTH_PROVIDERS" => Ok(r#"[{"name":"app","type":"cookie_session","introspection_url":"https://app.example.test/introspect","user_id_claim":"id","verified_claims":[]}]"#.to_owned()),
+        _ => Err(VarError::NotPresent),
+    })
+    .expect("an empty allowlist parses");
+    assert!(config.auth_providers[0].verified_claims.is_empty());
 }
 
 #[test]
@@ -3180,6 +3251,7 @@ fn jwt_doc_provider(
         client_id: None,
         client_secret: None,
         redirect_uri: None,
+        verified_claims: Vec::new(),
     }
 }
 
@@ -3219,6 +3291,7 @@ fn auth_providers_accept_issuer_only_jwt_provider_for_oidc_discovery() {
             client_id: None,
             client_secret: None,
             redirect_uri: None,
+            verified_claims: Vec::new(),
         }]
     );
 }
@@ -3397,6 +3470,7 @@ fn legacy_jwt_settings_create_implicit_auth_provider_when_auth_providers_unset()
             client_id: None,
             client_secret: None,
             redirect_uri: None,
+            verified_claims: Vec::new(),
         }]
     );
 }
@@ -3449,6 +3523,7 @@ fn auth_providers_take_precedence_over_legacy_jwt_settings() {
             client_id: None,
             client_secret: None,
             redirect_uri: None,
+            verified_claims: Vec::new(),
         }]
     );
 }

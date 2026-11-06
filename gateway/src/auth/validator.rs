@@ -225,6 +225,8 @@ mod tests {
             roles: vec!["member".to_owned()],
             session_id: "session-789".to_owned(),
             auth_method: AuthMethod::Bearer,
+            scopes: None,
+            verified_claims: Vec::new(),
         }
     }
 }

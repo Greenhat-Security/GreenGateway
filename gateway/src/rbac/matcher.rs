@@ -1495,6 +1495,8 @@ mod tests {
                 roles,
                 session_id: "session-123".to_owned(),
                 auth_method,
+                scopes: None,
+                verified_claims: Vec::new(),
             })
     }
 
@@ -1581,6 +1583,8 @@ mod tests {
             roles: roles.iter().map(|role| (*role).to_owned()).collect(),
             session_id: "session-123".to_owned(),
             auth_method,
+            scopes: None,
+            verified_claims: Vec::new(),
         }
     }
 }

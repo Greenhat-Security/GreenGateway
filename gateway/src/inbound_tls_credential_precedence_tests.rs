@@ -56,6 +56,8 @@ impl SessionValidator for StaticTokenValidator {
             roles: Vec::new(),
             session_id: "static-test-session".to_owned(),
             auth_method: AuthMethod::Bearer,
+            scopes: None,
+            verified_claims: Vec::new(),
         })
     }
 }
@@ -86,6 +88,8 @@ impl SessionValidator for PermissiveLegacyValidator {
             roles: Vec::new(),
             session_id: "legacy-test-session".to_owned(),
             auth_method: AuthMethod::Bearer,
+            scopes: None,
+            verified_claims: Vec::new(),
         })
     }
 

@@ -254,6 +254,8 @@ impl Caller {
             roles: vec![role.to_owned()],
             session_id: String::new(),
             auth_method,
+            scopes: None,
+            verified_claims: Vec::new(),
         })
     }
 }

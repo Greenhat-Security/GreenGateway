@@ -1,8 +1,10 @@
 //! The authentication settings the configuration compiler reads and the
 //! shapes it holds them to (issue #242): issuer canonicalization, the
 //! principal identity bounds a policy's identity mappings are held to, the
-//! JWKS key age bounds, cookie names, the client-certificate identity source
-//! and the admin session settings.
+//! JWKS key age bounds, cookie names, the verified-claim allowlist and the
+//! scope and claim bounds a policy's scope and claim matchers are held to
+//! (issue #243), the client-certificate identity source and the admin session
+//! settings.
 //!
 //! The gateway's validators and stores act on these; it re-exports each from
 //! the module that uses it (`auth::principal`, `auth::jwt`,
@@ -57,6 +59,74 @@ pub const MAX_JWKS_KEY_AGE_SECS_LIMIT: u64 = 86_400;
 /// go stale before a demand refresh was allowed again, and every request would
 /// fail closed against a reachable issuer until the throttle window passed.
 pub const MIN_JWKS_KEY_AGE_SECS_LIMIT: u64 = 10;
+
+/// Most claim names one provider's `verified_claims` allowlist may list, and
+/// so the most verified claims a principal carries.
+pub const MAX_VERIFIED_CLAIMS: usize = 16;
+/// Longest allowlisted claim name or dotted claim path, in bytes.
+pub const MAX_VERIFIED_CLAIM_NAME_BYTES: usize = 256;
+
+/// Claim names no `verified_claims` allowlist may list, compared exactly.
+/// Each is already read some other way, or bounds the token rather than
+/// describing the caller: the issuer, subject and audience are the
+/// principal's identity and its binding; the validity instants and the token,
+/// session and nonce identifiers and hashes are credential metadata; `cnf`
+/// binds a proof-of-possession key; `scope` and `scp` are the scope fact; and
+/// `email` is display metadata, never a policy input.
+const RESERVED_CLAIM_NAMES: &[&str] = &[
+    "iss", "sub", "aud", "exp", "nbf", "iat", "jti", "sid", "nonce", "at_hash", "c_hash", "s_hash",
+    "cnf", "scope", "scp", "email",
+];
+
+/// Fragments, compared ASCII case-insensitively, that mark a claim name as
+/// one that can carry a credential.
+const CREDENTIAL_CLAIM_FRAGMENTS: &[&str] = &["token", "secret", "passw", "credential"];
+
+/// Longest OAuth scope, in bytes: a principal's scope fact, a `scope`
+/// condition value and an identity mapping's `scopes` entry.
+pub const MAX_PRINCIPAL_SCOPE_BYTES: usize = 256;
+/// Longest verified claim string, in bytes: a captured claim value and a
+/// `claim` condition value.
+pub const MAX_VERIFIED_CLAIM_VALUE_BYTES: usize = 256;
+
+/// An RFC 6749 `scope-token` of at most [`MAX_PRINCIPAL_SCOPE_BYTES`]:
+/// printable ASCII without space, `"` or `\`.
+pub fn is_scope_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PRINCIPAL_SCOPE_BYTES
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
+}
+
+/// A verified claim string: at most [`MAX_VERIFIED_CLAIM_VALUE_BYTES`], with
+/// no control character.
+pub fn is_verified_claim_text(text: &str) -> bool {
+    text.len() <= MAX_VERIFIED_CLAIM_VALUE_BYTES && !text.chars().any(char::is_control)
+}
+
+/// Why `name` cannot be a verified claim -- an allowlist entry, or the claim
+/// a `claim` condition reads -- or `None` when it can be.
+pub fn verified_claim_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() || name.len() > MAX_VERIFIED_CLAIM_NAME_BYTES {
+        return Some("must be 1 to 256 bytes");
+    }
+    if name.chars().any(char::is_control) || name.trim() != name {
+        return Some("must not contain control characters or leading or trailing whitespace");
+    }
+    let lowercase = name.to_ascii_lowercase();
+    if RESERVED_CLAIM_NAMES.contains(&name)
+        || CREDENTIAL_CLAIM_FRAGMENTS
+            .iter()
+            .any(|fragment| lowercase.contains(fragment))
+    {
+        return Some(
+            "names a claim that carries the principal's identity, scopes, email or credential \
+             metadata, which policy reads some other way or never",
+        );
+    }
+    None
+}
 
 /// Whether `value` is an RFC 6265 cookie-name token.
 pub fn safe_cookie_token(value: &str) -> bool {

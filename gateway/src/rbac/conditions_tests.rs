@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use serde_json::{json, Value};
 
 use super::*;
-use crate::auth::{AuthMethod, Principal};
+use crate::auth::{AuthMethod, Principal, VerifiedClaim};
 use crate::rbac::policy_document::{IssueCode, PolicyIssue};
 
 const ISSUER: &str = "https://idp.example.test";
@@ -22,12 +22,23 @@ fn principal(issuer: Option<&str>) -> Principal {
         roles: vec!["reader".to_owned()],
         session_id: String::new(),
         auth_method: AuthMethod::Bearer,
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 
 fn facts() -> PolicyFacts {
     PolicyFacts {
         organization: Fact::Captured(Some("acme".to_owned())),
+        scopes: Fact::Captured(vec!["orders.read".to_owned(), "orders.write".to_owned()]),
+        claims: Fact::Captured(vec![
+            claim("acr", &[json!("phr")]),
+            claim("amr", &[json!("pwd"), json!("mfa")]),
+            claim("department", &[json!("engineering")]),
+            claim("email_verified", &[json!(true)]),
+            claim("level", &[json!(2)]),
+            claim("nickname", &[]),
+        ]),
         source_ip: Fact::Captured(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))),
         headers: Fact::Captured(vec![
             ("X-Environment".to_owned(), "staging".to_owned()),
@@ -46,6 +57,13 @@ fn facts() -> PolicyFacts {
             "list": ["eu"]
         })),
         now: Fact::Captured(1_767_225_600), // 2026-01-01T00:00:00Z
+    }
+}
+
+fn claim(name: &str, values: &[Value]) -> VerifiedClaim {
+    VerifiedClaim {
+        name: name.to_owned(),
+        values: values.to_vec(),
     }
 }
 
@@ -688,6 +706,310 @@ fn a_condition_round_trips_through_its_one_serialization() {
     }
 }
 
+#[test]
+fn scope_and_claim_leaves_answer_from_the_verified_facts() {
+    let alice = principal(Some(ISSUER));
+    let facts = facts();
+    for (condition, expected) in [
+        (
+            json!({ "scope": { "issuer": ISSUER, "in": ["orders.write"] } }),
+            Truth::True,
+        ),
+        (
+            json!({ "scope": { "issuer": ISSUER, "in": ["admin", "orders.read"] } }),
+            Truth::True,
+        ),
+        (
+            json!({ "scope": { "issuer": ISSUER, "in": ["Orders.Write"] } }),
+            Truth::False,
+        ),
+        (
+            json!({ "claim": { "issuer": ISSUER, "name": "department", "in": ["engineering"] } }),
+            Truth::True,
+        ),
+        (
+            json!({ "claim": { "issuer": ISSUER, "name": "department", "in": ["Engineering"] } }),
+            Truth::False,
+        ),
+        // A list claim matches when any element does.
+        (
+            json!({ "claim": { "issuer": ISSUER, "name": "amr", "in": ["mfa"] } }),
+            Truth::True,
+        ),
+        (
+            json!({ "claim": { "issuer": ISSUER, "name": "amr", "in": ["hwk"] } }),
+            Truth::False,
+        ),
+        // Booleans exactly, numbers by value, and never a string for either.
+        (
+            json!({ "claim": { "issuer": ISSUER, "name": "email_verified", "in": [true] } }),
+            Truth::True,
+        ),
+        (
+            json!({ "claim": { "issuer": ISSUER, "name": "email_verified", "in": ["true"] } }),
+            Truth::False,
+        ),
+        (
+            json!({ "claim": { "issuer": ISSUER, "name": "level", "in": [2.0] } }),
+            Truth::True,
+        ),
+        (
+            json!({ "claim": { "issuer": ISSUER, "name": "level", "in": ["2"] } }),
+            Truth::False,
+        ),
+        // Verified absent: the token did not carry the claim.
+        (
+            json!({ "claim": { "issuer": ISSUER, "name": "nickname", "in": ["al"] } }),
+            Truth::False,
+        ),
+        // Not captured for this principal (not allowlisted, or past the
+        // capture bounds): unknown, never absent.
+        (
+            json!({ "claim": { "issuer": ISSUER, "name": "groups", "in": ["eng"] } }),
+            Truth::Unknown,
+        ),
+        (
+            json!({ "not": { "claim": { "issuer": ISSUER, "name": "groups", "in": ["eng"] } } }),
+            Truth::Unknown,
+        ),
+    ] {
+        assert_eq!(
+            compiled(condition.clone()).evaluate(Some(&alice), &facts),
+            expected,
+            "{condition}"
+        );
+    }
+    for condition in [
+        json!({ "scope": { "issuer": ISSUER, "in": ["orders.write"] } }),
+        json!({ "claim": { "issuer": ISSUER, "name": "department", "in": ["engineering"] } }),
+    ] {
+        assert_eq!(
+            compiled(condition.clone()).evaluate(Some(&alice), &UNCAPTURED_FACTS),
+            Truth::Unknown,
+            "{condition}"
+        );
+        assert_eq!(
+            compiled(json!({ "not": condition.clone() })).evaluate(Some(&alice), &UNCAPTURED_FACTS),
+            Truth::Unknown,
+            "{condition}"
+        );
+    }
+}
+
+/// A scope or claim verified by another issuer belongs to that issuer,
+/// whatever it is called: a principal of another issuer, a service token (no
+/// issuer) and an anonymous caller never match, and the answer is certain,
+/// because the issuer is always known.
+#[test]
+fn scopes_and_claims_are_bound_to_the_issuer_that_verified_them() {
+    let facts = facts();
+    for condition in [
+        compiled(json!({ "scope": { "issuer": ISSUER, "in": ["orders.write"] } })),
+        compiled(
+            json!({ "claim": { "issuer": ISSUER, "name": "department", "in": ["engineering"] } }),
+        ),
+    ] {
+        for principal in [
+            Some(principal(Some("https://other.example.test"))),
+            Some(principal(None)),
+            None,
+        ] {
+            assert_eq!(condition.evaluate(principal.as_ref(), &facts), Truth::False);
+            assert_eq!(
+                condition.evaluate(principal.as_ref(), &UNCAPTURED_FACTS),
+                Truth::False
+            );
+        }
+    }
+    for authored in [
+        json!({ "scope": { "issuer": " https://idp.example.test/ ", "in": ["orders.write"] } }),
+        json!({ "claim": {
+            "issuer": "https://idp.example.test//",
+            "name": "department",
+            "in": ["engineering"]
+        } }),
+    ] {
+        let mut authored: Condition = serde_json::from_value(authored).expect("fixture");
+        canonicalize_condition_issuers(&mut authored);
+        assert_eq!(
+            CompiledCondition::new(&authored).evaluate(Some(&principal(Some(ISSUER))), &facts),
+            Truth::True
+        );
+    }
+}
+
+#[test]
+fn validation_bounds_scope_and_claim_leaves() {
+    let long_claim = "d".repeat(crate::auth::principal::MAX_VERIFIED_CLAIM_NAME_BYTES + 1);
+    let long_value = "v".repeat(crate::auth::principal::MAX_VERIFIED_CLAIM_VALUE_BYTES + 1);
+    let many: Vec<String> = (0..=MAX_CONDITION_VALUES)
+        .map(|n| format!("s{n}"))
+        .collect();
+    for (condition, expected) in [
+        (
+            json!({ "scope": { "issuer": " ", "in": ["read"] } }),
+            ("issuer_empty", "/rules/0/conditions/scope/issuer"),
+        ),
+        (
+            json!({ "scope": { "issuer": ISSUER, "in": [] } }),
+            ("condition_value_invalid", "/rules/0/conditions/scope/in"),
+        ),
+        (
+            json!({ "scope": { "issuer": ISSUER, "in": many } }),
+            ("condition_value_invalid", "/rules/0/conditions/scope/in"),
+        ),
+        (
+            json!({ "scope": { "issuer": ISSUER, "in": ["read", "read write"] } }),
+            ("condition_value_invalid", "/rules/0/conditions/scope/in/1"),
+        ),
+        (
+            json!({ "scope": { "issuer": ISSUER, "in": ["\"admin\""] } }),
+            ("condition_value_invalid", "/rules/0/conditions/scope/in/0"),
+        ),
+        (
+            json!({ "claim": { "issuer": "", "name": "department", "in": ["eng"] } }),
+            ("issuer_empty", "/rules/0/conditions/claim/issuer"),
+        ),
+        (
+            json!({ "claim": { "issuer": ISSUER, "name": "", "in": ["eng"] } }),
+            ("condition_value_invalid", "/rules/0/conditions/claim/name"),
+        ),
+        (
+            json!({ "claim": { "issuer": ISSUER, "name": long_claim, "in": ["eng"] } }),
+            ("condition_value_invalid", "/rules/0/conditions/claim/name"),
+        ),
+        (
+            json!({ "claim": { "issuer": ISSUER, "name": " department", "in": ["eng"] } }),
+            ("condition_value_invalid", "/rules/0/conditions/claim/name"),
+        ),
+        (
+            json!({ "claim": { "issuer": ISSUER, "name": "department", "in": [long_value] } }),
+            ("condition_value_invalid", "/rules/0/conditions/claim/in/0"),
+        ),
+        (
+            json!({ "claim": { "issuer": ISSUER, "name": "department", "in": ["eng", null] } }),
+            ("condition_value_invalid", "/rules/0/conditions/claim/in/1"),
+        ),
+        (
+            json!({ "claim": { "issuer": ISSUER, "name": "groups", "in": [["eng"]] } }),
+            ("condition_value_invalid", "/rules/0/conditions/claim/in/0"),
+        ),
+    ] {
+        assert_eq!(
+            refusal(condition.clone(), ConditionTarget::HttpPath),
+            (expected.0, expected.1.to_owned()),
+            "{condition}"
+        );
+    }
+    // The identity, scopes, email and credential metadata are read some other
+    // way, or never: no claim condition may name them.
+    for name in [
+        "sub",
+        "iss",
+        "aud",
+        "jti",
+        "scope",
+        "scp",
+        "email",
+        "refresh_token",
+        "client_secret",
+    ] {
+        assert_eq!(
+            refusal(
+                json!({ "claim": { "issuer": ISSUER, "name": name, "in": ["x"] } }),
+                ConditionTarget::HttpPath
+            ),
+            (
+                "condition_name_forbidden",
+                "/rules/0/conditions/claim/name".to_owned()
+            ),
+            "{name}"
+        );
+    }
+    // Both identity leaves read the principal, which every rule has.
+    for target in [ConditionTarget::HttpPath, ConditionTarget::ToolName] {
+        for condition in [
+            json!({ "scope": {
+                "issuer": ISSUER,
+                "in": ["orders.write", "https://api.example.test/read"]
+            } }),
+            json!({ "claim": {
+                "issuer": ISSUER,
+                "name": "realm_access.roles",
+                "in": ["eng", 2, true, ""]
+            } }),
+        ] {
+            assert!(validate(condition.clone(), target).is_ok(), "{condition}");
+        }
+    }
+}
+
+/// A policy captures the scope fact only when a `scope` leaf or a mapping's
+/// `scopes` reads it, and only the claims `claim` leaves name.
+#[test]
+fn fact_needs_name_exactly_the_scopes_and_claims_a_policy_reads() {
+    let rules: Vec<crate::rbac::rule::Rule> = serde_json::from_value(json!([
+        { "path": "/a", "action": "allow", "conditions": { "all": [
+            { "claim": { "issuer": ISSUER, "name": "department", "in": ["eng"] } },
+            { "not": { "claim": { "issuer": ISSUER, "name": "amr", "in": ["mfa"] } } }
+        ] } },
+        { "path": "/b", "action": "allow", "conditions":
+            { "claim": { "issuer": "https://other.example.test", "name": "department", "in": ["x"] } } },
+        { "path": "/c", "action": "allow", "conditions":
+            { "scope": { "issuer": ISSUER, "in": ["read"] } } }
+    ]))
+    .expect("rules");
+    let needs = FactNeeds::of(&rules, None);
+    assert!(needs.scopes);
+    assert_eq!(
+        needs.claims,
+        vec!["amr".to_owned(), "department".to_owned()]
+    );
+    assert!(!needs.organization);
+    assert!(
+        !needs.reads_request_facts(),
+        "scopes and claims are principal facts"
+    );
+
+    let mapping = |scopes: &[&str]| crate::rbac::identity_mappings::IdentityMapping {
+        id: "m".to_owned(),
+        issuer: ISSUER.to_owned(),
+        auth_methods: Vec::new(),
+        subjects: Vec::new(),
+        organizations: Vec::new(),
+        claimed_roles: Vec::new(),
+        scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+        grant_roles: vec!["r".to_owned()],
+    };
+    let plain = FactNeeds::of(&[], Some(&[mapping(&[])]));
+    assert!(plain.organization && !plain.scopes && plain.claims.is_empty());
+    let scoped = FactNeeds::of(&[], Some(&[mapping(&[]), mapping(&["orders.write"])]));
+    assert!(scoped.scopes);
+    assert_eq!(FactNeeds::of(&[], None), FactNeeds::default());
+
+    let mut pointers = Vec::new();
+    rules[0]
+        .conditions
+        .as_ref()
+        .expect("conditions")
+        .for_each_claim("/rules/0/conditions", &mut |leaf, pointer| {
+            pointers.push((leaf.name.clone(), pointer));
+        });
+    assert_eq!(
+        pointers,
+        vec![
+            (
+                "department".to_owned(),
+                "/rules/0/conditions/all/0/claim".to_owned()
+            ),
+            (
+                "amr".to_owned(),
+                "/rules/0/conditions/all/1/not/claim".to_owned()
+            ),
+        ]
+    );
+}
+
 /// A tool's input schema with one field of each kind the eligibility rule
 /// tells apart.
 fn eligibility_schema() -> Value {
@@ -871,7 +1193,7 @@ fn fact_needs_name_the_argument_pointers_of_each_tool() {
             json!({ "tool_argument": { "pointer": "/stray", "in": ["x"] } }),
         ),
     ];
-    let needs = FactNeeds::of(&rules, false);
+    let needs = FactNeeds::of(&rules, None);
     assert_eq!(
         needs.tool_argument_pointers("reports.export"),
         ["/region".to_owned(), "/scope/kind".to_owned()]
@@ -880,7 +1202,7 @@ fn fact_needs_name_the_argument_pointers_of_each_tool() {
     assert!(needs.tool_argument_pointers("missing").is_empty());
     assert_eq!(needs.tool_arguments.len(), 1);
     assert!(needs.reads_request_facts());
-    assert!(FactNeeds::of(&[], false).tool_arguments.is_empty());
+    assert!(FactNeeds::of(&[], None).tool_arguments.is_empty());
 
     let mut leaves = Vec::new();
     if let Some(conditions) = &rules[0].conditions {

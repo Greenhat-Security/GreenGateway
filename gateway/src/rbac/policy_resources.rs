@@ -52,6 +52,12 @@
 //!   refuses it -- the deciding rule or route, the default, or the roles.
 //! - `egress_change_requires_restart`: the egress section differs from the
 //!   live one, which the policy API has always refused with `409`.
+//! - `claim_not_captured`: an enabled rule's `claim` condition reads a claim
+//!   that no JWT provider for the condition's issuer lists in
+//!   `verified_claims` ([`ClaimAllowlists`]), so no principal ever carries it
+//!   and every request the condition decides would be refused as
+//!   undetermined. The allowlists are static configuration, identified by
+//!   the configuration fingerprint the snapshot already binds.
 //! - `condition_pointer_ineligible`: a tool-name rule's `tool_argument`
 //!   condition reads a pointer the named tool's registered input schema does
 //!   not make eligible (`rbac::conditions::tool_argument_pointer_eligible`):
@@ -92,8 +98,9 @@ use serde::Serialize;
 use url::Url;
 
 use crate::{
-    auth::Principal,
+    auth::{principal::canonical_issuer, JwtValidator, Principal},
     canonical_json,
+    config::{AuthProviderConfig, AuthProviderType},
     connections::control_plane::ConnectionControlPlane,
     policy_eval::{
         egress::{
@@ -146,6 +153,9 @@ pub(crate) struct PolicyResourceSources {
     pub(crate) configuration_fingerprint: String,
     /// `/v1{ADMIN_PREFIX}/policy`, where a `PUT` replaces the whole policy.
     pub(crate) policy_route: String,
+    /// The claims each issuer's JWT validation captures, from this process's
+    /// static configuration.
+    pub(crate) verified_claims: ClaimAllowlists,
 }
 
 impl PolicyResourceSources {
@@ -168,6 +178,7 @@ impl PolicyResourceSources {
                 policy_route_exempt,
             }),
             security_revision,
+            verified_claims: self.verified_claims.clone(),
         }
     }
 }
@@ -184,6 +195,54 @@ pub(crate) struct PolicyResourceView {
     pub(crate) admin: Option<AdminSurface>,
     /// Cluster mode only; standalone snapshots are not revisioned.
     pub(crate) security_revision: Option<i64>,
+    /// The claims each issuer's JWT validation captures. Static
+    /// configuration, never unavailable: a view without sources has none,
+    /// so every `claim` condition is reported as never captured.
+    pub(crate) verified_claims: ClaimAllowlists,
+}
+
+/// The claims each issuer's JWT validation captures as verified facts: its
+/// provider's `verified_claims` allowlist, keyed by the canonical issuer its
+/// principals carry. An issuer with no JWT provider, or whose provider lists
+/// none, captures no claim.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClaimAllowlists(BTreeMap<String, BTreeSet<String>>);
+
+impl ClaimAllowlists {
+    /// The allowlists of the JWT providers in `providers`, each keyed by the
+    /// issuer its validator stamps on principals
+    /// ([`JwtValidator::provider_principal_issuer`]). Configuration keeps
+    /// effective issuers unique; were two providers to share one, a claim
+    /// would count as captured only when both capture it, since a principal
+    /// of either could reach a condition bound to that issuer.
+    pub(crate) fn from_providers(providers: &[AuthProviderConfig]) -> Self {
+        let mut allowlists: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for provider in providers
+            .iter()
+            .filter(|provider| provider.provider_type == AuthProviderType::Jwt)
+        {
+            let issuer = match provider.issuer.as_deref() {
+                Some(issuer) => JwtValidator::issuer_boundary(issuer).ok(),
+                None => Some(crate::auth::principal::provider_issuer(&provider.name)),
+            };
+            let Some(issuer) = issuer.as_deref().and_then(canonical_issuer) else {
+                continue;
+            };
+            let names: BTreeSet<String> = provider.verified_claims.iter().cloned().collect();
+            allowlists
+                .entry(issuer)
+                .and_modify(|captured| captured.retain(|name| names.contains(name)))
+                .or_insert(names);
+        }
+        Self(allowlists)
+    }
+
+    /// Whether principals of `issuer`, already canonical, carry `claim`.
+    fn captures(&self, issuer: &str, claim: &str) -> bool {
+        self.0
+            .get(issuer)
+            .is_some_and(|names| names.contains(claim))
+    }
 }
 
 /// The registered tools: their names, their definitions, and a digest over
@@ -492,6 +551,7 @@ pub(crate) fn validate_resources(
     if let (Some(egress), Some(connections)) = (view.egress.as_ref(), view.connections.as_ref()) {
         check_connection_endpoints(egress, connections, &mut findings);
     }
+    check_claims_captured(candidate, &view.verified_claims, &mut findings);
     check_name_collisions(candidate, &mut findings);
 
     let snapshot = PolicyResourceSnapshot::of(view);
@@ -850,6 +910,41 @@ fn check_tool_registration(candidate: &Policy, tools: &ToolInventory, findings: 
                 element_id(rule.id.as_deref()),
             );
         }
+    }
+}
+
+/// A `claim` condition reads only a claim the JWT validation of its issuer
+/// captures. Any other is never verified for any principal, so the condition
+/// is undetermined for every principal of that issuer, and a serving lane
+/// refuses every request it decides. A disabled rule decides nothing.
+fn check_claims_captured(
+    candidate: &Policy,
+    allowlists: &ClaimAllowlists,
+    findings: &mut Findings,
+) {
+    for (index, rule) in candidate.rules.iter().enumerate() {
+        let Some(conditions) = rule.conditions.as_ref().filter(|_| rule.enabled) else {
+            continue;
+        };
+        conditions.for_each_claim(
+            &format!("/rules/{index}/conditions"),
+            &mut |leaf, pointer| {
+                // Policy loading canonicalized the leaf's issuer already.
+                if allowlists.captures(&leaf.issuer, &leaf.name) {
+                    return;
+                }
+                findings.error(
+                    IssueCode::ClaimNotCaptured,
+                    format!("{pointer}/name"),
+                    element_id(rule.id.as_deref()),
+                    format!(
+                    "rules[{index}] reads claim '{}' for issuer '{}', which no JWT provider for \
+                     that issuer lists in verified_claims, so the claim is never captured",
+                    leaf.name, leaf.issuer
+                ),
+                );
+            },
+        );
     }
 }
 

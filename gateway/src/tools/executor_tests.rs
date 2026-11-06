@@ -7123,6 +7123,8 @@ fn invocation_context() -> ToolInvocationContext {
         source_address: None,
         caller: None,
         admitted_deadline: None,
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 
@@ -7142,6 +7144,8 @@ fn invocation_context_with_roles(roles: &[&str]) -> ToolInvocationContext {
         source_address: None,
         caller: None,
         admitted_deadline: None,
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 

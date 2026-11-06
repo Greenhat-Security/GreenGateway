@@ -1228,6 +1228,8 @@ mod tests {
             roles: vec!["member".to_owned()],
             session_id: "session-async".to_owned(),
             auth_method: crate::auth::AuthMethod::Bearer,
+            scopes: None,
+            verified_claims: Vec::new(),
         });
 
         assert_eventually(Duration::from_secs(1), || row_count(&db.path) == 1);

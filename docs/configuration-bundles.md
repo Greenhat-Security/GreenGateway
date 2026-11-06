@@ -629,6 +629,7 @@ One authentication provider, an AUTH_PROVIDERS entry. client_id, client_secret a
 | `roles_claim` | string |
 | `roles_claim_delimiter` | string, kept exactly as written |
 | `org_claim` | string |
+| `verified_claims` | array of strings |
 | `introspection_url` | string |
 | `introspection_timeout_ms` | integer, 0 to 9007199254740991 |
 | `cache_ttl_ms` | integer, 0 to 9007199254740991 |

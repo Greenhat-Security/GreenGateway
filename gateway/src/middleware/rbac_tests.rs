@@ -2803,6 +2803,8 @@ fn test_principal(roles: &[&str]) -> Principal {
         roles: roles.iter().map(|role| (*role).to_owned()).collect(),
         session_id: "session-123".to_owned(),
         auth_method: AuthMethod::Bearer,
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 
@@ -4040,6 +4042,9 @@ mod identity_mappings;
 
 #[path = "rbac_condition_tests.rs"]
 mod conditions;
+
+#[path = "rbac_scope_claim_tests.rs"]
+mod scopes_and_claims;
 
 #[path = "rbac_decision_facts_tests.rs"]
 mod decision_facts;

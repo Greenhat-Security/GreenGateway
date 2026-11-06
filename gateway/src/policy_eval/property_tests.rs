@@ -32,6 +32,8 @@ fn principal(suffix: &str) -> Principal {
         email: None,
         org_id: None,
         session_id: String::new(),
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 
