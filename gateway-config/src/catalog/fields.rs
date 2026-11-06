@@ -2167,7 +2167,8 @@ pub const FIELDS: &[Field] = &[
         },
         cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
     },
-    // Read in both modes, unlike the authority-event settings after it.
+    // Read in both modes, like the sink and pseudonym-key settings after it;
+    // only the journal capacity and retention are cluster settings.
     Field {
         id: "authority_evidence_durability",
         environment: "AUTHORITY_EVIDENCE_DURABILITY",
@@ -2190,11 +2191,11 @@ pub const FIELDS: &[Field] = &[
         default: DefaultValue::Literal("none"),
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
-        state_backends: StateBackends::Cluster,
+        state_backends: StateBackends::Both,
         bundle: BundleMapping::Deployment {
             path: Some("/spec/authority_evidence/event_sink"),
         },
-        cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
+        cloudflare: Cloudflare::Forwarded,
     },
     // A host path, like AUDIT_LOG_FILE, that ADR-0008's bootstrap table does
     // not list.
@@ -2206,9 +2207,9 @@ pub const FIELDS: &[Field] = &[
         default: DefaultValue::Unset,
         blank: Blank::Unset,
         sensitivity: Sensitivity::HostPath,
-        state_backends: StateBackends::Cluster,
+        state_backends: StateBackends::Both,
         bundle: BundleMapping::Unplaced,
-        cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
+        cloudflare: Cloudflare::Forwarded,
     },
     Field {
         id: "authority_pseudonym_key_alias",
@@ -2218,11 +2219,11 @@ pub const FIELDS: &[Field] = &[
         default: DefaultValue::Unset,
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
-        state_backends: StateBackends::Cluster,
+        state_backends: StateBackends::Both,
         bundle: BundleMapping::Deployment {
             path: Some("/spec/authority_evidence/pseudonym_key_alias"),
         },
-        cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
+        cloudflare: Cloudflare::Forwarded,
     },
     Field {
         id: "authority_pseudonym_previous_key_alias",
@@ -2232,11 +2233,11 @@ pub const FIELDS: &[Field] = &[
         default: DefaultValue::Unset,
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
-        state_backends: StateBackends::Cluster,
+        state_backends: StateBackends::Both,
         bundle: BundleMapping::Deployment {
             path: Some("/spec/authority_evidence/previous_pseudonym_key_alias"),
         },
-        cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
+        cloudflare: Cloudflare::Forwarded,
     },
     Field {
         id: "authority_event_journal_capacity",

@@ -1098,9 +1098,8 @@ impl ConnectionControlPlane {
     }
 
     /// The same resolver as a shared handle, for a consumer that outlives
-    /// this borrow: the authority-event startup, which resolves the
+    /// this borrow: the authority-event startups, which resolve the
     /// pseudonym keyring after the network providers are activated.
-    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     pub(crate) fn secret_resolver_handle(&self) -> Arc<dyn SecretResolver> {
         Arc::clone(&self.secret_resolver) as Arc<dyn SecretResolver>
     }

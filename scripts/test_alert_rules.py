@@ -289,10 +289,13 @@ class AlertRepositoryContractTests(unittest.TestCase):
         self.assertTrue(runtime_used, "the rule pack must exercise runtime metrics")
 
     # Rules that read a counter with increase() but do not page on a single
-    # event, so their counter may stay lazy. The dispatcher's failure series
-    # must: its presence is how GreenGatewayAuthorityEventDeliveryLag tells a
-    # replica with AUTHORITY_EVENT_SINK from one without.
-    UNSEEDED_COUNTER_ALERTS = {"GreenGatewayAuthorityEventDeliveryFailures"}
+    # event, so their counter may stay lazy. The dispatchers' failure series
+    # must: their presence is how a gateway with AUTHORITY_EVENT_SINK is told
+    # from one without.
+    UNSEEDED_COUNTER_ALERTS = {
+        "GreenGatewayAuthorityEventDeliveryFailures",
+        "GreenGatewayStandaloneAuthorityEventDeliveryFailures",
+    }
 
     def test_single_event_counter_rules_read_counters_seeded_at_startup(self):
         # A series created by its first event appears at 1, and increase()

@@ -1,6 +1,7 @@
-//! Where the dispatcher delivers authority events (issue #425, PR 3).
+//! Where the dispatchers deliver authority events (issue #425, PR 3).
 //!
-//! A sink is pluggable: the dispatcher hands it one ordered batch of
+//! The cluster dispatcher and the standalone one share these sinks. A sink
+//! is pluggable: the dispatcher hands it one ordered batch of
 //! [`DeliveryRecord`]s and advances its durable cursor only after the sink
 //! returns `Ok`. A sink that fails, or never returns, leaves the cursor where
 //! it was, and the same batch is offered again: delivery is at least once,
@@ -29,11 +30,13 @@ use std::{
     fs::OpenOptions,
     io::{self, Read, Seek, SeekFrom, Write},
     path::PathBuf,
+    sync::Arc,
 };
 
 use async_trait::async_trait;
 
 use super::delivery::DeliveryRecord;
+use crate::config::AuthorityEventSinkSetting;
 
 /// The tracing target the log sink writes under, so a log pipeline can route
 /// authority events without parsing messages.
@@ -83,6 +86,23 @@ pub(crate) trait AuthorityEventSink: Send + Sync {
     /// as durably as it can; the dispatcher then advances its cursor past
     /// them and never offers them again unless that advance is lost.
     async fn deliver(&self, batch: &[DeliveryRecord]) -> Result<(), SinkError>;
+}
+
+/// The sink `setting` configures, proven able to accept: a file sink's
+/// file is opened for appending (created if missing) before it is returned.
+/// `None` for no sink. Only the error's kind is reported, never the path.
+pub(crate) async fn configured_sink(
+    setting: &AuthorityEventSinkSetting,
+) -> Result<Option<Arc<dyn AuthorityEventSink>>, io::ErrorKind> {
+    match setting {
+        AuthorityEventSinkSetting::None => Ok(None),
+        AuthorityEventSinkSetting::Log => Ok(Some(Arc::new(LogSink))),
+        AuthorityEventSinkSetting::File(path) => {
+            let sink = FileSink::new(path.into());
+            sink.probe().await?;
+            Ok(Some(Arc::new(sink)))
+        }
+    }
 }
 
 /// One structured log line per record.

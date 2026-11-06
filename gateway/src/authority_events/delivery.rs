@@ -77,6 +77,15 @@
 //! refused with a [`ProjectionError`] and the dispatcher stops there rather
 //! than skipping it. No error carries an identifier, a reference or key
 //! material.
+//!
+//! The record, its errors and the actor projection are shared with standalone
+//! mode, whose evidence rows are delivered straight from the SQLite stores
+//! that own them (`super::standalone_delivery`); only the journal's own
+//! projection below needs the `postgres` feature.
+
+// A build without the `postgres` feature projects standalone rows only, so
+// the journal's actions and transitions have no caller there.
+#![cfg_attr(not(feature = "postgres"), allow(dead_code))]
 
 use std::fmt;
 
@@ -85,7 +94,9 @@ use uuid::Uuid;
 
 use super::pseudonym::{PseudonymError, PseudonymKeyring, ReferenceDomain};
 use crate::auth::change_actor::{auth_mode_agrees, ActorKind};
+#[cfg(feature = "postgres")]
 use crate::auth::principal::{canonical_issuer, AuthMethod};
+#[cfg(feature = "postgres")]
 use crate::storage::postgres_authority_events::{JournalSource, JournaledEvidence};
 
 /// The `schema_version` of every delivered record.
@@ -94,7 +105,7 @@ pub(crate) const DELIVERY_SCHEMA_VERSION: &str = "authority_event_delivery.v1";
 /// The only result a delivered record carries: the evidence describes a
 /// committed change. Refused, rolled-back and no-op changes write no
 /// evidence, so they are never delivered.
-const RESULT_COMMITTED: &str = "committed";
+pub(super) const RESULT_COMMITTED: &str = "committed";
 
 // The evidence tables' closed action vocabularies (migrations 16 and 18,
 // the service-token issue since migration 27, the Connection create, replace
@@ -317,6 +328,7 @@ impl Transition {
 
 /// What a row's action projects to. `resource_id` matters only to a document
 /// row, whose resource type decides its resource and axis.
+#[cfg(feature = "postgres")]
 fn action_shape(
     source: JournalSource,
     action: &str,
@@ -406,6 +418,7 @@ fn action_shape(
 /// `tools.publish` with the tools document, `policy_tests.publish` with the
 /// stored suite, and the import's `configuration.import` with the policy or
 /// the tools document it activated.
+#[cfg(feature = "postgres")]
 fn document_shape(action: &str, resource_type: &str) -> Result<ActionShape, ProjectionError> {
     let applies = match action {
         ACTION_TOOLS_PUBLISH => resource_type == DOCUMENT_TOOLS,
@@ -435,6 +448,7 @@ fn document_shape(action: &str, resource_type: &str) -> Result<ActionShape, Proj
 }
 
 /// Project one journaled evidence row under `keyring`.
+#[cfg(feature = "postgres")]
 pub(crate) fn project(
     evidence: &JournaledEvidence,
     keyring: &PseudonymKeyring,
@@ -540,7 +554,7 @@ pub(crate) fn project(
         _ => return Err(ProjectionError::MissingEvidence),
     }
     .map_err(ProjectionError::Reference)?;
-    let actor = project_actor(evidence, actor, keyring)?;
+    let actor = journal_actor(evidence, actor, keyring)?;
 
     Ok(DeliveryRecord {
         schema_version: DELIVERY_SCHEMA_VERSION.to_owned(),
@@ -565,40 +579,50 @@ pub(crate) fn project(
     })
 }
 
-/// The actor as the evidence recorded it. A row records its kind, auth mode
-/// and issuer together or not at all (migration 24's CHECK), in a pairing
-/// authentication produces; anything else is out of shape. An issuer is
-/// referenced, never carried. A document row is first read in migration 24's
-/// vocabulary ([`document_actor`]).
-fn project_actor(
+/// A journaled row's actor. A document row is first read in migration 24's
+/// vocabulary ([`document_actor`]), and records its actor whole (migration
+/// 23's NOT NULL columns), so one that says nothing is not one the table
+/// holds; every other row's actor is projected as stored.
+#[cfg(feature = "postgres")]
+fn journal_actor(
     evidence: &JournaledEvidence,
     subject: &str,
+    keyring: &PseudonymKeyring,
+) -> Result<DeliveryActor, ProjectionError> {
+    let auth_mode = evidence.actor_auth_mode.as_deref();
+    if evidence.source != JournalSource::DocumentChange {
+        return project_actor(
+            subject,
+            evidence.actor_kind.as_deref(),
+            auth_mode,
+            evidence.actor_issuer.as_deref(),
+            keyring,
+        );
+    }
+    let (kind, issuer) = document_actor(evidence);
+    if kind.is_none() && auth_mode.is_none() && issuer.is_none() {
+        return Err(ProjectionError::MissingEvidence);
+    }
+    project_actor(subject, kind, auth_mode, issuer.as_deref(), keyring)
+}
+
+/// The actor as the evidence recorded it: its recorded `subject`, and its
+/// `kind`, `auth_mode` and `issuer` as stored (a journaled document row's in
+/// migration 24's vocabulary, [`journal_actor`]). A row records the last
+/// three together or not at all (migration 24's CHECK, and the standalone
+/// tables' own), in a pairing authentication produces; anything else is out
+/// of shape. An issuer is referenced, never carried.
+pub(super) fn project_actor(
+    subject: &str,
+    kind: Option<&str>,
+    auth_mode: Option<&str>,
+    issuer: Option<&str>,
     keyring: &PseudonymKeyring,
 ) -> Result<DeliveryActor, ProjectionError> {
     let recorded_ref = keyring
         .derive(ReferenceDomain::ActorRecorded, &[subject])
         .map_err(ProjectionError::Reference)?;
-    let canonical;
-    let (stored_kind, stored_issuer) = if evidence.source == JournalSource::DocumentChange {
-        let (kind, issuer) = document_actor(evidence);
-        canonical = issuer;
-        (kind, canonical.as_deref())
-    } else {
-        (
-            evidence.actor_kind.as_deref(),
-            evidence.actor_issuer.as_deref(),
-        )
-    };
-    let (kind, auth_mode, issuer_ref) = match (
-        stored_kind,
-        evidence.actor_auth_mode.as_deref(),
-        stored_issuer,
-    ) {
-        // A document row records its actor whole (migration 23's NOT NULL
-        // columns), so one that says nothing is not one the table holds.
-        (None, None, None) if evidence.source == JournalSource::DocumentChange => {
-            return Err(ProjectionError::MissingEvidence)
-        }
+    let (kind, auth_mode, issuer_ref) = match (kind, auth_mode, issuer) {
         // Committed before migration 24: nothing to say, and nothing guessed.
         (None, None, None) => (None, None, None),
         (Some(kind), Some(auth_mode), issuer) => {
@@ -640,6 +664,7 @@ fn project_actor(
 /// principal's (`ChangeActor::from_principal`), which leaves the canonical
 /// issuer every later row records as it is. Any other pairing passes through
 /// unchanged for [`project_actor`] to judge.
+#[cfg(feature = "postgres")]
 fn document_actor(evidence: &JournaledEvidence) -> (Option<&str>, Option<String>) {
     let kind = match (
         evidence.actor_kind.as_deref(),
@@ -656,13 +681,13 @@ fn document_actor(evidence: &JournaledEvidence) -> (Option<&str>, Option<String>
     (kind, issuer)
 }
 
-fn required(value: Option<&str>) -> Result<&str, ProjectionError> {
+pub(super) fn required(value: Option<&str>) -> Result<&str, ProjectionError> {
     value
         .filter(|value| !value.is_empty())
         .ok_or(ProjectionError::MissingEvidence)
 }
 
-fn positive(value: Option<i64>) -> Result<i64, ProjectionError> {
+pub(super) fn positive(value: Option<i64>) -> Result<i64, ProjectionError> {
     match value {
         Some(value) if value >= 1 => Ok(value),
         Some(_) => Err(ProjectionError::InvalidEvidence),
@@ -670,7 +695,7 @@ fn positive(value: Option<i64>) -> Result<i64, ProjectionError> {
     }
 }
 
-fn non_negative(value: Option<i64>) -> Result<i64, ProjectionError> {
+pub(super) fn non_negative(value: Option<i64>) -> Result<i64, ProjectionError> {
     match value {
         Some(value) if value >= 0 => Ok(value),
         Some(_) => Err(ProjectionError::InvalidEvidence),
@@ -680,7 +705,7 @@ fn non_negative(value: Option<i64>) -> Result<i64, ProjectionError> {
 
 /// The lowercase hyphenated form of a versioned RFC 4122 UUID, the shape the
 /// schema requires. The stores mint v4 UUIDs; anything else is refused.
-fn canonical_uuid(value: &str) -> Result<String, ProjectionError> {
+pub(super) fn canonical_uuid(value: &str) -> Result<String, ProjectionError> {
     let parsed = Uuid::parse_str(value).map_err(|_| ProjectionError::InvalidEvidence)?;
     let version = parsed.get_version_num();
     if !(1..=8).contains(&version) || parsed.get_variant() != uuid::Variant::RFC4122 {
@@ -689,9 +714,10 @@ fn canonical_uuid(value: &str) -> Result<String, ProjectionError> {
     Ok(parsed.hyphenated().to_string())
 }
 
-/// `YYYY-MM-DDTHH:MM:SS[.fraction]Z`, as the store's `to_char` renders the
-/// database clock.
-fn committed_at_in_shape(value: &str) -> bool {
+/// `YYYY-MM-DDTHH:MM:SS[.fraction]Z`, as the PostgreSQL store's `to_char`
+/// renders the database clock and as a standalone store formats its process
+/// clock (RFC 3339 in UTC).
+pub(super) fn committed_at_in_shape(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() < 20 || bytes.len() > MAX_COMMITTED_AT_CHARS || !value.is_ascii() {
         return false;
@@ -720,6 +746,6 @@ fn committed_at_in_shape(value: &str) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 #[path = "delivery_tests.rs"]
 mod tests;

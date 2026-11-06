@@ -13,13 +13,14 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::{
-    dispatcher::{spawn_authority_event_dispatcher, DispatcherConfig},
+    cadence::DispatcherConfig,
+    dispatcher::spawn_authority_event_dispatcher,
     pseudonym::{resolve_keyring, PseudonymError},
-    sink::{AuthorityEventSink, FileSink, LogSink},
+    sink::configured_sink,
 };
 use crate::{
     audit,
-    config::{AuthorityEventSettings, AuthorityEventSinkSetting},
+    config::AuthorityEventSettings,
     connections::secret::SecretResolver,
     ha::ClusterReadiness,
     lifecycle::GatewayLifecycle,
@@ -90,16 +91,11 @@ impl AuthorityEventStartup {
         lifecycle: &GatewayLifecycle,
         audit_log: &audit::AuditLog,
     ) -> Result<(), AuthorityEventStartupError> {
-        let sink: Arc<dyn AuthorityEventSink> = match &self.settings.sink {
-            AuthorityEventSinkSetting::None => return Ok(()),
-            AuthorityEventSinkSetting::Log => Arc::new(LogSink),
-            AuthorityEventSinkSetting::File(path) => {
-                let sink = FileSink::new(path.into());
-                sink.probe()
-                    .await
-                    .map_err(AuthorityEventStartupError::SinkFile)?;
-                Arc::new(sink)
-            }
+        let Some(sink) = configured_sink(&self.settings.sink)
+            .await
+            .map_err(AuthorityEventStartupError::SinkFile)?
+        else {
+            return Ok(());
         };
         let current = self
             .settings
@@ -165,6 +161,7 @@ mod tests {
     use super::*;
     use crate::{
         authority_events::pseudonym::{test_support::generated_key_hex, KeyRole},
+        config::AuthorityEventSinkSetting,
         connections::secret::{
             ResolvedSecret, SecretAliasMetadata, SecretPurpose, SecretResolveError,
             SecretResolveErrorKind,

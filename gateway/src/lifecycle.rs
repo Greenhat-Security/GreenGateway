@@ -355,6 +355,11 @@ pub(crate) struct GatewayApps {
     /// startup the serving path must finish before any listener binds.
     #[cfg(feature = "postgres")]
     pub(crate) authority_events: Option<crate::authority_events::startup::AuthorityEventStartup>,
+    /// Standalone mode with an authority-event sink configured: the delivery
+    /// startup for the SQLite stores that own evidence, finished on the same
+    /// path before any listener binds.
+    pub(crate) standalone_authority_events:
+        Option<crate::authority_events::standalone::StandaloneAuthorityEventStartup>,
 }
 
 /// The data and admin listener addresses [`serve_gateway`] binds, read from
