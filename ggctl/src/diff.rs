@@ -2,18 +2,19 @@
 //! [--check] [--strict] [--format human|json|sarif]` (issue #242, PR 9;
 //! ADR-0008, "Plan, risk acknowledgment, and conditional apply").
 //!
-//! Both bundles are read by the shared reader, exactly as `ggctl validate`
-//! reads them, and compared by `gateway_config::semantic_diff`, the engine
-//! the gateway's plans will use, so the CLI cannot approximate either. Two
-//! environment files are each compiled by the gateway's own configuration
-//! compiler, exactly as `ggctl validate --env` compiles one, and their plans
-//! compared by `compiler::semantic_diff::plans`, setting by setting. An
-//! environment file and a bundle are read and reported but never compared:
-//! no front end maps a bundle onto the compiler's settings yet, and an
-//! environment plan holds no policy or tools document, so there is no
-//! common ground to compare (`diff.not_comparable`). The change is from the
-//! `--against` side to the other. Everything written is value-free because
-//! the diff is:
+//! Both bundles are read by the shared reader with the production
+//! validators, exactly as `ggctl validate` reads them, and compared by
+//! `gateway_config::semantic_diff::compare_production_bundles`, the diff the
+//! revision ledger's plans make, by the documents those validators built:
+//! the CLI cannot approximate either. Two environment files are each
+//! compiled by the gateway's own configuration compiler, exactly as
+//! `ggctl validate --env` compiles one, and their plans compared by
+//! `compiler::semantic_diff::plans`, setting by setting. An environment file
+//! and a bundle are read and reported but never compared: no front end maps
+//! a bundle onto the compiler's settings yet, and an environment plan holds
+//! no policy or tools document, so there is no common ground to compare
+//! (`diff.not_comparable`). The change is from the `--against` side to the
+//! other. Everything written is value-free because the diff is:
 //!
 //! - human: one line per change, then the sorted risk codes;
 //! - `--format json`: one `GgctlReport` whose `result` carries the
@@ -29,7 +30,7 @@
 
 use gateway_config::{
     compiler,
-    semantic_diff::{compare_read_bundles, Change, Display, SemanticDiff, Severity, Shown},
+    semantic_diff::{compare_production_bundles, Change, Display, SemanticDiff, Severity, Shown},
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -94,13 +95,6 @@ impl Side {
         }
     }
 
-    fn supplies_a_resource(&self) -> bool {
-        match self {
-            Self::Bundle(read) => validate::supplies_a_resource(read),
-            Self::Env(_) => false,
-        }
-    }
-
     fn bundle(&self) -> Option<BundleRecord> {
         match self {
             Self::Bundle(read) => BundleRecord::of(read),
@@ -132,12 +126,9 @@ pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
     };
     let mut diagnostics = candidate.diagnostics();
     diagnostics.extend(base.diagnostics());
-    if candidate.supplies_a_resource() || base.supplies_a_resource() {
-        diagnostics.push(Diagnostic::new(Code::ProductionValidatorsNotRun).into());
-    }
     let diff = match (&base, &candidate) {
         (Side::Bundle(base), Side::Bundle(candidate)) => match (&base.bundle, &candidate.bundle) {
-            (Some(base), Some(candidate)) => Some(compare_read_bundles(base, candidate)),
+            (Some(base), Some(candidate)) => Some(compare_production_bundles(base, candidate)),
             _ => None,
         },
         (Side::Env(base), Side::Env(candidate)) => match (base.plan(), candidate.plan()) {

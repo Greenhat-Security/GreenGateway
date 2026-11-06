@@ -110,16 +110,31 @@ used to live in, so call sites did not change:
 | `gateway-config` module | Holds | Re-exported by |
 |---|---|---|
 | `compiler` | The configuration compiler ([contract](configuration-compiler.md)): `compile`, the input inventory, the parse and validate stages and the `ConfigPlan` they build, `ConfigError` and its value-free diagnostics, every setting's name, default and bound, the JSON setting types (`AuthProviderConfig`, `UpstreamRouteConfig`, `McpUpstreamServerConfig`, `InboundClientAuthConfig` and the rest), and the semantic diff of two plans | `config` (a glob re-export) |
-| `connections` | Connections limits (`MAX_CREDENTIALS`, display name, Connection and secret ID bounds) and the Connection ID grammar | `connections::model` |
+| `connections` | Connections limits (`MAX_CREDENTIALS`, display name, Connection and secret ID bounds), the Connection ID grammar, and the origin-relative path grammar (`normalize_origin_relative_path`, `ConnectionValidationError`) Connections and HTTP tool mappings share | `connections::model` |
 | `connections::secret` | The operator alias document, the secrets root, and the alias, environment-key and file-key grammars | `connections::secret` |
 | `connections::{aws,azure,gcp,vault,kubernetes}_secret` | Each secret provider's configuration document and validator | the gateway module of the same name |
 | `connections::local_secret` | The local keyring document and validator | `connections::local_secret` |
 | `inbound_tls` | `TlsMinVersion`, `ClientCertMode`, `ClientCertRequirement` | `inbound_tls` |
-| `auth` | Issuer canonicalization and bound, JWKS key age bounds, the cookie-name grammar, `ClientCertIdentitySource`, admin session settings | `auth::principal`, `auth::jwt`, `middleware::auth`, `auth::client_certificate`, `auth::admin_session` |
+| `auth` | Issuer canonicalization and the principal identity bounds, the `verified_claims` allowlist check and the OAuth scope-token and verified-claim value grammars the policy's `scope` and `claim` leaves are held to (issue #243), JWKS key age bounds, the cookie-name grammar, `ClientCertIdentitySource`, admin session settings | `auth::principal`, `auth::claims`, `auth::jwt`, `middleware::auth`, `auth::client_certificate`, `auth::admin_session` |
+| `rbac::{policy, policy_document, rule, conditions, identity_mappings}` | The policy document (v0 and v1): its model, `Policy::validate_json_value` and `Policy::from_source`, the schema dispatch, diagnostics and digests, and the rule, condition and identity-mapping models with their validation | `rbac::*` of the same names (glob re-exports) |
+| `tools::{definitions, composite, transforms, selector, codecs}` | The tools document (0.1.0): the `ToolDefinition` model, `definitions_from_json_value` and the registry's semantic checks, and the composite mapping, transform, JSON selector and codec models a definition carries | `tools::*` of the same names (glob re-exports) |
 | `path_match` | Exempt-path and prefix matching, unsafe request paths | `path_match` |
 | `request_bounds` | The request shape bounds admission, the policy kernel and configuration share | `request_bounds` |
 | `upstream_route` | The stable route ID grammar | `upstream_route` |
 | `discovery` | Signal detector thresholds and the rule suggestion window, with their defaults | `discovery::signals`, `discovery::suggestions` |
+
+The policy and tools models carry no evaluation: loading, persisting and
+watching their files, policy history, the tool registry, the policy kernel and
+rule matcher, and tool execution stay in the gateway. An inherent method that
+needs the gateway became a method of a gateway-side trait with the same name
+(`rbac::policy::PolicyFile` for `from_file`, `from_config` and
+`persist_to_file`, `ClusterDocumentFormat`, `RoleIdentity`,
+`rbac::rule::PrincipalMatch` and `RuleMatch`), so call sites import the trait
+and keep their syntax. The rule matcher keeps its own copy of the path
+pattern's capture grammar, which the pure-path microbenchmark compiles from
+it; a matcher property test holds `gateway_config::rbac`'s copy to it. The
+policy and tools suites stay in the gateway and run against the re-exports,
+with only their imports changed.
 
 Their unit tests moved with them and run under `cargo test -p gateway-config`,
 except `path_match`'s: the tests `security-mutations.json` selects and the

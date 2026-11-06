@@ -178,7 +178,7 @@ mod tests {
                 .with_hint("a fixed hint")
                 .into(),
             Diagnostic::new(Code::CapabilitiesInvalid).into(),
-            Diagnostic::new(Code::ProductionValidatorsNotRun).into(),
+            Diagnostic::new(Code::WarningsAsErrors).into(),
         ]);
         assert_eq!(log["version"], "2.1.0");
         let run = &log["runs"][0];
@@ -191,13 +191,14 @@ mod tests {
             rules[1]["help"]["text"],
             "See docs/ggctl.md#usage-diagnostics"
         );
-        assert_eq!(rules[2]["defaultConfiguration"]["level"], "note");
+        assert_eq!(rules[2]["id"], "validate.warnings_as_errors");
+        assert_eq!(rules[2]["defaultConfiguration"]["level"], "error");
         let results = run["results"].as_array().expect("results");
         assert_eq!(results.len(), 4);
         assert_eq!(results[2]["ruleIndex"], 0);
         assert_eq!(results[1]["ruleIndex"], 1);
         assert_eq!(results[1]["level"], "error");
-        assert_eq!(results[3]["level"], "note");
+        assert_eq!(results[3]["level"], "error");
         assert_eq!(
             results[1]["message"]["text"],
             "an argument's value is not one the command accepts (a fixed hint)"

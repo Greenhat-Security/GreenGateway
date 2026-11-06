@@ -1,23 +1,16 @@
 use serde_json::{Map, Value};
 
 use super::principal::{
-    VerifiedClaim, MAX_PRINCIPAL_SCOPES, MAX_PRINCIPAL_SCOPE_BYTES, MAX_VERIFIED_CLAIMS,
-    MAX_VERIFIED_CLAIM_VALUES, MAX_VERIFIED_CLAIM_VALUE_BYTES,
+    VerifiedClaim, MAX_PRINCIPAL_SCOPES, MAX_VERIFIED_CLAIMS, MAX_VERIFIED_CLAIM_VALUES,
 };
 
 // The claim-name check the configuration compiler holds a provider's
-// `verified_claims` allowlist to, shared with `ggctl` (issue #242).
-pub(crate) use gateway_config::auth::verified_claim_name_problem;
-
-/// An RFC 6749 `scope-token` of at most [`MAX_PRINCIPAL_SCOPE_BYTES`]:
-/// printable ASCII without space, `"` or `\`.
-pub(crate) fn is_scope_token(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_PRINCIPAL_SCOPE_BYTES
-        && value
-            .bytes()
-            .all(|byte| matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
-}
+// `verified_claims` allowlist to, and the scope-token and claim-text shapes
+// the policy's `scope` and `claim` leaves are validated against, shared with
+// `ggctl` (issues #242 and #243).
+pub(crate) use gateway_config::auth::{
+    is_scope_token, is_verified_claim_text, verified_claim_name_problem,
+};
 
 /// The OAuth scopes a token's top-level `scope` and `scp` claims grant,
 /// sorted and de-duplicated: the union of both, each either a
@@ -60,7 +53,8 @@ pub(crate) fn extract_scopes(extra: &Map<String, Value>) -> Option<Vec<String>> 
 /// A claim the token does not carry is verified absent: an entry with no
 /// values. One whose value is not a string, boolean or number, or a list of
 /// at most [`MAX_VERIFIED_CLAIM_VALUES`] strings, or that holds a string past
-/// [`MAX_VERIFIED_CLAIM_VALUE_BYTES`] or with a control character, gets no
+/// [`MAX_VERIFIED_CLAIM_VALUE_BYTES`](super::principal::MAX_VERIFIED_CLAIM_VALUE_BYTES) or
+/// with a control character, gets no
 /// entry at all, so a matcher that reads it is undetermined rather than
 /// misread. `allowlist` is already validated, sorted and unique.
 pub(crate) fn extract_verified_claims(
@@ -94,12 +88,6 @@ fn verified_claim_values(value: &Value) -> Option<Vec<Value>> {
         .then(|| items.clone()),
         Value::Null | Value::Object(_) => None,
     }
-}
-
-/// A verified claim string: at most [`MAX_VERIFIED_CLAIM_VALUE_BYTES`], with
-/// no control character.
-pub(crate) fn is_verified_claim_text(text: &str) -> bool {
-    text.len() <= MAX_VERIFIED_CLAIM_VALUE_BYTES && !text.chars().any(char::is_control)
 }
 
 pub(crate) fn resolve_claim<'a>(extra: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
@@ -163,7 +151,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::auth::principal::MAX_VERIFIED_CLAIM_NAME_BYTES;
+    use crate::auth::principal::{
+        MAX_PRINCIPAL_SCOPE_BYTES, MAX_VERIFIED_CLAIM_NAME_BYTES, MAX_VERIFIED_CLAIM_VALUE_BYTES,
+    };
 
     #[test]
     fn resolve_claim_prefers_literal_key_before_dotted_path_segments() {

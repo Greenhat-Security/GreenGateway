@@ -1,68 +1,17 @@
+//! Applying a tool transform to a request's arguments and to a response.
+//! The transform model is `gateway_config::tools::transforms` (issue #242),
+//! re-exported here so call sites keep their paths.
+
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::{
-    codecs::Codec,
-    selector::{visit_selected_objects_mut, JsonPointer, Selector, SelectorSegment},
-};
+pub use gateway_config::tools::transforms::*;
+
+use super::selector::{visit_selected_objects_mut, JsonPointer, SelectorSegment};
 
 pub const MAX_TRANSFORM_WARNINGS: usize = 32;
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ToolTransform {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub parameters: Vec<ParameterShape>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub response_fields: Vec<ParameterShape>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_root: Option<Selector>,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ParameterShape {
-    pub wire_property: String,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub wire_required: bool,
-    pub agent: Vec<AgentProperty>,
-    pub wire: Vec<WireBinding>,
-    pub response: Vec<ResponseBinding>,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentProperty {
-    pub name: String,
-    pub schema: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-pub struct WireBinding {
-    pub pointer: JsonPointer,
-    #[serde(flatten)]
-    pub source: WireSource,
-    #[serde(default, rename = "codec", skip_serializing_if = "Vec::is_empty")]
-    pub codecs: Vec<Codec>,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum WireSource {
-    From { from: String },
-    Const { r#const: Value },
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResponseBinding {
-    pub agent_property: String,
-    pub from: JsonPointer,
-    #[serde(default, rename = "codec", skip_serializing_if = "Vec::is_empty")]
-    pub codecs: Vec<Codec>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -553,7 +502,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::tools::codecs::{DecimalWireEncoding, MarkdownDialect};
+    use crate::tools::codecs::{Codec, DecimalWireEncoding, MarkdownDialect};
 
     fn pointer(value: &str) -> JsonPointer {
         value.parse().expect("fixture pointer should parse")

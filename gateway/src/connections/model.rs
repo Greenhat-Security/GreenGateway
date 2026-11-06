@@ -1,7 +1,6 @@
 use std::{fmt, str::FromStr};
 
 use http::HeaderName;
-use percent_encoding::percent_decode_str;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use url::Url;
 use uuid::Uuid;
@@ -15,7 +14,6 @@ pub const MAX_STATUS_HISTORY_ROWS: usize = 4_096;
 pub const MAX_CONCURRENT_REFRESHES: usize = 4;
 pub const MAX_DESCRIPTION_CHARS: usize = 1_024;
 pub const MAX_URL_BYTES: usize = 2_048;
-pub const MAX_PATH_BYTES: usize = 1_024;
 pub const MAX_HEADER_NAME_BYTES: usize = 64;
 pub const MAX_ADDITIONAL_HEADERS: usize = 4;
 pub const MAX_CLIENT_ID_BYTES: usize = 256;
@@ -35,6 +33,12 @@ pub(crate) use gateway_config::connections::{
     is_valid_connection_id, MAX_CONNECTION_ID_BYTES, MAX_CREDENTIALS, MAX_DISPLAY_NAME_CHARS,
     MAX_SECRET_ID_BYTES,
 };
+// The origin-relative path grammar a Connection's paths and an HTTP tool
+// definition's path template are held to, and the validation error it
+// reports, which the tools document's validating parse shares with `ggctl`
+// (issue #242).
+pub(crate) use gateway_config::connections::normalize_origin_relative_path;
+pub use gateway_config::connections::ConnectionValidationError;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConnectionId(String);
@@ -550,29 +554,6 @@ pub struct ConnectionTestProfile {
     pub method: String,
     pub path: String,
     pub expected_statuses: Vec<u16>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConnectionValidationError {
-    pub field: &'static str,
-    pub code: &'static str,
-    pub message: String,
-}
-
-impl ConnectionValidationError {
-    fn new(field: &'static str, code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            field,
-            code,
-            message: message.into(),
-        }
-    }
-}
-
-impl fmt::Display for ConnectionValidationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}: {}", self.field, self.message)
-    }
 }
 
 impl ConnectionWrite {
@@ -1780,75 +1761,6 @@ fn raw_url_path(value: &str) -> Option<&str> {
     }
     let path_end = suffix.find(['?', '#']).unwrap_or(suffix.len());
     suffix.get(..path_end)
-}
-
-pub(crate) fn normalize_origin_relative_path(
-    field: &'static str,
-    value: &str,
-) -> Result<String, ConnectionValidationError> {
-    if value.is_empty()
-        || value.len() > MAX_PATH_BYTES
-        || !value.starts_with('/')
-        || value.starts_with("//")
-        || value.contains("//")
-        || value.contains(['?', '#', '\\'])
-        || value.bytes().any(|byte| byte <= b' ' || byte == 0x7f)
-        || has_invalid_percent_escape(value)
-    {
-        return Err(ConnectionValidationError::new(
-            field,
-            "invalid_origin_relative_path",
-            format!(
-                "must be an origin-relative path of 1-{MAX_PATH_BYTES} bytes without authority, query, fragment, or backslash forms"
-            ),
-        ));
-    }
-
-    for segment in value.split('/') {
-        let decoded = percent_decode_str(segment).decode_utf8().map_err(|_| {
-            ConnectionValidationError::new(
-                field,
-                "invalid_percent_encoding",
-                "must contain valid UTF-8 percent encoding",
-            )
-        })?;
-        if matches!(decoded.as_ref(), "." | "..")
-            || decoded.contains('/')
-            || decoded.contains('\\')
-            || decoded.contains('\0')
-        {
-            return Err(ConnectionValidationError::new(
-                field,
-                "path_confusion",
-                "must not contain dot segments or encoded path separators",
-            ));
-        }
-    }
-
-    if value.len() > 1 {
-        Ok(value.trim_end_matches('/').to_owned())
-    } else {
-        Ok(value.to_owned())
-    }
-}
-
-fn has_invalid_percent_escape(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len()
-                || !bytes[index + 1].is_ascii_hexdigit()
-                || !bytes[index + 2].is_ascii_hexdigit()
-            {
-                return true;
-            }
-            index += 3;
-        } else {
-            index += 1;
-        }
-    }
-    false
 }
 
 fn validate_secret_id(

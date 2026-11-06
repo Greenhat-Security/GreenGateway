@@ -166,9 +166,9 @@ standalone deployment, as ADR-0008 states.
 online ([ADR-0008, "Plan, risk acknowledgment, and conditional
 apply"](adr/0008-setup-cli-and-configuration-bundles.md#plan-risk-acknowledgment-and-conditional-apply)).
 It owns one ledger and the plans made against it, and a caller supplies how
-bundles are compiled: the gateway passes its production policy and tools
-validators (`config::revisions::ProductionCompiler`), and the
-published-schemas compiler is what `ggctl` could run. A client's preview never
+bundles are compiled: the gateway and `ggctl` both pass the production policy
+and tools validators (`gateway_config::revisions::ProductionCompiler`); the
+published-schemas compiler serves the protocol's own tests. A client's preview never
 authorizes anything; every decision below is made from what the service
 compiles itself, and nothing is written unless every check passes.
 
@@ -310,11 +310,10 @@ waiting, so it refuses with `state_dir.locked` (exit `5`) while a gateway or
 another `ggctl` holds it, and two of them started together get exactly one
 winner. None writes a gateway audit event: what an offline command records is
 the revision itself, under the system actor `ggctl-ledger`, with no request.
-`ggctl` cannot link the gateway's production policy and tools validators, so
-it compiles with the published schemas only (`PublishedSchemasCompiler`) and
-every report about a revision it wrote says so; a gateway starting from the
-ledger compiles the desired revision again with its own validators and
-refuses to start if it does not compile.
+`ggctl` compiles with the production policy and tools validators
+(`ProductionCompiler`), as the gateway does; a gateway starting from the
+ledger compiles the desired revision again with them and refuses to start if
+it does not compile.
 
 - **Seed.** `ggctl ledger seed BUNDLE --state-dir DIR` reads the bundle
   strictly with the shared reader and calls `RevisionLedger::seed`, which

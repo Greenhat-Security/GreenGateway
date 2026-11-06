@@ -6,8 +6,8 @@ use serde_json::json;
 use super::*;
 use crate::rbac::conditions::UNCAPTURED_FACTS;
 use crate::{
-    auth::{AuthMethod, Principal},
-    rbac::PrincipalMatcher,
+    auth::{principal::MAX_PRINCIPAL_ISSUER_BYTES, AuthMethod, Principal},
+    rbac::{policy::RoleEntry, policy_document::IssueCode, rule::PrincipalMatch, PrincipalMatcher},
 };
 
 const ISSUER: &str = "https://idp.example.test";

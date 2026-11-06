@@ -73,9 +73,6 @@ pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
         return report::error(io, Diagnostic::new(Code::MissingArgument));
     };
     let mut diagnostics = validate::diagnostics(&read);
-    if validate::supplies_a_resource(&read) {
-        diagnostics.push(Diagnostic::new(Code::ProductionValidatorsNotRun).into());
-    }
     let mut result = ConvertResult {
         valid: read.bundle.is_some(),
         bundle: BundleRecord::of(&read),

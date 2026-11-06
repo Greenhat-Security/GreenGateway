@@ -145,7 +145,9 @@ mod tests {
 
     use gateway_config::{
         backup::{self, CreateRequest, Producer, RestoreRequest},
-        bundle::{read_bundle_files, sha256_pin, FileName, ReadOptions},
+        bundle::{
+            read_bundle, read_bundle_files, sha256_pin, FileName, ProductionValidators, ReadOptions,
+        },
         ledger::{LedgerActor, RevisionLedger},
         state_dir::{StateDirectory, StateFile, RESTORE_MARKER_FILE_NAME},
     };
@@ -157,7 +159,6 @@ mod tests {
             sqlite_sink::{SqliteSink, SqliteSinkConfig},
             AuditEvent,
         },
-        config::bundle::{read_bundle, ProductionValidators},
         connections::store::{ConnectionStore, SqliteConnectionStore},
     };
 
@@ -459,7 +460,11 @@ mod tests {
         // The next start, as bundle mode starts: the bundle compiled with
         // the production validators, the held directory, its stores opened
         // through the gateway's own migrations.
-        let report = read_bundle(&mounted.0, ReadOptions { strict: true });
+        let report = read_bundle(
+            &mounted.0,
+            ReadOptions { strict: true },
+            &ProductionValidators,
+        );
         assert!(report.bundle.is_some(), "{:?}", report.diagnostics);
         let held = StateDirectory::acquire(&target.0).expect("the restored directory should lock");
         let audit_path = held.file(StateFile::Audit);

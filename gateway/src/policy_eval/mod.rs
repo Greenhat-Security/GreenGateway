@@ -137,6 +137,7 @@ use crate::{
         identity_mappings::CompiledIdentityMappings,
         matcher::{method_matches, path_pattern_matches, RuleDispatchContext, RuleScan},
         policy::{RouteRule, KNOWN_TOP_LEVEL_KEYS},
+        rule::PrincipalMatch,
         DefaultAction, EnforcementMode, Policy, PolicyEngine, RateLimitRule, RuleAction,
         RuleMatcher,
     },

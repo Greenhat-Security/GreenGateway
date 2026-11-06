@@ -86,7 +86,7 @@ pub enum PolicyCommitPrecondition {
 pub struct PolicyCommitRequest<'a> {
     pub precondition: PolicyCommitPrecondition,
     pub candidate: &'a Policy,
-    pub change: super::DocumentChange<'a>,
+    pub change: super::DocumentChange,
     pub diff_summary: &'a Value,
 }
 

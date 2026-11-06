@@ -14,6 +14,27 @@ const ACTOR_ISSUER_MARKER: &str = "https://actor-issuer-marker.example.test";
 const JTI_DIGEST_MARKER: &str = "abababababababababababababababababababababababababababababababab";
 /// An admin session's random ID, as the evidence row stores it.
 const SESSION_MARKER: &str = "5e551011-0000-4000-8000-000000000001";
+/// The Connection a catalog belongs to, as catalog evidence stores it.
+const CATALOG_MARKER: &str = "ca7a1060-0000-4000-8000-0000000000c1";
+
+/// The document a row of the document table names by its resource type.
+fn document_of(action: &str) -> &'static str {
+    match action {
+        ACTION_TOOLS_PUBLISH => DOCUMENT_TOOLS,
+        ACTION_POLICY_TESTS_PUBLISH => DOCUMENT_POLICY_TESTS,
+        // The import's activation of the policy; [`document_evidence`] builds
+        // its tools activation.
+        _ => DOCUMENT_POLICY,
+    }
+}
+
+/// A document row of `resource_type` recording `action`.
+fn document_evidence(action: &str, resource_type: &str) -> JournaledEvidence {
+    JournaledEvidence {
+        resource_id: Some(resource_type.to_owned()),
+        ..evidence(JournalSource::DocumentChange, action)
+    }
+}
 
 fn evidence(source: JournalSource, action: &str) -> JournaledEvidence {
     let (resource_owner, resource_id, prior_version, new_version) = match source {
@@ -37,6 +58,9 @@ fn evidence(source: JournalSource, action: &str) -> JournaledEvidence {
         }
         JournalSource::ServiceTokenChange => (None, TOKEN_MARKER, Some(1), Some(2)),
         JournalSource::JwtRevocation => (Some(ISSUER_MARKER), JTI_DIGEST_MARKER, None, None),
+        // A document or catalog commit activates its next version.
+        JournalSource::DocumentChange => (None, document_of(action), Some(3), Some(4)),
+        JournalSource::CatalogChange => (None, CATALOG_MARKER, Some(2), Some(3)),
         // The read leaves every column the session table lacks empty.
         JournalSource::AdminSession => {
             return JournaledEvidence {
@@ -97,7 +121,7 @@ fn with_actor(
 }
 
 fn every_delivered_shape() -> Vec<JournaledEvidence> {
-    vec![
+    let mut shapes = vec![
         evidence(JournalSource::ConnectionChange, ACTION_CONNECTION_CREATE),
         evidence(JournalSource::ConnectionChange, ACTION_CONNECTION_REPLACE),
         evidence(
@@ -120,8 +144,35 @@ fn every_delivered_shape() -> Vec<JournaledEvidence> {
         evidence(JournalSource::JwtRevocation, ACTION_JWT_REVOKE),
         evidence(JournalSource::AdminSession, ACTION_ADMIN_SESSION_GRANT),
         evidence(JournalSource::AdminSession, ACTION_ADMIN_SESSION_WITHDRAW),
-    ]
+    ];
+    shapes.extend(
+        POLICY_ACTIONS
+            .into_iter()
+            .chain([
+                ACTION_TOOLS_PUBLISH,
+                ACTION_CONFIGURATION_IMPORT,
+                ACTION_POLICY_TESTS_PUBLISH,
+            ])
+            .map(|action| evidence(JournalSource::DocumentChange, action)),
+    );
+    shapes.push(document_evidence(
+        ACTION_CONFIGURATION_IMPORT,
+        DOCUMENT_TOOLS,
+    ));
+    shapes.extend(
+        CATALOG_ACTIONS
+            .into_iter()
+            .map(|action| evidence(JournalSource::CatalogChange, action)),
+    );
+    shapes
 }
+
+const CATALOG_ACTIONS: [&str; 4] = [
+    ACTION_CATALOG_MCP_PUBLISH,
+    ACTION_CATALOG_OPENAPI_PUBLISH,
+    ACTION_CATALOG_OVERLAY_REPLACE,
+    ACTION_CATALOG_OVERLAY_DELETE,
+];
 
 fn delivery_schema() -> jsonschema::Validator {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -174,7 +225,42 @@ fn the_schema_enumerates_exactly_the_delivered_operations() {
         .map(|evidence| evidence.action.as_deref().expect("fixture has an action"))
         .collect();
     delivered.sort_unstable();
+    // The import activates either document under one operation code.
+    delivered.dedup();
     assert_eq!(operations, delivered);
+    // Every resource kind and axis the projection names, and nothing else.
+    let keyring = generated_keyring(Uuid::new_v4());
+    let enumerated = |path: [&str; 2]| -> Vec<String> {
+        let mut values: Vec<String> = schema["properties"][path[0]]["properties"][path[1]]["enum"]
+            .as_array()
+            .expect("a closed enum")
+            .iter()
+            .map(|value| value.as_str().expect("strings").to_owned())
+            .collect();
+        values.sort_unstable();
+        values
+    };
+    let records: Vec<DeliveryRecord> = shapes
+        .iter()
+        .map(|evidence| project(evidence, &keyring).expect("well-formed evidence projects"))
+        .collect();
+    let projected = |field: fn(&DeliveryRecord) -> &str| -> Vec<String> {
+        let mut values: Vec<String> = records
+            .iter()
+            .map(|record| field(record).to_owned())
+            .collect();
+        values.sort_unstable();
+        values.dedup();
+        values
+    };
+    assert_eq!(
+        enumerated(["resource", "kind"]),
+        projected(|record| record.resource.kind.as_str())
+    );
+    assert_eq!(
+        enumerated(["revision", "axis"]),
+        projected(|record| record.revision.axis.as_str())
+    );
     // A schema the record does not satisfy is not a closed contract.
     assert_eq!(schema["additionalProperties"], Value::Bool(false));
     for object in ["actor", "resource", "revision"] {
@@ -313,6 +399,7 @@ fn references_name_the_recorded_identities_and_carry_none_of_them() {
             ISSUER_MARKER,
             JTI_DIGEST_MARKER,
             SESSION_MARKER,
+            CATALOG_MARKER,
         ] {
             assert!(
                 !serialized.contains(marker),
@@ -356,6 +443,15 @@ fn references_name_the_recorded_identities_and_carry_none_of_them() {
                 vec![ISSUER_MARKER, JTI_DIGEST_MARKER],
             ),
             JournalSource::AdminSession => (ReferenceDomain::AdminSession, vec![SESSION_MARKER]),
+            // A document is the singleton its resource type names.
+            JournalSource::DocumentChange => match evidence.resource_id.as_deref() {
+                Some(DOCUMENT_TOOLS) => (ReferenceDomain::Tools, vec![DOCUMENT_TOOLS]),
+                Some(DOCUMENT_POLICY_TESTS) => {
+                    (ReferenceDomain::Policy, vec![DOCUMENT_POLICY_TESTS])
+                }
+                _ => (ReferenceDomain::Policy, vec![DOCUMENT_POLICY]),
+            },
+            JournalSource::CatalogChange => (ReferenceDomain::Catalog, vec![CATALOG_MARKER]),
         };
         assert_eq!(
             keyring.verify(domain, &components, &record.resource.reference),
@@ -909,6 +1005,405 @@ fn admin_session_rows_project_without_actor_metadata_or_a_shared_revision() {
     assert_eq!(
         project(&unrevisioned, &keyring),
         Err(ProjectionError::MissingEvidence)
+    );
+}
+
+/// Policy, tools and stored policy test suite commits (journaled since
+/// migration 32) are delivered on the axis of the document their row names,
+/// and only in a pairing migration 29's CHECK admits: a policy operation on
+/// the policy, `tools.publish` on the tools document, `policy_tests.publish`
+/// on the suite, which is a `policy` resource of its own, and the import's
+/// `configuration.import` on the policy or the tools document it activated.
+/// Each activates a version: none before the document's initialization, a
+/// positive one otherwise, and a strictly greater one after, which need not
+/// be 1. Anything else is refused rather than delivered.
+#[test]
+fn document_changes_project_on_the_axis_of_their_document() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let validator = delivery_schema();
+    let reference = |domain, document| {
+        keyring
+            .derive(domain, &[document])
+            .expect("a document reference derives")
+            .as_str()
+            .to_owned()
+    };
+    let policy_ref = reference(ReferenceDomain::Policy, DOCUMENT_POLICY);
+    let tools_ref = reference(ReferenceDomain::Tools, DOCUMENT_TOOLS);
+    let suite_ref = reference(ReferenceDomain::Policy, DOCUMENT_POLICY_TESTS);
+    assert_ne!(policy_ref, suite_ref, "the suite is not the policy");
+
+    let mut cases: Vec<(&str, &str, &str, &str, &str)> = POLICY_ACTIONS
+        .into_iter()
+        .map(|action| {
+            (
+                action,
+                DOCUMENT_POLICY,
+                "policy",
+                "policy",
+                policy_ref.as_str(),
+            )
+        })
+        .collect();
+    cases.extend([
+        (
+            ACTION_TOOLS_PUBLISH,
+            DOCUMENT_TOOLS,
+            "tools",
+            "tools",
+            tools_ref.as_str(),
+        ),
+        (
+            ACTION_CONFIGURATION_IMPORT,
+            DOCUMENT_POLICY,
+            "policy",
+            "policy",
+            policy_ref.as_str(),
+        ),
+        (
+            ACTION_CONFIGURATION_IMPORT,
+            DOCUMENT_TOOLS,
+            "tools",
+            "tools",
+            tools_ref.as_str(),
+        ),
+        (
+            ACTION_POLICY_TESTS_PUBLISH,
+            DOCUMENT_POLICY_TESTS,
+            "policy",
+            "policy_tests",
+            suite_ref.as_str(),
+        ),
+    ]);
+    for (action, document, kind, axis, reference) in cases {
+        let base = document_evidence(action, document);
+        let record = project(&base, &keyring).expect("a document commit projects");
+        assert_eq!(
+            (
+                record.operation.as_str(),
+                record.resource.kind.as_str(),
+                record.resource.reference.as_str(),
+                record.revision.axis.as_str(),
+                record.revision.before.as_deref(),
+                record.revision.after.as_deref(),
+                record.revision.security.as_deref(),
+            ),
+            (
+                action,
+                kind,
+                reference,
+                axis,
+                Some("3"),
+                Some("4"),
+                Some("17")
+            ),
+            "{action} on {document}"
+        );
+        let value = serde_json::to_value(&record).expect("a record serializes");
+        if let Err(error) = validator.validate(&value) {
+            panic!("the published schema must accept {value}: {error}");
+        }
+
+        // The document's initialization, at a version above 1 (the import
+        // activates its policy above the history it copied).
+        let mut initialized = base.clone();
+        initialized.prior_version = None;
+        initialized.new_version = Some(12);
+        let revision = project(&initialized, &keyring)
+            .expect("an initialization projects")
+            .revision;
+        assert_eq!(
+            (revision.before.as_deref(), revision.after.as_deref()),
+            (None, Some("12"))
+        );
+        for (prior_version, new_version, expected) in [
+            (Some(0), Some(4), ProjectionError::InvalidEvidence),
+            (Some(4), Some(4), ProjectionError::InvalidEvidence),
+            (Some(5), Some(4), ProjectionError::InvalidEvidence),
+            (Some(3), Some(0), ProjectionError::InvalidEvidence),
+            (Some(3), None, ProjectionError::MissingEvidence),
+            (None, None, ProjectionError::MissingEvidence),
+        ] {
+            let mut refused = base.clone();
+            refused.prior_version = prior_version;
+            refused.new_version = new_version;
+            assert_eq!(
+                project(&refused, &keyring),
+                Err(expected),
+                "{action} {prior_version:?} -> {new_version:?}"
+            );
+        }
+        let mut unrevisioned = base.clone();
+        unrevisioned.security_revision = None;
+        assert_eq!(
+            project(&unrevisioned, &keyring),
+            Err(ProjectionError::MissingEvidence)
+        );
+        let mut with_axis = base.clone();
+        with_axis.revision_axis = Some(axis.to_owned());
+        assert_eq!(
+            project(&with_axis, &keyring),
+            Err(ProjectionError::InvalidEvidence)
+        );
+        // The document table alone holds these actions.
+        for source in [
+            JournalSource::ConnectionChange,
+            JournalSource::ServiceTokenChange,
+            JournalSource::CatalogChange,
+            JournalSource::AdminSession,
+        ] {
+            assert_eq!(
+                project(&evidence(source, action), &keyring),
+                Err(ProjectionError::UnknownAction),
+                "{action} from {source:?}"
+            );
+        }
+    }
+
+    // Pairings migration 29's CHECK refuses, and a document it does not know.
+    for (action, document) in [
+        (ACTION_POLICY_PUBLISH, DOCUMENT_TOOLS),
+        (ACTION_POLICY_SUGGESTION_ACCEPT, DOCUMENT_POLICY_TESTS),
+        (ACTION_TOOLS_PUBLISH, DOCUMENT_POLICY),
+        (ACTION_POLICY_TESTS_PUBLISH, DOCUMENT_POLICY),
+        (ACTION_CONFIGURATION_IMPORT, DOCUMENT_POLICY_TESTS),
+        (ACTION_POLICY_PUBLISH, "connection"),
+    ] {
+        assert_eq!(
+            project(&document_evidence(action, document), &keyring),
+            Err(ProjectionError::InvalidEvidence),
+            "{action} on {document:?}"
+        );
+    }
+    assert_eq!(
+        project(&document_evidence(ACTION_POLICY_PUBLISH, ""), &keyring),
+        Err(ProjectionError::MissingEvidence)
+    );
+    for action in [
+        ACTION_CATALOG_MCP_PUBLISH,
+        ACTION_CONNECTION_DELETE,
+        "policy.import",
+    ] {
+        assert_eq!(
+            project(&document_evidence(action, DOCUMENT_POLICY), &keyring),
+            Err(ProjectionError::UnknownAction),
+            "{action}"
+        );
+    }
+}
+
+/// Catalog publications (journaled since migration 32) are delivered as a
+/// `catalog` resource referenced by its Connection, under the catalog domain,
+/// on the `catalog` axis: the catalog revision before (none for a
+/// Connection's first catalog of its kind) and after. The overlay revision is
+/// not delivered. A catalog row committed before migration 25 recorded no
+/// actor kind, auth mode or issuer and says `null` there.
+#[test]
+fn catalog_publications_project_on_the_catalog_axis() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let validator = delivery_schema();
+    let catalog_ref = keyring
+        .derive(ReferenceDomain::Catalog, &[CATALOG_MARKER])
+        .expect("a catalog reference derives");
+    let connection_ref = keyring
+        .derive(ReferenceDomain::Connection, &[CATALOG_MARKER])
+        .expect("a Connection reference derives");
+    assert_ne!(catalog_ref.as_str(), connection_ref.as_str());
+    for action in CATALOG_ACTIONS {
+        let base = evidence(JournalSource::CatalogChange, action);
+        let record = project(&base, &keyring).expect("a catalog publication projects");
+        assert_eq!(
+            (
+                record.operation.as_str(),
+                record.resource.kind.as_str(),
+                record.resource.reference.as_str(),
+                record.revision.axis.as_str(),
+                record.revision.before.as_deref(),
+                record.revision.after.as_deref(),
+                record.revision.security.as_deref(),
+            ),
+            (
+                action,
+                "catalog",
+                catalog_ref.as_str(),
+                "catalog",
+                Some("2"),
+                Some("3"),
+                Some("17")
+            )
+        );
+        let mut first = base.clone();
+        first.prior_version = None;
+        first.new_version = Some(1);
+        let revision = project(&first, &keyring)
+            .expect("a first catalog projects")
+            .revision;
+        assert_eq!(
+            (revision.before.as_deref(), revision.after.as_deref()),
+            (None, Some("1"))
+        );
+        let unrecorded = project(&with_actor(base.clone(), None, None, None), &keyring)
+            .expect("a catalog row from before migration 25 projects");
+        assert_eq!(
+            (
+                unrecorded.actor.kind.as_deref(),
+                unrecorded.actor.auth_mode.as_deref(),
+                unrecorded.actor.issuer_ref.as_deref()
+            ),
+            (None, None, None)
+        );
+        for record in [record, unrecorded] {
+            let value = serde_json::to_value(&record).expect("a record serializes");
+            if let Err(error) = validator.validate(&value) {
+                panic!("the published schema must accept {value}: {error}");
+            }
+        }
+        for (prior_version, new_version) in [(Some(3), Some(3)), (Some(0), Some(1)), (None, None)] {
+            let mut refused = base.clone();
+            refused.prior_version = prior_version;
+            refused.new_version = new_version;
+            assert!(project(&refused, &keyring).is_err(), "{action}");
+        }
+        for source in [
+            JournalSource::ConnectionChange,
+            JournalSource::DocumentChange,
+            JournalSource::AdminSession,
+        ] {
+            assert_eq!(
+                project(&evidence(source, action), &keyring),
+                Err(ProjectionError::UnknownAction),
+                "{action} from {source:?}"
+            );
+        }
+    }
+}
+
+/// A document row committed before migration 32 recorded a service-token
+/// caller as kind `principal` with auth mode `service_token`, and the issuer
+/// as the principal carried it. It is delivered in migration 24's
+/// vocabulary: kind `service_token`, and the issuer canonicalized as
+/// authentication canonicalizes it, so it is referenced exactly as the same
+/// principal's issuer is from every other table. A row this release writes
+/// already records both and reads the same. No other table's row is
+/// reinterpreted, and the legacy service-token pairing never claims an
+/// issuer.
+#[test]
+fn legacy_document_actors_are_read_in_migration_24s_vocabulary() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let validator = delivery_schema();
+    let base = evidence(JournalSource::DocumentChange, ACTION_POLICY_PUBLISH);
+    let canonical_ref = keyring
+        .derive(ReferenceDomain::ActorIssuer, &[ACTOR_ISSUER_MARKER])
+        .expect("an issuer reference derives");
+    let as_recorded = format!(" {ACTOR_ISSUER_MARKER}/// ");
+    for (kind, auth_mode, issuer, expected) in [
+        // A service-token caller in migration 23's vocabulary, and in 32's.
+        (
+            "principal",
+            "service_token",
+            None,
+            ("service_token", "service_token", None),
+        ),
+        (
+            "service_token",
+            "service_token",
+            None,
+            ("service_token", "service_token", None),
+        ),
+        // An issuer as the principal carried it, and in canonical form.
+        (
+            "principal",
+            "bearer_token",
+            Some(as_recorded.as_str()),
+            ("principal", "bearer_token", Some(canonical_ref.as_str())),
+        ),
+        (
+            "principal",
+            "session_cookie",
+            Some(ACTOR_ISSUER_MARKER),
+            ("principal", "session_cookie", Some(canonical_ref.as_str())),
+        ),
+        // An issuer that canonicalizes to nothing names none.
+        (
+            "principal",
+            "client_certificate",
+            Some(" /// "),
+            ("principal", "client_certificate", None),
+        ),
+        ("system", "system", None, ("system", "system", None)),
+    ] {
+        let record = project(
+            &with_actor(base.clone(), Some(kind), Some(auth_mode), issuer),
+            &keyring,
+        )
+        .expect("a document actor projects");
+        assert_eq!(
+            (
+                record.actor.kind.as_deref(),
+                record.actor.auth_mode.as_deref(),
+                record.actor.issuer_ref.as_deref()
+            ),
+            (Some(expected.0), Some(expected.1), expected.2),
+            "{kind} {auth_mode} {issuer:?}"
+        );
+        let serialized = serde_json::to_string(&record).expect("a record serializes");
+        assert!(!serialized.contains(ACTOR_ISSUER_MARKER), "{serialized}");
+        let value = serde_json::to_value(&record).expect("a record serializes");
+        if let Err(error) = validator.validate(&value) {
+            panic!("the published schema must accept {value}: {error}");
+        }
+    }
+
+    // Still refused: a service token vouched for by an issuer in either
+    // vocabulary, pairings no table admits, and a row recording only part
+    // of its actor.
+    for (kind, auth_mode, issuer) in [
+        (
+            Some("principal"),
+            Some("service_token"),
+            Some(ACTOR_ISSUER_MARKER),
+        ),
+        (Some("service_token"), Some("bearer_token"), None),
+        (Some("principal"), Some("system"), None),
+        (Some("system"), Some("system"), Some(ACTOR_ISSUER_MARKER)),
+        (Some("principal"), None, None),
+        (None, None, None),
+    ] {
+        assert!(
+            project(&with_actor(base.clone(), kind, auth_mode, issuer), &keyring).is_err(),
+            "{kind:?} {auth_mode:?} {issuer:?}"
+        );
+    }
+
+    // The reading is the document table's alone: the tables migration 24
+    // aligned never recorded the old pairing, and their issuers are already
+    // canonical, so they are referenced as stored.
+    let connection = evidence(JournalSource::ConnectionChange, ACTION_CONNECTION_DELETE);
+    assert_eq!(
+        project(
+            &with_actor(
+                connection.clone(),
+                Some("principal"),
+                Some("service_token"),
+                None
+            ),
+            &keyring
+        ),
+        Err(ProjectionError::InvalidEvidence)
+    );
+    let stored = project(
+        &with_actor(
+            connection,
+            Some("principal"),
+            Some("bearer_token"),
+            Some(&as_recorded),
+        ),
+        &keyring,
+    )
+    .expect("a stored issuer projects");
+    assert_ne!(
+        stored.actor.issuer_ref.as_deref(),
+        Some(canonical_ref.as_str())
     );
 }
 

@@ -1,7 +1,10 @@
 //! The authentication settings the configuration compiler reads and the
-//! shapes it holds them to (issue #242): issuer canonicalization, the JWKS key
-//! age bounds, cookie names, the verified-claim allowlist (issue #243), the
-//! client-certificate identity source and the admin session settings.
+//! shapes it holds them to (issue #242): issuer canonicalization, the
+//! principal identity bounds a policy's identity mappings are held to, the
+//! JWKS key age bounds, cookie names, the verified-claim allowlist and the
+//! scope and claim bounds a policy's scope and claim matchers are held to
+//! (issue #243), the client-certificate identity source and the admin session
+//! settings.
 //!
 //! The gateway's validators and stores act on these; it re-exports each from
 //! the module that uses it (`auth::principal`, `auth::jwt`,
@@ -15,6 +18,10 @@ pub const PROVIDER_ISSUER_PREFIX: &str = "provider:";
 
 /// Longest issuer, in bytes.
 pub const MAX_PRINCIPAL_ISSUER_BYTES: usize = 4096;
+/// Longest role name, in bytes.
+pub const MAX_PRINCIPAL_ROLE_BYTES: usize = 256;
+/// Longest subject (`user_id`), in bytes.
+pub const MAX_PRINCIPAL_SUBJECT_BYTES: usize = 4096;
 
 /// Canonical issuer form used by authentication, policy, audit, and discovery.
 pub fn canonical_issuer(issuer: &str) -> Option<String> {
@@ -75,6 +82,29 @@ const RESERVED_CLAIM_NAMES: &[&str] = &[
 /// one that can carry a credential.
 const CREDENTIAL_CLAIM_FRAGMENTS: &[&str] = &["token", "secret", "passw", "credential"];
 
+/// Longest OAuth scope, in bytes: a principal's scope fact, a `scope`
+/// condition value and an identity mapping's `scopes` entry.
+pub const MAX_PRINCIPAL_SCOPE_BYTES: usize = 256;
+/// Longest verified claim string, in bytes: a captured claim value and a
+/// `claim` condition value.
+pub const MAX_VERIFIED_CLAIM_VALUE_BYTES: usize = 256;
+
+/// An RFC 6749 `scope-token` of at most [`MAX_PRINCIPAL_SCOPE_BYTES`]:
+/// printable ASCII without space, `"` or `\`.
+pub fn is_scope_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PRINCIPAL_SCOPE_BYTES
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
+}
+
+/// A verified claim string: at most [`MAX_VERIFIED_CLAIM_VALUE_BYTES`], with
+/// no control character.
+pub fn is_verified_claim_text(text: &str) -> bool {
+    text.len() <= MAX_VERIFIED_CLAIM_VALUE_BYTES && !text.chars().any(char::is_control)
+}
+
 /// Why `name` cannot be a verified claim -- an allowlist entry, or the claim
 /// a `claim` condition reads -- or `None` when it can be.
 pub fn verified_claim_name_problem(name: &str) -> Option<&'static str> {
@@ -91,7 +121,8 @@ pub fn verified_claim_name_problem(name: &str) -> Option<&'static str> {
             .any(|fragment| lowercase.contains(fragment))
     {
         return Some(
-            "names a claim that carries the principal's identity, scopes, email or credential              metadata, which policy reads some other way or never",
+            "names a claim that carries the principal's identity, scopes, email or credential \
+             metadata, which policy reads some other way or never",
         );
     }
     None
