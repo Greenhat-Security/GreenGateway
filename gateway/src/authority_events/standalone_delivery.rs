@@ -84,9 +84,9 @@ enum Transition {
 pub(crate) struct StandaloneShape {
     pub(crate) source: StandaloneEvidenceSource,
     pub(crate) action: &'static str,
-    resource_kind: &'static str,
+    pub(crate) resource_kind: &'static str,
     domain: ReferenceDomain,
-    axis: &'static str,
+    pub(crate) axis: &'static str,
     transition: Transition,
     /// Whether the row names its resource; only a re-encryption batch does
     /// not.

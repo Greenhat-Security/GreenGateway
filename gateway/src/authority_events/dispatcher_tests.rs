@@ -12,7 +12,7 @@ use crate::{
     connections::{
         model::{ConnectionWrite, MAX_CONNECTIONS},
         pg_store::PostgresConnectionStore,
-        store::ConnectionStoreError,
+        store::{ConnectionStoreError, StoredConnection, StoredMcpCatalogEntry},
     },
     storage::{
         contract_tests::postgres_audit_tests::{
@@ -21,7 +21,9 @@ use crate::{
         migrations,
         postgres::PostgresFoundation,
         postgres_authority_events::{append_to_journal, JournalSource, OPERATION_JOURNAL_APPEND},
-        PostgresJwtRevocationStore, PostgresServiceTokenStore, ServiceTokenStore,
+        ActivePolicy, DocumentAction, DocumentChange, PolicyCommitError, PolicyCommitPrecondition,
+        PolicyCommitRequest, PolicyControlPlane, PostgresJwtRevocationStore, PostgresPolicyStore,
+        PostgresServiceTokenStore, PostgresToolStore, ServiceTokenStore,
     },
     tools::lease::memory::MemoryLeaseStore,
 };
@@ -156,11 +158,15 @@ async fn migrated_pool(database: &TestDatabase) -> deadpool_postgres::Pool {
     foundation.pool().clone()
 }
 
-/// The three producers that journal evidence, on one pool.
+/// The producers that journal evidence through a store call, on one pool:
+/// tokens, JWT revocations, Connections and their catalogs, and the policy
+/// and tools documents.
 struct Producers {
     tokens: PostgresServiceTokenStore,
     jwt: PostgresJwtRevocationStore,
     connections: PostgresConnectionStore,
+    policies: PostgresPolicyStore,
+    tools: PostgresToolStore,
 }
 
 impl Producers {
@@ -170,7 +176,76 @@ impl Producers {
             jwt: PostgresJwtRevocationStore::new(pool.clone(), DEPLOYMENT, ISSUER),
             connections: PostgresConnectionStore::new(pool.clone(), MAX_CONNECTIONS)
                 .expect("the maximum is within the ceiling"),
+            policies: PostgresPolicyStore::new(pool.clone()),
+            tools: PostgresToolStore::new(pool.clone()),
         }
+    }
+
+    /// Commit `id` as the policy document: its initialization, or the
+    /// successor of `current`.
+    async fn publish_policy(
+        &self,
+        current: Option<&ActivePolicy>,
+        id: &str,
+        change: DocumentChange,
+    ) -> Result<ActivePolicy, PolicyCommitError> {
+        let precondition = match current {
+            Some(active) => PolicyCommitPrecondition::Expected {
+                etag: active.etag.clone(),
+            },
+            None => PolicyCommitPrecondition::Initialize,
+        };
+        let candidate = crate::rbac::Policy::validate_json_value(serde_json::json!({
+            "schema_version": "0.1.0",
+            "id": id,
+            "default_action": "deny",
+            "roles": { "reader": { "permissions": ["data:read"] } }
+        }))
+        .expect("the test policy validates");
+        PolicyControlPlane::commit(
+            &self.policies,
+            PolicyCommitRequest {
+                precondition,
+                candidate: &candidate,
+                change,
+                diff_summary: &serde_json::json!({ "action": "dispatcher_fixture" }),
+            },
+        )
+        .await
+    }
+
+    /// Create a managed MCP Connection: one journaled event.
+    async fn mcp_connection(&self, actor: &ChangeActor) -> StoredConnection {
+        self.connections
+            .create(mcp_candidate(), actor, None)
+            .await
+            .expect("an MCP Connection creates")
+    }
+
+    /// Publish `connection`'s first MCP catalog.
+    async fn publish_catalog(
+        &self,
+        connection: &StoredConnection,
+        actor: &ChangeActor,
+    ) -> Result<(), ConnectionStoreError> {
+        self.connections
+            .replace_mcp_catalog(
+                &connection.id,
+                &connection.etag(),
+                &[StoredMcpCatalogEntry {
+                    remote_tool_name: "lookup".to_owned(),
+                    title: None,
+                    description: "lookup description".to_owned(),
+                    input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                    annotations: None,
+                }],
+                &[],
+                &[],
+                0,
+                actor,
+            )
+            .await
+            .map(|_| ())
     }
 
     async fn token(&self) -> String {
@@ -247,6 +322,26 @@ fn candidate() -> ConnectionWrite {
         }
     }))
     .expect("the candidate deserializes")
+}
+
+/// A managed MCP Connection, whose catalog the store publishes.
+fn mcp_candidate() -> ConnectionWrite {
+    serde_json::from_value(serde_json::json!({
+        "display_name": "Managed MCP",
+        "enabled": true,
+        "kind": "mcp_streamable_http",
+        "endpoint": {
+            "base_url": "https://mcp.example.test",
+            "base_path": "/mcp"
+        },
+        "authentication": { "type": "none" },
+        "tls": {},
+        "discovery": {
+            "type": "managed_mcp",
+            "use_connection_authentication": false
+        }
+    }))
+    .expect("the MCP candidate deserializes")
 }
 
 /// The same Connection with a credential binding: replacing [`candidate`]
@@ -373,6 +468,35 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
     producers
         .create_rebind_and_delete_connection(&ChangeActor::for_test("deleting-admin"))
         .await;
+    // Since migration 32 the document and catalog sources too, interleaved
+    // with a Connection's: a policy published by a service token, a managed
+    // Connection and its first catalog, and the first-boot tools seed.
+    let policy = producers
+        .publish_policy(
+            None,
+            "dispatcher-policy",
+            DocumentChange {
+                action: DocumentAction::PolicyPublish,
+                actor: ChangeActor::service_token_for_test("service-token:publishing-token"),
+            },
+        )
+        .await
+        .expect("the policy commits");
+    let mcp = producers
+        .mcp_connection(&ChangeActor::for_test("catalog-admin"))
+        .await;
+    producers
+        .publish_catalog(
+            &mcp,
+            &ChangeActor::for_test_with_issuer("publishing-admin", ACTOR_ISSUER),
+        )
+        .await
+        .expect("the catalog publishes");
+    producers
+        .tools
+        .seed_empty_document()
+        .await
+        .expect("the tools document seeds");
 
     let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
     let keyring = keyring_for(&store).await;
@@ -384,7 +508,7 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
         term.deliver_until_caught_up(&stop)
             .await
             .expect("delivery succeeds"),
-        Some(9)
+        Some(13)
     );
 
     let delivered = sink.delivered();
@@ -403,6 +527,10 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
             ("7", "connection.replace"),
             ("8", "credential.binding_change"),
             ("9", "connection.delete"),
+            ("10", "policy.publish"),
+            ("11", "connection.create"),
+            ("12", "catalog.mcp.publish"),
+            ("13", "tools.publish"),
         ]
     );
     // A Connection's create, replace and delete are on its connection axis,
@@ -410,7 +538,7 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
     // of a Connection created without credential authority, under the
     // replace's operation and shared revision.
     assert_eq!(
-        delivered[5..]
+        delivered[5..9]
             .iter()
             .map(|record| (
                 record.resource.kind.as_str(),
@@ -432,9 +560,41 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
         delivered[7].revision.security
     );
     assert_ne!(delivered[5].operation_id, delivered[6].operation_id);
-    assert!(delivered[5..]
+    assert!(delivered[5..9]
         .iter()
         .all(|record| record.resource.reference == delivered[5].resource.reference));
+    // A document is on its own axis, from its initialization; a catalog on
+    // the catalog axis, from its Connection's first catalog, referenced
+    // apart from that Connection.
+    assert_eq!(
+        delivered[9..]
+            .iter()
+            .map(|record| (
+                record.resource.kind.as_str(),
+                record.revision.axis.as_str(),
+                record.revision.before.as_deref(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("policy", "policy", None),
+            ("connection", "connection", None),
+            ("catalog", "catalog", None),
+            ("tools", "tools", None),
+        ]
+    );
+    assert_eq!(
+        delivered[9].revision.after,
+        Some(policy.version.to_string())
+    );
+    assert_eq!(
+        delivered[9].revision.security,
+        Some(policy.security_revision.to_string())
+    );
+    assert_eq!(delivered[11].revision.after.as_deref(), Some("1"));
+    assert_ne!(
+        delivered[11].resource.reference,
+        delivered[10].resource.reference
+    );
     // An issue is the token's first revision on the token axis.
     assert_eq!(
         (
@@ -444,23 +604,26 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
         ),
         ("token", None, Some("1"))
     );
-    // Each event ID is the one its evidence row was committed with.
-    let mut evidence_ids = Vec::new();
-    for table in [
-        "service_token_change_evidence ORDER BY security_revision",
-        "jwt_revocation_evidence",
-        // The replace and its binding change share a revision; the replace
-        // row is written first, and sorts first.
-        "connection_change_evidence ORDER BY security_revision, action",
-    ] {
-        evidence_ids.extend(
-            texts(
-                &pool,
-                &format!("SELECT event_id::text FROM greengateway.{table}"),
-            )
-            .await,
-        );
-    }
+    // Each event ID is the one its evidence row was committed with, in commit
+    // order, which here is shared-revision order across every source. The
+    // replace and its binding change share a revision; the replace row is
+    // written first, and sorts first.
+    let evidence_ids = texts(
+        &pool,
+        "SELECT event_id FROM ( \
+             SELECT event_id::text, security_revision, action \
+                 FROM greengateway.service_token_change_evidence \
+             UNION ALL SELECT event_id::text, security_revision, action \
+                 FROM greengateway.jwt_revocation_evidence \
+             UNION ALL SELECT event_id::text, security_revision, action \
+                 FROM greengateway.connection_change_evidence \
+             UNION ALL SELECT event_id::text, security_revision, action \
+                 FROM greengateway.document_change_evidence \
+             UNION ALL SELECT event_id::text, security_revision, action \
+                 FROM greengateway.catalog_change_evidence \
+         ) AS evidence ORDER BY security_revision, action",
+    )
+    .await;
     assert_eq!(
         delivered
             .iter()
@@ -496,6 +659,14 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
             (Some("principal"), Some("bearer_token"), None),
             (Some("principal"), Some("bearer_token"), None),
             (Some("principal"), Some("bearer_token"), None),
+            (Some("service_token"), Some("service_token"), None),
+            (Some("principal"), Some("bearer_token"), None),
+            (
+                Some("principal"),
+                Some("bearer_token"),
+                Some(actor_issuer_ref.as_str())
+            ),
+            (Some("system"), Some("system"), None),
         ]
     );
     for record in &delivered {
@@ -512,6 +683,14 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
             "operator:revoke-jwt",
             "billing-token",
             "billing.example.test",
+            "service-token:publishing-token",
+            "catalog-admin",
+            "publishing-admin",
+            "bootstrap",
+            "dispatcher-policy",
+            "mcp.example.test",
+            "lookup",
+            mcp.id.as_str(),
             ISSUER,
             ACTOR_ISSUER,
         ] {
@@ -520,15 +699,15 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
     }
 
     let stats = store.stats().await.expect("stats read");
-    assert_eq!(stats.cursor, Some(9));
-    assert_eq!(stats.head, 9);
+    assert_eq!(stats.cursor, Some(13));
+    assert_eq!(stats.head, 13);
     assert_eq!(stats.undelivered(), 0);
     assert_eq!(stats.oldest_undelivered_age_secs, None);
 
     // A restart resumes from the committed cursor and delivers nothing again.
     drop(term);
     let mut restarted = begin(&store, &sink, &keyring, 100, 2).await;
-    assert_eq!(restarted.committed_position(), 9);
+    assert_eq!(restarted.committed_position(), 13);
     assert_eq!(
         restarted
             .deliver_until_caught_up(&stop)
@@ -1019,6 +1198,164 @@ async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing() {
         .await;
     let stats = store.stats().await.expect("stats");
     assert_eq!((stats.retained, stats.head), (1, 4));
+}
+
+/// A full journal refuses a policy publication, a catalog publication and
+/// the first-boot tools seed exactly as it refuses every other producer
+/// (migration 32): each is answered unavailable, which the admin API answers
+/// `503` and a first boot fails closed on, and commits nothing -- no version,
+/// active pointer, shared revision, outbox row, catalog, tool name
+/// reservation, evidence row or journal row -- and each refusal is counted
+/// once. Once delivery and retention free room, the same changes commit and
+/// journal.
+#[tokio::test]
+async fn a_full_journal_refuses_policy_and_catalog_publications_and_commits_nothing() {
+    let (_guard, database) = database_or_skip!();
+    let pool = migrated_pool(&database).await;
+    let producers = Producers::new(&pool);
+    let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
+    store.configure_capacity(2).await.expect("capacity applies");
+    // A managed Connection and the first policy fill the journal.
+    let mcp = producers
+        .mcp_connection(&ChangeActor::for_test("catalog-admin"))
+        .await;
+    let initial = producers
+        .publish_policy(
+            None,
+            "capacity-initial",
+            DocumentChange::test_policy("installer"),
+        )
+        .await
+        .expect("the first policy fits");
+
+    let journal = || {
+        texts(
+            &pool,
+            "SELECT event_id::text FROM greengateway.authority_event_journal ORDER BY position",
+        )
+    };
+    let counts = || {
+        let pool = &pool;
+        async move {
+            let mut counts = Vec::new();
+            for table in [
+                "security_outbox",
+                "policy_documents",
+                "tool_documents",
+                "tool_active",
+                "connection_mcp_catalogs",
+                "connection_mcp_catalog_entries",
+                "tool_name_reservations",
+                "document_change_evidence",
+                "catalog_change_evidence",
+            ] {
+                counts.push((
+                    table,
+                    scalar(pool, &format!("SELECT count(*) FROM greengateway.{table}")).await,
+                ));
+            }
+            counts.push((
+                "last_revision",
+                scalar(
+                    pool,
+                    "SELECT last_revision FROM greengateway.security_revision_state",
+                )
+                .await,
+            ));
+            counts
+        }
+    };
+    let journal_before = journal().await;
+    let counts_before = counts().await;
+    // The recorder is this thread's, and the test's current-thread runtime
+    // runs every producer on this thread.
+    let recorder = crate::audit::sink::tests::CountingRecorder::default();
+    let _recording = ::metrics::set_default_local_recorder(&recorder);
+    let unavailable = |outcome: Result<ActivePolicy, PolicyCommitError>| {
+        matches!(outcome, Err(PolicyCommitError::Store(error))
+            if error.kind() == RepositoryErrorKind::Unavailable)
+    };
+
+    assert!(unavailable(
+        producers
+            .publish_policy(
+                Some(&initial),
+                "capacity-refused",
+                DocumentChange::test_policy("publishing-admin"),
+            )
+            .await
+    ));
+    assert!(matches!(
+        producers.tools.seed_empty_document().await,
+        Err(PolicyCommitError::Store(error)) if error.kind() == RepositoryErrorKind::Unavailable
+    ));
+    assert!(matches!(
+        producers
+            .publish_catalog(&mcp, &ChangeActor::for_test("publishing-admin"))
+            .await,
+        Err(ConnectionStoreError::Unavailable { operation }) if operation == OPERATION_JOURNAL_APPEND
+    ));
+
+    assert_eq!(journal().await, journal_before);
+    assert_eq!(counts().await, counts_before);
+    let active = PolicyControlPlane::active(&producers.policies)
+        .await
+        .expect("the active policy reads")
+        .expect("the first policy is active");
+    assert_eq!(
+        (active.version, active.etag.as_str()),
+        (initial.version, initial.etag.as_str())
+    );
+    assert_eq!(
+        producers
+            .connections
+            .mcp_catalog(&mcp.id)
+            .await
+            .expect("the catalog reads"),
+        None
+    );
+    assert_eq!(
+        recorder.count(crate::metrics::AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL, &[]),
+        3
+    );
+    assert_eq!(
+        recorder.count(crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL, &[]),
+        0,
+        "a full journal is not a refused write"
+    );
+
+    // Delivery and retention free the room; the refused changes then commit
+    // and journal at the next positions.
+    let keyring = keyring_for(&store).await;
+    let sink = Arc::new(RecordingSink::default());
+    let mut term = begin(&store, &sink, &keyring, 100, 1).await;
+    assert_eq!(
+        term.deliver_until_caught_up(&CancellationToken::new())
+            .await
+            .expect("delivery succeeds"),
+        Some(2)
+    );
+    let client = pool.get().await.expect("maintenance session");
+    assert_eq!(
+        PostgresAuthorityEventStore::prune_with(&client, Duration::ZERO, 1_000)
+            .await
+            .expect("retention runs"),
+        2
+    );
+    producers
+        .publish_policy(
+            Some(&initial),
+            "capacity-refused",
+            DocumentChange::test_policy("publishing-admin"),
+        )
+        .await
+        .expect("the publication commits once there is room");
+    producers
+        .publish_catalog(&mcp, &ChangeActor::for_test("publishing-admin"))
+        .await
+        .expect("the catalog publishes once there is room");
+    let stats = store.stats().await.expect("stats");
+    assert_eq!((stats.retained, stats.head), (2, 4));
 }
 
 /// Make one table refuse every new row from now on. `NOT VALID` keeps the

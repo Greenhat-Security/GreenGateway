@@ -384,6 +384,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("21a4635ecdbb9ff352c29531ba454f03575e32c9f37ed673f7f95eec480d441d"),
+        Migration::new(
+            32,
+            "document_and_catalog_evidence_journal",
+            include_str!("migrations/0032_document_and_catalog_evidence_journal.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("d0d858a1951e685832d0047b4963d1c4278f5603da9eeb680380e37343777b47"),
     ]
 });
 
@@ -416,13 +423,21 @@ impl SchemaCompatibility {
     }
 }
 
-// This build's manifest ends at 31, and it serves exactly schema 31: it
-// approves no migration above its manifest, and it does not serve schema 30.
-// The move from 30 to 31 (policy analysis suppressions, #243 slice 15) is
-// coordinated, without an overlap: a schema-30 binary left serving after
-// migration 31 would analyze policies without the suppressions other
-// replicas record, so one finding would read as suppressed through one
-// replica and as open through another.
+// This build's manifest ends at 32, and it serves exactly schema 32: it
+// approves no migration above its manifest, and it does not serve schema 31.
+// The move from 31 to 32 (policy, tools and catalog change evidence in the
+// authority-event journal, and the document actor in migration 24's
+// vocabulary, #425) is coordinated, without an overlap: a schema-31 binary
+// left serving after migration 32 would commit policy, tools and catalog
+// changes whose evidence is never journaled, so the dispatcher would never
+// deliver them, and would keep writing service-token callers' document rows
+// in the old vocabulary, which migration 32's CHECK refuses for new rows.
+//
+// The move from 30 to 31 (policy analysis suppressions, #243 slice 15) was
+// coordinated too: a schema-30 binary left serving after migration 31 would
+// analyze policies without the suppressions other replicas record, so one
+// finding would read as suppressed through one replica and as open through
+// another.
 //
 // The move from 29 to 30 (durable policy replay jobs, #243) was coordinated
 // too: a schema-29 binary left serving after migration 30 would still answer
@@ -450,7 +465,7 @@ impl SchemaCompatibility {
 // the same explicit column list (`connections::pg_store::
 // record_catalog_change_evidence`). This build is not that successor: it
 // carries migration 25 byte for byte, so its migrator records the approved
-// checksum, but it serves only schema 31, so from a prepared fleet it is a
+// checksum, but it serves only schema 32, so from a prepared fleet it is a
 // coordinated drain/migrate/restart like every other step.
 // That shared column list left out the three columns; this build's catalog
 // writer records all three.
@@ -469,20 +484,20 @@ impl SchemaCompatibility {
 // journaled authority evidence, #425), from 25 to 26 (admin session evidence
 // in the authority-event journal, with capacity held for every session's
 // withdrawal, #425), from 26 to 27 (service-token issue evidence, #425),
-// from 27 to 28, from 28 to 29, from 29 to 30 and from 30 to 31. A schema-26
-// binary left serving after migration 27 would issue tokens without their
-// evidence, and a schema-25 binary left serving after migration 26 would
-// grant and withdraw admin sessions without journaling their evidence. A
-// schema-23 binary must not keep writing evidence after migration 24: its
-// Connection, service-token and JWT revocation rows would record no actor
-// kind, auth mode or issuer. A schema-22 binary would also commit policy,
-// tools and catalog changes without their evidence, and a schema-20 one
-// would write evidence that is never journaled. The fence keeps covering
-// every binary that can serve this database: none that predates it accepts
-// this ledger either.
+// from 27 to 28, from 28 to 29, from 29 to 30, from 30 to 31 and from 31 to
+// 32. A schema-26 binary left serving after migration 27 would issue tokens
+// without their evidence, and a schema-25 binary left serving after
+// migration 26 would grant and withdraw admin sessions without journaling
+// their evidence. A schema-23 binary must not keep writing evidence after
+// migration 24: its Connection, service-token and JWT revocation rows would
+// record no actor kind, auth mode or issuer. A schema-22 binary would also
+// commit policy, tools and catalog changes without their evidence, and a
+// schema-20 one would write evidence that is never journaled. The fence keeps
+// covering every binary that can serve this database: none that predates it
+// accepts this ledger either.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (31, 31),
-    write: (31, 31),
+    read: (32, 32),
+    write: (32, 32),
     approved_extensions: &[],
 };
 
@@ -517,7 +532,7 @@ const APPROVED_EXTENSION_SOURCES: &[ExtensionSource] = &[];
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 31.
+/// contract the schema. The shipped contract accepts only schema 32.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1437,18 +1452,18 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            31,
+            32,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (31, 31));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (31, 31));
-        assert_eq!(schema_version_range(), (31, 31));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (32, 32));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (32, 32));
+        assert_eq!(schema_version_range(), (32, 32));
         assert!(
             BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty(),
             "this build approves no migration above its manifest"
         );
         // Readiness samples the manifest and one row more.
-        assert_eq!(runtime_ledger_row_limit(), 32);
+        assert_eq!(runtime_ledger_row_limit(), 33);
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
             Ok(SchemaStatus::Current)
@@ -1456,19 +1471,19 @@ mod tests {
         // The next migration is refused whatever it is: nothing prepared this
         // build for one.
         let mut beyond = ledger_for(&MANIFEST, MANIFEST.len(), "");
-        beyond.push((32, hex_checksum("-- migration 32")));
+        beyond.push((33, hex_checksum("-- migration 33")));
         assert_eq!(
             validate_runtime_ledger(&beyond),
             Err(LedgerProblem::UnknownVersion)
         );
 
-        // The previous releases' schemas are not served: schemas 30, 29, 28, 27,
-        // 26 and 25 are left by coordinated upgrades, and so are the prepared
-        // release's schema 24 and every earlier point. The overlap of the
-        // rolling step from 24 to 25 belonged to the prepared release and the
-        // schema-25 successor, both of which serve 25; this build serves none of
-        // 24 through 30.
-        for behind in 1..=15 {
+        // The previous releases' schemas are not served: schemas 31, 30, 29, 28,
+        // 27, 26 and 25 are left by coordinated upgrades, and so are the
+        // prepared release's schema 24 and every earlier point. The overlap of
+        // the rolling step from 24 to 25 belonged to the prepared release and
+        // the schema-25 successor, both of which serve 25; this build serves
+        // none of 24 through 31.
+        for behind in 1..=16 {
             assert_eq!(
                 validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - behind, "")),
                 Ok(SchemaStatus::NeedsUpgrade {
@@ -4748,12 +4763,365 @@ mod tests {
         clean_database(foundation.pool()).await;
     }
 
+    /// Migration 32 makes the document and catalog evidence tables journal
+    /// sources and journals the evidence a schema-31 deployment committed:
+    /// after every row already journaled, both tables together in their own
+    /// commit order (committed_at, then event ID), each at its own commit time,
+    /// one retained unit each, with the capacity unchanged. Every evidence row
+    /// stays exactly as written, including a service-token caller recorded in
+    /// migration 23's vocabulary and an issuer that is not canonical. From then
+    /// on a new document row pairs its kind with its auth mode as migration
+    /// 24's tables do, a service token is its own kind, and the pairing CHECK
+    /// is not validated over the old rows.
+    #[tokio::test]
+    async fn migration_thirty_two_journals_document_and_catalog_evidence_and_aligns_the_actor() {
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let config = migration_config(&dsn_file);
+        let foundation = establish(&config).await;
+        clean_database(foundation.pool()).await;
+        let client = foundation.pool().get().await.expect("checkout");
+        bootstrap_ledger(&client)
+            .await
+            .expect("migration ledger should bootstrap");
+        let through_v31 = MANIFEST
+            .iter()
+            .take_while(|migration| migration.version <= 31)
+            .count();
+        for migration in &MANIFEST[..through_v31] {
+            apply_one(&client, migration, &test_settings())
+                .await
+                .expect("migrations through 31 should apply");
+        }
+
+        // What a schema-31 deployment holds: one journaled JWT revocation,
+        // committed after everything below, and document and catalog evidence
+        // that is not journaled, committed out of table order, two rows of it
+        // in the same instant.
+        let jwt_event = uuid::Uuid::new_v4().to_string();
+        client
+            .execute(
+                "INSERT INTO greengateway.jwt_revocation_evidence \
+                     (event_id, operation_id, actor_user_id, action, issuer, jti_hash, \
+                      security_revision, committed_at, actor_kind, actor_auth_mode) \
+                 VALUES ($1::text::uuid, gen_random_uuid(), 'operator:revoke-jwt', \
+                         'jwt.revoke', 'https://issuer.example', repeat('c', 64), 9, \
+                         '2026-10-01T00:00:09Z', 'system', 'system')",
+                &[&jwt_event],
+            )
+            .await
+            .expect("a schema-31 JWT revocation");
+        client
+            .execute(
+                "WITH reserved AS ( \
+                     UPDATE greengateway.authority_event_state \
+                     SET last_position = last_position + 1, \
+                         retained_events = retained_events + 1 \
+                     WHERE singleton RETURNING last_position) \
+                 INSERT INTO greengateway.authority_event_journal (position, event_id, source) \
+                 SELECT last_position, $1::text::uuid, 'jwt_revocation_evidence' FROM reserved",
+                &[&jwt_event],
+            )
+            .await
+            .expect("its journal row");
+        const DOCUMENT: &str = "INSERT INTO greengateway.document_change_evidence \
+                 (event_id, operation_id, actor_kind, actor_user_id, actor_issuer, \
+                  actor_auth_mode, action, resource_type, prior_version, new_version, \
+                  security_revision, committed_at) \
+             VALUES ($1::text::uuid, gen_random_uuid(), $2, $3, $4, $5, $6, $7, NULL, $8, $9, \
+                     $10::text::timestamptz)";
+        let mut evidence = Vec::new();
+        for (kind, subject, issuer, mode, action, resource, version, revision, committed_at) in [
+            // A service-token caller in migration 23's vocabulary.
+            (
+                "principal",
+                "service-token:token_1",
+                None,
+                "service_token",
+                "policy.publish",
+                "policy",
+                1_i64,
+                3_i64,
+                "2026-10-01T00:00:04Z",
+            ),
+            // An issuer as the principal carried it.
+            (
+                "principal",
+                "operator",
+                Some("https://idp.example.test/"),
+                "bearer_token",
+                "tools.publish",
+                "tools",
+                1,
+                1,
+                "2026-10-01T00:00:02Z",
+            ),
+            (
+                "system",
+                "import-standalone",
+                None,
+                "system",
+                "configuration.import",
+                "policy",
+                2,
+                5,
+                "2026-10-01T00:00:06Z",
+            ),
+        ] {
+            let event_id = uuid::Uuid::new_v4().to_string();
+            client
+                .execute(
+                    DOCUMENT,
+                    &[
+                        &event_id,
+                        &kind,
+                        &subject,
+                        &issuer,
+                        &mode,
+                        &action,
+                        &resource,
+                        &version,
+                        &revision,
+                        &committed_at,
+                    ],
+                )
+                .await
+                .expect("schema-31 document evidence");
+            evidence.push((committed_at, event_id, "document_change_evidence"));
+        }
+        const CATALOG: &str = "INSERT INTO greengateway.catalog_change_evidence \
+                 (event_id, operation_id, actor_user_id, action, connection_id, \
+                  prior_version, new_version, overlay_revision, security_revision, \
+                  committed_at, actor_kind, actor_auth_mode, actor_issuer) \
+             VALUES ($1::text::uuid, gen_random_uuid(), 'operator', $2, gen_random_uuid(), \
+                     NULL, 1, $3, $4, $5::text::timestamptz, $6, $7, NULL)";
+        for (action, overlay, revision, committed_at, kind, mode) in [
+            // Before migration 25's actor columns were written.
+            (
+                "catalog.mcp.publish",
+                None,
+                2_i64,
+                "2026-10-01T00:00:02Z",
+                None,
+                None,
+            ),
+            (
+                "catalog.openapi.publish",
+                Some(0_i64),
+                4,
+                "2026-10-01T00:00:01Z",
+                Some("principal"),
+                Some("session_cookie"),
+            ),
+        ] {
+            let event_id = uuid::Uuid::new_v4().to_string();
+            client
+                .execute(
+                    CATALOG,
+                    &[
+                        &event_id,
+                        &action,
+                        &overlay,
+                        &revision,
+                        &committed_at,
+                        &kind,
+                        &mode,
+                    ],
+                )
+                .await
+                .expect("schema-31 catalog evidence");
+            evidence.push((committed_at, event_id, "catalog_change_evidence"));
+        }
+        let snapshot = || {
+            let client = &client;
+            async move {
+                let mut rows = Vec::new();
+                for table in ["document_change_evidence", "catalog_change_evidence"] {
+                    rows.extend(
+                        client
+                            .query(
+                                &format!(
+                                    "SELECT row_to_json(t)::text FROM greengateway.{table} t \
+                                     ORDER BY event_id"
+                                ),
+                                &[],
+                            )
+                            .await
+                            .expect("evidence snapshot")
+                            .iter()
+                            .map(|row| row.get::<_, String>(0)),
+                    );
+                }
+                rows
+            }
+        };
+        let evidence_before = snapshot().await;
+
+        apply_one(&client, &MANIFEST[through_v31], &test_settings())
+            .await
+            .expect("migration 32 should apply");
+        assert_eq!(
+            snapshot().await,
+            evidence_before,
+            "old rows stay as written"
+        );
+
+        // After the existing event, both tables in one commit order, the
+        // event ID breaking the tie, each at its own commit time.
+        evidence.sort();
+        let journal: Vec<(i64, String, String, String)> = client
+            .query(
+                "SELECT position, event_id::text, source, \
+                        to_char(journaled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+                 FROM greengateway.authority_event_journal ORDER BY position",
+                &[],
+            )
+            .await
+            .expect("the journal reads")
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        assert_eq!(journal.len(), 6);
+        assert_eq!(
+            (journal[0].0, journal[0].1.as_str(), journal[0].2.as_str()),
+            (1, jwt_event.as_str(), "jwt_revocation_evidence")
+        );
+        for (index, (committed_at, event_id, source)) in evidence.iter().enumerate() {
+            let row = &journal[index + 1];
+            assert_eq!(
+                (row.0, row.1.as_str(), row.2.as_str(), row.3.as_str()),
+                (
+                    i64::try_from(index).expect("small") + 2,
+                    event_id.as_str(),
+                    *source,
+                    *committed_at
+                )
+            );
+        }
+        let state = client
+            .query_one(
+                "SELECT last_position, retained_events, reserved_withdrawals, capacity \
+                 FROM greengateway.authority_event_state WHERE singleton",
+                &[],
+            )
+            .await
+            .expect("the state row exists");
+        assert_eq!(
+            (
+                state.get::<_, i64>(0),
+                state.get::<_, i64>(1),
+                state.get::<_, i64>(2),
+                state.get::<_, i64>(3)
+            ),
+            (6, 6, 0, 1_000_000)
+        );
+
+        // New document rows: migration 24's pairings, and nothing else. The
+        // pairing CHECK is not validated over the old rows, one of which it
+        // would refuse.
+        let next_version = std::cell::Cell::new(10_i64);
+        let new_row = |kind: &'static str, mode: &'static str, issuer: Option<&'static str>| {
+            let client = &client;
+            // A version of its own, so only the actor can refuse the row.
+            let version = next_version.get();
+            next_version.set(version + 1);
+            async move {
+                client
+                    .execute(
+                        DOCUMENT,
+                        &[
+                            &uuid::Uuid::new_v4().to_string(),
+                            &kind,
+                            &"actor",
+                            &issuer,
+                            &mode,
+                            &"policy.publish",
+                            &"policy",
+                            &version,
+                            &version,
+                            &"2026-10-02T00:00:00Z",
+                        ],
+                    )
+                    .await
+            }
+        };
+        for (kind, mode, issuer) in [
+            ("service_token", "service_token", None),
+            (
+                "principal",
+                "bearer_token",
+                Some("https://idp.example.test"),
+            ),
+            ("principal", "session_cookie", None),
+            ("principal", "client_certificate", None),
+            ("system", "system", None),
+        ] {
+            new_row(kind, mode, issuer)
+                .await
+                .unwrap_or_else(|error| panic!("{kind} {mode} {issuer:?}: {error}"));
+        }
+        for (kind, mode, issuer) in [
+            ("principal", "service_token", None),
+            (
+                "service_token",
+                "service_token",
+                Some("https://idp.example.test"),
+            ),
+            ("service_token", "bearer_token", None),
+            ("principal", "system", None),
+            ("system", "session_cookie", None),
+            ("person", "bearer_token", None),
+        ] {
+            assert!(
+                new_row(kind, mode, issuer).await.is_err(),
+                "{kind} {mode} {issuer:?}"
+            );
+        }
+        let validated: bool = client
+            .query_one(
+                "SELECT convalidated FROM pg_constraint \
+                 WHERE conname = 'document_change_evidence_actor_metadata'",
+                &[],
+            )
+            .await
+            .expect("the pairing CHECK exists")
+            .get(0);
+        assert!(!validated, "old rows stay as written");
+
+        // The source vocabulary is closed and names both tables.
+        for source in ["document_change_evidence", "catalog_change_evidence"] {
+            client
+                .execute(
+                    "INSERT INTO greengateway.authority_event_journal (position, event_id, source) \
+                     VALUES ((SELECT max(position) + 1 FROM greengateway.authority_event_journal), \
+                             gen_random_uuid(), $1)",
+                    &[&source],
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
+        }
+        assert!(client
+            .execute(
+                "INSERT INTO greengateway.authority_event_journal (position, event_id, source) \
+                 VALUES (99, gen_random_uuid(), 'security_outbox')",
+                &[],
+            )
+            .await
+            .is_err());
+        drop(client);
+        clean_database(foundation.pool()).await;
+    }
+
     /// The schema-24 ledger migration 25's prepared release leaves, as this
     /// build sees it. This build serves nothing there: validate-only startup
     /// refuses naming the missing migrations and readiness reports the schema
     /// incompatible, so a replica of it started before the migration stalls
     /// the rollout rather than serving. Its `migrate check` reports exactly
-    /// migrations 25 through 31 unapplied, and its `migrate up` applies them
+    /// migrations 25 through 32 unapplied, and its `migrate up` applies them
     /// and nothing else, recording for migration 25 exactly the checksum the
     /// prepared release approved. From then on it serves, with and without
     /// development auto-migration, and its migrator has nothing left to do.
@@ -4810,7 +5178,7 @@ mod tests {
 
         // The prepared release's schema: not served here.
         let missing = MANIFEST.len() - through_v24;
-        assert_eq!(missing, 7, "migrations 25 through 31");
+        assert_eq!(missing, 8, "migrations 25 through 32");
         let authority = PostgresReadinessAuthority::new(pool.clone());
         assert_eq!(
             read_and_validate_runtime(pool).await,
@@ -4825,7 +5193,7 @@ mod tests {
                 error,
                 PostgresFoundationError::SchemaNotReady {
                     applied: 24,
-                    missing: 7,
+                    missing: 8,
                     auto_migrate: false
                 }
             ),
@@ -4843,7 +5211,7 @@ mod tests {
             })
         );
 
-        // The migration role's `migrate up`: migrations 25 through 31 and
+        // The migration role's `migrate up`: migrations 25 through 32 and
         // nothing else, migration 25 under the approved checksum.
         assert_eq!(
             execute(&strict, false).await,
@@ -4873,7 +5241,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 31 }
+            AuthorityObservation::Writable { schema_version: 32 }
         );
         assert_eq!(
             execute(&strict, true).await,
@@ -4913,7 +5281,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 31 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 32 }
         );
         drop(client);
         clean_database(pool).await;

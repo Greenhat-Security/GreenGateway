@@ -48,6 +48,30 @@
 //! was (logout, replacement, rejection, expiry) stays in the evidence row;
 //! the closed record has no field for it.
 //!
+//! Policy, tools and stored policy test suite commits and managed catalog
+//! publications (journaled since migration 32) are delivered under their
+//! evidence's own operation codes. A document is a singleton, so its resource
+//! is referenced by the document it is: a `policy` resource on the `policy`
+//! axis, a `tools` resource on the `tools` axis, and the stored policy test
+//! suite a `policy` resource of its own on the `policy_tests` axis, as the
+//! proposed v1 event names it. The offline import's `configuration.import` is
+//! on the axis of the document it activated. A catalog is a `catalog` resource
+//! referenced by its Connection, on the `catalog` axis; the overlay revision
+//! it was compiled from stays in the evidence row. Either kind of change
+//! activates a version: `null` before it when the resource had none (a
+//! document's initialization, a Connection's first catalog of its kind), and
+//! a strictly greater one after it. Document versions are identity values,
+//! so the first is not always `1`.
+//!
+//! A document row committed before migration 32 recorded its actor in
+//! migration 23's vocabulary: kind `principal` for a service-token caller,
+//! told apart only by its `service_token` auth mode, and the issuer as the
+//! principal carried it. The record reads it in migration 24's: that pairing
+//! is delivered as kind `service_token`, and the issuer is canonicalized as
+//! authentication canonicalizes it before it is referenced, so the same
+//! principal yields the same issuer reference from every table. The stored
+//! row is not changed.
+//!
 //! A row that cannot be projected faithfully -- its evidence row is gone, its
 //! action is not one this build knows, a stored value is out of shape -- is
 //! refused with a [`ProjectionError`] and the dispatcher stops there rather
@@ -70,6 +94,8 @@ use uuid::Uuid;
 
 use super::pseudonym::{PseudonymError, PseudonymKeyring, ReferenceDomain};
 use crate::auth::change_actor::{auth_mode_agrees, ActorKind};
+#[cfg(feature = "postgres")]
+use crate::auth::principal::{canonical_issuer, AuthMethod};
 #[cfg(feature = "postgres")]
 use crate::storage::postgres_authority_events::{JournalSource, JournaledEvidence};
 
@@ -96,6 +122,43 @@ const ACTION_JWT_REVOKE: &str = "jwt.revoke";
 // Migration 19's admin session vocabulary.
 const ACTION_ADMIN_SESSION_GRANT: &str = "admin_session.grant";
 const ACTION_ADMIN_SESSION_WITHDRAW: &str = "admin_session.withdraw";
+// Migration 23's document vocabulary (widened by migration 29) and catalog
+// vocabulary, journaled since migration 32.
+const ACTION_POLICY_PUBLISH: &str = "policy.publish";
+const ACTION_POLICY_ROLLBACK: &str = "policy.rollback";
+const ACTION_POLICY_RULE_CREATE: &str = "policy.rule.create";
+const ACTION_POLICY_RULE_UPDATE: &str = "policy.rule.update";
+const ACTION_POLICY_RULE_DELETE: &str = "policy.rule.delete";
+const ACTION_POLICY_RULE_REORDER: &str = "policy.rule.reorder";
+const ACTION_POLICY_SUGGESTION_ACCEPT: &str = "policy.suggestion.accept";
+const ACTION_TOOLS_PUBLISH: &str = "tools.publish";
+const ACTION_CONFIGURATION_IMPORT: &str = "configuration.import";
+const ACTION_POLICY_TESTS_PUBLISH: &str = "policy_tests.publish";
+const ACTION_CATALOG_MCP_PUBLISH: &str = "catalog.mcp.publish";
+const ACTION_CATALOG_OPENAPI_PUBLISH: &str = "catalog.openapi.publish";
+const ACTION_CATALOG_OVERLAY_REPLACE: &str = "catalog.overlay.replace";
+const ACTION_CATALOG_OVERLAY_DELETE: &str = "catalog.overlay.delete";
+
+/// The policy document's own operations, which migration 29's CHECK pairs
+/// with resource type `policy` alone.
+const POLICY_ACTIONS: [&str; 7] = [
+    ACTION_POLICY_PUBLISH,
+    ACTION_POLICY_ROLLBACK,
+    ACTION_POLICY_RULE_CREATE,
+    ACTION_POLICY_RULE_UPDATE,
+    ACTION_POLICY_RULE_DELETE,
+    ACTION_POLICY_RULE_REORDER,
+    ACTION_POLICY_SUGGESTION_ACCEPT,
+];
+
+// The document evidence's closed `resource_type` vocabulary (migration 29).
+const DOCUMENT_POLICY: &str = "policy";
+const DOCUMENT_TOOLS: &str = "tools";
+const DOCUMENT_POLICY_TESTS: &str = "policy_tests";
+
+/// The actor kind every authenticated caller's document row recorded
+/// before migration 32, a service token's included.
+const LEGACY_DOCUMENT_PRINCIPAL_KIND: &str = "principal";
 
 /// The revision a created resource starts at: a service token's row revision
 /// after its issue and a Connection's first specification version
@@ -136,18 +199,19 @@ pub(crate) struct DeliveryRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DeliveryActor {
-    /// `principal`, `service_token` or `system`; `null` for evidence
-    /// committed before migration 24.
+    /// `principal`, `service_token` or `system`; `null` where the evidence
+    /// recorded none (before migration 24, before migration 25 for a
+    /// catalog, and for an admin session).
     pub(crate) kind: Option<String>,
     /// The recorded actor identifier's reference in the `actor.recorded`
     /// domain.
     pub(crate) recorded_ref: String,
     /// The actor's canonical issuer's reference in the `actor.issuer`
-    /// domain; `null` for an actor without one and for evidence committed
-    /// before migration 24.
+    /// domain; `null` for an actor without one and where the evidence
+    /// recorded none.
     pub(crate) issuer_ref: Option<String>,
-    /// The audit auth mode, or `system`; `null` for evidence committed
-    /// before migration 24.
+    /// The audit auth mode, or `system`; `null` where the evidence recorded
+    /// none.
     pub(crate) auth_mode: Option<String>,
 }
 
@@ -246,6 +310,12 @@ enum Transition {
     /// An admin session's withdrawal: [`SESSION_REVISION`] before, nothing
     /// after, and no shared revision.
     SessionWithdraw,
+    /// A new version of a document or catalog activated: a positive prior
+    /// version, or none when the resource had none, and a strictly greater
+    /// new one. Not pinned to [`FIRST_REVISION`]: document versions are
+    /// identity values, and the import activates its policy above the
+    /// history it copied.
+    Activate,
 }
 
 impl Transition {
@@ -256,9 +326,18 @@ impl Transition {
     }
 }
 
+/// What a row's action projects to. `resource_id` matters only to a document
+/// row, whose resource type decides its resource and axis.
 #[cfg(feature = "postgres")]
-fn action_shape(source: JournalSource, action: &str) -> Option<ActionShape> {
-    match (source, action) {
+fn action_shape(
+    source: JournalSource,
+    action: &str,
+    resource_id: &str,
+) -> Result<ActionShape, ProjectionError> {
+    if source == JournalSource::DocumentChange {
+        return document_shape(action, resource_id);
+    }
+    let shape = match (source, action) {
         (JournalSource::ConnectionChange, ACTION_CONNECTION_CREATE) => Some(ActionShape {
             resource_kind: "connection",
             domain: ReferenceDomain::Connection,
@@ -316,8 +395,56 @@ fn action_shape(source: JournalSource, action: &str) -> Option<ActionShape> {
             axis: "session",
             transition: Transition::SessionWithdraw,
         }),
+        (
+            JournalSource::CatalogChange,
+            ACTION_CATALOG_MCP_PUBLISH
+            | ACTION_CATALOG_OPENAPI_PUBLISH
+            | ACTION_CATALOG_OVERLAY_REPLACE
+            | ACTION_CATALOG_OVERLAY_DELETE,
+        ) => Some(ActionShape {
+            resource_kind: "catalog",
+            domain: ReferenceDomain::Catalog,
+            axis: "catalog",
+            transition: Transition::Activate,
+        }),
         _ => None,
+    };
+    shape.ok_or(ProjectionError::UnknownAction)
+}
+
+/// A document commit's shape. The row's resource type names the document,
+/// which decides the resource and the axis, and the action must be one
+/// migration 29's CHECK pairs with it: a policy operation with the policy,
+/// `tools.publish` with the tools document, `policy_tests.publish` with the
+/// stored suite, and the import's `configuration.import` with the policy or
+/// the tools document it activated.
+#[cfg(feature = "postgres")]
+fn document_shape(action: &str, resource_type: &str) -> Result<ActionShape, ProjectionError> {
+    let applies = match action {
+        ACTION_TOOLS_PUBLISH => resource_type == DOCUMENT_TOOLS,
+        ACTION_POLICY_TESTS_PUBLISH => resource_type == DOCUMENT_POLICY_TESTS,
+        ACTION_CONFIGURATION_IMPORT => {
+            resource_type == DOCUMENT_POLICY || resource_type == DOCUMENT_TOOLS
+        }
+        _ if POLICY_ACTIONS.contains(&action) => resource_type == DOCUMENT_POLICY,
+        _ => return Err(ProjectionError::UnknownAction),
+    };
+    let (resource_kind, domain, axis) = match resource_type {
+        DOCUMENT_POLICY => ("policy", ReferenceDomain::Policy, "policy"),
+        DOCUMENT_TOOLS => ("tools", ReferenceDomain::Tools, "tools"),
+        // Its versions are not policy versions, so it has an axis of its own.
+        DOCUMENT_POLICY_TESTS => ("policy", ReferenceDomain::Policy, "policy_tests"),
+        _ => return Err(ProjectionError::InvalidEvidence),
+    };
+    if !applies {
+        return Err(ProjectionError::InvalidEvidence);
     }
+    Ok(ActionShape {
+        resource_kind,
+        domain,
+        axis,
+        transition: Transition::Activate,
+    })
 }
 
 /// Project one journaled evidence row under `keyring`.
@@ -332,7 +459,7 @@ pub(crate) fn project(
     let resource_id = required(evidence.resource_id.as_deref())?;
     let committed_at = required(evidence.committed_at.as_deref())?;
 
-    let shape = action_shape(evidence.source, action).ok_or(ProjectionError::UnknownAction)?;
+    let shape = action_shape(evidence.source, action, resource_id)?;
     let takes_security_revision = shape.transition.takes_security_revision();
     let security_revision = match evidence.security_revision {
         Some(revision) if takes_security_revision && revision >= 1 => Some(revision),
@@ -405,6 +532,14 @@ pub(crate) fn project(
             }
             (Some(SESSION_REVISION), None)
         }
+        Transition::Activate => {
+            let new = positive(evidence.new_version)?;
+            match evidence.prior_version {
+                None => (None, Some(new)),
+                Some(prior) if prior >= 1 && prior < new => (Some(prior), Some(new)),
+                Some(_) => return Err(ProjectionError::InvalidEvidence),
+            }
+        }
     };
 
     // A JWT revocation's digest is only unique under its issuer, so the
@@ -419,13 +554,7 @@ pub(crate) fn project(
         _ => return Err(ProjectionError::MissingEvidence),
     }
     .map_err(ProjectionError::Reference)?;
-    let actor = project_actor(
-        actor,
-        evidence.actor_kind.as_deref(),
-        evidence.actor_auth_mode.as_deref(),
-        evidence.actor_issuer.as_deref(),
-        keyring,
-    )?;
+    let actor = journal_actor(evidence, actor, keyring)?;
 
     Ok(DeliveryRecord {
         schema_version: DELIVERY_SCHEMA_VERSION.to_owned(),
@@ -450,11 +579,39 @@ pub(crate) fn project(
     })
 }
 
+/// A journaled row's actor. A document row is first read in migration 24's
+/// vocabulary ([`document_actor`]), and records its actor whole (migration
+/// 23's NOT NULL columns), so one that says nothing is not one the table
+/// holds; every other row's actor is projected as stored.
+#[cfg(feature = "postgres")]
+fn journal_actor(
+    evidence: &JournaledEvidence,
+    subject: &str,
+    keyring: &PseudonymKeyring,
+) -> Result<DeliveryActor, ProjectionError> {
+    let auth_mode = evidence.actor_auth_mode.as_deref();
+    if evidence.source != JournalSource::DocumentChange {
+        return project_actor(
+            subject,
+            evidence.actor_kind.as_deref(),
+            auth_mode,
+            evidence.actor_issuer.as_deref(),
+            keyring,
+        );
+    }
+    let (kind, issuer) = document_actor(evidence);
+    if kind.is_none() && auth_mode.is_none() && issuer.is_none() {
+        return Err(ProjectionError::MissingEvidence);
+    }
+    project_actor(subject, kind, auth_mode, issuer.as_deref(), keyring)
+}
+
 /// The actor as the evidence recorded it: its recorded `subject`, and its
-/// `kind`, `auth_mode` and `issuer` as stored. A row records the last three
-/// together or not at all (migration 24's CHECK, and the standalone tables'
-/// own), in a pairing authentication produces; anything else is out of
-/// shape. An issuer is referenced, never carried.
+/// `kind`, `auth_mode` and `issuer` as stored (a journaled document row's in
+/// migration 24's vocabulary, [`journal_actor`]). A row records the last
+/// three together or not at all (migration 24's CHECK, and the standalone
+/// tables' own), in a pairing authentication produces; anything else is out
+/// of shape. An issuer is referenced, never carried.
 pub(super) fn project_actor(
     subject: &str,
     kind: Option<&str>,
@@ -498,6 +655,30 @@ pub(super) fn project_actor(
         issuer_ref,
         auth_mode,
     })
+}
+
+/// A document row's actor kind and issuer in migration 24's vocabulary. A
+/// row committed before migration 32 named a service-token caller kind
+/// `principal`, with auth mode `service_token`: that is kind `service_token`
+/// here. Its issuer is canonicalized as authentication canonicalizes a
+/// principal's (`ChangeActor::from_principal`), which leaves the canonical
+/// issuer every later row records as it is. Any other pairing passes through
+/// unchanged for [`project_actor`] to judge.
+#[cfg(feature = "postgres")]
+fn document_actor(evidence: &JournaledEvidence) -> (Option<&str>, Option<String>) {
+    let kind = match (
+        evidence.actor_kind.as_deref(),
+        evidence.actor_auth_mode.as_deref(),
+    ) {
+        (Some(LEGACY_DOCUMENT_PRINCIPAL_KIND), Some(auth_mode))
+            if auth_mode == AuthMethod::ServiceToken.audit_mode() =>
+        {
+            Some(ActorKind::ServiceToken.as_str())
+        }
+        (kind, _) => kind,
+    };
+    let issuer = evidence.actor_issuer.as_deref().and_then(canonical_issuer);
+    (kind, issuer)
 }
 
 pub(super) fn required(value: Option<&str>) -> Result<&str, ProjectionError> {

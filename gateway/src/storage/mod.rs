@@ -115,7 +115,7 @@ pub use analysis_suppressions::{AnalysisSuppressionStore, SqliteAnalysisSuppress
 pub use audit::{AuditEventStore, SqliteAuditEventStore};
 pub use change_evidence::DocumentAction;
 #[cfg(feature = "postgres")]
-pub use change_evidence::{ChangeActor, DocumentChange};
+pub use change_evidence::DocumentChange;
 pub use policy_drafts::{PolicyDraftStore, SqlitePolicyDraftStore};
 pub use policy_history::PolicyHistory;
 #[cfg(feature = "postgres")]

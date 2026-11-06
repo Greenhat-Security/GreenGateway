@@ -5441,6 +5441,23 @@ async fn catalog_evidence_survives_replacement_cascade_and_restart() {
     );
     assert_evidence_matches_outbox(&rows, &outbox_before_delete);
     assert_ne!(rows[0].operation_id, rows[1].operation_id);
+    // Each publication is journaled under its own evidence row's event ID
+    // (migration 32), in commit order between the Connection's create and
+    // delete; the refused publications journaled nothing.
+    let journal = journaled_evidence(&pool).await;
+    assert_eq!(journal.len(), 4, "{journal:?}");
+    assert_eq!(
+        journal[1..3].to_vec(),
+        rows.iter()
+            .map(|row| (row.event_id.clone(), "catalog_change_evidence".to_owned()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        [&journal[0], &journal[3]]
+            .iter()
+            .all(|(_, source)| source == "connection_change_evidence"),
+        "{journal:?}"
+    );
 
     // Identifiers, revisions and the actor only.
     let rendered = format!("{rows:?}");
