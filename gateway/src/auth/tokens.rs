@@ -458,6 +458,24 @@ impl SqliteTokenStore {
     }
 }
 
+/// The token database is its own evidence authority: its one evidence table
+/// is delivered after a cursor kept beside it (issue #425).
+impl crate::storage::standalone_authority_events::StandaloneEvidenceAuthority for SqliteTokenStore {
+    fn evidence_store(&self) -> crate::storage::StandaloneEvidenceStore {
+        crate::storage::StandaloneEvidenceStore::ServiceTokens
+    }
+
+    fn evidence_sources(
+        &self,
+    ) -> &'static [crate::storage::standalone_authority_events::StandaloneEvidenceSource] {
+        &[crate::storage::standalone_authority_events::StandaloneEvidenceSource::ServiceTokenChange]
+    }
+
+    fn evidence_connection(&self) -> MutexGuard<'_, Connection> {
+        self.connection_guard()
+    }
+}
+
 impl TokenStore for SqliteTokenStore {
     fn create(
         &self,
@@ -1014,7 +1032,12 @@ pub fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     ))?;
     connection.execute_batch(CHANGE_EVIDENCE_INDEX_SQL)?;
     add_change_evidence_actor_columns(connection)?;
-    rebuild_change_evidence_for_issue(connection)
+    rebuild_change_evidence_for_issue(connection)?;
+    // The delivery state of the evidence above (issue #425): this file's
+    // authority ID and its cursor, created empty on open like the evidence
+    // table, so an older binary simply never reads them.
+    connection
+        .execute_batch(crate::storage::standalone_authority_events::AUTHORITY_EVENT_TABLES_SQL)
 }
 
 /// Widen an evidence table created before token issue evidence existed, so it

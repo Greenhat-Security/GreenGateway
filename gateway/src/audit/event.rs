@@ -95,10 +95,10 @@ pub const CLUSTER_CONTRACT_FENCE_RAISED: &str = "cluster.contract_fence_raised";
 /// readiness for good.
 #[cfg(feature = "postgres")]
 pub const CLUSTER_CONTRACT_FENCED: &str = "cluster.contract_fenced";
-/// A cluster replica resolved the authority pseudonym keyring its delivered
-/// authority events are referenced under (issue #425): the authority ID, the
-/// current and previous key IDs and the sink kind, never key material.
-#[cfg(feature = "postgres")]
+/// A gateway resolved the authority pseudonym keyring its delivered authority
+/// events are referenced under (issue #425): the authority ID, the current
+/// and previous key IDs and the sink kind, and in standalone mode the store
+/// that is the authority, never key material.
 pub const AUTHORITY_EVENT_KEYRING_LOADED: &str = "authority_event.keyring_loaded";
 /// `AUTHORITY_EVIDENCE_DURABILITY=required` refused an authority change this
 /// deployment mode records no evidence of (issue #425, PR 4): the operation

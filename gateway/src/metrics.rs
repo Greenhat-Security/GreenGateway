@@ -492,6 +492,31 @@ pub const AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL: &str =
 pub const STANDALONE_EVIDENCE_FAILURES_TOTAL: &str =
     "greengateway_standalone_evidence_failures_total";
 
+/// Standalone authority-event delivery (issue #425): rows of one SQLite
+/// store's evidence tables above their delivery cursors, summed over the
+/// store's tables. Published by the standalone dispatcher after every pass,
+/// so the series exists only where `AUTHORITY_EVENT_SINK` is set.
+///
+/// `store` is one of `storage::STANDALONE_EVIDENCE_STORES`; nothing else is
+/// a label.
+pub const STANDALONE_AUTHORITY_EVENT_UNDELIVERED: &str =
+    "greengateway_standalone_authority_event_undelivered";
+
+/// How long the oldest evidence row of one standalone store that no sink has
+/// accepted has waited, by the gateway's clock against the row's own commit
+/// time; 0 when every row is delivered. Same label and publication as
+/// [`STANDALONE_AUTHORITY_EVENT_UNDELIVERED`].
+pub const STANDALONE_AUTHORITY_EVENT_OLDEST_UNDELIVERED_AGE_SECONDS: &str =
+    "greengateway_standalone_authority_event_oldest_undelivered_age_seconds";
+
+/// Standalone dispatcher steps that failed, by store and by the step that
+/// failed: every `kind` is a compile-time constant from
+/// [`crate::authority_events::standalone::FAILURE_KINDS`]. The cause goes to
+/// the log line, never to a label. Created by the first failure, like the
+/// cluster dispatcher's.
+pub const STANDALONE_AUTHORITY_EVENT_DELIVERY_FAILURES_TOTAL: &str =
+    "greengateway_standalone_authority_event_delivery_failures_total";
+
 /// Client-certificate outcomes, per listener.
 ///
 /// Every label value is a compile-time constant. The identity a rejected

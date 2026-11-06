@@ -19,8 +19,9 @@ use crate::auth::admin_session::{
     AdminSessionStorage, AdminSessions,
 };
 use crate::authority_events::{
+    cadence::DispatcherConfig,
     delivery::DeliveryRecord,
-    dispatcher::{DispatcherConfig, DispatcherTerm},
+    dispatcher::DispatcherTerm,
     pseudonym::{test_support::generated_keyring, ReferenceDomain},
     sink::{AuthorityEventSink, SinkError},
 };

@@ -4,12 +4,13 @@
 //! Cluster mode journals every committed evidence row in its own transaction
 //! whatever these say; they choose where the dispatcher delivers the journal,
 //! the key its safe references are derived under, how much the journal may
-//! hold, and how long delivered rows stay. Standalone mode has no journal and
-//! no dispatcher, so every delivery setting here is refused there rather than
-//! ignored.
+//! hold, and how long delivered rows stay. Standalone mode has no journal: its
+//! dispatcher delivers each SQLite store's own evidence tables, so the sink,
+//! the event file and the key aliases are read there too, and the journal's
+//! capacity and retention are refused there rather than ignored.
 //!
-//! `AUTHORITY_EVIDENCE_DURABILITY` is read in both modes. Under `required` a
-//! cluster replica must deliver what it journals, so a sink is mandatory; the
+//! `AUTHORITY_EVIDENCE_DURABILITY` is read in both modes. Under `required`
+//! either mode must deliver what it records, so a sink is mandatory; the
 //! storage stage adds the rule that needs the admin session store, and the
 //! changes refused at runtime are `authority_events::required`'s.
 //!
@@ -18,7 +19,7 @@
 //! the block once the backend is parsed, into the same findings as its own
 //! rules: everything found here is reported before them, which is where the
 //! legacy parser reported it. Nothing here opens the event file or resolves
-//! a pseudonym key alias; the cluster wiring does both at startup.
+//! a pseudonym key alias; each mode's delivery startup does both.
 
 use std::{env::VarError, fmt, str::FromStr, time::Duration};
 
@@ -57,8 +58,8 @@ pub const MAX_AUTHORITY_EVENT_RETENTION_HOURS: u64 = 87_600;
 /// changes is nothing durable. `Required` refuses every change the evidence
 /// inventory says this deployment mode cannot record in the change's own
 /// transaction -- at startup when the configuration itself enables it, and
-/// otherwise when it is asked for -- and refuses a cluster replica that would
-/// journal evidence without delivering it.
+/// otherwise when it is asked for -- and refuses a gateway that would record
+/// evidence without delivering it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AuthorityEvidenceDurability {
     #[default]
@@ -91,7 +92,8 @@ impl FromStr for AuthorityEvidenceDurability {
 /// Where delivered authority events go.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum AuthorityEventSinkSetting {
-    /// No dispatcher runs. Events are still journaled and retained.
+    /// No dispatcher runs. Cluster mode still journals and retains events;
+    /// standalone evidence stays in its stores.
     #[default]
     None,
     /// One structured log line per event.
@@ -111,8 +113,8 @@ impl AuthorityEventSinkSetting {
     }
 }
 
-/// The validated settings. Defaults are standalone mode's: nothing to
-/// deliver, and no change refused for its evidence.
+/// The validated settings. The defaults deliver nothing and refuse no change
+/// for its evidence, in either mode.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorityEventSettings {
     /// Whether a change this deployment cannot evidence is refused.
@@ -264,11 +266,9 @@ pub(super) fn compile(
             problems,
         )
     });
-    // Set means set to anything but whitespace. A value that is not Unicode
-    // is refused as a value, and is not also reported as material the
-    // backend never reads.
+    // Blank is unset. A value that is not Unicode is refused as a value, and
+    // is not also reported as material nothing reads.
     let sink_raw = blank_as_unset(inputs.sink.value());
-    let sink_set = sink_raw.is_ok();
     let sink_kind = findings.input(AUTHORITY_EVENT_SINK, |problems| {
         parse_var(
             AUTHORITY_EVENT_SINK,
@@ -350,97 +350,102 @@ pub(super) fn compile(
         }
     }
 
-    match state_backend {
-        StateBackend::Sqlite => {
+    // Standalone mode has no journal: what bounds and prunes one is refused
+    // there rather than ignored. Every other setting below is read in both
+    // modes, because both deliver.
+    if state_backend == StateBackend::Sqlite {
+        for (name, set) in [
+            (AUTHORITY_EVENT_JOURNAL_CAPACITY, capacity_set),
+            (AUTHORITY_EVENT_RETENTION_HOURS, retention_set),
+        ] {
+            if set {
+                findings.refuse(
+                    after,
+                    ConfigRule::ClusterSettingInStandaloneMode,
+                    format!(
+                        "{name} is set while {STATE_BACKEND} is sqlite; standalone mode has no authority-event journal and never reads it"
+                    ),
+                );
+            }
+        }
+    }
+    match sink_kind {
+        SinkKind::None => {
             for (name, set) in [
-                (AUTHORITY_EVENT_SINK, sink_set),
                 (AUTHORITY_EVENT_FILE, file.is_some()),
                 (AUTHORITY_PSEUDONYM_KEY_ALIAS, key.is_some()),
                 (AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS, previous.is_some()),
-                (AUTHORITY_EVENT_JOURNAL_CAPACITY, capacity_set),
-                (AUTHORITY_EVENT_RETENTION_HOURS, retention_set),
             ] {
                 if set {
                     findings.refuse(
                         after,
-                        ConfigRule::ClusterSettingInStandaloneMode,
+                        ConfigRule::AuthorityEventMaterialUnused,
                         format!(
-                            "{name} is set while {STATE_BACKEND} is sqlite; standalone mode has no authority-event journal or dispatcher and never reads it"
+                            "{name} is set while {AUTHORITY_EVENT_SINK} is none; no dispatcher runs and nothing reads it"
                         ),
                     );
                 }
             }
         }
-        StateBackend::Postgres => {
-            match sink_kind {
-                SinkKind::None => {
-                    for (name, set) in [
-                        (AUTHORITY_EVENT_FILE, file.is_some()),
-                        (AUTHORITY_PSEUDONYM_KEY_ALIAS, key.is_some()),
-                        (AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS, previous.is_some()),
-                    ] {
-                        if set {
-                            findings.refuse(
-                                after,
-                                ConfigRule::AuthorityEventMaterialUnused,
-                                format!(
-                                    "{name} is set while {AUTHORITY_EVENT_SINK} is none; no dispatcher runs and nothing reads it"
-                                ),
-                            );
-                        }
-                    }
-                }
-                SinkKind::Log | SinkKind::File => {
-                    if key.is_none() {
-                        findings.refuse(
-                            after,
-                            ConfigRule::AuthorityEventSinkRequirements,
-                            format!(
-                                "{AUTHORITY_PSEUDONYM_KEY_ALIAS} is required when {AUTHORITY_EVENT_SINK} is set; delivered events name every actor and resource by a reference keyed under it, and there is no unkeyed mode"
-                            ),
-                        );
-                    }
-                }
-            }
-            if sink_kind == SinkKind::File && file.is_none() {
+        SinkKind::Log | SinkKind::File => {
+            if key.is_none() {
                 findings.refuse(
                     after,
                     ConfigRule::AuthorityEventSinkRequirements,
-                    format!("{AUTHORITY_EVENT_FILE} is required when {AUTHORITY_EVENT_SINK}=file"),
-                );
-            }
-            if sink_kind == SinkKind::Log && file.is_some() {
-                findings.refuse(
-                    after,
-                    ConfigRule::AuthorityEventMaterialUnused,
                     format!(
-                        "{AUTHORITY_EVENT_FILE} is set while {AUTHORITY_EVENT_SINK}=log; only the file sink writes a file"
-                    ),
-                );
-            }
-            if key.is_some() && key == previous {
-                findings.refuse(
-                    after,
-                    ConfigRule::AuthorityPseudonymKeysDistinct,
-                    format!(
-                        "{AUTHORITY_PSEUDONYM_KEY_ALIAS} and {AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS} must name different aliases"
-                    ),
-                );
-            }
-            // Every change this replica journals is evidence the deployment
-            // undertook to deliver. With no sink no dispatcher runs and the
-            // journal only retains it. A configured sink's own requirements
-            // are the rules above.
-            if durability == AuthorityEvidenceDurability::Required && sink_kind == SinkKind::None {
-                findings.refuse(
-                    after,
-                    ConfigRule::AuthorityEvidenceDeliveryRequired,
-                    format!(
-                        "{AUTHORITY_EVIDENCE_DURABILITY}=required needs {AUTHORITY_EVENT_SINK}=log or file when {STATE_BACKEND}=postgres; with none, the authority evidence this replica journals is retained but never delivered"
+                        "{AUTHORITY_PSEUDONYM_KEY_ALIAS} is required when {AUTHORITY_EVENT_SINK} is set; delivered events name every actor and resource by a reference keyed under it, and there is no unkeyed mode"
                     ),
                 );
             }
         }
+    }
+    if sink_kind == SinkKind::File && file.is_none() {
+        findings.refuse(
+            after,
+            ConfigRule::AuthorityEventSinkRequirements,
+            format!("{AUTHORITY_EVENT_FILE} is required when {AUTHORITY_EVENT_SINK}=file"),
+        );
+    }
+    if sink_kind == SinkKind::Log && file.is_some() {
+        findings.refuse(
+            after,
+            ConfigRule::AuthorityEventMaterialUnused,
+            format!(
+                "{AUTHORITY_EVENT_FILE} is set while {AUTHORITY_EVENT_SINK}=log; only the file sink writes a file"
+            ),
+        );
+    }
+    if key.is_some() && key == previous {
+        findings.refuse(
+            after,
+            ConfigRule::AuthorityPseudonymKeysDistinct,
+            format!(
+                "{AUTHORITY_PSEUDONYM_KEY_ALIAS} and {AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS} must name different aliases"
+            ),
+        );
+    }
+    // Every change either mode records is evidence the deployment undertook
+    // to deliver. With no sink no dispatcher runs: a cluster journal only
+    // retains it, and a standalone store's evidence stays in its file. A
+    // configured sink's own requirements are the rules above.
+    if durability == AuthorityEvidenceDurability::Required && sink_kind == SinkKind::None {
+        let (backend, undelivered) = match state_backend {
+            StateBackend::Postgres => (
+                "postgres",
+                "the authority evidence this replica journals is retained but never delivered",
+            ),
+            StateBackend::Sqlite => (
+                "sqlite",
+                "the authority evidence the standalone stores record is never delivered",
+            ),
+        };
+        findings.refuse(
+            after,
+            ConfigRule::AuthorityEvidenceDeliveryRequired,
+            format!(
+                "{AUTHORITY_EVIDENCE_DURABILITY}=required needs {AUTHORITY_EVENT_SINK}=log or file when {STATE_BACKEND}={backend}; with none, {undelivered}"
+            ),
+        );
     }
 
     let sink = match sink_kind {

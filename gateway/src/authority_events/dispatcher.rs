@@ -69,6 +69,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
+    cadence::{retry_backoff, sleep_or_stop, DispatcherConfig},
     delivery::{project, DeliveryRecord, ProjectionError},
     pseudonym::PseudonymKeyring,
     sink::{AuthorityEventSink, SinkError},
@@ -125,13 +126,6 @@ pub(crate) const FAILURE_KINDS: [&str; 7] = [
     FAILURE_FENCED,
 ];
 
-/// Defaults for the cadence. These are not settings: they bound load on the
-/// authority, not anything an operator's sink needs to tune.
-pub(crate) const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
-pub(crate) const DEFAULT_BATCH_SIZE: usize = 100;
-pub(crate) const DEFAULT_RETRY_BASE: Duration = Duration::from_millis(500);
-pub(crate) const DEFAULT_RETRY_CAP: Duration = Duration::from_secs(60);
-
 /// Count one dispatcher failure by the step that failed.
 pub(crate) fn record_failure(kind: &'static str) {
     ::metrics::counter!(crate::metrics::AUTHORITY_EVENT_DELIVERY_FAILURES_TOTAL, "kind" => kind)
@@ -152,42 +146,6 @@ pub(crate) fn record_journal_stats(stats: &JournalStats) {
     ::metrics::gauge!(crate::metrics::AUTHORITY_EVENT_UNDELIVERED).set(stats.undelivered() as f64);
     ::metrics::gauge!(crate::metrics::AUTHORITY_EVENT_OLDEST_UNDELIVERED_AGE_SECONDS)
         .set(stats.oldest_undelivered_age_secs.unwrap_or(0.0).max(0.0));
-}
-
-/// How the dispatcher runs.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct DispatcherConfig {
-    /// The wait when the journal has nothing after the cursor.
-    pub(crate) poll_interval: Duration,
-    /// Journal rows per batch, at most [`MAX_READ_BATCH`].
-    pub(crate) batch_size: usize,
-    /// The first retry wait after a failure; it doubles per consecutive
-    /// failure up to `retry_cap`.
-    pub(crate) retry_base: Duration,
-    pub(crate) retry_cap: Duration,
-}
-
-impl Default for DispatcherConfig {
-    fn default() -> Self {
-        Self {
-            poll_interval: DEFAULT_POLL_INTERVAL,
-            batch_size: DEFAULT_BATCH_SIZE,
-            retry_base: DEFAULT_RETRY_BASE,
-            retry_cap: DEFAULT_RETRY_CAP,
-        }
-    }
-}
-
-/// The wait before retry number `failures` (1 for the first): `base`
-/// doubled per earlier failure, capped, plus up to a quarter more of jitter
-/// so a fleet of dispatchers recovering from one outage does not retry in
-/// lockstep. Never below one millisecond.
-pub(crate) fn retry_backoff(base: Duration, cap: Duration, failures: u32) -> Duration {
-    let exponent = failures.saturating_sub(1).min(20);
-    let doubled = base.saturating_mul(1_u32 << exponent);
-    let capped = doubled.min(cap).max(Duration::from_millis(1));
-    let jitter_steps = std::collections::hash_map::RandomState::new().hash_one(failures) % 256;
-    capped + capped.mul_f64(jitter_steps as f64 / 1024.0)
 }
 
 /// What one [`DispatcherTerm::step`] did.
@@ -673,13 +631,6 @@ async fn release_lease(
 fn contention_backoff(poll: Duration) -> Duration {
     let jitter_steps = std::collections::hash_map::RandomState::new().hash_one(0_u8) % 16;
     poll * 4 + poll.mul_f64(jitter_steps as f64 / 16.0)
-}
-
-async fn sleep_or_stop(stop: &CancellationToken, duration: Duration) {
-    tokio::select! {
-        () = stop.cancelled() => {}
-        () = tokio::time::sleep(duration) => {}
-    }
 }
 
 #[cfg(test)]

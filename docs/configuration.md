@@ -604,7 +604,7 @@ Format and validation: unset, empty, or whitespace-only values become `None`. No
 
 The store contains connection metadata, opaque credential-binding IDs, dependency records, monotonic revisions, bounded safe status history, and—only when the encrypted local provider is enabled—authenticated ciphertext envelopes. It does not store resolved plaintext, master keys, OAuth access tokens, or unencrypted private-key material. Connection changes use transactions and canonical ETags; dependent records prevent deletion rather than being silently cascaded. A status observation is accepted only for the exact connection ETag it tested, and reconfiguration invalidates the prior current observation. With managed storage configured, the combined managed and projected connection count is capped at `256`; credential-binding and encrypted-local-secret rows are each capped at `512`; dependency rows are capped at `4096`; and current plus historical safe-status rows are capped at `4096`. Every persisted bound is revalidated before startup.
 
-Every committed Connection create, replace, and delete, and every committed encrypted-local-secret create, rotate, delete, and non-empty re-encryption batch, also writes one append-only change-evidence row in the same SQLite transaction (issue #425, connection-schema migration 12): `connection_change_evidence` or `connection_local_secret_change_evidence`. A row holds the acting principal -- its subject, actor kind (`principal` or `service_token`), auth mode and, when it has one, canonical issuer; the maintenance command records `operator:connection-secrets-reencrypt` as a `system` actor with no issuer -- the action (`connection.create`, `connection.replace`, `credential.binding_change`, `connection.delete`, `secret.create`, `secret.rotate`, `secret.delete`, or `secret.reencrypt`), generated event and operation IDs, the Connection ID or local-secret ID, the revision before and after on the action's axis, and the change's commit time; a replacement that changes credential authority adds a `credential.binding_change` row under the same operation ID, and a re-encryption batch records only how many envelopes it rewrote. Rows hold no specification, endpoint, label, purpose, binding, bound secret ID, secret material, ciphertext, nonce, or key ID, have no foreign key so they survive the deletion they record, and are never pruned. A change whose evidence cannot be written fails and changes nothing (the admin API answers `503`); refused and identical changes write nothing, and an actor the evidence cannot record exactly is refused before anything is written. The rows are not delivered anywhere and `import-standalone` does not carry them; see [Standalone evidence](authority-evidence.md#standalone-evidence) for what they do not provide. A gateway built before migration 12 refuses to open a migrated database, so keep the pre-upgrade backup if a rollback may be needed.
+Every committed Connection create, replace, and delete, and every committed encrypted-local-secret create, rotate, delete, and non-empty re-encryption batch, also writes one append-only change-evidence row in the same SQLite transaction (issue #425, connection-schema migration 12): `connection_change_evidence` or `connection_local_secret_change_evidence`. A row holds the acting principal -- its subject, actor kind (`principal` or `service_token`), auth mode and, when it has one, canonical issuer; the maintenance command records `operator:connection-secrets-reencrypt` as a `system` actor with no issuer -- the action (`connection.create`, `connection.replace`, `credential.binding_change`, `connection.delete`, `secret.create`, `secret.rotate`, `secret.delete`, or `secret.reencrypt`), generated event and operation IDs, the Connection ID or local-secret ID, the revision before and after on the action's axis, and the change's commit time; a replacement that changes credential authority adds a `credential.binding_change` row under the same operation ID, and a re-encryption batch records only how many envelopes it rewrote. Rows hold no specification, endpoint, label, purpose, binding, bound secret ID, secret material, ciphertext, nonce, or key ID, have no foreign key so they survive the deletion they record, and are never pruned. A change whose evidence cannot be written fails and changes nothing (the admin API answers `503`); refused and identical changes write nothing, and an actor the evidence cannot record exactly is refused before anything is written. With `AUTHORITY_EVENT_SINK` set they are delivered after a cursor kept in the same database ([Standalone delivery](authority-evidence.md#standalone-delivery)); `import-standalone` does not carry them; see [Standalone evidence](authority-evidence.md#standalone-evidence) for what they do not provide. A gateway built before migration 12 refuses to open a migrated database, so keep the pre-upgrade backup if a rollback may be needed.
 
 Every committed managed catalog publication -- an MCP refresh, an OpenAPI registration or refresh, and an overlay put or delete -- likewise writes one append-only `catalog_change_evidence` row in its own SQLite transaction (connection-schema migration 13): the publishing principal (subject, actor kind, auth mode and, when it has one, canonical issuer), the action (`catalog.mcp.publish`, `catalog.openapi.publish`, `catalog.overlay.replace`, or `catalog.overlay.delete`, named by what the write did to the overlay), generated event and operation IDs, the Connection ID, the catalog revision before and after, the overlay revision the catalog was compiled from, and the publication's commit time. Rows hold no specification, digest, tool or resource name, definition, overlay document, source report, or enum value, have no foreign key, and are never pruned. A publication whose evidence cannot be written fails and changes nothing (`503`); a stale or refused publication, an enum-value refresh and a status observation write nothing. A gateway built before migration 13 refuses to open a database migrated with it.
 
@@ -2517,7 +2517,7 @@ Format and validation: must parse as a boolean. Honoured in both modes -- unlike
 
 ### AUTHORITY_EVIDENCE_DURABILITY
 
-Whether the gateway refuses an authority change it cannot evidence instead of performing it (issue #425, PR 4; see [Required-durability mode](authority-evidence.md#required-durability-mode)). Unlike the other `AUTHORITY_*` settings it is read in both modes.
+Whether the gateway refuses an authority change it cannot evidence instead of performing it (issue #425, PR 4; see [Required-durability mode](authority-evidence.md#required-durability-mode)). It is read in both modes, like the sink and key settings below; only the journal's capacity and retention are cluster-only.
 
 Default: `best_effort`
 
@@ -2525,7 +2525,7 @@ Format and validation: must be exactly `required` or `best_effort`. A blank valu
 
 - `best_effort` performs every change the configuration enables and keeps whatever evidence its store records. For several standalone changes that is nothing durable: the [inventory](authority-evidence-inventory.json) lists each one.
 - `required` refuses every change the inventory's `required_mode` marks `refused` or `refused_at_startup` in this deployment mode, and every change the mode cannot perform at all:
-  - Startup fails when `STATE_BACKEND=postgres` and `AUTHORITY_EVENT_SINK` is `none` (journaled evidence would be retained but never delivered), and when `ADMIN_SESSION_MODE=standalone_memory` (process-local sessions leave no record of who was granted or withdrawn one). Both are reported as configuration problems with their own rule (`AuthorityEvidenceDeliveryRequired`, `AuthorityEvidenceUnsupportedConfiguration`) and name this setting.
+  - Startup fails when `AUTHORITY_EVENT_SINK` is `none`, in either mode (cluster evidence would be journaled and retained but never delivered; standalone evidence would stay in its SQLite stores, never delivered), and when `ADMIN_SESSION_MODE=standalone_memory` (process-local sessions leave no record of who was granted or withdrawn one). Both are reported as configuration problems with their own rule (`AuthorityEvidenceDeliveryRequired`, `AuthorityEvidenceUnsupportedConfiguration`) and name this setting. A standalone gateway that ran `required` without a sink before this release must set `AUTHORITY_EVENT_SINK` and `AUTHORITY_PSEUDONYM_KEY_ALIAS` to keep starting.
   - In standalone mode the admin API answers `409 {"error":"...","reason":"authority_evidence_unsupported","operation":"<code>"}` to every policy mutation (`PUT` and rollback, rule create, update, delete and reorder, draft publication and suggestion acceptance) and OpenAPI tools registration. The caller is authorized first; nothing is written. Connection create, replace and delete, local-secret create, rotate and delete, `connection-secrets reencrypt`, managed catalog refresh, OpenAPI catalog registration and overlay writes and removals, and service-token issue, rotation and revocation are admitted: the Connections and token databases record each of them in the change's own transaction.
   - In standalone mode a watched or `SIGHUP` reload of `POLICY_FILE` or `TOOLS_FILE` is refused and the active policy or registry stays as it is; a restart activates the file.
   - Each refusal is logged and audited as `authority_evidence.operation_refused` with `operation`, `deployment_mode`, `trigger` (`admin_api`, `file_watch` or `signal`) and `reason`; an admin API refusal also names its request and caller.
@@ -2536,13 +2536,15 @@ The setting reads configuration only and waits on nothing: no admin change and n
 
 Where the authority-event dispatcher delivers committed authority evidence (issue #425, PR 3; see [Durable delivery](authority-evidence.md#durable-delivery)). In cluster mode every committed Connection create, replace (with its credential binding change, when it has one) and delete, service-token issue, rotate or revoke, effective JWT revoke, admin session grant and withdrawal, and (since migration 32) policy, tools and stored policy test suite commit and managed catalog publication is journaled in `greengateway.authority_event_journal` in its own transaction, whatever this setting says. With a sink configured, one replica at a time -- whichever holds the `authority-event-dispatcher` execution lease -- reads the journal after its durable cursor in batches of at most 100, projects each row into an `authority_event_delivery.v1` record ([schema](schemas/authority_event_delivery.v1.schema.json)) whose actor and resource are keyed safe references, hands the batch to the sink, and advances the cursor only after the sink accepted it. Only a replica the cluster membership has admitted contends for that lease: a replica held at the fingerprint door (`config_fingerprint_mismatch`) or excluded by the durable contract fence (`contract_fenced`) proves its sink and key at startup like any other, then logs that delivery is held and leaves the lease and the cursor alone until it is admitted. Delivery is at least once: a crash between acceptance and the cursor advance delivers the batch again with the same `event_id`s, so a consumer deduplicates on `(authority_id, event_id)`. A failing sink is retried with exponential backoff from 0.5 s to 60 s; nothing is skipped.
 
-- `none`: no dispatcher runs. Events are still journaled and still count against `AUTHORITY_EVENT_JOURNAL_CAPACITY`. `AUTHORITY_EVIDENCE_DURABILITY=required` refuses to start with it.
+Standalone mode has no journal. With a sink configured, one task delivers the evidence tables of every SQLite store that owns an authority -- the token database (`SERVICE_TOKEN_SQLITE_PATH`: service-token issue, rotate and revoke) and the Connections database (`CONNECTIONS_SQLITE_PATH`: Connection create, replace, credential binding change and delete, local-secret changes and re-encryption batches, managed catalog and overlay publication). Each store is its own evidence authority, with its own persisted `authority_id`, and each of its evidence tables is delivered after its own cursor kept in the same file: at most 100 rows after the cursor, projected into the same `authority_event_delivery.v1` records, handed to the sink, and only then the cursor advanced in an IMMEDIATE transaction. The guarantees are the cluster's: at least once, the same backoff, nothing skipped, and a row that cannot be projected stalls its table there ([Standalone delivery](authority-evidence.md#standalone-delivery)).
+
+- `none`: no dispatcher runs. In cluster mode events are still journaled and still count against `AUTHORITY_EVENT_JOURNAL_CAPACITY`; in standalone mode the evidence stays in its stores. `AUTHORITY_EVIDENCE_DURABILITY=required` refuses to start with it in either mode.
 - `log`: one structured `INFO` line per event under the tracing target `greengateway::authority_event`, the record's JSON in the `authority_event` field. Accepted means handed to the process's log writer; it is a reference sink for wiring a log pipeline, not a durable store.
 - `file`: JSON lines appended to `AUTHORITY_EVENT_FILE`, with `fsync` before a batch counts as delivered.
 
 Default: `none`
 
-Format and validation: exactly `none`, `log` or `file`. A sink other than `none` requires `AUTHORITY_PSEUDONYM_KEY_ALIAS`. Cluster mode only: rejected when `STATE_BACKEND=sqlite`, which has no journal and no dispatcher. Every replica of a deployment must agree on it: the sink kind is part of the static-configuration fingerprint.
+Format and validation: exactly `none`, `log` or `file`. A sink other than `none` requires `AUTHORITY_PSEUDONYM_KEY_ALIAS`. Read in both modes. In cluster mode every replica of a deployment must agree on it: the sink kind is part of the static-configuration fingerprint.
 
 ### AUTHORITY_EVENT_FILE
 
@@ -2552,7 +2554,7 @@ The path is deliberately not part of the static-configuration fingerprint, becau
 
 Default: (empty)
 
-Format and validation: a non-empty path. Required when `AUTHORITY_EVENT_SINK=file` and rejected otherwise. Cluster mode only.
+Format and validation: a non-empty path. Required when `AUTHORITY_EVENT_SINK=file` and rejected otherwise. Read in both modes; a standalone gateway is the only writer, so its file needs no shared storage.
 
 ### AUTHORITY_PSEUDONYM_KEY_ALIAS
 
@@ -2560,7 +2562,7 @@ The secret alias of the current authority pseudonym key, the key every delivered
 
 Default: (empty)
 
-Format and validation: a secret alias ID of 1 to 128 ASCII letters, digits, `.`, `_` or `-`, starting with a letter or digit. Required when `AUTHORITY_EVENT_SINK` is `log` or `file`, rejected when it is `none`. Cluster mode only. The alias is part of the static-configuration fingerprint, so replicas naming different aliases are held at the fingerprint door. The gateway does not compare the key material behind one alias across replicas: every replica must resolve it to the same key, since two keys would give one identity two unrelated references. Each replica logs and audits the key ID it loaded, so a mismatch is visible as two key IDs for one authority ID.
+Format and validation: a secret alias ID of 1 to 128 ASCII letters, digits, `.`, `_` or `-`, starting with a letter or digit. Required when `AUTHORITY_EVENT_SINK` is `log` or `file`, rejected when it is `none`. Read in both modes: a standalone gateway resolves it once per store that owns evidence, under that store's own authority ID, and audits each load with the store's name. In cluster mode the alias is part of the static-configuration fingerprint, so replicas naming different aliases are held at the fingerprint door. The gateway does not compare the key material behind one alias across replicas: every replica must resolve it to the same key, since two keys would give one identity two unrelated references. Each replica logs and audits the key ID it loaded, so a mismatch is visible as two key IDs for one authority ID.
 
 ### AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS
 
@@ -2568,7 +2570,7 @@ The secret alias of the previous pseudonym key while a rotation's dual-key windo
 
 Default: (empty)
 
-Format and validation: as `AUTHORITY_PSEUDONYM_KEY_ALIAS`; must name a different alias, and the two must resolve to different keys. Rejected when `AUTHORITY_EVENT_SINK` is `none`. Cluster mode only.
+Format and validation: as `AUTHORITY_PSEUDONYM_KEY_ALIAS`; must name a different alias, and the two must resolve to different keys. Rejected when `AUTHORITY_EVENT_SINK` is `none`. Read in both modes.
 
 ### AUTHORITY_EVENT_JOURNAL_CAPACITY
 
@@ -2576,7 +2578,7 @@ The most units of capacity the journal may have in use: one for every event it r
 
 Default: `1000000`
 
-Format and validation: an integer between `1` and `1000000000`. A value below the number already retained admits nothing until retention frees room. Cluster mode only; part of the static-configuration fingerprint.
+Format and validation: an integer between `1` and `1000000000`. A value below the number already retained admits nothing until retention frees room. Cluster mode only (rejected when `STATE_BACKEND=sqlite`, which has no journal: standalone evidence has no capacity bound); part of the static-configuration fingerprint.
 
 ### AUTHORITY_EVENT_RETENTION_HOURS
 
@@ -2584,7 +2586,7 @@ How long, in hours, a delivered authority event stays in the journal. The mainte
 
 Default: `168`
 
-Format and validation: an integer hour count of at most `87600`. Cluster mode only; part of the static-configuration fingerprint.
+Format and validation: an integer hour count of at most `87600`. Cluster mode only (rejected when `STATE_BACKEND=sqlite`: standalone evidence is never pruned); part of the static-configuration fingerprint.
 
 ## Production Deployment And Migration
 

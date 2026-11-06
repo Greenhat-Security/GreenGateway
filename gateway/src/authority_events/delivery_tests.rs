@@ -2,6 +2,7 @@ use serde_json::Value;
 
 use super::*;
 use crate::authority_events::pseudonym::{test_support::generated_keyring, ReferenceCheck};
+use crate::authority_events::standalone_delivery::{StandaloneShape, STANDALONE_SHAPES};
 
 // Synthetic markers standing in for real identifiers. If any of them reaches
 // a serialized record, the projection leaked an identifier.
@@ -219,16 +220,21 @@ fn the_schema_enumerates_exactly_the_delivered_operations() {
         .iter()
         .map(|value| value.as_str().expect("operations are strings"))
         .collect();
+    // What either mode delivers: the journal's operations and the
+    // standalone stores' (`super::super::standalone_delivery`).
     let shapes = every_delivered_shape();
     let mut delivered: Vec<&str> = shapes
         .iter()
         .map(|evidence| evidence.action.as_deref().expect("fixture has an action"))
+        .chain(STANDALONE_SHAPES.iter().map(|shape| shape.action))
         .collect();
     delivered.sort_unstable();
-    // The import activates either document under one operation code.
+    // The import activates either document under one operation code, and
+    // both modes deliver the catalog publications.
     delivered.dedup();
     assert_eq!(operations, delivered);
-    // Every resource kind and axis the projection names, and nothing else.
+    // Every resource kind and axis either mode's projection names, and
+    // nothing else.
     let keyring = generated_keyring(Uuid::new_v4());
     let enumerated = |path: [&str; 2]| -> Vec<String> {
         let mut values: Vec<String> = schema["properties"][path[0]]["properties"][path[1]]["enum"]
@@ -244,10 +250,17 @@ fn the_schema_enumerates_exactly_the_delivered_operations() {
         .iter()
         .map(|evidence| project(evidence, &keyring).expect("well-formed evidence projects"))
         .collect();
-    let projected = |field: fn(&DeliveryRecord) -> &str| -> Vec<String> {
+    let projected = |field: fn(&DeliveryRecord) -> &str,
+                     standalone: fn(&StandaloneShape) -> &'static str|
+     -> Vec<String> {
         let mut values: Vec<String> = records
             .iter()
             .map(|record| field(record).to_owned())
+            .chain(
+                STANDALONE_SHAPES
+                    .iter()
+                    .map(|shape| standalone(shape).to_owned()),
+            )
             .collect();
         values.sort_unstable();
         values.dedup();
@@ -255,11 +268,14 @@ fn the_schema_enumerates_exactly_the_delivered_operations() {
     };
     assert_eq!(
         enumerated(["resource", "kind"]),
-        projected(|record| record.resource.kind.as_str())
+        projected(
+            |record| record.resource.kind.as_str(),
+            |shape| shape.resource_kind
+        )
     );
     assert_eq!(
         enumerated(["revision", "axis"]),
-        projected(|record| record.revision.axis.as_str())
+        projected(|record| record.revision.axis.as_str(), |shape| shape.axis)
     );
     // A schema the record does not satisfy is not a closed contract.
     assert_eq!(schema["additionalProperties"], Value::Bool(false));

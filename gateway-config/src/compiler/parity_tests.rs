@@ -1401,8 +1401,9 @@ fn authority_event_problems_come_after_the_database_and_before_the_mode_rules() 
         )]
     );
 
-    // Standalone mode: a value's own refusal, then each setting nothing
-    // reads, then the other cluster material.
+    // Standalone mode: a value's own refusal, then the journal setting
+    // nothing reads, then the other cluster material. The sink is read in
+    // standalone mode too, so it is refused only as a value.
     let error = refused(&[
         ("CLUSTER_HEARTBEAT_MS", "5000"),
         ("DEPLOYMENT_ID", "deploy-prod-eu"),
@@ -1413,8 +1414,7 @@ fn authority_event_problems_come_after_the_database_and_before_the_mode_rules() 
         error.problems,
         [
             "AUTHORITY_EVENT_SINK must be a valid authority event sink, got 'syslog': expected one of none, log, file",
-            "AUTHORITY_EVENT_SINK is set while STATE_BACKEND is sqlite; standalone mode has no authority-event journal or dispatcher and never reads it",
-            "AUTHORITY_EVENT_JOURNAL_CAPACITY is set while STATE_BACKEND is sqlite; standalone mode has no authority-event journal or dispatcher and never reads it",
+            "AUTHORITY_EVENT_JOURNAL_CAPACITY is set while STATE_BACKEND is sqlite; standalone mode has no authority-event journal and never reads it",
             "CLUSTER_HEARTBEAT_MS is set while STATE_BACKEND is sqlite; standalone mode has no cluster membership and never reads it",
             "DEPLOYMENT_ID is set while STATE_BACKEND is sqlite; a deployment ID scopes a cluster-mode deployment and standalone mode never reads it \u{2014} set STATE_BACKEND=postgres or unset DEPLOYMENT_ID",
         ]
@@ -1428,7 +1428,6 @@ fn authority_event_problems_come_after_the_database_and_before_the_mode_rules() 
         rules,
         [
             ConfigRule::Value,
-            ConfigRule::ClusterSettingInStandaloneMode,
             ConfigRule::ClusterSettingInStandaloneMode,
             ConfigRule::ClusterSettingInStandaloneMode,
             ConfigRule::ClusterSettingInStandaloneMode,
