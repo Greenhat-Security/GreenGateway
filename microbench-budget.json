@@ -5,10 +5,12 @@
     "f0c6abba555cb81e8cc419f39473895eeefb3ad558537f95659dfcdfcf22285e"
   ],
   "kernel_harness_sha256": [
-    "0afee7ba79d7531eb2c7fbccef0e99605eeb09b8329973debf957b864569120c"
+    "0afee7ba79d7531eb2c7fbccef0e99605eeb09b8329973debf957b864569120c",
+    "401efb5d98bf795fda9676e291f1eb513c4a38bd6d1daf0beebac2cc17562ae1"
   ],
   "lane_harness_sha256": [
-    "c6bceb2b37eef9ebffa02baa24db09ab09a9c9b28c08ff7f4b69ebb7c02d364c"
+    "c6bceb2b37eef9ebffa02baa24db09ab09a9c9b28c08ff7f4b69ebb7c02d364c",
+    "68b1deb1e8b993c83c0ed32030f543300016eb67bcf20f9a8b1d7b4820e367d0"
   ],
   "targets": [
     {
