@@ -102,6 +102,8 @@ fn principal(subject: &str, auth_method: AuthMethod, roles: &[&str]) -> Principa
         roles: roles.iter().map(|role| (*role).to_owned()).collect(),
         session_id: "session-1".to_owned(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 
@@ -684,6 +686,8 @@ async fn replayed_tool_admissions_are_the_live_runtime_decisions() {
                         caller: None,
                         source: ToolInvocationSource::Mcp,
                         admitted_deadline: None,
+                        scopes: None,
+                        verified_claims: Vec::new(),
                     },
                     CancellationToken::new(),
                     || async {},

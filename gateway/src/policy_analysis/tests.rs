@@ -52,8 +52,8 @@ use crate::{
         matcher::path_pattern_matches,
         policy_document::parse_v1,
         policy_resources::{
-            AdminSurface, ConnectionInventory, PolicyResourceSnapshot, PolicyResourceView,
-            ToolInventory,
+            AdminSurface, ClaimAllowlists, ConnectionInventory, PolicyResourceSnapshot,
+            PolicyResourceView, ToolInventory,
         },
         Policy, RuleAction,
     },
@@ -121,6 +121,7 @@ fn resource_view_for(policy: &Policy) -> PolicyResourceView {
             policy_route_exempt: false,
         }),
         security_revision: None,
+        verified_claims: ClaimAllowlists::default(),
     }
 }
 
@@ -2249,6 +2250,8 @@ fn universe_identities() -> Vec<Principal> {
                 roles: roles.iter().map(|role| (*role).to_owned()).collect(),
                 session_id: String::new(),
                 auth_method: AuthMethod::Bearer,
+                scopes: None,
+                verified_claims: Vec::new(),
             });
         }
     }

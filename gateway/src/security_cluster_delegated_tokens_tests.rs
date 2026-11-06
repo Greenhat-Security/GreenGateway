@@ -193,6 +193,8 @@ fn caller(subject: &str) -> AttestedCaller {
         roles: vec!["member".to_owned()],
         session_id: format!("session-{subject}"),
         auth_method: AuthMethod::Bearer,
+        scopes: None,
+        verified_claims: Vec::new(),
     })
     .expect("a provider-vouched principal is attestable")
 }
@@ -207,6 +209,8 @@ fn operator() -> DelegatedTokenPurgeTrigger {
             roles: vec!["admin".to_owned()],
             session_id: "session-operator".to_owned(),
             auth_method: AuthMethod::Bearer,
+            scopes: None,
+            verified_claims: Vec::new(),
         }),
         request_id: "request-purge".to_owned(),
         source_ip: "203.0.113.20".to_owned(),

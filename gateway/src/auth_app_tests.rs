@@ -303,6 +303,7 @@ async fn auth_validator_resolves_oidc_discovery_for_issuer_only_provider() {
         client_id: None,
         client_secret: None,
         redirect_uri: None,
+        verified_claims: Vec::new(),
     }];
     config.egress_deny_private_ips = false;
     let egress_client = Arc::new(
@@ -387,6 +388,7 @@ async fn a_denylisted_jwt_validator_reports_the_principal_of_a_revoked_token() {
         client_id: None,
         client_secret: None,
         redirect_uri: None,
+        verified_claims: Vec::new(),
     }];
     config.egress_deny_private_ips = false;
     let egress_client = Arc::new(
@@ -574,6 +576,7 @@ fn auth_validator_rejects_oidc_discovery_with_mismatched_issuer() {
         client_id: None,
         client_secret: None,
         redirect_uri: None,
+        verified_claims: Vec::new(),
     }];
     config.egress_deny_private_ips = false;
     let egress_client = Arc::new(
@@ -621,6 +624,7 @@ fn auth_validator_rejects_oidc_discovery_without_issuer() {
         client_id: None,
         client_secret: None,
         redirect_uri: None,
+        verified_claims: Vec::new(),
     }];
     config.egress_deny_private_ips = false;
     let egress_client = Arc::new(
@@ -665,6 +669,7 @@ async fn oidc_discovery_allowlists_jwks_uri_host_when_it_differs_from_issuer() {
         client_id: None,
         client_secret: None,
         redirect_uri: None,
+        verified_claims: Vec::new(),
     }];
     config.egress_deny_private_ips = false;
     let recorder = PrometheusBuilder::new().build_recorder();
@@ -740,6 +745,7 @@ async fn oidc_discovery_jwks_uri_auto_seed_still_blocks_private_ip() {
         client_id: None,
         client_secret: None,
         redirect_uri: None,
+        verified_claims: Vec::new(),
     }];
     let recorder = PrometheusBuilder::new().build_recorder();
     let router = app(
@@ -800,6 +806,7 @@ fn auth_validator_reports_construction_error_when_oidc_discovery_lacks_jwks_uri(
         client_id: None,
         client_secret: None,
         redirect_uri: None,
+        verified_claims: Vec::new(),
     }];
     config.egress_deny_private_ips = false;
     let egress_client = Arc::new(
@@ -959,5 +966,6 @@ fn oidc_jwt_provider(issuer: String) -> config::AuthProviderConfig {
         client_id: None,
         client_secret: None,
         redirect_uri: None,
+        verified_claims: Vec::new(),
     }
 }

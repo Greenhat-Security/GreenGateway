@@ -2190,6 +2190,8 @@ fn common_principal(
         roles,
         session_id: String::new(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     }))
 }
 
@@ -2214,6 +2216,8 @@ fn foreign_issuer_caller(
         roles: vec![role.to_owned()],
         session_id: String::new(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     }))
 }
 
@@ -2232,6 +2236,8 @@ fn role_holder(name: &str, role: &crate::rbac::policy::RoleEntry) -> Option<Synt
         roles: vec![name.to_owned()],
         session_id: String::new(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     }))
 }
 
@@ -2888,6 +2894,8 @@ fn witness_identity(matcher: &PrincipalMatcher) -> Option<Principal> {
         roles: matcher.roles.first().cloned().into_iter().collect(),
         session_id: String::new(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     })
 }
 

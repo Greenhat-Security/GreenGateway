@@ -11184,9 +11184,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::mcp::invocation_context_from_request#1",
-      "sha256": "a1878e3928e84a484c3e47941f0bb219edfb2aa12e4380cb825b358106b2cdd6",
+      "sha256": "31a0006ee895058bf5377814e93fffe5d7f28c614c6dd340c7b25601701b82fe",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review. Reviewed for #463: the item now also projects the authenticated Principal into the caller a signed caller assertion names (AttestedCaller::from_principal), a pure data copy that adds no network, process or transport capability. Reviewed for #243: the item also copies the authenticated Principal's verified organization (org_id) into the invocation context as a policy fact identity mappings read, a pure data copy that adds no network, process or transport capability. Reviewed for #243 (request conditions): the item also records the canonical client address (client_ip::canonical_client_addr, the trusted-proxy-aware address it already audits as source_ip) as the typed policy fact a source_network condition reads, a pure data read of the connection peer and admitted headers that adds no network, process or transport capability."
+      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review. Reviewed for #463: the item now also projects the authenticated Principal into the caller a signed caller assertion names (AttestedCaller::from_principal), a pure data copy that adds no network, process or transport capability. Reviewed for #243: the item also copies the authenticated Principal's verified organization (org_id) into the invocation context as a policy fact identity mappings read, a pure data copy that adds no network, process or transport capability. Reviewed for #243 (request conditions): the item also records the canonical client address (client_ip::canonical_client_addr, the trusted-proxy-aware address it already audits as source_ip) as the typed policy fact a source_network condition reads, a pure data read of the connection peer and admitted headers that adds no network, process or transport capability. Reviewed for #243 (scope and claim matchers): the item also copies the authenticated Principal's verified OAuth scopes and allowlisted claims (Principal::scopes, Principal::verified_claims) into the invocation context as policy facts the tool lanes read, a pure data copy from the request's Principal extension that adds no network, process or transport capability."
     },
     {
       "file": "gateway/src/mcp.rs",
@@ -15599,9 +15599,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::tools::runtime::ToolInvocationContext#1",
-      "sha256": "3fc8dc1df9da2c65ac9c629d99e86b57132e7defebb09c7c11910a74ad182493",
+      "sha256": "2f2c5b650d0b8638bb2e8beb879a629376a5cac97a76404347c6384af459ffbc",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #243 tool invocation context: carries the canonical client address the call entered with (Option<std::net::IpAddr>, a value set by the MCP and admin playground entry points) as the policy fact a source_network condition reads; a data field that adds no network, process or transport capability."
+      "purpose": "Issue #243 tool invocation context: carries the canonical client address the call entered with (Option<std::net::IpAddr>, a value set by the MCP and admin playground entry points) as the policy fact a source_network condition reads; a data field that adds no network, process or transport capability. Reviewed for #243 (scope and claim matchers): two more data fields, scopes (Option<Vec<String>>) and verified_claims (Vec<auth::VerifiedClaim>), carry the authenticated principal's verified scopes and allowlisted claims as policy facts; values only, never audited, signed or sent upstream, and no network, process or transport capability."
     },
     {
       "file": "gateway/src/tools/selector.rs",

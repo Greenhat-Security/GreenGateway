@@ -292,6 +292,8 @@ mod tests {
             roles: vec!["reader".to_owned()],
             session_id: String::new(),
             auth_method: AuthMethod::Bearer,
+            scopes: None,
+            verified_claims: Vec::new(),
         }))
     }
 
@@ -559,6 +561,8 @@ mod tests {
             roles: roles.iter().map(|role| (*role).to_owned()).collect(),
             session_id: String::new(),
             auth_method: AuthMethod::Bearer,
+            scopes: None,
+            verified_claims: Vec::new(),
         }))
     }
 

@@ -387,6 +387,104 @@ async fn non_string_org_claim_leaves_org_id_none() {
     assert_eq!(principal.org_id, None);
 }
 
+/// The verified `scope` and `scp` claims become the principal's scope fact,
+/// sorted and unique, and never its roles: the roles claim alone decides
+/// those.
+#[tokio::test]
+async fn verified_scopes_are_captured_beside_the_roles_and_never_become_roles() {
+    let mut claims = base_claims();
+    claims["scope"] = json!("orders.write orders.read");
+    claims["scp"] = json!(["orders.read", "reports.read"]);
+
+    let principal = principal_for_claims(claims, default_cfg()).await;
+
+    assert_eq!(
+        principal.scopes,
+        Some(vec![
+            "orders.read".to_owned(),
+            "orders.write".to_owned(),
+            "reports.read".to_owned()
+        ])
+    );
+    assert!(principal
+        .roles
+        .iter()
+        .all(|role| !role.starts_with("orders.") && !role.starts_with("reports.")));
+
+    // A token without either claim granted none, which is a verified fact.
+    let principal = principal_for_claims(base_claims(), default_cfg()).await;
+    assert_eq!(principal.scopes, Some(Vec::new()));
+}
+
+/// A scope claim past the bounds, or in a shape no scope claim has, still
+/// authenticates: it simply yields no scope fact, so a scope matcher is
+/// undetermined rather than handed a shortened list.
+#[tokio::test]
+async fn an_oversized_or_malformed_scope_claim_authenticates_without_a_scope_fact() {
+    let too_many = (0..=crate::auth::principal::MAX_PRINCIPAL_SCOPES)
+        .map(|index| format!("s{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for scope in [
+        json!(too_many),
+        json!("s".repeat(crate::auth::principal::MAX_PRINCIPAL_SCOPE_BYTES + 1)),
+        json!({ "orders": "write" }),
+        json!(["orders.write", 7]),
+    ] {
+        let mut claims = base_claims();
+        claims["scope"] = scope;
+        let principal = principal_for_claims(claims, default_cfg()).await;
+        assert_eq!(principal.scopes, None);
+    }
+}
+
+/// Only the claims the provider allowlists are captured, read with the same
+/// exact-key-first resolution as every claim mapping; an allowlisted claim
+/// the token lacks is verified absent, and one past the bounds is left out.
+#[tokio::test]
+async fn only_allowlisted_claims_are_captured_as_verified_facts() {
+    let mut claims = base_claims();
+    claims["department"] = json!("engineering");
+    claims["amr"] = json!(["pwd", "mfa"]);
+    claims["tier"] = json!("x".repeat(crate::auth::principal::MAX_VERIFIED_CLAIM_VALUE_BYTES + 1));
+    claims["tenant"] = json!({ "region": "eu" });
+    claims["unlisted"] = json!("never-captured");
+
+    let mut cfg = default_cfg();
+    cfg.verified_claims = ["amr", "department", "missing", "tenant.region", "tier"]
+        .map(str::to_owned)
+        .to_vec();
+
+    let principal = principal_for_claims(claims, cfg).await;
+
+    assert_eq!(
+        principal.verified_claims,
+        vec![
+            crate::auth::VerifiedClaim {
+                name: "amr".to_owned(),
+                values: vec![json!("pwd"), json!("mfa")]
+            },
+            crate::auth::VerifiedClaim {
+                name: "department".to_owned(),
+                values: vec![json!("engineering")]
+            },
+            crate::auth::VerifiedClaim {
+                name: "missing".to_owned(),
+                values: Vec::new()
+            },
+            crate::auth::VerifiedClaim {
+                name: "tenant.region".to_owned(),
+                values: vec![json!("eu")]
+            },
+        ]
+    );
+    // Without an allowlist nothing is captured, whatever the token carries.
+    let mut claims = base_claims();
+    claims["department"] = json!("engineering");
+    let principal = principal_for_claims(claims, default_cfg()).await;
+    assert!(principal.verified_claims.is_empty());
+}
+
 #[tokio::test]
 async fn email_is_lowercased() {
     let validator = validator(
@@ -1687,6 +1785,7 @@ fn default_cfg() -> JwtAuthConfig {
         roles_claim: "roles".to_owned(),
         roles_claim_delimiter: None,
         org_claim: None,
+        verified_claims: Vec::new(),
     }
 }
 

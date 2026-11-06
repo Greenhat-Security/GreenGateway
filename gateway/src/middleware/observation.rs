@@ -3588,6 +3588,8 @@ paths:
             roles: roles.iter().map(|role| (*role).to_owned()).collect(),
             session_id: "session-123".to_owned(),
             auth_method: AuthMethod::Bearer,
+            scopes: None,
+            verified_claims: Vec::new(),
         }
     }
 

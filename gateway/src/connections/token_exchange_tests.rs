@@ -18,6 +18,8 @@ fn caller(subject: &str, issuer: &str, roles: &[&str]) -> AttestedCaller {
         roles: roles.iter().map(|role| (*role).to_owned()).collect(),
         session_id: format!("session-{subject}"),
         auth_method: AuthMethod::Bearer,
+        scopes: None,
+        verified_claims: Vec::new(),
     })
     .expect("a provider-vouched principal is attestable")
 }
@@ -928,6 +930,8 @@ async fn a_revoked_credential_records_nothing_where_no_connection_caches_princip
                     roles: vec!["admin".to_owned()],
                     session_id: "session-operator".to_owned(),
                     auth_method: AuthMethod::Bearer,
+                    scopes: None,
+                    verified_claims: Vec::new(),
                 }),
                 request_id: "request-purge".to_owned(),
                 source_ip: "203.0.113.20".to_owned(),

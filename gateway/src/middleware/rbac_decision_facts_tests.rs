@@ -54,6 +54,8 @@ fn acme_reader() -> Principal {
         roles: Vec::new(),
         session_id: "synthetic-session".to_owned(),
         auth_method: AuthMethod::Bearer,
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 
@@ -484,5 +486,111 @@ async fn the_facts_a_rule_condition_reads_are_marked_available_without_their_val
         "1780275600",
     ] {
         assert!(!rendered.contains(value), "the facts repeat {value}");
+    }
+}
+
+/// The verified scopes and allowlisted claims a `scope` or `claim` condition
+/// reads are marked available once the lane captured them, on the HTTP and
+/// tool lanes alike, and the facts never carry a scope or claim value.
+#[tokio::test]
+async fn the_scopes_and_claims_a_condition_reads_are_marked_available_without_their_values() {
+    const SCOPE: &str = "facts-scope-canary-5e19";
+    const CLAIM_VALUE: &str = "facts-claim-canary-9b62";
+    let policy = Policy::validate_json_value(json!({
+        "schema_version": "1.0.0",
+        "id": "scoped-facts",
+        "default_action": "allow",
+        "rules": [
+            {
+                "id": "scoped-orders",
+                "path": "/orders/**",
+                "action": "deny",
+                "conditions": { "all": [
+                    { "scope": { "issuer": ISSUER, "in": [SCOPE] } },
+                    { "claim": { "issuer": ISSUER, "name": "department", "in": [CLAIM_VALUE] } }
+                ] }
+            },
+            {
+                "id": "scoped-reports",
+                "path": "/reports/**",
+                "action": "deny",
+                "conditions": { "scope": { "issuer": ISSUER, "in": [SCOPE] } }
+            },
+            {
+                "id": "scoped-tool",
+                "tool_name": "ruled",
+                "action": "deny",
+                "conditions": { "scope": { "issuer": ISSUER, "in": [SCOPE] } }
+            }
+        ],
+        "tools": { "ruled": {} }
+    }))
+    .expect("the fixture validates");
+    let (state, _capture) = test_state(policy, &[]);
+    let principal = Principal {
+        scopes: Some(vec![SCOPE.to_owned()]),
+        verified_claims: vec![crate::auth::VerifiedClaim {
+            name: "department".to_owned(),
+            values: vec![json!(CLAIM_VALUE)],
+        }],
+        ..acme_reader()
+    };
+    let http = facts_available::METHOD
+        | facts_available::PATH
+        | facts_available::PRINCIPAL
+        | facts_available::ROUTING
+        | facts_available::REQUEST_HOST;
+
+    let decision = decision_for(
+        &test_router(state.clone(), Some(principal.clone())),
+        "/orders/1",
+    )
+    .await;
+    assert_eq!(decision.outcome, PolicyDecisionOutcome::Denied);
+    let facts = facts_json(&decision);
+    assert_eq!(
+        facts["facts_available"],
+        json!(http | facts_available::SCOPES | facts_available::CLAIMS)
+    );
+    assert_eq!(
+        facts["element"],
+        json!({ "kind": "rule", "position": 0, "id": "scoped-orders" })
+    );
+
+    // An anonymous caller is verified to hold no scope and no claim: both
+    // facts were captured, and neither matches.
+    let anonymous = decision_for(&test_router(state.clone(), None), "/reports/1").await;
+    assert_eq!(anonymous.outcome, PolicyDecisionOutcome::Allowed);
+    assert_eq!(
+        facts_json(&anonymous)["facts_available"],
+        json!(http | facts_available::SCOPES | facts_available::CLAIMS)
+    );
+
+    let tool = state
+        .evaluate_tool_authorization_without_arguments(
+            "ruled",
+            Some(&principal),
+            None,
+            |authorization| authorization.decision_facts.map(|facts| facts.to_json()),
+        )
+        .expect("a tool verdict carries its facts");
+    assert_eq!(
+        tool["facts_available"],
+        json!(
+            facts_available::TOOL_NAME
+                | facts_available::PRINCIPAL
+                | facts_available::SCOPES
+                | facts_available::CLAIMS
+        )
+    );
+    assert_eq!(
+        tool["element"],
+        json!({ "kind": "rule", "position": 2, "id": "scoped-tool" })
+    );
+
+    for rendered in [facts.to_string(), tool.to_string()] {
+        for value in [SCOPE, CLAIM_VALUE, "department"] {
+            assert!(!rendered.contains(value), "the facts repeat {value}");
+        }
     }
 }

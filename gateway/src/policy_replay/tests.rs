@@ -1205,6 +1205,99 @@ fn an_organization_mapping_replays_as_not_recorded() {
     );
 }
 
+/// Retained observations record no scope and no verified claim, so replay
+/// leaves both not recorded (#243): a scope or claim condition, under `not`
+/// too, and a mapping that tests scopes are indeterminate in every lane they
+/// decide, never read as a principal that holds none; a condition bound to
+/// another issuer, which no recorded principal of this issuer can meet,
+/// replays as it is served.
+#[test]
+fn scope_and_claim_matchers_replay_as_not_recorded() {
+    let principal = PrincipalRecord::Authenticated(recorded_principal(AuthMethod::Bearer, &[]));
+    let facts = http(Method::GET, "/api/items", principal.clone());
+    let tool = ToolFacts {
+        tool_name: "lookup".to_owned(),
+        principal,
+        egress: EgressRecord::NotRecorded,
+    };
+    let conditioned = |condition: Value| {
+        compiled(json!({
+            "schema_version": "1.0.0",
+            "default_action": "allow",
+            "rules": [
+                { "id": "http", "path": "/api/**", "action": "deny", "conditions": condition.clone() },
+                { "id": "tool", "tool_name": "lookup", "action": "deny", "conditions": condition }
+            ],
+            "tools": { "lookup": {} }
+        }))
+    };
+    for condition in [
+        json!({ "scope": { "issuer": ISSUER, "in": ["items.write"] } }),
+        json!({ "not": { "scope": { "issuer": ISSUER, "in": ["items.read"] } } }),
+        json!({ "claim": { "issuer": ISSUER, "name": "department", "in": ["sales"] } }),
+        json!({ "not": { "claim": { "issuer": ISSUER, "name": "department", "in": ["eng"] } } }),
+    ] {
+        let policy = conditioned(condition.clone());
+        assert_eq!(
+            evaluate_http(&policy, &facts).expect("evaluates"),
+            HttpReplayOutcome::Indeterminate(HttpReplayLimitation::Kernel(
+                Limitation::MissingMatcherFact
+            )),
+            "{condition}"
+        );
+        assert!(
+            !evaluate_tool(&policy, &tool)
+                .expect("evaluates")
+                .is_complete(),
+            "{condition}"
+        );
+    }
+    let elsewhere = conditioned(
+        json!({ "scope": { "issuer": "https://other.example.test", "in": ["items.write"] } }),
+    );
+    let HttpReplayOutcome::Decided(decision) =
+        evaluate_http(&elsewhere, &facts).expect("evaluates")
+    else {
+        panic!("a condition no recorded principal can meet replays");
+    };
+    assert_eq!(decision.logical, LogicalDecision::Allow);
+
+    let scoped = compiled(json!({
+        "schema_version": "1.0.0",
+        "default_action": "deny",
+        "roles": { "reader": { "permissions": ["items:read"] } },
+        "identity_mappings": [{
+            "id": "readers",
+            "issuer": ISSUER,
+            "scopes": ["items.read"],
+            "grant_roles": ["reader"]
+        }],
+        "routes": [{ "id": "items", "path_prefix": "/api", "permission": "items:read" }],
+        "rate_limits": [{
+            "id": "reader-lane",
+            "principal": { "roles": ["reader"] },
+            "requests_per_second": 1,
+            "burst": 1
+        }],
+        "tools": { "lookup": { "allowed_roles": ["reader"] } }
+    }));
+    assert_eq!(
+        evaluate_http(&scoped, &facts).expect("evaluates"),
+        HttpReplayOutcome::Indeterminate(HttpReplayLimitation::Kernel(
+            Limitation::MissingMatcherFact
+        ))
+    );
+    assert_eq!(
+        select_rate_lane(&scoped, &facts)
+            .expect("selects")
+            .limitation(),
+        Some(Limitation::MissingMatcherFact)
+    );
+    assert!(!evaluate_tool(&scoped, &tool)
+        .expect("evaluates")
+        .is_complete());
+}
+
 #[test]
 fn an_unstated_mcp_identity_decides_only_when_both_readings_agree() {
     let mut facts = http(Method::POST, "/base/mcp", PrincipalRecord::Anonymous);
@@ -1479,7 +1572,8 @@ fn recorded_decision_facts_are_refused_out_of_bounds_or_describing_another_recor
             ReplayContextError::InvalidValue,
         ),
         (
-            edit(&decided, &|d| d["facts_available"] = json!(4096)),
+            // The first bit no version-1 input names.
+            edit(&decided, &|d| d["facts_available"] = json!(1 << 14)),
             ReplayContextError::InvalidValue,
         ),
         (
@@ -1603,6 +1697,24 @@ fn recorded_decision_facts_are_refused_out_of_bounds_or_describing_another_recor
             ReplayContext::parse(&bytes).map(|_| ()),
             Err(expected),
             "the parser accepted or misjudged {value}"
+        );
+    }
+    // The verified scopes and claims are inputs either lane may have had.
+    for record in [&decided, &decided_tool] {
+        let value = edit(record, &|d| {
+            let bits = d["facts_available"].as_u64().expect("a bit set");
+            d["facts_available"] =
+                json!(bits | u64::from(facts_available::SCOPES | facts_available::CLAIMS));
+        });
+        let bytes = serde_json::to_vec(&value).expect("serializes");
+        assert_eq!(
+            ReplayContext::parse(&bytes).map(|_| ()),
+            Ok(()),
+            "the parser refused {value}"
+        );
+        assert!(
+            validator.is_valid(&value),
+            "the published schema refused {value}"
         );
     }
 }

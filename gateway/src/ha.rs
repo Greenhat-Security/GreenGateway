@@ -590,6 +590,17 @@ fn insert_auth_settings(input: &mut BTreeMap<String, String>, config: &Config) {
             format!("{prefix}.org_claim"),
             provider.org_claim.clone().unwrap_or_default(),
         );
+        // The claims a provider captures decide what a claim condition can
+        // match, so replicas must agree on them. An empty allowlist keeps the
+        // earlier projection, so a deployment that sets none keeps its
+        // fingerprint across a rolling upgrade. Names hold no control
+        // character, so the newline-joined list is unambiguous.
+        if !provider.verified_claims.is_empty() {
+            input.insert(
+                format!("{prefix}.verified_claims"),
+                provider.verified_claims.join("\n"),
+            );
+        }
         input.insert(
             format!("{prefix}.introspection_url"),
             provider.introspection_url.clone().unwrap_or_default(),
@@ -1456,6 +1467,57 @@ mod tests {
             static_config_fingerprint(&with_secret),
             static_config_fingerprint(&without_secret),
             "a provider that lost its client secret entirely must not match"
+        );
+    }
+
+    /// The claims a provider captures decide what a claim condition can
+    /// match, so replicas must agree on them; a provider without an
+    /// allowlist keeps the projection it had before allowlists existed, so a
+    /// rolling upgrade of a deployment that sets none keeps its fingerprint.
+    #[test]
+    fn fingerprint_covers_a_verified_claims_allowlist_only_when_one_is_set() {
+        let provider = |extra: &str| {
+            config_from(&[(
+                "AUTH_PROVIDERS",
+                &format!(
+                    r#"[{{"name":"primary","type":"jwt","issuer":"https://idp.example.test"{extra}}}]"#
+                ),
+            )])
+        };
+        let plain = provider("");
+        let mut projection = BTreeMap::new();
+        insert_auth_settings(&mut projection, &plain);
+        assert!(projection
+            .keys()
+            .all(|key| !key.ends_with(".verified_claims")));
+        assert_eq!(
+            static_config_fingerprint(&plain),
+            static_config_fingerprint(&provider(r#","verified_claims":[]"#)),
+            "an empty allowlist is no allowlist"
+        );
+
+        let captured = provider(r#","verified_claims":["department","amr"]"#);
+        let mut projection = BTreeMap::new();
+        insert_auth_settings(&mut projection, &captured);
+        assert_eq!(
+            projection
+                .get("auth_provider[0].verified_claims")
+                .map(String::as_str),
+            Some("amr\ndepartment")
+        );
+        assert_ne!(
+            static_config_fingerprint(&plain),
+            static_config_fingerprint(&captured),
+            "a replica that captures claims must not match one that captures none"
+        );
+        assert_eq!(
+            static_config_fingerprint(&captured),
+            static_config_fingerprint(&provider(r#","verified_claims":["amr","department"]"#)),
+            "the allowlist is a set"
+        );
+        assert_ne!(
+            static_config_fingerprint(&captured),
+            static_config_fingerprint(&provider(r#","verified_claims":["amr"]"#)),
         );
     }
 

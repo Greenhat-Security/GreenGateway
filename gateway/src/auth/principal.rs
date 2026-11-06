@@ -31,8 +31,19 @@ pub(crate) use gateway_config::auth::{
     canonical_issuer, provider_issuer, MAX_PRINCIPAL_ISSUER_BYTES, MAX_PRINCIPAL_ROLE_BYTES,
     MAX_PRINCIPAL_SUBJECT_BYTES,
 };
+// The verified-claim allowlist bounds, which the configuration compiler
+// holds `AUTH_PROVIDERS` to, and the scope and claim-value bounds the
+// policy's `scope` and `claim` leaves and identity-mapping `scopes` are held
+// to (issue #243).
+pub(crate) use gateway_config::auth::{
+    MAX_PRINCIPAL_SCOPE_BYTES, MAX_VERIFIED_CLAIMS, MAX_VERIFIED_CLAIM_NAME_BYTES,
+    MAX_VERIFIED_CLAIM_VALUE_BYTES,
+};
 
 /// Authenticated caller identity used for authorization and audit attribution.
+///
+/// `scopes` and `verified_claims` are policy facts only (issue #243): typed
+/// matchers read them, and nothing audits, signs, logs or forwards them.
 #[derive(Debug, Clone)]
 pub struct Principal {
     /// Canonical user identifier for authorization and ownership checks.
@@ -53,10 +64,44 @@ pub struct Principal {
     pub session_id: String,
     /// Authentication mechanism used for this principal.
     pub auth_method: AuthMethod,
+    /// The OAuth scopes the credential's verified `scope` or `scp` claim
+    /// granted, sorted and de-duplicated: `Some` of an empty list for a
+    /// token that granted none. `None` when authentication captured no scope
+    /// fact -- a principal no JWT validation produced (a cookie-session
+    /// provider's session, a client certificate, a service token), and a
+    /// token whose scope claim is malformed or past [`MAX_PRINCIPAL_SCOPES`]
+    /// or [`MAX_PRINCIPAL_SCOPE_BYTES`] -- so a matcher that reads scopes is
+    /// undetermined rather than told there are none. An admin login session
+    /// carries the scopes of the access token it revalidates. Distinct from `roles`:
+    /// a scope is never a role, and a service token's scopes, which are its
+    /// roles, are never mirrored here.
+    pub scopes: Option<Vec<String>>,
+    /// The claims the JWT provider's `verified_claims` allowlist names, one
+    /// entry per name the token was read for, sorted by name. A name the
+    /// allowlist does not list, or whose value is not a bounded scalar or
+    /// short string list, has no entry, so a matcher that reads it is
+    /// undetermined rather than told the token lacked it.
+    pub verified_claims: Vec<VerifiedClaim>,
+}
+
+/// One claim JWT validation verified because its provider's
+/// `verified_claims` allowlist names it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifiedClaim {
+    /// The allowlisted claim name, or dotted claim path, it was read by.
+    pub name: String,
+    /// What the token carried under it: nothing when the token did not
+    /// carry the claim, its one value for a string, boolean or number, and
+    /// each element for a list of strings.
+    pub values: Vec<serde_json::Value>,
 }
 
 /// Most role names a principal may carry.
 pub(crate) const MAX_PRINCIPAL_ROLES: usize = 256;
+/// Most OAuth scopes a principal's scope fact may hold.
+pub(crate) const MAX_PRINCIPAL_SCOPES: usize = 256;
+/// Most values a verified claim may carry: the elements of a list claim.
+pub(crate) const MAX_VERIFIED_CLAIM_VALUES: usize = 32;
 
 /// Why a principal's identity facts are outside the shape every consumer of a
 /// [`Principal`] is entitled to assume.
@@ -343,6 +388,8 @@ mod tests {
             roles: roles.into_iter().map(str::to_owned).collect(),
             session_id: "session-789".to_owned(),
             auth_method,
+            scopes: None,
+            verified_claims: Vec::new(),
         }
     }
 }

@@ -263,9 +263,13 @@ pub mod facts_available {
     pub const QUERY: u16 = 1 << 9;
     pub const TOOL_ARGUMENTS: u16 = 1 << 10;
     pub const CLOCK: u16 = 1 << 11;
+    /// The OAuth scopes authentication verified for the principal.
+    pub const SCOPES: u16 = 1 << 12;
+    /// The allowlisted claims authentication verified for the principal.
+    pub const CLAIMS: u16 = 1 << 13;
     /// The typed-matcher facts, which every lane reads beside its context.
     pub const MATCHER_FACTS: u16 =
-        ORGANIZATION | CLIENT_ADDRESS | HEADERS | QUERY | TOOL_ARGUMENTS | CLOCK;
+        ORGANIZATION | CLIENT_ADDRESS | HEADERS | QUERY | TOOL_ARGUMENTS | CLOCK | SCOPES | CLAIMS;
     /// Every bit an HTTP verdict can set.
     pub const HTTP: u16 = METHOD | PATH | PRINCIPAL | ROUTING | REQUEST_HOST | MATCHER_FACTS;
     /// Every bit a tool invocation verdict can set.
@@ -279,6 +283,14 @@ fn matcher_facts_available(facts: &PolicyFacts) -> u16 {
         (
             matches!(facts.organization, Fact::Captured(_)),
             facts_available::ORGANIZATION,
+        ),
+        (
+            matches!(facts.scopes, Fact::Captured(_)),
+            facts_available::SCOPES,
+        ),
+        (
+            matches!(facts.claims, Fact::Captured(_)),
+            facts_available::CLAIMS,
         ),
         (
             matches!(facts.source_ip, Fact::Captured(_)),

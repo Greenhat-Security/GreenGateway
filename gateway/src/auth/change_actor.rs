@@ -214,6 +214,8 @@ mod tests {
             roles: vec!["admin".to_owned()],
             session_id: "session-1".to_owned(),
             auth_method,
+            scopes: None,
+            verified_claims: Vec::new(),
         }
     }
 

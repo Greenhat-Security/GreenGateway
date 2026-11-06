@@ -228,22 +228,29 @@ and never reused:
 | 9 | 512 | query |
 | 10 | 1024 | tool arguments |
 | 11 | 2048 | clock |
+| 12 | 4096 | scopes |
+| 13 | 8192 | claims |
 
 An HTTP verdict sets method, path, principal, request host and, for a
 classified request, routing (`31`); a tool invocation sets tool name and
 principal (`36`). A lane captures a typed-matcher fact only when the policy
 reads it, and the bits say which it captured: the organization (`64`) under
 a policy whose roles come from identity mappings, which read the
-organization the principal's issuer verified; and the client address, the
-referenced headers, the referenced query parameters and the clock (`128`,
-`256`, `512`, `2048`) when a v1 rule condition reads them. The client
+organization the principal's issuer verified; the scopes (`4096`) when a
+`scope` condition or a mapping's `scopes` reads them and authentication
+captured a scope fact for the principal (an anonymous caller, verified to
+hold none, included); the claims (`8192`) when a `claim` condition reads
+them; and the client address, the referenced headers, the referenced query
+parameters and the clock (`128`, `256`, `512`, `2048`) when a v1 rule
+condition reads them. The client
 address bit is clear when the request or call had no address to capture,
 and a tool call never has headers or a query. Tool invocation admission
 captures the tool arguments (`1024`) only when a `tool_argument` condition
 of a rule for the invoked tool reads them, every earlier stage left the
 call to the rules, and the arguments passed the tool's input schema; the
 HTTP lane never does. The bits never carry the values: an address, header,
-query value, argument or instant the evaluator read is not in the facts.
+query value, argument, scope, claim or instant the evaluator read is not in
+the facts.
 
 A request the policy stage refused to answer -- an unsafe path, an
 incomplete or failed evaluation, a failed revision check, an audit outage --
@@ -375,6 +382,7 @@ an allow.
 | routing `proxy_dispatch` | the classified dispatch with the recorded facts |
 | egress `destination` | the destination with no resolution facts |
 | organization (never recorded) | not recorded: an identity mapping that tests `organizations` is `missing_matcher_fact` |
+| scopes, verified claims (never recorded) | not recorded: a `scope` or `claim` condition, and an identity mapping that tests `scopes`, is `missing_matcher_fact` |
 | source address, headers, query values, clock, tool arguments (never recorded as condition facts) | not recorded: a rule condition that reads one is `missing_matcher_fact` |
 
 **MCP identity.** A record that does not say whether its path was an MCP
@@ -394,12 +402,13 @@ the issuer, authentication method, subject and claimed roles replay as they
 are served.
 
 **Rule conditions.** Replay captures no condition fact: not the
-organization, the source address a record carries for audit, the headers,
-the query values, the tool arguments or the instant of the original
-decision. A tool call whose arguments failed the input schema at admission,
-before an argument rule decided it, is recorded as a `tool.invoke_rejected`
-whose reason (`invalid_params` and the like) is no policy result, and is
-counted as `unsupported_tool_rejection`. A condition that
+organization, the scopes or verified claims, the source address a record
+carries for audit, the headers, the query values, the tool arguments or the
+instant of the original decision. A tool call whose arguments failed the
+input schema at admission, before an argument rule decided it, is recorded
+as a `tool.invoke_rejected` whose reason (`invalid_params` and the like) is
+no policy result, and is counted as `unsupported_tool_rejection`. A
+condition that
 reads one is unknown, so a decision that turns on it is `indeterminate` with
 `missing_matcher_fact`, never a guessed match or no-match; a condition
 decided without one (an `organization` leaf bound to another issuer, say)

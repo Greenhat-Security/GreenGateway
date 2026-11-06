@@ -320,6 +320,8 @@ fn caller_from(subject: &str, issuer: &str, email: Option<&str>) -> AttestedCall
         roles: vec!["mail:read".to_owned()],
         session_id: format!("session-{subject}"),
         auth_method: AuthMethod::Bearer,
+        scopes: None,
+        verified_claims: Vec::new(),
     })
     .expect("a provider-vouched principal is attestable")
 }

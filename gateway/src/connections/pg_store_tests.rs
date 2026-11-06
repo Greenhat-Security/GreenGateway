@@ -3634,6 +3634,8 @@ async fn deletion_evidence_survives_cascade_and_restart_and_reconciles_a_lost_re
         roles: vec!["connections-admin".to_owned()],
         session_id: "session-deleting-admin".to_owned(),
         auth_method: crate::auth::AuthMethod::Cookie,
+        scopes: None,
+        verified_claims: Vec::new(),
     });
 
     let columns: Vec<String> = pool
@@ -4246,6 +4248,8 @@ async fn create_and_replace_evidence_names_the_actor_and_survives_delete_and_res
         roles: vec!["connections-admin".to_owned()],
         session_id: "session-creating-admin".to_owned(),
         auth_method: crate::auth::AuthMethod::Cookie,
+        scopes: None,
+        verified_claims: Vec::new(),
     });
     let editing_token = ChangeActor::service_token_for_test("service-token:token_editor");
     let rebinding_admin = ChangeActor::for_test("rebinding-admin");
@@ -5486,6 +5490,11 @@ fn catalog_principal(
         roles: vec!["marker-role".to_owned()],
         session_id: "marker-session".to_owned(),
         auth_method,
+        scopes: Some(vec!["marker-scope".to_owned()]),
+        verified_claims: vec![crate::auth::VerifiedClaim {
+            name: "marker-claim".to_owned(),
+            values: vec![json!("marker-claim-value")],
+        }],
     }
 }
 
@@ -5703,6 +5712,8 @@ async fn catalog_evidence_records_the_whole_actor_for_every_catalog_action() {
         "marker-org",
         "marker-role",
         "marker-session",
+        "marker-scope",
+        "marker-claim",
         "idp.example.test/",
         " https://",
         "actor_listing",

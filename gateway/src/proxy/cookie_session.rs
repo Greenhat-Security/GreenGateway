@@ -234,6 +234,8 @@ mod tests {
             roles: vec![],
             session_id: "fixture-session-id".into(),
             auth_method: AuthMethod::Cookie,
+            scopes: None,
+            verified_claims: Vec::new(),
         };
         let dispatch = crate::rbac::RuleDispatchContext::classified_with_route_id(
             Some("greenpm-module-access"),
@@ -307,6 +309,8 @@ mod tests {
             roles: vec![],
             session_id: "fixture-session-id".into(),
             auth_method: AuthMethod::Cookie,
+            scopes: None,
+            verified_claims: Vec::new(),
         };
         let owned = crate::rbac::RuleDispatchContext::classified_with_route_id(
             Some("greenpm-owned"),
@@ -393,6 +397,8 @@ mod tests {
                 roles: vec!["member".into()],
                 session_id: "independent-id".into(),
                 auth_method,
+                scopes: None,
+                verified_claims: Vec::new(),
             })
         }
         fn supports_cookie(&self) -> bool {

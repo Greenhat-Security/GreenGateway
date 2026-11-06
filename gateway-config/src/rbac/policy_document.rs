@@ -227,11 +227,12 @@ pub enum IssueCode {
     ConditionCidrInvalid,
     ConditionPointerInvalid,
     ConditionTimeInvalid,
+    ClaimNotCaptured,
 }
 
 impl IssueCode {
     /// Every code, so tests can check the vocabulary as a whole.
-    pub const ALL: [Self; 68] = [
+    pub const ALL: [Self; 69] = [
         Self::InvalidJson,
         Self::DocumentTooLarge,
         Self::DuplicateMember,
@@ -300,6 +301,7 @@ impl IssueCode {
         Self::ConditionCidrInvalid,
         Self::ConditionPointerInvalid,
         Self::ConditionTimeInvalid,
+        Self::ClaimNotCaptured,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -372,6 +374,7 @@ impl IssueCode {
             Self::ConditionCidrInvalid => "condition_cidr_invalid",
             Self::ConditionPointerInvalid => "condition_pointer_invalid",
             Self::ConditionTimeInvalid => "condition_time_invalid",
+            Self::ClaimNotCaptured => "claim_not_captured",
         }
     }
 
@@ -519,8 +522,8 @@ impl IssueCode {
                  long"
             }
             Self::ConditionNameForbidden => {
-                "the header or query parameter can carry credentials, identity, or hop-by-hop \
-                 routing, so no condition may read it"
+                "the header, query parameter, or claim can carry credentials, identity, or \
+                 hop-by-hop routing, or is read some other way, so no condition may read it"
             }
             Self::ConditionCidrInvalid => "the condition's network is not a CIDR network address",
             Self::ConditionPointerInvalid => {
@@ -528,6 +531,11 @@ impl IssueCode {
             }
             Self::ConditionTimeInvalid => {
                 "the time window is empty or unordered, or not written as RFC 3339 UTC instants"
+            }
+            Self::ClaimNotCaptured => {
+                "the condition reads a claim no JWT provider for its issuer lists in \
+                 verified_claims, so the claim is never captured and every request the \
+                 condition decides is refused as undetermined"
             }
         }
     }
@@ -652,7 +660,7 @@ impl IssueCode {
             }
             Self::ConditionOperatorInvalid => {
                 "Write each node as an object with one member: all, any, not, organization, \
-                 source_network, header, query, tool_argument, or time_window."
+                 scope, claim, source_network, header, query, tool_argument, or time_window."
             }
             Self::ConditionTooComplex => {
                 "Keep a rule's conditions within 4 levels and 32 nodes, with at most 16 operands \
@@ -667,8 +675,9 @@ impl IssueCode {
                  docs/schemas."
             }
             Self::ConditionNameForbidden => {
-                "Match identity through the verified principal or an identity mapping, and the \
-                 client address through source_network."
+                "Match identity through the verified principal, an identity mapping, or an \
+                 allowlisted claim; scopes through scope; and the client address through \
+                 source_network."
             }
             Self::ConditionCidrInvalid => {
                 "Write the network as an IPv4 or IPv6 CIDR with no host bits set, such as \
@@ -681,6 +690,10 @@ impl IssueCode {
             Self::ConditionTimeInvalid => {
                 "Write from and until as YYYY-MM-DDTHH:MM:SSZ, with from earlier than until; the \
                  window includes from and excludes until."
+            }
+            Self::ClaimNotCaptured => {
+                "List the claim in verified_claims of the AUTH_PROVIDERS entry for that issuer \
+                 and restart the gateway, or correct the condition's issuer or claim name."
             }
             Self::PolicyWriteUnreachable => {
                 "Keep at least one role that grants admin:policy:write, or \"*\", to the \
@@ -841,13 +854,16 @@ impl DiagnosticBlocks {
                 evidence: false,
             },
             // The policy is sound and can be simulated and tested; publishing
-            // it here would lock its administrators out, or would change what
-            // only a restart applies.
+            // it here would lock its administrators out, change what only a
+            // restart applies, serve a claim condition this deployment never
+            // captures a fact for, or read a tool argument the tool's schema
+            // does not make eligible.
             (
                 DiagnosticSeverity::Error,
                 IssueCode::PolicyWriteUnreachable
                 | IssueCode::PublisherPolicyWriteLost
                 | IssueCode::EgressChangeRequiresRestart
+                | IssueCode::ClaimNotCaptured
                 | IssueCode::ConditionPointerIneligible,
             ) => Self {
                 simulation: false,
@@ -1370,16 +1386,19 @@ pub const IDENTITY_MAPPING_MEMBERS: Members = Members {
         "subjects",
         "organizations",
         "claimed_roles",
+        "scopes",
         "grant_roles",
     ],
     required: &["issuer", "grant_roles"],
 };
 /// The operators a condition node may name, one per node.
-pub const CONDITION_OPERATORS: [&str; 9] = [
+pub const CONDITION_OPERATORS: [&str; 11] = [
     "all",
     "any",
     "not",
     "organization",
+    "scope",
+    "claim",
     "source_network",
     "header",
     "query",
@@ -1389,6 +1408,14 @@ pub const CONDITION_OPERATORS: [&str; 9] = [
 pub const ORGANIZATION_CONDITION_MEMBERS: Members = Members {
     allowed: &["issuer", "in"],
     required: &["issuer", "in"],
+};
+pub const SCOPE_CONDITION_MEMBERS: Members = Members {
+    allowed: &["issuer", "in"],
+    required: &["issuer", "in"],
+};
+pub const CLAIM_CONDITION_MEMBERS: Members = Members {
+    allowed: &["issuer", "name", "in"],
+    required: &["issuer", "name", "in"],
 };
 pub const SOURCE_NETWORK_CONDITION_MEMBERS: Members = Members {
     allowed: &["cidrs"],
@@ -1416,6 +1443,8 @@ pub const TIME_WINDOW_CONDITION_MEMBERS: Members = Members {
 pub(super) fn condition_leaf_members(operator: &str) -> Option<&'static Members> {
     match operator {
         "organization" => Some(&ORGANIZATION_CONDITION_MEMBERS),
+        "scope" => Some(&SCOPE_CONDITION_MEMBERS),
+        "claim" => Some(&CLAIM_CONDITION_MEMBERS),
         "source_network" => Some(&SOURCE_NETWORK_CONDITION_MEMBERS),
         "header" => Some(&HEADER_CONDITION_MEMBERS),
         "query" => Some(&QUERY_CONDITION_MEMBERS),

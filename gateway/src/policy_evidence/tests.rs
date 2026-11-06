@@ -45,8 +45,8 @@ use crate::{
     rbac::{
         policy_document::inspect_source,
         policy_resources::{
-            AdminSurface, ConnectionInventory, PolicyResourceSnapshot, PolicyResourceView,
-            ToolInventory,
+            AdminSurface, ClaimAllowlists, ConnectionInventory, PolicyResourceSnapshot,
+            PolicyResourceView, ToolInventory,
         },
         Policy,
     },
@@ -134,6 +134,7 @@ fn analysis_resource_view() -> PolicyResourceView {
             policy_route_exempt: false,
         }),
         security_revision: None,
+        verified_claims: ClaimAllowlists::default(),
     }
 }
 

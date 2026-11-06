@@ -147,6 +147,7 @@ async fn oauth_protected_resource_metadata_returns_mcp_resource_document() {
         client_id: None,
         client_secret: None,
         redirect_uri: None,
+        verified_claims: Vec::new(),
     }];
     let recorder = PrometheusBuilder::new().build_recorder();
     let router = app(

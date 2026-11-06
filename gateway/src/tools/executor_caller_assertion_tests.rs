@@ -34,6 +34,8 @@ fn principal(subject: &str, email: &str, roles: &[&str], auth_method: AuthMethod
         roles: roles.iter().map(|role| (*role).to_owned()).collect(),
         session_id: format!("session-{subject}"),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 
@@ -58,6 +60,8 @@ fn context_for(principal: &Principal, request_id: &str) -> ToolInvocationContext
         caller: AttestedCaller::from_principal(principal).map(Arc::new),
         source: ToolInvocationSource::Mcp,
         admitted_deadline: None,
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 
@@ -459,6 +463,8 @@ async fn a_service_token_is_not_a_principal_an_assertion_can_name() {
         roles: vec!["billing:read".to_owned()],
         session_id: "svc_1".to_owned(),
         auth_method: AuthMethod::ServiceToken,
+        scopes: None,
+        verified_claims: Vec::new(),
     };
     // A service token carrying an issuer is still not a provider-vouched
     // identity.
@@ -1462,6 +1468,8 @@ async fn a_composite_call_naming_nobody_is_refused_before_any_leaf_io() {
         roles: Vec::new(),
         session_id: "svc_1".to_owned(),
         auth_method: AuthMethod::ServiceToken,
+        scopes: None,
+        verified_claims: Vec::new(),
     };
     let context = context_for(&service, "request-composite-service");
     assert!(context.caller.is_none());

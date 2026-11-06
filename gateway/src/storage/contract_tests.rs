@@ -646,6 +646,8 @@ fn principal_actor(
         roles: vec!["token-admin".to_owned()],
         session_id: "session-evidence".to_owned(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     })
 }
 
@@ -16240,6 +16242,8 @@ pub(crate) mod postgres_audit_tests {
             roles: vec!["admin".to_owned()],
             session_id: "session-a".to_owned(),
             auth_method: crate::auth::AuthMethod::Cookie,
+            scopes: None,
+            verified_claims: Vec::new(),
         };
         let candidate = contract_policy_variant("accept-evidenced", "reader");
         let request = |suggestion_id| AcceptSuggestionRequest {

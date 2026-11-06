@@ -1162,6 +1162,8 @@ mod tests {
             roles: vec![],
             session_id: "opaque-session".to_owned(),
             auth_method: AuthMethod::Bearer,
+            scopes: None,
+            verified_claims: Vec::new(),
         }
     }
 

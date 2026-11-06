@@ -12,6 +12,10 @@
 //!
 //! - `organization`: the organization authentication verified for the
 //!   principal, bound to the issuer that verified it.
+//! - `scope`: the OAuth scopes the principal's verified `scope` or `scp`
+//!   claim granted, bound to the issuer that verified them.
+//! - `claim`: one claim the issuer's JWT provider allowlists in
+//!   `verified_claims`, as its validation verified it, bound to that issuer.
 //! - `source_network`: the canonical client address the gateway derived after
 //!   trusted-proxy processing, never a forwarding header.
 //! - `header` and `query`: one named request header or decoded query
@@ -22,9 +26,16 @@
 //!   eligible ([`tool_argument_pointer_eligible`]).
 //! - `time_window`: a half-open UTC interval over an injected clock.
 //!
-//! An HTTP path rule may read the first, second, third, fourth and last; a
-//! tool-name rule the first, second, fifth and last. Validation refuses the
-//! rest, so a leaf never sits where its fact cannot exist.
+//! An HTTP path rule may read every leaf but `tool_argument`; a tool-name rule
+//! every leaf but `header` and `query`. Validation refuses the rest, so a leaf
+//! never sits where its fact cannot exist.
+//!
+//! The identity leaves -- `organization`, `scope` and `claim` -- read what
+//! authentication verified for the principal, never a request header, and
+//! are issuer-bound: a principal another issuer authenticated does not match,
+//! whatever it carries. A scope or claim the principal's authentication did
+//! not capture -- a method that verifies none, a claim its provider does not
+//! allowlist, a value past the capture bounds -- is unknown, never absent.
 //!
 //! ## Which tool arguments a leaf may read
 //!
@@ -45,10 +56,6 @@
 //! so a rule that reads them is undetermined and refused rather than decided
 //! without a value the schema calls secret.
 //!
-//! Scopes and other verified claims are not leaves yet: authentication keeps
-//! no verified fact for them apart from the claimed roles, so a leaf over them
-//! would have nothing true to read.
-//!
 //! ## Where each half lives
 //!
 //! This module is the condition model and its validation, which the policy's
@@ -64,7 +71,11 @@ use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use super::policy_document::{IssueCode, PolicyIssue};
-use crate::auth::{canonical_issuer, MAX_PRINCIPAL_ISSUER_BYTES};
+use crate::auth::{
+    canonical_issuer, is_scope_token, is_verified_claim_text, verified_claim_name_problem,
+    MAX_PRINCIPAL_ISSUER_BYTES, MAX_PRINCIPAL_SCOPE_BYTES, MAX_VERIFIED_CLAIM_NAME_BYTES,
+    MAX_VERIFIED_CLAIM_VALUE_BYTES,
+};
 
 /// Deepest a condition tree may nest; the root node is depth 1.
 pub const MAX_CONDITION_DEPTH: usize = 4;
@@ -94,6 +105,8 @@ pub enum Condition {
     /// The operand does not hold.
     Not(Box<Condition>),
     Organization(OrganizationCondition),
+    Scope(ScopeCondition),
+    Claim(ClaimCondition),
     SourceNetwork(SourceNetworkCondition),
     Header(HeaderCondition),
     Query(QueryCondition),
@@ -109,6 +122,28 @@ pub struct OrganizationCondition {
     pub issuer: String,
     #[serde(rename = "in")]
     pub values: Vec<String>,
+}
+
+/// The principal was authenticated by exactly `issuer` and one of its
+/// verified OAuth scopes is one of `values`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeCondition {
+    pub issuer: String,
+    #[serde(rename = "in")]
+    pub values: Vec<String>,
+}
+
+/// The principal was authenticated by exactly `issuer` and some value of its
+/// verified claim `name` -- a claim that issuer's JWT provider allowlists --
+/// equals one of `values`: strings and booleans exactly, numbers by value.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimCondition {
+    pub issuer: String,
+    pub name: String,
+    #[serde(rename = "in")]
+    pub values: Vec<Value>,
 }
 
 /// The canonical client address lies in one of `cidrs`.
@@ -292,9 +327,37 @@ impl Condition {
                 leaf.pointer.as_str(),
             )),
             Self::Organization(_)
+            | Self::Scope(_)
+            | Self::Claim(_)
             | Self::SourceNetwork(_)
             | Self::Header(_)
             | Self::Query(_)
+            | Self::TimeWindow(_) => {}
+        }
+    }
+
+    /// Calls `visit` with every `claim` leaf of the tree and the JSON Pointer
+    /// to it, `pointer` being the tree's own, in document order.
+    pub fn for_each_claim(&self, pointer: &str, visit: &mut impl FnMut(&ClaimCondition, String)) {
+        match self {
+            Self::All(operands) | Self::Any(operands) => {
+                let operator = if matches!(self, Self::All(_)) {
+                    "all"
+                } else {
+                    "any"
+                };
+                for (index, operand) in operands.iter().enumerate() {
+                    operand.for_each_claim(&format!("{pointer}/{operator}/{index}"), visit);
+                }
+            }
+            Self::Not(operand) => operand.for_each_claim(&format!("{pointer}/not"), visit),
+            Self::Claim(leaf) => visit(leaf, format!("{pointer}/claim")),
+            Self::Organization(_)
+            | Self::Scope(_)
+            | Self::SourceNetwork(_)
+            | Self::Header(_)
+            | Self::Query(_)
+            | Self::ToolArgument(_)
             | Self::TimeWindow(_) => {}
         }
     }
@@ -310,6 +373,12 @@ pub fn canonicalize_condition_issuers(condition: &mut Condition) {
         }
         Condition::Not(operand) => canonicalize_condition_issuers(operand),
         Condition::Organization(leaf) => {
+            leaf.issuer = canonical_issuer(&leaf.issuer).unwrap_or_default();
+        }
+        Condition::Scope(leaf) => {
+            leaf.issuer = canonical_issuer(&leaf.issuer).unwrap_or_default();
+        }
+        Condition::Claim(leaf) => {
             leaf.issuer = canonical_issuer(&leaf.issuer).unwrap_or_default();
         }
         Condition::SourceNetwork(_)
@@ -400,22 +469,69 @@ fn validate_node(
         Condition::Organization(leaf) => {
             let pointer = format!("{pointer}/organization");
             let field_path = format!("{field_path}.organization");
-            if leaf.issuer.trim().is_empty() {
-                return Err(PolicyIssue::new(
-                    IssueCode::IssuerEmpty,
-                    format!("{pointer}/issuer"),
-                    format!("{field_path}.issuer must not be empty"),
-                ));
-            }
-            if leaf.issuer.len() > MAX_PRINCIPAL_ISSUER_BYTES {
-                return Err(value_issue(
-                    format!("{pointer}/issuer"),
-                    format!(
-                        "{field_path}.issuer must not exceed {MAX_PRINCIPAL_ISSUER_BYTES} bytes"
-                    ),
-                ));
-            }
+            validate_issuer(&leaf.issuer, &pointer, &field_path)?;
             validate_text_values(&leaf.values, &pointer, &field_path, false)
+        }
+        Condition::Scope(leaf) => {
+            let pointer = format!("{pointer}/scope");
+            let field_path = format!("{field_path}.scope");
+            validate_issuer(&leaf.issuer, &pointer, &field_path)?;
+            validate_value_count(leaf.values.len(), &format!("{pointer}/in"), &field_path)?;
+            for (index, value) in leaf.values.iter().enumerate() {
+                if !is_scope_token(value) {
+                    return Err(value_issue(
+                        format!("{pointer}/in/{index}"),
+                        format!(
+                            "{field_path}.in[{index}] must be an OAuth scope token: 1 to \
+                             {MAX_PRINCIPAL_SCOPE_BYTES} bytes of visible ASCII without a space, \
+                             a quote or a backslash"
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Condition::Claim(leaf) => {
+            let pointer = format!("{pointer}/claim");
+            let field_path = format!("{field_path}.claim");
+            validate_issuer(&leaf.issuer, &pointer, &field_path)?;
+            if let Some(problem) = verified_claim_name_problem(&leaf.name) {
+                // A malformed name is a value problem; a well-formed one that
+                // names an identity, scope, email or credential claim is a
+                // name no condition may read.
+                let malformed = leaf.name.is_empty()
+                    || leaf.name.len() > MAX_VERIFIED_CLAIM_NAME_BYTES
+                    || leaf.name.chars().any(char::is_control)
+                    || leaf.name.trim() != leaf.name;
+                return Err(PolicyIssue::new(
+                    if malformed {
+                        IssueCode::ConditionValueInvalid
+                    } else {
+                        IssueCode::ConditionNameForbidden
+                    },
+                    format!("{pointer}/name"),
+                    format!("{field_path}.name {problem}"),
+                ));
+            }
+            validate_value_count(leaf.values.len(), &format!("{pointer}/in"), &field_path)?;
+            for (index, value) in leaf.values.iter().enumerate() {
+                let scalar = match value {
+                    Value::String(text) => is_verified_claim_text(text),
+                    Value::Bool(_) | Value::Number(_) => true,
+                    Value::Null | Value::Array(_) | Value::Object(_) => false,
+                };
+                if !scalar {
+                    return Err(value_issue(
+                        format!("{pointer}/in/{index}"),
+                        format!(
+                            "{field_path}.in[{index}] must be a string of at most \
+                             {MAX_VERIFIED_CLAIM_VALUE_BYTES} bytes without control characters, \
+                             a number, or a boolean"
+                        ),
+                    ));
+                }
+            }
+            Ok(())
         }
         Condition::SourceNetwork(leaf) => {
             let pointer = format!("{pointer}/source_network");
@@ -581,6 +697,25 @@ fn validate_node(
             Ok(())
         }
     }
+}
+
+/// An identity leaf's issuer: present, and within the bound a principal's
+/// issuer is held to.
+fn validate_issuer(issuer: &str, pointer: &str, field_path: &str) -> Result<(), PolicyIssue> {
+    if issuer.trim().is_empty() {
+        return Err(PolicyIssue::new(
+            IssueCode::IssuerEmpty,
+            format!("{pointer}/issuer"),
+            format!("{field_path}.issuer must not be empty"),
+        ));
+    }
+    if issuer.len() > MAX_PRINCIPAL_ISSUER_BYTES {
+        return Err(value_issue(
+            format!("{pointer}/issuer"),
+            format!("{field_path}.issuer must not exceed {MAX_PRINCIPAL_ISSUER_BYTES} bytes"),
+        ));
+    }
+    Ok(())
 }
 
 fn require_target(

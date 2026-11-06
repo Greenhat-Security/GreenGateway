@@ -1956,6 +1956,7 @@ fn from_config_auto_seeds_auth_provider_hosts_into_allowlist() {
         client_id: None,
         client_secret: None,
         redirect_uri: None,
+        verified_claims: Vec::new(),
     }];
 
     let egress = EgressConfig::from_config(&config);
@@ -1987,6 +1988,7 @@ fn from_config_auto_seeds_cookie_session_introspection_host_into_allowlist() {
         client_id: None,
         client_secret: None,
         redirect_uri: None,
+        verified_claims: Vec::new(),
     }];
 
     let egress = EgressConfig::from_config(&config);

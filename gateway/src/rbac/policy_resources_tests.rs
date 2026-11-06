@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use super::*;
 use crate::{
     auth::{AuthMethod, Principal},
+    config::{AuthProviderConfig, AuthProviderType},
     policy_eval::egress::{CompiledEgressPolicy, EgressControls},
     rbac::policy_document::{DiagnosticBlocks, DiagnosticSeverity},
 };
@@ -49,6 +50,8 @@ fn principal(roles: &[&str]) -> Principal {
         email: None,
         org_id: None,
         session_id: "synthetic-session".to_owned(),
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 
@@ -82,6 +85,7 @@ fn complete_view() -> PolicyResourceView {
             policy_route_exempt: false,
         }),
         security_revision: None,
+        verified_claims: ClaimAllowlists::default(),
     }
 }
 
@@ -406,6 +410,8 @@ fn mapped_role_mode_strips_a_service_token_writer() {
         email: None,
         org_id: None,
         session_id: "synthetic".to_owned(),
+        scopes: None,
+        verified_claims: Vec::new(),
     };
     let live = policy(administered(json!({})));
     let candidate = policy(administered_v1(json!({
@@ -1044,6 +1050,137 @@ fn the_rbac_state_reports_its_own_exemption_and_no_resources_it_was_not_given() 
     let view = admin.policy_resource_view();
     assert!(view.configuration.is_none() && view.tools.is_none() && view.admin.is_none());
     assert!(view.security_revision.is_none());
+}
+
+fn jwt_provider(
+    name: &str,
+    issuer: Option<&str>,
+    provider_type: AuthProviderType,
+    verified_claims: &[&str],
+) -> AuthProviderConfig {
+    AuthProviderConfig {
+        name: name.to_owned(),
+        provider_type,
+        jwks_url: Some("https://keys.example.test/jwks.json".to_owned()),
+        issuer: issuer.map(str::to_owned),
+        audience: None,
+        jwks_timeout_ms: 2_000,
+        jwks_max_key_age_secs: 300,
+        require_jti: false,
+        roles_claim: "roles".to_owned(),
+        roles_claim_delimiter: None,
+        org_claim: None,
+        verified_claims: verified_claims
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
+        introspection_url: None,
+        introspection_timeout_ms: 2_000,
+        cache_ttl_ms: 5_000,
+        user_id_claim: None,
+        email_claim: None,
+        client_id: None,
+        client_secret: None,
+        redirect_uri: None,
+    }
+}
+
+/// Each JWT provider's allowlist is keyed by the issuer its validator stamps
+/// on principals: the configured issuer as validation normalizes it, or the
+/// provider label when none is configured. A cookie-session provider
+/// captures no claim.
+#[test]
+fn claim_allowlists_are_keyed_by_the_issuer_principals_carry() {
+    let allowlists = ClaimAllowlists::from_providers(&[
+        jwt_provider(
+            "corp",
+            Some("https://idp.example.test/"),
+            AuthProviderType::Jwt,
+            &["amr", "department"],
+        ),
+        jwt_provider("partners", None, AuthProviderType::Jwt, &["tier"]),
+        jwt_provider("sessions", None, AuthProviderType::CookieSession, &["tier"]),
+    ]);
+    assert!(allowlists.captures(ISSUER, "department"));
+    assert!(allowlists.captures(ISSUER, "amr"));
+    assert!(!allowlists.captures(ISSUER, "tier"));
+    assert!(allowlists.captures("provider:partners", "tier"));
+    assert!(!allowlists.captures("provider:sessions", "tier"));
+    assert!(!allowlists.captures("https://other.example.test", "department"));
+    assert_eq!(
+        ClaimAllowlists::from_providers(&[]),
+        ClaimAllowlists::default()
+    );
+}
+
+/// A claim condition that reads a claim its issuer's JWT validation never
+/// captures blocks publication -- and only publication -- at the leaf's
+/// name, whichever issuer did capture it. One that reads a captured claim,
+/// and a disabled rule, find nothing.
+#[test]
+fn a_claim_condition_its_issuer_never_captures_blocks_publication() {
+    let live = policy(administered_v1(json!({})));
+    let candidate = |enabled: bool, issuer: &str| {
+        policy(administered_v1(json!({
+            "rules": [{
+                "id": "engineering-reports",
+                "path": "/reports/**",
+                "action": "allow",
+                "enabled": enabled,
+                "conditions": { "all": [
+                    { "scope": { "issuer": issuer, "in": ["reports.read"] } },
+                    { "not": { "claim": { "issuer": issuer, "name": "department", "in": ["sales"] } } }
+                ] }
+            }]
+        })))
+    };
+    let mut view = complete_view();
+    view.verified_claims = ClaimAllowlists::from_providers(&[jwt_provider(
+        "corp",
+        Some(ISSUER),
+        AuthProviderType::Jwt,
+        &["department"],
+    )]);
+
+    assert!(!has(
+        &validate(&candidate(true, ISSUER), &live, &view),
+        IssueCode::ClaimNotCaptured
+    ));
+    assert!(!has(
+        &validate(
+            &candidate(false, "https://other.example.test"),
+            &live,
+            &view
+        ),
+        IssueCode::ClaimNotCaptured
+    ));
+    for (view, issuer) in [
+        (view.clone(), "https://other.example.test"),
+        (complete_view(), ISSUER),
+    ] {
+        let validation = validate(&candidate(true, issuer), &live, &view);
+        let refusal = finding(&validation, IssueCode::ClaimNotCaptured);
+        assert_eq!(
+            refusal.diagnostic.pointer,
+            "/rules/0/conditions/all/1/not/claim/name"
+        );
+        assert_eq!(
+            refusal.diagnostic.element_id.as_deref(),
+            Some("engineering-reports")
+        );
+        assert_eq!(refusal.diagnostic.severity, DiagnosticSeverity::Error);
+        assert_eq!(refusal.diagnostic.blocks, PUBLICATION_ONLY);
+        assert!(validation.blocks_publication());
+        assert_eq!(validation.blocking_codes(), vec!["claim_not_captured"]);
+        // The free-text detail tells the publisher which claim and issuer;
+        // the diagnostic itself names neither.
+        let detail = refusal.detail.as_deref().expect("an error has a detail");
+        assert!(
+            detail.contains("department") && detail.contains(issuer),
+            "{detail}"
+        );
+        assert!(!refusal.diagnostic.message.contains("department"));
+    }
 }
 
 /// A registry holding one tool, `reports.export`, whose input schema has an

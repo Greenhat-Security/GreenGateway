@@ -43,6 +43,8 @@ impl SessionValidator for Authority {
                 roles: vec!["admin".to_owned()],
                 session_id: "issuer-token-id".to_owned(),
                 auth_method: AuthMethod::Bearer,
+                scopes: None,
+                verified_claims: Vec::new(),
             }),
         }
     }

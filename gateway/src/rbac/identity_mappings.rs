@@ -64,7 +64,8 @@ pub(crate) fn admitted_auth_methods(mapping: &IdentityMapping) -> impl Iterator<
 }
 
 /// Whether `mapping` applies to `principal`. Every constraint but the
-/// organization reads the principal itself, which is always known.
+/// organization and the scopes reads the principal itself, which is always
+/// known.
 pub(crate) fn mapping_applies(
     mapping: &IdentityMapping,
     principal: &Principal,
@@ -87,16 +88,28 @@ pub(crate) fn mapping_applies(
     if !identity_holds {
         return Truth::False;
     }
-    if mapping.organizations.is_empty() {
-        return Truth::True;
-    }
-    match &facts.organization {
-        Fact::Uncaptured => Truth::Unknown,
-        Fact::Captured(None) => Truth::False,
-        Fact::Captured(Some(organization)) => {
-            Truth::of(mapping.organizations.contains(organization))
+    let organization = if mapping.organizations.is_empty() {
+        Truth::True
+    } else {
+        match &facts.organization {
+            Fact::Uncaptured => Truth::Unknown,
+            Fact::Captured(None) => Truth::False,
+            Fact::Captured(Some(organization)) => {
+                Truth::of(mapping.organizations.contains(organization))
+            }
         }
-    }
+    };
+    organization.and_then(|| {
+        if mapping.scopes.is_empty() {
+            return Truth::True;
+        }
+        match &facts.scopes {
+            Fact::Uncaptured => Truth::Unknown,
+            Fact::Captured(scopes) => {
+                Truth::of(scopes.iter().any(|scope| mapping.scopes.contains(scope)))
+            }
+        }
+    })
 }
 
 #[cfg(test)]

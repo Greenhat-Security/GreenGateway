@@ -17,11 +17,14 @@
 //! | routing `proxy_dispatch` | `HttpTarget::ProxyDispatch` with the recorded facts |
 //! | egress destination | `EgressDestination`, with `ResolutionFact::Missing` |
 //! | organization (never recorded) | `PolicyFacts::organization` uncaptured: every lane asks the uncaptured entry point |
+//! | scopes, verified claims (never recorded) | `PolicyFacts::scopes` and `PolicyFacts::claims` uncaptured, the same way |
 //!
-//! A record carries no organization, so an identity mapping that tests one
-//! answers `missing_matcher_fact` here, where the live lane read the
-//! organization the principal's provider verified. Replay never reads it as
-//! none, which would withhold a role the live lane granted.
+//! A record carries no organization, scope or verified claim, so an identity
+//! mapping that tests an organization or scopes, and a scope or claim
+//! condition, answers `missing_matcher_fact` here, where the live lane read
+//! what the principal's provider verified. Replay never reads one as none,
+//! which would withhold a role, or satisfy a `not`, the live lane decided
+//! otherwise.
 //!
 //! The tool lane projects the recorded principal the way the live tool runtime
 //! projects an invocation's actor, through the runtime's own function
@@ -101,6 +104,8 @@ fn recorded_principal(principal: &RecordedPrincipal) -> Principal {
         roles: principal.roles.clone(),
         session_id: String::new(),
         auth_method: principal.auth_method.clone(),
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 

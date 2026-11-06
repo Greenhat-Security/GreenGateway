@@ -354,6 +354,8 @@ impl CachedSessionValidation {
                 roles: valid.roles,
                 session_id: valid.session_id,
                 auth_method: AuthMethod::Cookie,
+                scopes: None,
+                verified_claims: Vec::new(),
             }),
             Self::Invalid(reason) => Err(AuthError::InvalidSession(reason)),
         }

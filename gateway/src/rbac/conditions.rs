@@ -28,7 +28,7 @@ use serde_json::Value;
 
 pub use gateway_config::rbac::conditions::*;
 
-use crate::auth::{principal::canonical_issuer, Principal};
+use crate::auth::{principal::canonical_issuer, Principal, VerifiedClaim};
 
 /// One fact a typed matcher reads, distinguishing a fact the caller never
 /// captured from what it captured.
@@ -52,6 +52,15 @@ pub(crate) struct PolicyFacts {
     /// reads it from the authenticated principal (`Principal::org_id`), never
     /// from a request header.
     pub(crate) organization: Fact<Option<String>>,
+    /// The OAuth scopes authentication verified for the principal
+    /// (`Principal::scopes`), sorted and unique, and verified by the
+    /// principal's own issuer like the organization. Uncaptured when the
+    /// principal's authentication captured no scope fact.
+    pub(crate) scopes: Fact<Vec<String>>,
+    /// The verified claims (`Principal::verified_claims`) whose names a
+    /// `claim` leaf reads: one entry per name authentication captured, so a
+    /// name with no entry was not captured for this principal.
+    pub(crate) claims: Fact<Vec<VerifiedClaim>>,
     /// The canonical client address after trusted-proxy processing.
     pub(crate) source_ip: Fact<IpAddr>,
     /// Request header field lines, one entry per occurrence, as received.
@@ -72,6 +81,8 @@ impl PolicyFacts {
     pub(crate) const fn uncaptured() -> Self {
         Self {
             organization: Fact::Uncaptured,
+            scopes: Fact::Uncaptured,
+            claims: Fact::Uncaptured,
             source_ip: Fact::Uncaptured,
             headers: Fact::Uncaptured,
             query: Fact::Uncaptured,
@@ -86,6 +97,8 @@ impl PolicyFacts {
             self,
             Self {
                 organization: Fact::Uncaptured,
+                scopes: Fact::Uncaptured,
+                claims: Fact::Uncaptured,
                 source_ip: Fact::Uncaptured,
                 headers: Fact::Uncaptured,
                 query: Fact::Uncaptured,
@@ -105,6 +118,12 @@ pub(crate) struct FactNeeds {
     /// An identity mapping or an `organization` leaf reads the organization
     /// authentication verified for the principal.
     pub(crate) organization: bool,
+    /// A `scope` leaf, or an identity mapping that lists `scopes`, reads the
+    /// principal's verified OAuth scopes.
+    pub(crate) scopes: bool,
+    /// The claim names `claim` leaves read, sorted and unique. A lane copies
+    /// these verified claims and no others.
+    pub(crate) claims: Vec<String>,
     /// A `source_network` leaf reads the canonical client address.
     pub(crate) source_ip: bool,
     /// The header names `header` leaves read: lowercase, sorted and unique.
@@ -122,11 +141,16 @@ pub(crate) struct FactNeeds {
 }
 
 impl FactNeeds {
-    /// What the conditions of `rules`, and identity mappings when the policy
-    /// has them, read.
-    pub(crate) fn of(rules: &[super::rule::Rule], identity_mappings: bool) -> Self {
+    /// What the conditions of `rules`, and the identity mappings of a policy
+    /// in mapped-role mode, read.
+    pub(crate) fn of(
+        rules: &[super::rule::Rule],
+        identity_mappings: Option<&[super::identity_mappings::IdentityMapping]>,
+    ) -> Self {
         let mut needs = Self {
-            organization: identity_mappings,
+            organization: identity_mappings.is_some(),
+            scopes: identity_mappings
+                .is_some_and(|mappings| mappings.iter().any(|mapping| !mapping.scopes.is_empty())),
             ..Self::default()
         };
         for rule in rules {
@@ -134,10 +158,10 @@ impl FactNeeds {
                 needs.add(conditions, rule.tool_name.as_deref());
             }
         }
-        needs.headers.sort_unstable();
-        needs.headers.dedup();
-        needs.query.sort_unstable();
-        needs.query.dedup();
+        for names in [&mut needs.headers, &mut needs.query, &mut needs.claims] {
+            names.sort_unstable();
+            names.dedup();
+        }
         for pointers in needs.tool_arguments.values_mut() {
             pointers.sort_unstable();
             pointers.dedup();
@@ -158,6 +182,8 @@ impl FactNeeds {
             }
             Condition::Not(operand) => self.add(operand, tool_name),
             Condition::Organization(_) => self.organization = true,
+            Condition::Scope(_) => self.scopes = true,
+            Condition::Claim(leaf) => self.claims.push(leaf.name.clone()),
             Condition::SourceNetwork(_) => self.source_ip = true,
             Condition::Header(leaf) => self.headers.push(leaf.name.to_ascii_lowercase()),
             Condition::Query(leaf) => self.query.push(leaf.name.clone()),
@@ -182,8 +208,8 @@ impl FactNeeds {
             .map_or(&[], Vec::as_slice)
     }
 
-    /// Whether a request fact -- anything beyond the organization, which a
-    /// lane reads from the principal -- is read at all.
+    /// Whether a request fact -- anything beyond the organization, scopes and
+    /// claims, which a lane reads from the principal -- is read at all.
     pub(crate) fn reads_request_facts(&self) -> bool {
         self.source_ip
             || !self.headers.is_empty()
@@ -308,6 +334,15 @@ pub(crate) enum CompiledCondition {
         issuer: String,
         values: Vec<String>,
     },
+    Scope {
+        issuer: String,
+        values: Vec<String>,
+    },
+    Claim {
+        issuer: String,
+        name: String,
+        values: Vec<Value>,
+    },
     SourceNetwork(Vec<IpNet>),
     Header {
         name: String,
@@ -341,6 +376,21 @@ impl CompiledCondition {
             Condition::Organization(leaf) => match canonical_issuer(&leaf.issuer) {
                 Some(issuer) => Self::Organization {
                     issuer,
+                    values: leaf.values.clone(),
+                },
+                None => Self::Unusable,
+            },
+            Condition::Scope(leaf) => match canonical_issuer(&leaf.issuer) {
+                Some(issuer) => Self::Scope {
+                    issuer,
+                    values: leaf.values.clone(),
+                },
+                None => Self::Unusable,
+            },
+            Condition::Claim(leaf) => match canonical_issuer(&leaf.issuer) {
+                Some(issuer) => Self::Claim {
+                    issuer,
+                    name: leaf.name.clone(),
                     values: leaf.values.clone(),
                 },
                 None => Self::Unusable,
@@ -393,15 +443,49 @@ impl CompiledCondition {
             Self::Organization { issuer, values } => {
                 // Issuer-bound: an organization another issuer verified is a
                 // different organization, whatever it is called.
-                let bound = principal
-                    .is_some_and(|principal| principal.issuer.as_deref() == Some(issuer.as_str()));
-                if !bound {
+                if !issued_by(principal, issuer) {
                     return Truth::False;
                 }
                 match &facts.organization {
                     Fact::Uncaptured => Truth::Unknown,
                     Fact::Captured(None) => Truth::False,
                     Fact::Captured(Some(organization)) => Truth::of(values.contains(organization)),
+                }
+            }
+            Self::Scope { issuer, values } => {
+                // Issuer-bound as an organization is: a scope another issuer
+                // granted is another issuer's scope.
+                if !issued_by(principal, issuer) {
+                    return Truth::False;
+                }
+                match &facts.scopes {
+                    Fact::Uncaptured => Truth::Unknown,
+                    Fact::Captured(scopes) => {
+                        Truth::of(scopes.iter().any(|scope| values.contains(scope)))
+                    }
+                }
+            }
+            Self::Claim {
+                issuer,
+                name,
+                values,
+            } => {
+                if !issued_by(principal, issuer) {
+                    return Truth::False;
+                }
+                match &facts.claims {
+                    Fact::Uncaptured => Truth::Unknown,
+                    // A name with no entry was never captured for this
+                    // principal -- its provider does not allowlist it, or its
+                    // value was past the capture bounds -- so it is unknown,
+                    // not absent.
+                    Fact::Captured(claims) => match claims.iter().find(|claim| claim.name == *name)
+                    {
+                        None => Truth::Unknown,
+                        Some(claim) => Truth::of(claim.values.iter().any(|actual| {
+                            values.iter().any(|authored| scalar_eq(authored, actual))
+                        })),
+                    },
                 }
             }
             Self::SourceNetwork(networks) => match facts.source_ip {
@@ -444,7 +528,13 @@ impl CompiledCondition {
     }
 }
 
-/// Scalar equality for a tool argument: strings and booleans exactly,
+/// Whether `principal` was authenticated by exactly `issuer`, already
+/// canonical on both sides. An anonymous caller was authenticated by none.
+fn issued_by(principal: Option<&Principal>, issuer: &str) -> bool {
+    principal.is_some_and(|principal| principal.issuer.as_deref() == Some(issuer))
+}
+
+/// Scalar equality for a tool argument or a claim: strings and booleans exactly,
 /// numbers by value, so `1` and `1.0` are one number. An array or object is
 /// never equal to an authored scalar.
 fn scalar_eq(authored: &Value, actual: &Value) -> bool {

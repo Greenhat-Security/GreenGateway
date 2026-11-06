@@ -47,6 +47,8 @@ fn writer() -> Principal {
         roles: vec!["admin".to_owned()],
         session_id: "session-suite".to_owned(),
         auth_method: AuthMethod::Cookie,
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 

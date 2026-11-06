@@ -50,6 +50,8 @@ fn person(issuer: Option<&str>, roles: &[&str], auth_method: AuthMethod) -> Prin
         roles: roles.iter().map(|role| (*role).to_owned()).collect(),
         session_id: String::new(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 
@@ -96,6 +98,11 @@ fn at(now: i64) -> PolicyFacts {
 fn canary_facts() -> PolicyFacts {
     PolicyFacts {
         organization: Fact::Captured(Some("canary-organization".to_owned())),
+        scopes: Fact::Captured(vec!["canary-scope-value".to_owned()]),
+        claims: Fact::Captured(vec![crate::auth::VerifiedClaim {
+            name: "department".to_owned(),
+            values: vec![json!("canary-claim-value")],
+        }]),
         source_ip: Fact::Captured(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77))),
         headers: Fact::Captured(vec![(
             "x-environment".to_owned(),
@@ -724,6 +731,8 @@ fn no_fact_value_reaches_a_trace_and_a_fact_bound_answer_is_never_reused() {
                 { "query": { "name": "mode", "in": ["canary-query-value"] } },
                 { "source_network": { "cidrs": ["203.0.113.0/24"] } },
                 { "organization": { "issuer": ISSUER, "in": ["canary-organization"] } },
+                { "scope": { "issuer": ISSUER, "in": ["canary-scope-value"] } },
+                { "claim": { "issuer": ISSUER, "name": "department", "in": ["canary-claim-value"] } },
                 { "time_window": { "from": ALWAYS } }
             ] }
         }]
@@ -739,6 +748,9 @@ fn no_fact_value_reaches_a_trace_and_a_fact_bound_answer_is_never_reused() {
         "canary-header-value",
         "canary-query-value",
         "canary-argument-value",
+        "canary-scope-value",
+        "canary-claim-value",
+        "department",
         "203.0.113.77",
         "x-environment",
     ] {
@@ -778,7 +790,46 @@ fn facts_past_the_kernel_work_bounds_are_refused() {
     long_name.headers = Fact::Captured(vec![("h".repeat(MAX_FACT_NAME_BYTES + 1), "v".to_owned())]);
     let mut long_organization = PolicyFacts::uncaptured();
     long_organization.organization = Fact::Captured(Some("o".repeat(MAX_FACT_VALUE_BYTES + 1)));
-    for facts in [too_many, too_long, long_name, long_organization] {
+    let claim = |name: String, values: Vec<Value>| crate::auth::VerifiedClaim { name, values };
+    let mut too_many_scopes = PolicyFacts::uncaptured();
+    too_many_scopes.scopes = Fact::Captured(
+        (0..=crate::auth::principal::MAX_PRINCIPAL_SCOPES)
+            .map(|n| format!("s{n}"))
+            .collect(),
+    );
+    let mut long_scope = PolicyFacts::uncaptured();
+    long_scope.scopes = Fact::Captured(vec![
+        "s".repeat(crate::auth::principal::MAX_PRINCIPAL_SCOPE_BYTES + 1)
+    ]);
+    let mut too_many_claims = PolicyFacts::uncaptured();
+    too_many_claims.claims = Fact::Captured(
+        (0..=crate::auth::principal::MAX_VERIFIED_CLAIMS)
+            .map(|n| claim(format!("c{n}"), Vec::new()))
+            .collect(),
+    );
+    let mut too_many_values = PolicyFacts::uncaptured();
+    too_many_values.claims = Fact::Captured(vec![claim(
+        "groups".to_owned(),
+        vec![json!("g"); crate::auth::principal::MAX_VERIFIED_CLAIM_VALUES + 1],
+    )]);
+    let mut long_value = PolicyFacts::uncaptured();
+    long_value.claims = Fact::Captured(vec![claim(
+        "department".to_owned(),
+        vec![json!("v".repeat(
+            crate::auth::principal::MAX_VERIFIED_CLAIM_VALUE_BYTES + 1
+        ))],
+    )]);
+    for facts in [
+        too_many,
+        too_long,
+        long_name,
+        long_organization,
+        too_many_scopes,
+        long_scope,
+        too_many_claims,
+        too_many_values,
+        long_value,
+    ] {
         assert_eq!(
             compiled.evaluate_with_facts(&input, &facts),
             Err(EvaluationError::ContextTooLarge)
@@ -800,4 +851,79 @@ fn facts_past_the_kernel_work_bounds_are_refused() {
             Err(EvaluationError::ContextTooLarge)
         );
     }
+    // Authentication captures string, boolean and number claim values only.
+    let mut nested = PolicyFacts::uncaptured();
+    nested.claims = Fact::Captured(vec![claim(
+        "department".to_owned(),
+        vec![json!({ "name": "engineering" })],
+    )]);
+    assert_eq!(
+        compiled.evaluate_with_facts(&input, &nested).map(|_| ()),
+        Err(EvaluationError::InvalidPrincipal)
+    );
+}
+
+/// A serving lane captures the scope fact only when the policy reads it, and
+/// only the verified claims its conditions name; a principal whose
+/// authentication captured no scope fact leaves the fact uncaptured.
+#[test]
+fn serving_facts_carry_exactly_the_scopes_and_claims_the_policy_reads() {
+    let compiled = compile(json!({
+        "schema_version": "1.0.0",
+        "rules": [{
+            "id": "engineering",
+            "path": "/eng/**",
+            "action": "deny",
+            "conditions": { "not": { "claim": { "issuer": ISSUER, "name": "department", "in": ["eng"] } } }
+        }]
+    }));
+    let mut alice = person(Some(ISSUER), &[], AuthMethod::Bearer);
+    alice.scopes = Some(vec!["orders.read".to_owned()]);
+    alice.verified_claims = vec![
+        crate::auth::VerifiedClaim {
+            name: "amr".to_owned(),
+            values: vec![json!("mfa")],
+        },
+        crate::auth::VerifiedClaim {
+            name: "department".to_owned(),
+            values: vec![json!("eng")],
+        },
+    ];
+    let facts = compiled.serving_facts(Some(&alice));
+    assert_eq!(facts.scopes, Fact::Uncaptured, "no condition reads scopes");
+    assert_eq!(
+        facts.claims,
+        Fact::Captured(vec![crate::auth::VerifiedClaim {
+            name: "department".to_owned(),
+            values: vec![json!("eng")],
+        }])
+    );
+    assert_eq!(
+        compiled.serving_facts(None).claims,
+        Fact::Captured(Vec::new())
+    );
+
+    let scoped = compile(json!({
+        "schema_version": "1.0.0",
+        "rules": [{
+            "id": "writers",
+            "path": "/orders/**",
+            "action": "allow",
+            "conditions": { "scope": { "issuer": ISSUER, "in": ["orders.write"] } }
+        }]
+    }));
+    assert_eq!(
+        scoped.serving_facts(Some(&alice)).scopes,
+        Fact::Captured(vec!["orders.read".to_owned()])
+    );
+    assert_eq!(scoped.serving_facts(Some(&alice)).claims, Fact::Uncaptured);
+    alice.scopes = None;
+    assert_eq!(scoped.serving_facts(Some(&alice)).scopes, Fact::Uncaptured);
+    assert_eq!(
+        scoped.serving_facts(None).scopes,
+        Fact::Captured(Vec::new())
+    );
+    // A policy that reads no fact captures none, exactly as before.
+    let plain = compile(json!({ "schema_version": "1.0.0" }));
+    assert!(!plain.serving_facts(Some(&alice)).any_captured());
 }

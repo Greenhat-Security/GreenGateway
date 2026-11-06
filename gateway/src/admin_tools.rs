@@ -203,6 +203,8 @@ pub(super) async fn tool_playground_execute_endpoint(
         ),
         actor: Some(auth::actor_from_principal(&principal)),
         organization: principal.org_id.clone(),
+        scopes: principal.scopes.clone(),
+        verified_claims: principal.verified_claims.clone(),
         source_address: client_ip::canonical_client_addr(
             &parts.headers,
             &parts.extensions,

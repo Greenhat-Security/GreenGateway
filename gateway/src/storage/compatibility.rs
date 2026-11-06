@@ -148,10 +148,10 @@ pub(crate) enum Capability {
     /// such a document, so [`POLICY_ROLE_DESCRIPTIONS`] waits for it.
     PolicyRoleDescriptions,
     /// The member reads, validates and enforces a policy v1 document whose
-    /// direct rules carry `conditions` over the organization, the source
-    /// network, headers, query parameters and time windows (issue #243). A
-    /// member without it refuses such a document, so
-    /// [`POLICY_RULE_CONDITIONS`] waits for it.
+    /// direct rules carry `conditions` over the organization, the verified
+    /// scopes and allowlisted claims, the source network, headers, query
+    /// parameters and time windows (issue #243). A member without it
+    /// refuses such a document, so [`POLICY_RULE_CONDITIONS`] waits for it.
     PolicyRuleConditions,
     /// The member reads, validates and enforces a policy v1 document whose
     /// rule conditions contain a `tool_argument` leaf, deciding it on tool

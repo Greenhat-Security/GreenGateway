@@ -209,6 +209,8 @@ fn a_principal_actor_records_migration_24s_vocabulary() {
         roles: vec!["admin".to_owned()],
         session_id: "session".to_owned(),
         auth_method: AuthMethod::Cookie,
+        scopes: None,
+        verified_claims: Vec::new(),
     };
     let actor = DocumentChange::by_principal(DocumentAction::PolicyPublish, &principal).actor;
     assert_eq!(actor.kind(), ActorKind::Principal);
@@ -433,6 +435,8 @@ async fn committed_document_changes_record_attributed_evidence_and_refusals_reco
         roles: vec!["admin".to_owned()],
         session_id: "session-a".to_owned(),
         auth_method: AuthMethod::ClientCertificate,
+        scopes: None,
+        verified_claims: Vec::new(),
     };
     let initial = policy("evidence-initial", "reader");
     let first = PolicyControlPlane::commit(
