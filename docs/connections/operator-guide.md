@@ -14,6 +14,8 @@ trust sits when a Connection acts for the calling user, through a signed
 caller assertion, a delegated issuer token or a Google domain-wide delegation,
 is collected in the
 [per-caller credential trust boundary](per-caller-trust-boundary.md).
+For the tested call paths, full provider-document checks and remaining
+decisions, see the [Phase 8 acceptance ledger](per-caller-trust-boundary.md#phase-8-acceptance-ledger).
 
 ## Production Readiness Checklist
 

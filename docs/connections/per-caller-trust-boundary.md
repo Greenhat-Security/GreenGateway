@@ -694,14 +694,39 @@ no Google token material reaches the audit trail.
 PostgreSQL that a purge on one replica retires another's cached tokens before
 that replica serves again.
 
-`gateway/src/tests/issue_446_acceptance.rs` drives the attested and delegated
-lanes through the composed router, with Connections created through the admin
-API and a real MCP client authenticated to `/mcp` by a JWT: two principals
-reach an internal API with its service bearer and a request-bound assertion
-that verifies against the anonymously fetched JWKS; a delegated catalog
-registered from the Gmail Discovery golden serves a read declared read-only
-and no mutation, each caller with a token of their own; a per-principal deny
-rule and a service token are refused before any byte reaches the issuer or an
-upstream; and no key, token or assertion appears in the captured audit trail
-or logs. Domain-wide delegation
-has no such router-level test: its evidence is the executor-level suite above.
+## Phase 8 acceptance ledger
+
+The [router suite](../../gateway/src/tests/issue_446_acceptance.rs) creates
+Connections through the admin API and exercises them through a streamable-HTTP
+MCP client authenticated to `/mcp`. An in-process TLS server plays the issuer,
+the internal API and Gmail. Run the three scenarios with the repository's CI
+toolchain.
+
+```sh
+cargo test --locked -p gateway --bin gateway issue_446_acceptance
+```
+
+| Work item | What the checks exercise |
+| --- | --- |
+| Delegated issuer token (#441) | Two users call the same generated Gmail tool with distinct provider tokens. A per-principal deny rule takes effect before exchange or upstream access. A service token is refused before either endpoint receives a request. The router suite checks captured logs and audit for token material. [Executor and cache tests](../../gateway/src/tools/executor_delegated_token_tests.rs) |
+| Google domain-wide delegation (#442) | The runtime signs for two principals and obtains a token for each. It serves manual HTTP tools and stored tests, and refuses managed catalogs. The Google IAM and token endpoints are exercised through stubs at the Connection runtime boundary. [Google delegation tests](../../gateway/src/connections/google_delegation_tests.rs) |
+| Catalog import (#443) | The router suite registers the profile, message get/list and thread get/list reads from the checked-in Gmail Discovery fixture. All five tools appear with read-only annotations, mutations stay off the tool list and repeated label filters reach the stub in order. |
+| Audit failure detail (#444) | Executor failures record a fixed `failure_reason`. Validation problems retain bounded schema paths while redacting caller-controlled keys and values. [Audit event tests](../../gateway/src/tools/runtime.rs) and [validation tests](../../gateway/src/tools/executor_tests.rs) |
+| Sanitised upstream errors (#445) | `tools/call` returns an upstream error with a numeric `statusCode` and bounded, redacted `messages`. Tests also cover malformed fields and the outer HTTP status. [MCP result tests](../../gateway/src/mcp.rs) and [router test](../../gateway/src/mcp_app_tests.rs) |
+| Signed caller assertion (#463) | Two users call an internal API with the same service bearer and different request-bound assertions. The router suite verifies both against the public JWKS. Executor tests cover ES256, RS256, key rotation and distinct assertion IDs for composite leaves. [Assertion tests](../../gateway/src/tools/executor_caller_assertion_tests.rs) |
+
+To verify catalog compatibility against the full provider documents, supply
+the two SHA-256-pinned snapshots and run the opt-in admin API tests. They
+preview and register Slack's `users_info` and `users_list` and Gmail's
+message and thread get/list operations. The normal workspace test run uses
+checked-in fixtures. Provider account access and production deployment
+qualification require separate evidence.
+[Snapshot sources and verification command](operator-guide.md#verify-the-full-slack-and-gmail-documents)
+
+Two decisions remain on the [Phase 8 tracker](https://github.com/Greenhat-Security/GreenGateway/issues/446).
+The exchange supports `caller_assertion` as its subject token. Forwarding the
+raw inbound bearer remains an open scope decision in
+[#441](https://github.com/Greenhat-Security/GreenGateway/issues/441).
+An assertion with `bind_approval: true` is refused. Supporting it requires an
+approval subsystem, and [#463](https://github.com/Greenhat-Security/GreenGateway/issues/463)
+tracks that decision.
