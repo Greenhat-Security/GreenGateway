@@ -2397,6 +2397,11 @@ them or call either provider.
 | [Slack Web API Swagger 2.0](https://raw.githubusercontent.com/slackapi/slack-api-specs/dfea73e06d146c368d7f94b52ac90796dc4e27e1/web-api/slack_web_openapi_v2.json) | `742a5c977180a829df8767cf57bc417d99b3713583aee83741efb9c08ca731e7` | `users_info`, `users_list` |
 | [Gmail v1 Discovery](https://raw.githubusercontent.com/googleapis/discovery-artifact-manager/b54f57986191f04556a56ce2d90e8b1fe5dd8a0f/discoveries/gmail.v1.json) | `f651441dcc942f428d92768e8b20c94a28ff82bf485b79872d9eef267a894225` | `gmail.users.messages.get`, `gmail.users.messages.list`, `gmail.users.threads.get`, `gmail.users.threads.list` |
 
+The Gmail test also registers all six `gmail.users.threads.*` methods on a
+separate, temporary Connection with the synthetic `https://mail.google.com/`
+scope. It includes `delete`, `modify`, `trash` and `untrash` in that catalog.
+The test makes no Gmail requests.
+
 With the repository build tools on your path, run:
 
 ```sh

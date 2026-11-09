@@ -5106,7 +5106,7 @@ async fn all_connection_mutations_report_unconfigured_store_as_unavailable() {
 
 /// Run with the immutable upstream documents described in the operator guide.
 /// The default suite is hermetic. An explicit run must have the exact inputs.
-async fn register_pinned_provider_reads(
+async fn register_pinned_provider_tools(
     document_variable: &str,
     sha256: &str,
     base_url: &str,
@@ -5172,7 +5172,7 @@ async fn register_pinned_provider_reads(
 #[tokio::test]
 #[ignore = "requires the operator-supplied Slack Swagger snapshot"]
 async fn pinned_provider_document_slack_preview_and_register() {
-    register_pinned_provider_reads(
+    register_pinned_provider_tools(
         "GGW_SLACK_SWAGGER_FILE",
         "742a5c977180a829df8767cf57bc417d99b3713583aee83741efb9c08ca731e7",
         "https://slack.com",
@@ -5186,20 +5186,38 @@ async fn pinned_provider_document_slack_preview_and_register() {
 #[tokio::test]
 #[ignore = "requires the operator-supplied Gmail Discovery snapshot"]
 async fn pinned_provider_document_gmail_preview_and_register() {
-    register_pinned_provider_reads(
-        "GGW_GMAIL_DISCOVERY_FILE",
-        "f651441dcc942f428d92768e8b20c94a28ff82bf485b79872d9eef267a894225",
-        "https://gmail.googleapis.com",
-        "/",
-        "https://www.googleapis.com/auth/gmail.readonly",
-        &[
-            "gmail.users.messages.get",
-            "gmail.users.messages.list",
-            "gmail.users.threads.get",
-            "gmail.users.threads.list",
-        ],
-    )
-    .await;
+    let read_only = [
+        "gmail.users.messages.get",
+        "gmail.users.messages.list",
+        "gmail.users.threads.get",
+        "gmail.users.threads.list",
+    ];
+    let all_thread_methods = [
+        "gmail.users.threads.delete",
+        "gmail.users.threads.get",
+        "gmail.users.threads.list",
+        "gmail.users.threads.modify",
+        "gmail.users.threads.trash",
+        "gmail.users.threads.untrash",
+    ];
+    for (scope, selected) in [
+        (
+            "https://www.googleapis.com/auth/gmail.readonly",
+            read_only.as_slice(),
+        ),
+        ("https://mail.google.com/", all_thread_methods.as_slice()),
+    ] {
+        // Each selection is registered on a fresh Connection and store.
+        register_pinned_provider_tools(
+            "GGW_GMAIL_DISCOVERY_FILE",
+            "f651441dcc942f428d92768e8b20c94a28ff82bf485b79872d9eef267a894225",
+            "https://gmail.googleapis.com",
+            "/",
+            scope,
+            selected,
+        )
+        .await;
+    }
 }
 
 /// The connection admin router, with an operator alias holding a generated
