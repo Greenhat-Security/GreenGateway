@@ -5179,7 +5179,7 @@ async fn register_pinned_provider_tools(
 #[ignore = "requires the operator-supplied Slack Swagger snapshot"]
 async fn pinned_provider_document_slack_preview_and_register() {
     register_pinned_provider_tools(
-        "GGW_SLACK_SWAGGER_FILE",
+        "GATEWAY_TEST_SLACK_SWAGGER_FILE",
         "742a5c977180a829df8767cf57bc417d99b3713583aee83741efb9c08ca731e7",
         "https://slack.com",
         "/api",
@@ -5215,7 +5215,7 @@ async fn pinned_provider_document_gmail_preview_and_register() {
     ] {
         // Each selection is registered on a fresh Connection and store.
         register_pinned_provider_tools(
-            "GGW_GMAIL_DISCOVERY_FILE",
+            "GATEWAY_TEST_GMAIL_DISCOVERY_FILE",
             "f651441dcc942f428d92768e8b20c94a28ff82bf485b79872d9eef267a894225",
             "https://gmail.googleapis.com",
             "/",

@@ -13,12 +13,12 @@ ROOT = Path(__file__).resolve().parents[1]
 CACHE = ROOT / "target" / "provider-documents"
 MAX_BYTES = 2 * 1024 * 1024
 SNAPSHOTS = {
-    "GGW_SLACK_SWAGGER_FILE": (
+    "GATEWAY_TEST_SLACK_SWAGGER_FILE": (
         "https://raw.githubusercontent.com/slackapi/slack-api-specs/"
         "dfea73e06d146c368d7f94b52ac90796dc4e27e1/web-api/slack_web_openapi_v2.json",
         "742a5c977180a829df8767cf57bc417d99b3713583aee83741efb9c08ca731e7",
     ),
-    "GGW_GMAIL_DISCOVERY_FILE": (
+    "GATEWAY_TEST_GMAIL_DISCOVERY_FILE": (
         "https://raw.githubusercontent.com/googleapis/discovery-artifact-manager/"
         "b54f57986191f04556a56ce2d90e8b1fe5dd8a0f/discoveries/gmail.v1.json",
         "f651441dcc942f428d92768e8b20c94a28ff82bf485b79872d9eef267a894225",

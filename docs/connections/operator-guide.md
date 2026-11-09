@@ -2427,7 +2427,7 @@ python scripts/provider_document_acceptance.py --fetch
 
 The command caches verified files in `target/provider-documents/`. Repeat it
 without `--fetch` to use the cached snapshots without contacting the providers. To supply your own local copies,
-set `GGW_SLACK_SWAGGER_FILE` and `GGW_GMAIL_DISCOVERY_FILE` to their file
+set `GATEWAY_TEST_SLACK_SWAGGER_FILE` and `GATEWAY_TEST_GMAIL_DISCOVERY_FILE` to their file
 paths before running it. Explicit paths always take precedence. Use
 `--verify-only` to check the files without compiling or running the gateway.
 The default CI suite leaves these tests ignored.
