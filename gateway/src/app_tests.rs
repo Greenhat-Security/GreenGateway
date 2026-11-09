@@ -1107,8 +1107,9 @@ async fn preview_and_register_managed_openapi(
         ))
         .await
         .expect("managed OpenAPI preview should complete");
-    assert_eq!(preview.status(), StatusCode::OK);
+    let status = preview.status();
     let preview = json_body(preview).await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
     let confirmations = preview["security_confirmations"]
         .as_array()
         .expect("preview should list security confirmations")
