@@ -2382,6 +2382,32 @@ not exist there. Register and edit such catalogs through upgraded replicas.
 After a rollback the catalog stays stored, unserved, until the upgrade is
 repeated.
 
+### Verify the full Slack and Gmail documents
+
+The following acceptance tests upload the unmodified provider documents to a
+temporary gateway through its admin preview and registration endpoints. Each
+test checks the SHA-256 of its input and the names in the published catalog.
+Supply these exact public snapshots as local files. The tests do not download
+them or call either provider.
+
+| Document | SHA-256 | Read operations selected |
+| --- | --- | --- |
+| [Slack Web API Swagger 2.0](https://raw.githubusercontent.com/slackapi/slack-api-specs/dfea73e06d146c368d7f94b52ac90796dc4e27e1/web-api/slack_web_openapi_v2.json) | `742a5c977180a829df8767cf57bc417d99b3713583aee83741efb9c08ca731e7` | `users_info`, `users_list` |
+| [Gmail v1 Discovery](https://raw.githubusercontent.com/googleapis/discovery-artifact-manager/b54f57986191f04556a56ce2d90e8b1fe5dd8a0f/discoveries/gmail.v1.json) | `f651441dcc942f428d92768e8b20c94a28ff82bf485b79872d9eef267a894225` | `gmail.users.messages.get`, `gmail.users.messages.list`, `gmail.users.threads.get`, `gmail.users.threads.list` |
+
+With the repository build tools on your path, run:
+
+```sh
+export GGW_SLACK_SWAGGER_FILE=/absolute/path/to/slack_web_openapi_v2.json
+export GGW_GMAIL_DISCOVERY_FILE=/absolute/path/to/gmail.v1.json
+cargo test --locked -p gateway --bin gateway pinned_provider_document_ -- --ignored
+```
+
+The full Slack snapshot is 1,237,332 bytes before JSON envelope escaping. A
+gateway receiving that upload needs a request body limit above the default
+1 MiB. The acceptance gateway uses `MAX_BODY_SIZE=2097152`. The separate
+2 MiB document limit also applies.
+
 ## OpenAPI Overlays
 
 An OpenAPI overlay is one versioned document stored beside a managed
