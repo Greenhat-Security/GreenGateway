@@ -16,7 +16,7 @@ integrity and read without extracting or executing their contents.
 | Package | Projects | Published lifecycle behavior | Decision |
 | --- | --- | --- | --- |
 | esbuild 0.28.2 | root | `postinstall: node install.js`; selects a platform binary, may rewrite its launcher, validates the version, and can invoke npm or fetch a fallback binary | Deny; use the locked platform optional dependency |
-| workerd 1.20261023.1 | root | `postinstall: node install.js`; selects and validates the native binary, optimizes its launcher, and can fetch a fallback binary | Deny; use the locked platform optional dependency |
+| workerd 1.20261104.1 | root | `postinstall: node install.js`; selects and validates the native binary, optimizes its launcher, and can fetch a fallback binary | Deny; use the locked platform optional dependency |
 | fsevents 2.3.3 | root, admin-ui | Lockfile flags install scripts, but the published archive has no install hook or `binding.gyp`; explicit build/prepublish scripts compile the Darwin addon | Deny conservatively; optional Darwin-only watcher |
 
 Esbuild is locked only by the root package since Vite 8 replaced it with
