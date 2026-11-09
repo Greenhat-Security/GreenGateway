@@ -151,7 +151,9 @@ describe('Policy Studio suggestions', () => {
     gateway.suggestion(BILLING).state = 'dismissed';
     gateway.suggestion(BILLING).revision = 2;
 
-    fireEvent.click(screen.getByRole('button', { name: 'Publish draft' }));
+    const publish = screen.getByRole('button', { name: 'Publish draft' }) as HTMLButtonElement;
+    await waitFor(() => expect(publish.disabled).toBe(false), WAIT);
+    fireEvent.click(publish);
     fireEvent.click(screen.getByRole('button', { name: 'Confirm publish' }));
     expect(await screen.findByText('Not published: the suggestion changed', undefined, WAIT)).toBeTruthy();
     expect(gateway.live.etag).toBe(LIVE_ETAG);

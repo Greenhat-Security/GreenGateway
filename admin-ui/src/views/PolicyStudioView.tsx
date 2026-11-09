@@ -3,6 +3,7 @@ import {
   type RefObject,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -460,10 +461,9 @@ export function PolicyStudioView() {
     }
   }, [confirming]);
 
-  // A publish confirmation is for the candidate, validation and revisions
-  // it shows: a change to any of them withdraws it, so it has to be
-  // reviewed again.
-  useEffect(() => {
+  // Withdraw the prior confirmation before the newly validated candidate
+  // can be reviewed. A deferred reset can otherwise close the fresh review.
+  useLayoutEffect(() => {
     setConfirming((current) => (current === 'publish' ? null : current));
   }, [source, validation, draft, live]);
 
