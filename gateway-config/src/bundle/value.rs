@@ -8,7 +8,10 @@
 //! accepts only a [`SecretReference`], every fractional field only a
 //! [`Decimal`], and no field an [`Unresolved`] placeholder.
 
-use crate::opaque_id::{is_valid_opaque_id, MAX_SECRET_ALIAS_ID_BYTES};
+use crate::{
+    connections::secret::MAX_OPERATOR_SECRET_ALIASES,
+    opaque_id::{is_valid_opaque_id, MAX_SECRET_ALIAS_ID_BYTES},
+};
 
 use super::{
     diagnostic::Code,
@@ -19,6 +22,33 @@ use super::{
 pub(crate) const SECRET_MEMBER: &str = "secret";
 /// The member of an unresolved placeholder object.
 pub(crate) const UNRESOLVED_MEMBER: &str = "unresolved";
+
+/// Finds the first reference beyond the deployment's budget before the
+/// settings reader builds typed values and secret slots. Count occurrences,
+/// including repeated uses of one alias. The syntax reader bounds depth.
+pub(super) fn excess_secret_reference(deployment: &Node) -> Option<&Node> {
+    fn visit<'a>(node: &'a Node, remaining: &mut usize) -> Option<&'a Node> {
+        match &node.value {
+            Value::Object(members) => match members.as_slice() {
+                [member] if member.key == SECRET_MEMBER && member.value.as_str().is_some() => {
+                    if *remaining == 0 {
+                        return Some(node);
+                    }
+                    *remaining -= 1;
+                    None
+                }
+                _ => members
+                    .iter()
+                    .find_map(|member| visit(&member.value, remaining)),
+            },
+            Value::Array(entries) => entries.iter().find_map(|entry| visit(entry, remaining)),
+            _ => None,
+        }
+    }
+
+    let mut remaining = MAX_OPERATOR_SECRET_ALIASES;
+    visit(deployment, &mut remaining)
+}
 
 /// `{ secret: <alias-id> }`: an opaque #240 alias ID in a sensitive field.
 ///

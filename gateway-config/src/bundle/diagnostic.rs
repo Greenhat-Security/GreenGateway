@@ -184,6 +184,7 @@ pub enum Code {
     // Secret references.
     InlineSecretValue,
     InvalidSecretReference,
+    TooManySecretReferences,
     // Referenced policy and tools documents.
     UnsupportedSchemaVersion,
     SchemaVersionMismatch,
@@ -267,6 +268,7 @@ impl Code {
         Self::Unresolved,
         Self::InlineSecretValue,
         Self::InvalidSecretReference,
+        Self::TooManySecretReferences,
         Self::UnsupportedSchemaVersion,
         Self::SchemaVersionMismatch,
         Self::ResourceUnknownMember,
@@ -539,6 +541,10 @@ impl Code {
             Self::InvalidSecretReference => (
                 "secret.invalid_reference",
                 "a secret reference is not a single opaque alias ID",
+            ),
+            Self::TooManySecretReferences => (
+                "secret.too_many_references",
+                "the deployment exceeds the secret reference limit",
             ),
             Self::UnsupportedSchemaVersion => (
                 "resource.unsupported_schema_version",

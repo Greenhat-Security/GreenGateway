@@ -1099,6 +1099,11 @@ ceiling; nothing raises one, and zero never means unlimited.
 
 An empty document is `syntax.empty_document`.
 
+The deployment document can use up to 512 secret references across all
+settings, including nested route endpoints and MCP servers. Each occurrence
+counts, even when multiple settings refer to the same alias. The reader checks
+this limit before it builds the typed settings.
+
 ## The state directory
 
 **Not yet selectable.** In bundle mode with standalone stores, and in ledger
@@ -1276,6 +1281,7 @@ can appear in one. A published code never changes meaning.
 | `reference.unresolved` | An unresolved placeholder. |
 | `secret.inline_value` | A sensitive setting holds a literal value. |
 | `secret.invalid_reference` | A secret reference is not a single opaque alias ID. |
+| `secret.too_many_references` | The deployment exceeds 512 secret references. Repeated uses of an alias count separately across all settings. |
 | `resource.unsupported_schema_version` | The manifest declares a resource version this reader does not implement. |
 | `resource.schema_version_mismatch` | The resource's `schema_version` differs from the declared one. |
 | `resource.unknown_member` | A policy top-level member the loader would drop. |
