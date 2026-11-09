@@ -163,16 +163,17 @@ export async function adminFetchJsonResponse<T>(
   input: string,
   options: AdminFetchOptions = {},
 ): Promise<AdminJsonResponse<T>> {
-  const response = await adminFetchTextResponse(input, options);
-  return { ...response, body: parseJsonBody(response.body) as T };
+  return adminFetchResponse(input, options, async response => await parseJsonBody(response) as T);
 }
 
-// Canonical JSON downloads need the gateway's original UTF-8 text. They use
-// the same origin, CSRF, identity and authorization checks as JSON callers.
-export async function adminFetchTextResponse(
+// Canonical downloads read the original bytes. All readers go through the
+// same origin and CSRF checks and are checked for identity changes after
+// the entire body is read.
+export async function adminFetchResponse<T>(
   input: string,
-  options: AdminFetchOptions = {},
-): Promise<AdminJsonResponse<string>> {
+  options: AdminFetchOptions,
+  readSuccess: (response: Response) => Promise<T>,
+): Promise<AdminJsonResponse<T>> {
   assertAdminRequestOrigin(input);
   const { answerStatuses = [], ...requestOptions } = options;
   const requestIdentity = getAdminIdentityVersion();
@@ -191,20 +192,21 @@ export async function adminFetchTextResponse(
     redirect: 'error',
     headers,
   });
-  const body = await response.text();
+  const answered =
+    response.status !== 401 &&
+    response.status !== 403 &&
+    answerStatuses.includes(response.status);
+  const failed = !response.ok && !answered;
+  const body = failed ? await parseJsonBody(response) : await readSuccess(response);
   if (requestOptions.signal?.aborted) {
     throw new DOMException('Admin request aborted.', 'AbortError');
   }
   if (requestIdentity !== getAdminIdentityVersion()) {
     throw new Error('Admin identity changed while the request was pending.');
   }
-  const answered =
-    response.status !== 401 &&
-    response.status !== 403 &&
-    answerStatuses.includes(response.status);
-  if (!response.ok && !answered) {
+  if (failed) {
     adminAuthorizationFailed(response.status, requestIdentity, input === adminApiUrl('/capabilities'));
-    throw adminApiError(parseJsonBody(body), response);
+    throw adminApiError(body, response);
   }
   const method = (requestOptions.method ?? 'GET').toUpperCase();
   if (response.ok && !SAFE_METHODS.has(method)) {
@@ -219,7 +221,7 @@ export async function adminFetchTextResponse(
   }
 
   return {
-    body,
+    body: body as T,
     headers: response.headers,
     status: response.status,
     etag: response.headers.get('etag'),
@@ -265,7 +267,8 @@ function changesLivePolicy(path: string): boolean {
   return true;
 }
 
-function parseJsonBody(text: string): unknown {
+async function parseJsonBody(response: Response): Promise<unknown> {
+  const text = await response.text();
   if (text.trim().length === 0) {
     return null;
   }

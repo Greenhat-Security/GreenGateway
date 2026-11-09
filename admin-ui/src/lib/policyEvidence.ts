@@ -1,10 +1,11 @@
-import { adminFetchTextResponse } from './api';
+import { adminFetchResponse } from './api';
 import { adminApiUrl } from './config';
 import { isBoundedText, isCode, isJsonObject } from './policyRuns';
 
 export const POLICY_EVIDENCE_READ = 'admin:policy:evidence:read';
 const MEDIA_TYPE = 'application/vnd.greengateway.policy-evidence+json';
 const HEADER = 'x-greengateway-policy-evidence-';
+const MAX_PACKAGE_BYTES = 4 * 1024 * 1024;
 
 export type EvidenceCandidate =
   | { publication: { version: number } }
@@ -33,27 +34,51 @@ export async function fetchPolicyEvidence(
   sections: EvidenceSections,
   signal: AbortSignal,
 ): Promise<EvidencePackage> {
-  const { body, headers } = await adminFetchTextResponse(adminApiUrl('/policy/evidence'), {
+  const { body } = await adminFetchResponse(adminApiUrl('/policy/evidence'), {
     method: 'POST',
     cache: 'no-store',
     headers: { Accept: MEDIA_TYPE, 'Content-Type': 'application/json' },
     body: JSON.stringify({ schema_version: 'policy-evidence-request.v1', ...candidate, ...sections }),
     signal,
-  });
+  }, response => readPackage(response, candidate));
+  return body;
+}
+
+async function readPackage(response: Response, candidate: EvidenceCandidate): Promise<EvidencePackage> {
+  const { headers } = response;
   const invalid = () => new Error('The gateway returned an invalid or mismatched evidence package.');
-  const packageBlob = new Blob([body], { type: MEDIA_TYPE });
-  if (headers.get('content-type')?.split(';')[0] !== MEDIA_TYPE || packageBlob.size > 4 * 1024 * 1024) {
+  if (!response.body || headers.get('content-type')?.split(';')[0] !== MEDIA_TYPE) {
     throw invalid();
   }
+  // Stop even a chunked response at the gateway's documented limit. Save
+  // the bytes received, so downloading never reserializes the report.
+  const reader = response.body.getReader();
+  const chunks: BlobPart[] = [];
+  let bytes = 0;
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      bytes += chunk.value.byteLength;
+      if (bytes > MAX_PACKAGE_BYTES) {
+        await reader.cancel();
+        throw invalid();
+      }
+      chunks.push(chunk.value.slice());
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const packageBlob = new Blob(chunks, { type: MEDIA_TYPE });
   let value: unknown;
   try {
-    value = JSON.parse(body) as unknown;
+    value = JSON.parse(await packageBlob.text()) as unknown;
   } catch {
     throw invalid();
   }
   if (!isJsonObject(value) || value.schema_version !== 'policy-evidence.v1' ||
       !isJsonObject(value.report) || value.report.schema_version !== 'policy-evidence-report.v1' ||
-      !Array.isArray(value.manifest) || !isBoundedText(value.report_markdown, 4 * 1024 * 1024)) {
+      !Array.isArray(value.manifest) || !isBoundedText(value.report_markdown, MAX_PACKAGE_BYTES)) {
     throw invalid();
   }
   const { report } = value;
