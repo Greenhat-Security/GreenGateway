@@ -8086,7 +8086,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::authority_events::delivery::file_attributes#1",
-      "sha256": "409f56821d6740d9c9a5649b37353f2df03a1426b1def7e699362ea5c543ab49",
+      "sha256": "67e21686f9e810201859562c3a9c3ef978cb300b6049f5e810176f8207924dea",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
     },
@@ -12832,7 +12832,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_admin_sessions::impl  PostgresAdminSessionStore::grant_in#1",
-      "sha256": "162cc45acdf7d35d5772dcfd6546429c3d8d394bcf3b0bb5e1eb07fc6fedbbc0",
+      "sha256": "805781cef89587e2e8b9c61e852a2d1796e74148a996b6e02a7d9ce963544ed8",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12842,7 +12842,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_admin_sessions::impl  PostgresAdminSessionStore::withdraw_in#1",
-      "sha256": "ad5a4a7437066d29c274c748654f72d206cf7eb388fc93c22a1fee80843c8b0b",
+      "sha256": "e3075d5ec9d4dad9ee5be393385bbe41d447c219315618d6d200d22cb6e3678d",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
