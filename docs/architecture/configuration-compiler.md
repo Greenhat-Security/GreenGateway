@@ -323,7 +323,7 @@ bundle format, not a change to this stage. The deployment document already
 takes it only as a secret reference (`admin_login.client_secret`), and the
 URLs and static headers above only as references or not at all
 ([structured settings](../configuration-bundles.md#structured-settings)); the
-compiler does not read a deployment document yet.
+identity and proxy stages still require a deployment-document front end.
 
 What the contract covers, and what holds it:
 
@@ -492,10 +492,10 @@ bundle's files, digests, documents, and profile today. Its deployment document
 carries the profile and every catalog field with a document path, in the
 closed sections those paths imply (`bundle::settings`), each held to its
 catalog type and its own bounds; the parity tests below hold those bounds to
-this compiler. Nothing maps a bundle onto compiler inputs yet, so the
-cross-field rules and each value's own grammar are not applied to a document,
-and profile invariants on deployment settings (authentication required,
-private-address egress denied, and so on) are not enforced yet. A front end
+this compiler. The bundle reader maps `spec.egress` into the existing egress
+stage and uses its findings in offline validation. This covers the hostname
+grammar and NAT64 prefix and overlap checks. Other domains and profile
+invariants on deployment settings still need compiler integration. A front end
 gives a decimal setting the `f64` its text parses to, which is the value the
 same text gives in the environment.
 

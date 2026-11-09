@@ -239,14 +239,15 @@ without repeating the value:
   The policy publication history is not one of them: ADR-0008 has not decided
   whether bundle mode keeps one beside a bundle-owned policy.
 
-The reader checks each setting's shape and its own bounds, and nothing else.
-Rules that relate settings (an idle timeout within its session's lifetime, a
-client certificate mode that needs a CA, settings only one state backend reads)
-and each string's own grammar (addresses, URLs, CIDRs, header and cookie names)
-are the configuration compiler's, and the compiler does not read a deployment
-document yet. So a document the reader accepts can still be one the compiler
-would refuse, and no gateway starts from it. The profiles' invariants on these
-settings arrive with the mapping onto the compiler (see
+The reader checks each setting's shape and bounds, then runs the gateway's
+egress compiler on `spec.egress`. For example, it checks that allowlist entries
+are hostnames without ports and that NAT64 prefixes meet the gateway's IPv6
+prefix and overlap rules. A refusal points to the affected setting and omits
+the supplied value. This check runs offline.
+
+The remaining domains still need compiler integration for checks such as
+session lifetime bounds, client-certificate requirements and cookie-name
+syntax. Profile requirements on the deployment settings are also pending (see
 [deployment profiles](#deployment-profiles)).
 
 Some environment variables have no document form:
@@ -852,11 +853,10 @@ An absent `default_action` is `deny` and an absent `enforcement_mode` is
 `enforce`, as in environment mode. Role names are policy values, so a wildcard
 role is reported at `/roles` and the line of its `*`, never by name. A policy left
 to the server's store (`source: server`) is not checked by the reader. The
-profiles' other invariants (authentication, egress, CSRF, audit durability,
-listeners) concern deployment settings, which the reader checks for shape and
-bounds only: they are enforced once the compiler reads a deployment document, a
-later #242 slice. Until then a `production` document that, say, turns
-authentication off is accepted by the reader, and no gateway can start from it.
+profiles' other invariants (authentication, private egress, CSRF, audit
+durability and listeners) concern deployment settings. Enforcing those profile
+requirements is a later #242 slice. A `production` document that turns
+authentication off still passes this reader, and gateway bundle startup is pending.
 
 ## Generated bundles
 
@@ -1227,6 +1227,7 @@ can appear in one. A published code never changes meaning.
 | `bundle.carriage_return` | A file contains a carriage return. |
 | `bundle.not_utf8` | A file is not valid UTF-8. |
 | `bundle.digest_mismatch` | A file's SHA-256 differs from its pin. |
+| `bundle.invalid_egress_setting` | The gateway's egress compiler refused the setting at the reported deployment pointer. |
 | `syntax.empty_document` | The document is empty. |
 | `syntax.too_deep` | Too many nested collections. |
 | `syntax.too_many_members` | An object has too many members. |

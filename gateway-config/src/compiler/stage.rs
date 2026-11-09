@@ -211,6 +211,12 @@ impl<T> Checked<T> {
         Self { value, findings }
     }
 
+    /// The inventoried inputs after which the stage reports findings. Never
+    /// exposes the environment-mode problem text, which may quote values.
+    pub(super) fn finding_inputs(self) -> impl Iterator<Item = &'static str> {
+        self.findings.found.into_iter().map(|finding| finding.after)
+    }
+
     /// Appends the findings, each with the rule behind it, to the report in
     /// the order the legacy parser reports them, and returns the result.
     pub(super) fn report(self, report: &mut Report) -> T {

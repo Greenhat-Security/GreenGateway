@@ -30,11 +30,9 @@
 //!   member that may carry a secret accepts only a secret reference;
 //! - no field accepts an unresolved placeholder.
 //!
-//! Rules relating one setting to another, and each string's own grammar, stay
-//! the compiler's. The compiler does not consume a deployment document yet,
-//! so in this alpha the reader checks the settings' shape and their own
-//! bounds only: a document can still set a combination the compiler would
-//! refuse, and nothing starts from it.
+//! The reader checks shape and per-field bounds here. It runs the compiler's
+//! egress stage after reading these settings. The other domains still need
+//! their compiler mappings.
 //!
 //! Some members are the document's own rather than one field's
 //! ([`OWN_MEMBERS`]): the standalone stores a deployment keeps beneath its
@@ -52,17 +50,21 @@ mod structured_tests;
 #[cfg(test)]
 mod tests;
 
+use std::{collections::BTreeMap, env::VarError};
+
 use crate::{
-    catalog::{DecimalBound, DecimalRange, Field, FieldType, Sensitivity, FIELDS},
+    catalog::{self, DecimalBound, DecimalRange, Domain, Field, FieldType, Sensitivity, FIELDS},
+    compiler::egress,
     state_dir::StateFile,
 };
 
 pub use render::{render_deployment_reference, render_deployment_schema};
 
 use super::{
-    diagnostic::{Code, Pointer},
-    document::Checker,
+    diagnostic::{BundleDiagnostic, Code, Pointer},
+    document::{member, Checker},
     profile::Compatibility,
+    source::FileName,
     syntax::{Member, Node, Value, MAX_SAFE_INTEGER},
     value::{Decimal, SecretReference, Unresolved},
 };
@@ -419,6 +421,68 @@ pub(crate) struct Settings {
 }
 
 impl Settings {
+    /// Compile the document's public egress settings independently of the
+    /// process environment. A list entry cannot contain a comma, so joining
+    /// it preserves exactly the entries the egress stage will read.
+    pub(super) fn egress_diagnostics(
+        &self,
+        document: &Node,
+        file: &FileName,
+    ) -> Vec<BundleDiagnostic> {
+        let mut inputs = BTreeMap::new();
+        let mut unsupported = Vec::new();
+        for setting in self
+            .values
+            .iter()
+            .filter(|setting| setting.field.domain == Domain::Egress)
+        {
+            let input = match &setting.value {
+                SettingValue::Boolean(value) => value.to_string(),
+                SettingValue::Integer(value) => value.to_string(),
+                SettingValue::List(entries) => entries.join(","),
+                _ => {
+                    unsupported.push(setting.field.environment);
+                    continue;
+                }
+            };
+            inputs.insert(setting.field.environment, input);
+        }
+        if inputs.is_empty() && unsupported.is_empty() {
+            return Vec::new();
+        }
+        let mut refused =
+            egress::refused_settings(|name| inputs.remove(name).ok_or(VarError::NotPresent));
+        // The stage requests each input once. A new catalog field that it
+        // never requested must not silently pass validation.
+        refused.extend(inputs.into_keys());
+        refused.extend(unsupported);
+        refused
+            .into_iter()
+            .map(|name| {
+                let mut pointer = Pointer::root();
+                let mut node = document;
+                if let Some(path) = catalog::field(name).and_then(Field::document_path) {
+                    for segment in path.split('/').skip(1) {
+                        let Some(next) = node
+                            .as_object()
+                            .and_then(|members| member(members, segment))
+                        else {
+                            break;
+                        };
+                        pointer = pointer.member(segment);
+                        node = next;
+                    }
+                }
+                BundleDiagnostic::at(
+                    Code::InvalidEgressSetting,
+                    file,
+                    pointer,
+                    Some(node.position),
+                )
+            })
+            .collect()
+    }
+
     /// The value the document gave the member of its own at `path`.
     pub(crate) fn own_value(&self, path: &str) -> Option<&SettingValue> {
         self.own

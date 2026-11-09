@@ -52,9 +52,9 @@
 //! to this reader before anything treats it as a bundle.
 //!
 //! The deployment document's settings come from the field catalog
-//! ([`settings`]): the reader checks their shape and their own bounds. Nothing
-//! selects a bundle for startup yet, and the compiler does not consume the
-//! settings: bundle mode is a later #242 slice.
+//! ([`settings`]): the reader checks their shape and their own bounds, then
+//! validates egress through the shared compiler stage. Gateway bundle startup
+//! and compiler integration for the other domains are later #242 slices.
 
 pub mod convert;
 mod diagnostic;
@@ -586,6 +586,7 @@ fn read_deployment(
     let Deployment {
         profile, settings, ..
     } = document::deployment(&node, &reference.file, diagnostics)?;
+    diagnostics.extend(settings.egress_diagnostics(&node, &reference.file));
     // Decimals take their shortest exact spelling and the word sets their
     // canonical order, so neither changes the canonical bytes.
     let mut document = node.to_json();
