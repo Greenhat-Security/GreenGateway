@@ -641,8 +641,8 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             "Reads the bundle in the directory BUNDLE with the gateway's own bundle reader and \
              reports every problem it finds: unsafe files and bounds, the YAML subset and strict \
              JSON, exact document versions, closed documents, the deployment settings' types and \
-             their own bounds, references and SHA-256 pins, the published policy and tools \
-             schemas, and the deployment profile's policy invariants. \
+             their own bounds, the gateway compiler's egress checks, references and SHA-256 pins, \
+             the published policy and tools schemas, and the deployment profile's policy invariants. \
              It makes no network request, reads no environment variable and writes nothing.",
             "With --env FILE instead, reads a KEY=VALUE environment file as data, in the grammar \
              gateway import-standalone reads, and runs the gateway's own configuration compiler \

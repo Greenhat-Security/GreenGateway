@@ -1232,6 +1232,7 @@ mod tests {
             vec![
                 "delegated_token_purges",
                 "openapi_discovery_catalogs",
+                "openapi_repeated_query",
                 "openapi_swagger2_catalogs",
                 "operation_requirements",
                 "policy_document_v1",

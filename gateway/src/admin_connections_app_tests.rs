@@ -1775,6 +1775,10 @@ fn admin_caller_assertion_json() -> Value {
 /// material, so the creator holds secrets-write as well.
 async fn create_attested_connection(router: &Router, mut body: Value) -> (String, String) {
     body["caller_assertion"] = admin_caller_assertion_json();
+    create_connection_with_secret_bindings(router, body).await
+}
+
+async fn create_connection_with_secret_bindings(router: &Router, body: Value) -> (String, String) {
     let list = router
         .clone()
         .oneshot(connection_admin_request(
@@ -5097,6 +5101,128 @@ async fn all_connection_mutations_report_unconfigured_store_as_unavailable() {
             json_body(response).await["error"],
             json!("connection mutations require CONNECTIONS_SQLITE_PATH to be configured")
         );
+    }
+}
+
+/// Run with the immutable upstream documents described in the operator guide.
+/// The default suite is hermetic. An explicit run must have the exact inputs.
+async fn register_pinned_provider_tools(
+    document_variable: &str,
+    sha256: &str,
+    base_url: &str,
+    base_path: &str,
+    scope: &str,
+    selected: &[&str],
+) {
+    use sha2::Digest;
+
+    let path = std::env::var_os(document_variable)
+        .unwrap_or_else(|| panic!("set {document_variable} to the provider document path"));
+    let spec = fs::read_to_string(path).expect("the unmodified provider document should be UTF-8");
+    assert_eq!(hex::encode(sha2::Sha256::digest(spec.as_bytes())), sha256);
+
+    let db = TempDb::new("pinned-provider-document");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let mut config = connection_admin_config(&db, &policy, config::DEFAULT_ADMIN_PREFIX);
+    // The escaped full Slack document exceeds the default 1 MiB request limit.
+    config.max_body_size = 2 * 1024 * 1024;
+    config
+        .connection_secret_aliases
+        .push(connections::test_support::write_assertion_signing_key(
+            &db.path.with_extension("secrets"),
+            &connections::test_support::generated_es256_pem(),
+        ));
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let router = app(
+        config,
+        recorder.handle(),
+        test_audit_log(),
+        test_audit_event_sender(),
+    )
+    .expect("the test gateway should build");
+    let mut assertion = admin_caller_assertion_json();
+    assertion["bind_request"] = json!(false);
+    let (id, etag) = create_connection_with_secret_bindings(
+        &router,
+        json!({
+            "display_name": "Provider document acceptance",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": { "base_url": base_url, "base_path": base_path },
+            "authentication": {
+                "type": "delegated_issuer_token",
+                "token_exchange_url": "https://issuer.example.test/token",
+                "client_id": "greengateway",
+                "client_secret_id": "credential-secret-id-canary",
+                "requested_scopes": [scope],
+                "subject_token_source": "caller_assertion"
+            },
+            "caller_assertion": assertion,
+            "discovery": { "type": "managed_openapi", "use_connection_authentication": false }
+        }),
+    )
+    .await;
+    let response = preview_and_register_managed_openapi(&router, &id, &etag, &spec, selected).await;
+    let status = response.status();
+    let result = json_body(response).await;
+    assert_eq!(status, StatusCode::CREATED, "{result}");
+    let mut registered: Vec<String> =
+        serde_json::from_value(result["registered_tool_names"].clone())
+            .expect("registration should return the names it published");
+    let mut expected = selected.to_vec();
+    registered.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(registered, expected);
+}
+
+#[tokio::test]
+#[ignore = "requires the operator-supplied Slack Swagger snapshot"]
+async fn pinned_provider_document_slack_preview_and_register() {
+    register_pinned_provider_tools(
+        "GATEWAY_TEST_SLACK_SWAGGER_FILE",
+        "742a5c977180a829df8767cf57bc417d99b3713583aee83741efb9c08ca731e7",
+        "https://slack.com",
+        "/api",
+        "users:read",
+        &["users_info", "users_list"],
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires the operator-supplied Gmail Discovery snapshot"]
+async fn pinned_provider_document_gmail_preview_and_register() {
+    let read_only = [
+        "gmail.users.messages.get",
+        "gmail.users.messages.list",
+        "gmail.users.threads.get",
+        "gmail.users.threads.list",
+    ];
+    let all_thread_methods = [
+        "gmail.users.threads.delete",
+        "gmail.users.threads.get",
+        "gmail.users.threads.list",
+        "gmail.users.threads.modify",
+        "gmail.users.threads.trash",
+        "gmail.users.threads.untrash",
+    ];
+    for (scope, selected) in [
+        (
+            "https://www.googleapis.com/auth/gmail.readonly",
+            read_only.as_slice(),
+        ),
+        ("https://mail.google.com/", all_thread_methods.as_slice()),
+    ] {
+        // Each selection is registered on a fresh Connection and store.
+        register_pinned_provider_tools(
+            "GATEWAY_TEST_GMAIL_DISCOVERY_FILE",
+            "f651441dcc942f428d92768e8b20c94a28ff82bf485b79872d9eef267a894225",
+            "https://gmail.googleapis.com",
+            "/",
+            scope,
+            selected,
+        )
+        .await;
     }
 }
 

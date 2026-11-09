@@ -39,10 +39,10 @@
 //!
 //! Admin session grants and withdrawals (journaled since migration 26) are
 //! delivered as `admin_session.grant` and `admin_session.withdraw`. Their
-//! evidence records the session's own identity and no actor kind, auth mode
-//! or shared revision, so the record names the session's subject as its
-//! recorded actor, says `null` for the kind, auth mode, issuer reference and
-//! security revision, and puts the session on the v1 `session` axis: a
+//! evidence since migration 33 names the verified login for a grant and the
+//! session it replaces, and the system for a rejection or expiry. Logout
+//! has no authenticated actor. Logout and pre-33 rows retain the session
+//! owner's reference with null actor metadata. On the session axis a
 //! session is granted once and withdrawn once, so its one revision is `1`,
 //! created by the grant and deleted by the withdrawal. Which withdrawal it
 //! was (logout, replacement, rejection, expiry) stays in the evidence row;
@@ -201,7 +201,7 @@ pub(crate) struct DeliveryRecord {
 pub(crate) struct DeliveryActor {
     /// `principal`, `service_token` or `system`; `null` where the evidence
     /// recorded none (before migration 24, before migration 25 for a
-    /// catalog, and for an admin session).
+    /// catalog, or before migration 33 and on logout for an admin session).
     pub(crate) kind: Option<String>,
     /// The recorded actor identifier's reference in the `actor.recorded`
     /// domain.

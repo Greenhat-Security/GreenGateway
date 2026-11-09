@@ -33,6 +33,104 @@ afterEach(() => {
 });
 
 describe('Policy Studio workbench', () => {
+  it('downloads the gateway package for the saved draft and shows its limitations', async () => {
+    const gateway = fakeGateway({ permissions: [READ, WRITE, ANALYZE, 'admin:policy:evidence:read'] });
+    const digest = 'sha256:' + 'a'.repeat(64);
+    const source = JSON.stringify({
+      schema_version: 'policy-evidence.v1',
+      manifest: [{ name: 'report', digest }],
+      report: {
+        schema_version: 'policy-evidence-report.v1', candidate_kind: 'draft',
+        draft: { draft_id: DRAFT_ID, draft_etag: '"sha256:draft-r1"', revision: 1 },
+        completeness: 'incomplete', limitations: ['tests_not_included'],
+        trust: { signed: false, statement: 'This package is unsigned.' },
+      },
+      report_markdown: '# Evidence\n\nThis package is unsigned.',
+    }, null, 2);
+    gateway.evidence = () => new Response(source, { headers: {
+      'content-type': 'application/vnd.greengateway.policy-evidence+json',
+      'x-greengateway-policy-evidence-completeness': 'incomplete',
+      'x-greengateway-policy-evidence-candidate-kind': 'draft',
+      'x-greengateway-policy-evidence-digest': digest,
+    } });
+    const createObjectURL = vi.fn((_blob: Blob) => 'blob:package');
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal('URL', class extends URL {
+      static createObjectURL = createObjectURL;
+      static revokeObjectURL = revokeObjectURL;
+    });
+    renderStudio(gateway);
+    await openDraft();
+    openView('Evidence');
+    const panel = viewPanel('Evidence');
+    fireEvent.click(within(panel).getByLabelText('Structural analysis'));
+    expect((within(panel).getByLabelText('Completed replay job ID') as HTMLInputElement).disabled).toBe(true);
+    fireEvent.click(within(panel).getByRole('button', { name: 'Generate evidence package' }));
+    const link = await within(panel).findByRole('link', { name: 'Download canonical JSON' }, WAIT);
+    expect(link.getAttribute('download')).toBe('policy-draft-evidence.json');
+    expect(within(panel).getByRole('status').textContent).toContain('Evidence incomplete · Unsigned');
+    expect(within(panel).getByText('tests_not_included')).toBeTruthy();
+    expect(await createObjectURL.mock.calls[0][0].text()).toBe(source);
+    const [request] = gateway.requests('POST', '/v1/admin/policy/evidence');
+    expect(JSON.parse(request.body!)).toEqual({
+      schema_version: 'policy-evidence-request.v1',
+      draft: { draft_id: DRAFT_ID, draft_etag: '"sha256:draft-r1"' },
+      analysis: true,
+    });
+    fireEvent.change(within(panel).getByLabelText('Candidate'), { target: { value: 'publication' } });
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:package');
+    expect(within(panel).queryByRole('link')).toBeNull();
+    fireEvent.change(within(panel).getByLabelText('Version from policy history'), { target: { value: '7' } });
+    fireEvent.click(within(panel).getByRole('button', { name: 'Generate evidence package' }));
+    expect(await within(panel).findByRole('alert')).toBeTruthy();
+    expect(JSON.parse(gateway.requests('POST', '/v1/admin/policy/evidence')[1].body!).publication).toEqual({ version: 7 });
+    expect(within(panel).queryByRole('link')).toBeNull();
+  });
+
+  it('requires evidence-read even when policy write is granted', async () => {
+    const gateway = fakeGateway({ permissions: [READ, WRITE] });
+    renderStudio(gateway);
+    await studioLoaded();
+    openView('Evidence');
+    expect(within(viewPanel('Evidence')).getByRole('note').textContent).toContain('admin:policy:evidence:read');
+    expect(within(viewPanel('Evidence')).queryByRole('button')).toBeNull();
+    expect(gateway.requests('POST', '/v1/admin/policy/evidence')).toEqual([]);
+  });
+
+  it('discards a pending export on leaving Evidence and keeps refusal payloads private', async () => {
+    const gateway = fakeGateway({ permissions: [READ, 'admin:policy:evidence:read'] });
+    let finish!: (response: Response) => void;
+    const pending = new Promise<Response>(resolve => { finish = resolve; });
+    const fetchNormally = gateway.fetch.getMockImplementation()!;
+    let exportSignal: AbortSignal | null = null;
+    gateway.fetch.mockImplementation((input, init) => {
+      if (!exportSignal && String(input).endsWith('/policy/evidence')) {
+        exportSignal = init?.signal ?? null;
+        return pending;
+      }
+      return fetchNormally(input, init);
+    });
+    gateway.evidence = () => jsonResponse(503, { reason: 'opaque_example', error: 'private upstream text' });
+    renderStudio(gateway);
+    await studioLoaded();
+    openView('Evidence');
+    function requestPublication() {
+      const panel = viewPanel('Evidence');
+      fireEvent.change(within(panel).getByLabelText('Version from policy history'), { target: { value: '4' } });
+      fireEvent.click(within(panel).getByRole('button', { name: 'Generate evidence package' }));
+    }
+    requestPublication();
+    openView('Edit');
+    expect(exportSignal).toHaveProperty('aborted', true);
+    openView('Evidence');
+    finish(jsonResponse(200, {}));
+    requestPublication();
+    const alert = await within(viewPanel('Evidence')).findByRole('alert');
+    expect(alert.textContent).toContain('HTTP 503');
+    expect(alert.textContent).not.toMatch(/private upstream text|opaque_example/);
+    expect(within(viewPanel('Evidence')).queryByRole('link')).toBeNull();
+  });
+
   it('simulates the unsaved draft against the live revision and shows each answer as a waterfall', async () => {
     const gateway = fakeGateway();
     renderStudio(gateway);
@@ -470,6 +568,7 @@ function fakeGateway({ permissions = [READ, WRITE, SIMULATE] }: { permissions?: 
     validate: (_source: string): Response => jsonResponse(200, validInspection()),
     simulation: (body: string): Response => jsonResponse(200, simulationResult(body)),
     testRun: (): Response => jsonResponse(200, testReport('passed')),
+      evidence: (): Response => jsonResponse(503, { reason: 'policy_evidence_audit_unavailable' }),
     requests(method: string, path: string) {
       return gateway.log.filter((request) => request.method === method && request.path === path);
     },
@@ -506,6 +605,9 @@ function fakeGateway({ permissions = [READ, WRITE, SIMULATE] }: { permissions?: 
       }
       if (path === '/v1/admin/policy/tests/runs') {
         return gateway.testRun();
+      }
+      if (path === '/v1/admin/policy/evidence' && method === 'POST') {
+        return gateway.evidence();
       }
       if (path === '/v1/admin/policy/replays' && method === 'POST') {
         return jsonResponse(202, replayJob('queued'));

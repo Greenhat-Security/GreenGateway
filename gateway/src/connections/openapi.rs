@@ -100,12 +100,20 @@ pub struct OpenApiConnectionCatalogService {
 /// do they ask the gate for that source format and call again with
 /// [`Self::Admitted`] for it. Admission covers only the format it names: a
 /// refresh whose document changed format between the two calls is refused
-/// again. An OpenAPI 3.x document, and every call in standalone mode, never
-/// needs it.
+/// again. A document using repeated query mappings also requires admission
+/// for that capability. Standalone mode has no roster gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvertedCatalogAdmission {
     NotAsked,
-    Admitted(OpenApiSourceFormat),
+    Admitted(CatalogWriteRequirement),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogWriteRequirement {
+    Converted(OpenApiSourceFormat),
+    RepeatedQuery {
+        source_format: Option<OpenApiSourceFormat>,
+    },
 }
 
 struct OpenApiPublishCandidate<'a> {
@@ -316,11 +324,11 @@ pub enum OpenApiCatalogError {
     InvalidResponse,
     StorageUnavailable,
     /// The write would store a catalog generated from a document converted
-    /// from `source_format`, and the caller has not been admitted by the
+    /// with the named requirement, and the caller has not been admitted by the
     /// cluster's operation gate for that format. Nothing was written or
     /// recorded; see [`ConvertedCatalogAdmission`].
     ConvertedCatalogNeedsAdmission {
-        source_format: OpenApiSourceFormat,
+        requirement: CatalogWriteRequirement,
     },
 }
 
@@ -646,18 +654,29 @@ impl OpenApiConnectionCatalogService {
     /// operation gate's admission.
     fn require_converted_catalog_admission(
         &self,
-        generation: &openapi::OpenApiToolGeneration,
+        conversion: Option<&openapi::OpenApiDocumentConversion>,
+        binding: &OpenApiToolBinding,
         admission: ConvertedCatalogAdmission,
     ) -> Result<(), OpenApiCatalogError> {
-        let Some(conversion) = generation.conversion.as_ref() else {
+        if !self.gate_converted_catalogs {
+            return Ok(());
+        }
+        let source_format = conversion.map(|conversion| conversion.source_format);
+        let repeated = binding.definitions.iter().any(|tool| {
+            tool.upstream
+                .query_params
+                .iter()
+                .any(|param| param.repeated)
+        });
+        let requirement = if repeated {
+            CatalogWriteRequirement::RepeatedQuery { source_format }
+        } else if let Some(format) = source_format {
+            CatalogWriteRequirement::Converted(format)
+        } else {
             return Ok(());
         };
-        if self.gate_converted_catalogs
-            && admission != ConvertedCatalogAdmission::Admitted(conversion.source_format)
-        {
-            return Err(OpenApiCatalogError::ConvertedCatalogNeedsAdmission {
-                source_format: conversion.source_format,
-            });
+        if admission != ConvertedCatalogAdmission::Admitted(requirement) {
+            return Err(OpenApiCatalogError::ConvertedCatalogNeedsAdmission { requirement });
         }
         Ok(())
     }
@@ -1095,10 +1114,6 @@ impl OpenApiConnectionCatalogService {
             &prior.spec,
         )
         .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
-        // An overlay over a converted catalog is what makes a replica built
-        // before the conversion fail to rebuild its source plan, so it asks
-        // the gate before any source is resolved or anything is written.
-        self.require_converted_catalog_admission(&generation, converted_catalog)?;
         let (selected_tool_names, confirmations) =
             surviving_refresh_selection(&prior, &generation, prior_document.as_ref())?;
         let binding = bind_selected_tools(
@@ -1107,6 +1122,11 @@ impl OpenApiConnectionCatalogService {
             &record,
             &selected_tool_names,
             &confirmations,
+        )?;
+        self.require_converted_catalog_admission(
+            generation.conversion.as_ref(),
+            &binding,
+            converted_catalog,
         )?;
         let compile_context =
             self.overlay_compile_context(&connection_id, Some(&prior), prior_document.as_ref());
@@ -1216,6 +1236,7 @@ impl OpenApiConnectionCatalogService {
         &self,
         raw_connection_id: &str,
         expected_overlay_etag: &str,
+        converted_catalog: ConvertedCatalogAdmission,
         actor: &ChangeActor,
     ) -> Result<OpenApiOverlayMutationResult, OpenApiOverlayOperationError> {
         let connection_id = ConnectionId::parse(raw_connection_id.to_owned())
@@ -1252,8 +1273,8 @@ impl OpenApiConnectionCatalogService {
             return Err(OpenApiCatalogError::StalePreview.into());
         }
         let prior_document = decode_stored_overlay(stored_overlay.as_ref())?;
-        // Not gated, even over a converted catalog: deleting the overlay
-        // removes what makes a replica built before the conversion fail.
+        // Removing the overlay removes the need to rebuild its source plan.
+        // The bare catalog still needs readers for any repeated query mapping.
         let generation = openapi::generate_tools_from_api_document_str(
             "managed-openapi-overlay-delete",
             &prior.spec,
@@ -1268,6 +1289,7 @@ impl OpenApiConnectionCatalogService {
             &selected_tool_names,
             &confirmations,
         )?;
+        self.require_converted_catalog_admission(None, &binding, converted_catalog)?;
         validate_binding_budget(&binding)?;
         let digest = prior.spec_digest.clone();
         let published = self
@@ -1491,7 +1513,6 @@ impl OpenApiConnectionCatalogService {
         let generation =
             openapi::generate_tools_from_api_document_str("managed-openapi-register", spec)
                 .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
-        self.require_converted_catalog_admission(&generation, converted_catalog)?;
         let store = self
             .control_plane
             .managed_store()
@@ -1514,6 +1535,11 @@ impl OpenApiConnectionCatalogService {
             &record,
             &selected_tool_names,
             confirmations,
+        )?;
+        self.require_converted_catalog_admission(
+            generation.conversion.as_ref(),
+            &binding,
+            converted_catalog,
         )?;
         let (source_plan, enum_values, overlay_write) =
             if let Some(document) = overlay_document.as_ref() {
@@ -1665,9 +1691,6 @@ impl OpenApiConnectionCatalogService {
                     return Err(OpenApiCatalogError::InvalidSpec);
                 }
             };
-        // Not a refresh failure: no status is recorded, so the caller can
-        // ask the gate and refresh again.
-        self.require_converted_catalog_admission(&generation, converted_catalog)?;
         if validate_catalog_overlay_pair(Some(&prior), stored_overlay.as_ref()).is_err() {
             let error = OpenApiCatalogError::StorageUnavailable;
             self.record_failed_status(
@@ -1729,6 +1752,11 @@ impl OpenApiConnectionCatalogService {
                 return Err(error);
             }
         };
+        self.require_converted_catalog_admission(
+            generation.conversion.as_ref(),
+            &binding,
+            converted_catalog,
+        )?;
         let (source_plan, enum_values, overlay_write) =
             if let Some(document) = overlay_document.as_ref() {
                 let source_plan = match overlay::plan_sources(&generation, document) {
@@ -4960,6 +4988,7 @@ paths:
                         arg_name: "api_key".to_owned(),
                         query_name: "api_key".to_owned(),
                         required: false,
+                        repeated: false,
                     },
                 );
                 if let Some(ToolTarget::Http { mapping, .. }) = &mut definition.target {
@@ -5169,7 +5198,7 @@ paths:
         assert_eq!(
             refused,
             OpenApiCatalogError::ConvertedCatalogNeedsAdmission {
-                source_format: OpenApiSourceFormat::Swagger2
+                requirement: CatalogWriteRequirement::Converted(OpenApiSourceFormat::Swagger2)
             }
         );
         let (catalog, _) = store
@@ -5191,7 +5220,9 @@ paths:
                 swagger_spec,
                 &selected,
                 &preview.registration_security_selections,
-                ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::Swagger2),
+                ConvertedCatalogAdmission::Admitted(CatalogWriteRequirement::Converted(
+                    OpenApiSourceFormat::Swagger2,
+                )),
                 &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
@@ -5221,7 +5252,7 @@ paths:
             refused,
             OpenApiOverlayOperationError::Catalog(
                 OpenApiCatalogError::ConvertedCatalogNeedsAdmission {
-                    source_format: OpenApiSourceFormat::Swagger2
+                    requirement: CatalogWriteRequirement::Converted(OpenApiSourceFormat::Swagger2)
                 }
             )
         ));
@@ -5237,7 +5268,9 @@ paths:
                 &overlay,
                 false,
                 true,
-                ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::Swagger2),
+                ConvertedCatalogAdmission::Admitted(CatalogWriteRequirement::Converted(
+                    OpenApiSourceFormat::Swagger2,
+                )),
                 &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
@@ -5246,10 +5279,11 @@ paths:
             .delete_overlay(
                 record.id.as_str(),
                 updated.etag.as_str(),
+                ConvertedCatalogAdmission::NotAsked,
                 &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
-            .expect("deleting an overlay is never gated");
+            .expect("deleting this scalar catalog overlay needs no source-format gate");
 
         let statuses = store
             .status_history(&record.id, 64)
@@ -5267,7 +5301,7 @@ paths:
         assert_eq!(
             refused,
             OpenApiCatalogError::ConvertedCatalogNeedsAdmission {
-                source_format: OpenApiSourceFormat::Swagger2
+                requirement: CatalogWriteRequirement::Converted(OpenApiSourceFormat::Swagger2)
             }
         );
         assert_eq!(
@@ -5283,7 +5317,9 @@ paths:
             .refresh_with_admission(
                 record.id.as_str(),
                 record.etag().as_str(),
-                ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::Swagger2),
+                ConvertedCatalogAdmission::Admitted(CatalogWriteRequirement::Converted(
+                    OpenApiSourceFormat::Swagger2,
+                )),
                 &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
@@ -5359,7 +5395,8 @@ paths:
                             "httpMethod": "GET",
                             "description": "Read one widget.",
                             "parameters": {
-                                "widgetId": { "type": "string", "location": "path", "required": true }
+                                "widgetId": { "type": "string", "location": "path", "required": true },
+                                "label": { "type": "string", "location": "query", "repeated": true }
                             },
                             "response": { "$ref": "Widget" }
                         }
@@ -5384,7 +5421,12 @@ paths:
         );
         for admission in [
             ConvertedCatalogAdmission::NotAsked,
-            ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::Swagger2),
+            ConvertedCatalogAdmission::Admitted(CatalogWriteRequirement::Converted(
+                OpenApiSourceFormat::Swagger2,
+            )),
+            ConvertedCatalogAdmission::Admitted(CatalogWriteRequirement::Converted(
+                OpenApiSourceFormat::GoogleDiscovery,
+            )),
         ] {
             let refused = service
                 .register_with_admission(
@@ -5404,7 +5446,9 @@ paths:
             assert_eq!(
                 refused,
                 OpenApiCatalogError::ConvertedCatalogNeedsAdmission {
-                    source_format: OpenApiSourceFormat::GoogleDiscovery
+                    requirement: CatalogWriteRequirement::RepeatedQuery {
+                        source_format: Some(OpenApiSourceFormat::GoogleDiscovery)
+                    }
                 },
                 "{admission:?}"
             );
@@ -5419,7 +5463,9 @@ paths:
                 &spec,
                 &selected,
                 &preview.registration_security_selections,
-                ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::GoogleDiscovery),
+                ConvertedCatalogAdmission::Admitted(CatalogWriteRequirement::RepeatedQuery {
+                    source_format: Some(OpenApiSourceFormat::GoogleDiscovery),
+                }),
                 &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
@@ -5446,7 +5492,9 @@ paths:
                 &overlay,
                 false,
                 true,
-                ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::GoogleDiscovery),
+                ConvertedCatalogAdmission::Admitted(CatalogWriteRequirement::RepeatedQuery {
+                    source_format: Some(OpenApiSourceFormat::GoogleDiscovery),
+                }),
                 &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
@@ -6096,6 +6144,7 @@ paths:
             .delete_overlay(
                 record.id.as_str(),
                 first_put_etag.as_str(),
+                ConvertedCatalogAdmission::NotAsked,
                 &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
@@ -6378,6 +6427,7 @@ paths:
             .delete_overlay(
                 updated.id.as_str(),
                 current_etag.as_str(),
+                ConvertedCatalogAdmission::NotAsked,
                 &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await

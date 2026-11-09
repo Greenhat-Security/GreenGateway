@@ -97,6 +97,15 @@ const ENVIRONMENT_READS: &[EnvironmentRead] = &[
         reads: 1,
     },
     EnvironmentRead {
+        file: "src/admin_connections_app_tests.rs",
+        names: ReadNames::Fixed(&[
+            "GATEWAY_TEST_SLACK_SWAGGER_FILE",
+            "GATEWAY_TEST_GMAIL_DISCOVERY_FILE",
+        ]),
+        purpose: ReadPurpose::TestHarness,
+        reads: 1,
+    },
+    EnvironmentRead {
         file: "src/admin_observability_app_tests.rs",
         names: ReadNames::Fixed(&["GATEWAY_TEST_POSTGRES_URL_FILE"]),
         purpose: ReadPurpose::TestHarness,

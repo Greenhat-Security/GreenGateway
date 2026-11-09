@@ -2151,14 +2151,18 @@
       ],
       "boundary": "Only with ADMIN_SESSION_MODE=cluster_postgres, which configuration accepts only with STATE_BACKEND=postgres (standalone_memory stays refused there). Beginning a login and granting a session first run the bounded expiry prune in a transaction of its own, so the journal's state row is the last row any admission locks. PostgresAdminSessionStore grant is then one transaction: a transaction-scoped advisory lock, the pending cookie login (live, unissued, FOR UPDATE), the capacity count, the replaced session's withdrawal with its evidence and journal rows, the session row (access token sealed under ADMIN_LOGIN_KEYRING), its grant evidence row and its journal row in one statement, then the login's issued marker; it commits once. Since migration 26 the grant statement takes two units of authority-event journal capacity, its own event's and one held for the session's withdrawal, only while both fit; when they do not, the grant rolls back and is answered 503. Logout (withdraw), a provider rejection or identity change (reject) and expiry (the bounded prune, per admission and in the admin_session_prune maintenance job, each in a transaction) each delete the session row, insert its withdrawal evidence row and journal it in one statement, spending the unit the grant held and checking no capacity, so a full journal never refuses a withdrawal. A failed evidence or journal write rolls the change back and is answered 503.",
       "record": "admin_sessions rows (cookie digest, sealed token, CSRF-token digest, subject and issuer, database-clock absolute and idle deadlines) are runtime state that every withdrawal deletes. admin_session_evidence (migration 19) has no foreign key and outlives them: event and operation UUIDs, the random session ID, the action, a reason (issued, logout, replaced, rejected, expired), subject and issuer, the absolute deadline and database-clock committed_at; never the cookie, CSRF token, login binding or access token. Since migration 26 each row is journaled in authority_event_journal (source admin_session_evidence) in the statement that writes it, and authority_event_state.reserved_withdrawals holds one unit per session granted and not yet withdrawn; migration 26 journals the evidence committed before it and holds a unit for every session row then present. Moving the idle deadline on use writes no evidence, and an expiry is committed when the prune removes the row, not at the deadline.",
-      "actor": "The session's own principal (subject and issuer, as the provider validated them at issuance) on the grant and on its withdrawal. Logout is authentication-exempt and made by whoever presents the session cookie or the login binding; it names no other actor. A replaced withdrawal shares its operation_id with the replacement's grant. rejected and expired are system withdrawals on the provider's verdict and the database clock. No actor kind or auth mode is stored.",
+      "actor": "Migration 33 records the verified new login on a grant and on the session it replaces, including canonical issuer when present. Expiry and rejection record the fixed system actor. Authentication-exempt logout by cookie or binding and rows committed before migration 33 have no actor metadata. Their delivered reference identifies only the affected session owner.",
       "identity": "Generated event_id per row and operation_id per store call (a replacement's withdrawal and grant share one; a prune step uses one for its batch), the session's random UUID (Principal.session_id, never the cookie) and database-clock committed_at. UNIQUE (session_id, action) allows one grant and one withdrawal per session. No revision axis is stored, and operation_id is not bound to a client idempotency key.",
       "delivery": "journaled_dispatch",
       "disposition": [
         "missing_metadata"
       ],
-      "follow_up": "Actor kind and auth mode (an expiry and a provider rejection are system withdrawals, but the evidence names only the session's subject, which the delivered record carries under actor.recorded with null kind, auth mode and issuer reference), an issuer-scoped subject reference, the withdrawal reason in the delivered record, and a caller-bound operation identity, before any authority_event.v1 projection. Delivery is the journaled dispatcher since migration 26: admin_session.grant and admin_session.withdraw on the session axis (revision 1 created by the grant, deleted by the withdrawal) with a null shared security revision. Holding a unit per grant so that withdrawals are never refused at capacity is the documented reversible default (docs/authority-evidence.md, Admin session withdrawals and journal capacity); required-durability mode is still not implemented.",
+      "follow_up": "An issuer-scoped subject reference, a caller-bound operation identity and delivery of the withdrawal reason are outstanding. The journal delivers grants and withdrawals on the session axis with a null shared security revision. Required mode admits this store; the row is not qualified for the full durability contract.",
       "sources": [
+        {
+          "path": "gateway/src/storage/migrations/0033_admin_session_evidence_actor.sql",
+          "anchor": "ADD CONSTRAINT admin_session_evidence_actor CHECK ("
+        },
         {
           "path": "gateway/src/storage/migrations/0019_admin_sessions.sql",
           "anchor": "CREATE TABLE greengateway.admin_session_evidence ("
@@ -2213,6 +2217,10 @@
         }
       ],
       "tests": [
+        {
+          "path": "gateway/src/storage/migrations.rs",
+          "anchor": "async fn migration_thirty_three_preserves_existing_session_evidence_and_checks_new_rows("
+        },
         {
           "path": "gateway/src/storage/postgres_admin_sessions_tests.rs",
           "anchor": "async fn every_grant_and_withdrawal_leaves_one_evidence_row("

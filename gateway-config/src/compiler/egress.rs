@@ -7,7 +7,7 @@
 //! is accepted exactly as the legacy parser accepts it, and the egress
 //! boundary decides each destination when a request is made.
 
-use std::env::VarError;
+use std::{collections::BTreeSet, env::VarError};
 
 use ipnet::IpNet;
 
@@ -94,6 +94,16 @@ pub struct EgressPlan {
     pub egress_deny_private_ips: bool,
     /// Where each of the block's inputs came from, in the order they are read.
     pub provenance: Vec<Provenance>,
+}
+
+/// Runs the same pure stage for offline bundle validation. Every finding in
+/// this block is attributed to the input being parsed.
+pub(crate) fn refused_settings(
+    get_var: impl FnMut(&str) -> Result<String, VarError>,
+) -> BTreeSet<&'static str> {
+    compile(EgressInputs::read(get_var))
+        .finding_inputs()
+        .collect()
 }
 
 /// Parses the egress block. Every input here is checked on its own.

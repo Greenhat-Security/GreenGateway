@@ -287,11 +287,24 @@ key, naming the caller exactly as a caller assertion does, with no request
 binding and a fresh `jti`; the issuer verifies it against the published JWKS.
 The Connection must therefore carry a `caller_assertion` block without
 `bind_request`, and that assertion is sent to the issuer only, never upstream.
-Exchanging the caller's own inbound bearer token instead was deliberately not
-built: it would make the gateway retain and forward a credential presented to
-it alone, and needs its own security review. `subject_token_source` is a
-closed enum with the single value `caller_assertion` so that the later choice
-is explicit.
+
+For the generic Connection, `subject_token_source` has one supported value,
+`caller_assertion`. Operators can choose the exchange URL per Connection.
+Permission to contact that endpoint gives it no authority over a reusable
+access token issued to GreenGateway. A compatible broker verifies the
+short-lived gateway assertion, checks its audience and uses the subject's
+grant to obtain the downstream credential.
+
+This is an interoperability choice. Microsoft Entra's on-behalf-of flow
+submits an inbound token for the middle-tier app to its tenant's token
+endpoint. Keycloak's standard exchange uses an access token in the same
+realm. Those deployments establish trust in the token endpoint independently
+of a Connection editor. Operators integrating such a service need a broker
+that accepts GreenGateway's JWT subject-token profile.
+[RFC 8693](https://www.rfc-editor.org/rfc/rfc8693.html#section-2.1) ·
+[MCP audience validation](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/security-considerations#token-audience-binding-and-validation) ·
+[Microsoft Entra OBO](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-on-behalf-of-flow) ·
+[Keycloak standard exchange](https://www.keycloak.org/securing-apps/token-exchange)
 
 - The client secret binds under its own `SecretPurpose::TokenExchangeClientSecret`
   and is not held by the encrypted local store. A purpose sets size and

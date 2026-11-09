@@ -14,6 +14,8 @@ trust sits when a Connection acts for the calling user, through a signed
 caller assertion, a delegated issuer token or a Google domain-wide delegation,
 is collected in the
 [per-caller credential trust boundary](per-caller-trust-boundary.md).
+For the tested call paths, full provider-document checks and remaining
+decisions, see the [Phase 8 acceptance ledger](per-caller-trust-boundary.md#phase-8-acceptance-ledger).
 
 ## Production Readiness Checklist
 
@@ -639,7 +641,7 @@ Each refusal is a fixed string in the `failure_reason` of `tool.invoke_failure`
 | `caller_assertion_claim_invalid` | A value would not survive as a claim: a subject longer than 256 bytes, an issuer longer than 512 bytes or containing `#`, a role longer than 128 bytes, an email longer than 320 bytes, a request ID (a `jti`, with the sequence suffix of a managed MCP session's request or a composite tool's leaf) longer than 128 bytes or missing, with `bind_request` a request target longer than 2048 bytes or a method longer than 16 bytes, or any of them containing a control character. |
 | `caller_assertion_header_conflict` | Another header source had already set the assertion header. |
 | `caller_assertion_signature_failed`, `caller_assertion_token_too_long` | Signing failed, including on a host whose clock reads before 1970 and a managed MCP session asked to sign after its call ended, or the assertion would exceed 8 KiB. |
-| `caller_assertion_not_enforced` | The lane has no caller to attest (discovery, enum and label sources, stored tests), serves a `delegated_issuer_token` Connection other than through a manual tool or a stored test, or the stored block is one only an earlier release accepted: `bind_approval: true`, an assertion header that matches an additional header, or a plain HTTP endpoint. |
+| `caller_assertion_not_enforced` | Discovery and enum or label sources have no caller to attest. Stored tests of ordinary attested Connections are also refused. A delegated issuer token can serve only manual HTTP tools, managed OpenAPI tools and the testing principal's stored test. Any lane refuses a legacy block with `bind_approval: true`, an assertion header that matches an additional header, or a plain HTTP endpoint. |
 
 A signing key that cannot be read or loaded at call time also raises
 `connection.secret_resolution_failed` with the same reason. A proxied request
@@ -1092,10 +1094,10 @@ identity shared by every caller. It is for per-user systems -- a mailbox, a
 calendar, a document store, a chat workspace -- where a shared credential
 would let every caller read one account.
 
-The gateway never holds anybody's provider grant. A trusted issuer does: an
-identity provider or token broker that stores each user's grant for the
-upstream (Auth0, Keycloak, Entra or a small purpose-built service) and
-answers OAuth 2.0 token exchange ([RFC 8693](https://www.rfc-editor.org/rfc/rfc8693)).
+The trusted issuer stores each user's grant for the upstream. Its exchange
+endpoint must accept a gateway-signed JWT as the subject token and
+authenticate GreenGateway with `client_secret_basic`. Check that the issuer
+supports this combination when configuring [RFC 8693 token exchange](https://www.rfc-editor.org/rfc/rfc8693#section-2.1).
 For each caller the gateway asks it for that caller's access token, caches the
 answer for that caller only, and sends it upstream as
 `Authorization: Bearer`.
@@ -1149,9 +1151,11 @@ because the token it buys serves many requests. The issuer verifies it against
 looks up the stored grant for `caller_iss` and `caller_sub`. Set the block's
 `audience` to the value the issuer expects, never to an upstream's.
 
-The caller's own inbound bearer token is never forwarded to the issuer.
-Exchanging it would mean the gateway retaining a credential the caller gave to
-the gateway alone; that is a separate decision with its own security review.
+The caller's inbound bearer token authenticates the caller to GreenGateway.
+Setting `token_exchange_url` and allowing egress to its host do not authorize
+that endpoint to receive the token. GreenGateway presents its own client
+credentials and the signed subject token minted for that issuer.
+See the [delegated issuer token decision](../adr/0006-first-class-connections-and-credentials.md#delegated-issuer-tokens-issue-441-phase-8).
 
 On a delegated Connection the assertion goes to the issuer only. It is not sent
 upstream, and its `header_name` is only cleared from anything a caller sends.
@@ -1520,9 +1524,9 @@ must enforce because the gateway cannot, and what is out of scope. In short:
 
 - **The issuer's grant store is the most sensitive component in the
   deployment.** Whoever holds this Connection's client secret can exchange
-  any subject token the issuer accepts for that user's upstream token, and
-  with the signing key as well, any user's, so one leaked secret can unlock
-  every stored grant. Keep the secret in an external provider, restrict the issuer
+  any subject token the issuer accepts for that user's upstream token. With
+  the signing key as well, they can obtain a token for any user who has a
+  grant. Keep the secret in an external provider, restrict the issuer
   to this client's subject tokens and audience, have it store grants
   encrypted, grant read-only scopes wherever the upstream allows it, and
   have it log every hand-out.
@@ -1589,8 +1593,9 @@ The editor creates and edits delegated Connections:
 
 The detail page shows every field but the client secret's alias, which
 appears only as configured or not, the revocation endpoint included, and the
-caller assertion as the subject token. A principal's tokens are purged through
-the admin API only.
+caller assertion as the subject token. An operator can
+[purge a principal's cached tokens](#purging-a-principals-tokens) through
+the admin API.
 
 ### Google domain-wide delegation
 
@@ -2232,6 +2237,22 @@ and the refusal is audited as `cluster.operation_refused`. Before rolling
 back, re-register those Connections with an OpenAPI 3.x document, or delete
 their overlays first.
 
+Discovery `repeated` query inputs such as Gmail's `labelIds` and
+`metadataHeaders` accept arrays of scalar values. Each item becomes one
+separately URL-encoded occurrence of the parameter, in input order. An empty
+optional array emits zero occurrences. Required arrays need at least one item.
+Each repeated parameter accepts up to 128 items and a query name of up to 256 bytes.
+
+Before publishing tools with these mappings in cluster mode, upgrade every
+live replica. The `connections.openapi_repeated_query` gate checks for
+`openapi_repeated_query` on registration, refresh and overlay edits that
+publish a repeated parameter. The standalone-to-cluster import checks the
+roster before copying catalog entries that use this mapping. Before rolling
+back to a build that predates
+this capability, re-register just the tools with scalar query mappings or
+delete the affected catalogs. An older replica refuses to load a persisted
+tool with the new mapping field.
+
 ## Security binding and read-only selection
 
 A preview binds every generated operation, whatever format it was imported
@@ -2381,6 +2402,43 @@ tools; a call that reaches an earlier replica fails as for a tool that does
 not exist there. Register and edit such catalogs through upgraded replicas.
 After a rollback the catalog stays stored, unserved, until the upgrade is
 repeated.
+
+### Verify the full Slack and Gmail documents
+
+The following acceptance tests upload the unmodified provider documents to a
+temporary gateway through its admin preview and registration endpoints. Each
+test checks the SHA-256 of its input and the names in the published catalog.
+The inputs are the following immutable public snapshots.
+
+| Document | SHA-256 | Read operations selected |
+| --- | --- | --- |
+| [Slack Web API Swagger 2.0](https://raw.githubusercontent.com/slackapi/slack-api-specs/dfea73e06d146c368d7f94b52ac90796dc4e27e1/web-api/slack_web_openapi_v2.json) | `742a5c977180a829df8767cf57bc417d99b3713583aee83741efb9c08ca731e7` | `users_info`, `users_list` |
+| [Gmail v1 Discovery](https://raw.githubusercontent.com/googleapis/discovery-artifact-manager/b54f57986191f04556a56ce2d90e8b1fe5dd8a0f/discoveries/gmail.v1.json) | `f651441dcc942f428d92768e8b20c94a28ff82bf485b79872d9eef267a894225` | `gmail.users.messages.get`, `gmail.users.messages.list`, `gmail.users.threads.get`, `gmail.users.threads.list` |
+
+The Gmail test also registers all six `gmail.users.threads.*` methods on a
+separate, temporary Connection with the synthetic `https://mail.google.com/`
+scope. It includes `delete`, `modify`, `trash` and `untrash` in that catalog.
+The test makes no Gmail requests.
+
+With the repository build tools on your path, this command fetches the two
+snapshots, verifies them and runs both acceptance tests on Windows, macOS or
+Linux:
+
+```sh
+python scripts/provider_document_acceptance.py --fetch
+```
+
+The command caches verified files in `target/provider-documents/`. Repeat it
+without `--fetch` to use the cached snapshots without contacting the providers. To supply your own local copies,
+set `GATEWAY_TEST_SLACK_SWAGGER_FILE` and `GATEWAY_TEST_GMAIL_DISCOVERY_FILE` to their file
+paths before running it. Explicit paths always take precedence. Use
+`--verify-only` to check the files without compiling or running the gateway.
+The default CI suite leaves these tests ignored.
+
+The full Slack snapshot is 1,237,332 bytes before JSON envelope escaping. A
+gateway receiving that upload needs a request body limit above the default
+1 MiB. The acceptance gateway uses `MAX_BODY_SIZE=2097152`. The separate
+2 MiB document limit also applies.
 
 ## OpenAPI Overlays
 

@@ -3322,8 +3322,37 @@ impl ToolExecutor {
                     }
                     continue;
                 };
-                let value = scalar_argument_to_string(tool, &mapping.arg_name, "query", value)?;
-                query.append_pair(&mapping.query_name, &value);
+                let values = if mapping.repeated {
+                    let items = value.as_array().ok_or_else(|| {
+                        ToolExecutorError::UnsupportedArgumentValue {
+                            tool_name: tool.name.clone(),
+                            arg_name: mapping.arg_name.clone(),
+                            location: "query",
+                            value_type: json_value_type(value),
+                        }
+                    })?;
+                    if mapping.required && items.is_empty() {
+                        return Err(ToolExecutorError::MissingArgument {
+                            tool_name: tool.name.clone(),
+                            arg_name: mapping.arg_name.clone(),
+                            location: "query",
+                        });
+                    }
+                    // Bound name amplification before appending anything to the URL.
+                    if items.len() > crate::tools::definitions::MAX_REPEATED_QUERY_ITEMS {
+                        return Err(ToolExecutorError::UrlBuild {
+                            tool_name: tool.name.clone(),
+                            message: "repeated query parameter exceeds its item bound".to_owned(),
+                        });
+                    }
+                    items.as_slice()
+                } else {
+                    std::slice::from_ref(value)
+                };
+                for item in values {
+                    let value = scalar_argument_to_string(tool, &mapping.arg_name, "query", item)?;
+                    query.append_pair(&mapping.query_name, &value);
+                }
             }
         }
 

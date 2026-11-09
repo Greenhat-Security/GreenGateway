@@ -72,6 +72,8 @@ pub struct SessionGrant {
     /// The session this browser presented. A successful grant withdraws it.
     pub previous: Option<SessionDigest>,
     pub session: StoredSession,
+    #[cfg(feature = "postgres")]
+    pub(crate) actor: super::change_actor::ChangeActor,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -259,6 +261,8 @@ impl AdminSessions {
         let value = Zeroizing::new(hex::encode(random));
         let cookie = self.cookie(&value, self.ttl_seconds())?;
         let grant = SessionGrant {
+            #[cfg(feature = "postgres")]
+            actor: super::change_actor::ChangeActor::from_principal(&principal),
             key: self.digest(PURPOSE_SESSION, &value),
             binding: self.digest(PURPOSE_BINDING, binding),
             // Successful identity replacement revokes the prior session

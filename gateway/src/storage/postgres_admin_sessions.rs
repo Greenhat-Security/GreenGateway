@@ -75,7 +75,7 @@ use crate::{
             AdminSessionConfig, AdminSessionStore, GrantOutcome, SessionDigest, SessionGrant,
             StoredSession, MAX_ACCESS_TOKEN_BYTES,
         },
-        principal::{MAX_PRINCIPAL_ISSUER_BYTES, MAX_PRINCIPAL_SUBJECT_BYTES},
+        principal::MAX_PRINCIPAL_ISSUER_BYTES,
         AuthError,
     },
     connections::local_secret::LocalSecretKeyring,
@@ -189,10 +189,11 @@ const WITHDRAW_SQL: &str = concat!(
         WHERE issued_session_hash IN (SELECT session_hash FROM withdrawn)
     ), evidence AS (
         INSERT INTO greengateway.admin_session_evidence (
-            event_id, operation_id, session_id, action, reason, user_id, issuer, expires_at
+            event_id, operation_id, session_id, action, reason, user_id, issuer, expires_at,
+            actor_subject, actor_kind, actor_auth_mode, actor_issuer
         )
         SELECT gen_random_uuid(), $2::text::uuid, id, 'admin_session.withdraw', $3,
-               user_id, issuer, expires_at
+               user_id, issuer, expires_at, $4, $5, $6, $7
         FROM withdrawn
         RETURNING event_id
     )"#,
@@ -213,10 +214,11 @@ const REJECT_SQL: &str = concat!(
         WHERE issued_session_hash IN (SELECT session_hash FROM withdrawn)
     ), evidence AS (
         INSERT INTO greengateway.admin_session_evidence (
-            event_id, operation_id, session_id, action, reason, user_id, issuer, expires_at
+            event_id, operation_id, session_id, action, reason, user_id, issuer, expires_at,
+            actor_subject, actor_kind, actor_auth_mode, actor_issuer
         )
         SELECT gen_random_uuid(), $3::text::uuid, id, 'admin_session.withdraw', 'rejected',
-               user_id, issuer, expires_at
+               user_id, issuer, expires_at, 'system:admin-session', 'system', 'system', NULL
         FROM withdrawn
         RETURNING event_id
     )"#,
@@ -243,10 +245,11 @@ const PRUNE_SESSIONS_SQL: &str = concat!(
         WHERE issued_session_hash IN (SELECT session_hash FROM withdrawn)
     ), evidence AS (
         INSERT INTO greengateway.admin_session_evidence (
-            event_id, operation_id, session_id, action, reason, user_id, issuer, expires_at
+            event_id, operation_id, session_id, action, reason, user_id, issuer, expires_at,
+            actor_subject, actor_kind, actor_auth_mode, actor_issuer
         )
         SELECT gen_random_uuid(), $2::text::uuid, id, 'admin_session.withdraw', 'expired',
-               user_id, issuer, expires_at
+               user_id, issuer, expires_at, 'system:admin-session', 'system', 'system', NULL
         FROM withdrawn
         RETURNING event_id
     )"#,
@@ -283,10 +286,11 @@ const GRANT_SQL: &str = r#"
         RETURNING id, user_id, issuer, expires_at
     ), evidence AS (
         INSERT INTO greengateway.admin_session_evidence (
-            event_id, operation_id, session_id, action, reason, user_id, issuer, expires_at
+            event_id, operation_id, session_id, action, reason, user_id, issuer, expires_at,
+            actor_subject, actor_kind, actor_auth_mode, actor_issuer
         )
         SELECT gen_random_uuid(), $11::text::uuid, id, 'admin_session.grant', 'issued',
-               user_id, issuer, expires_at
+               user_id, issuer, expires_at, user_id, $12, $13, $14
         FROM granted
         RETURNING event_id
     ), held AS (
@@ -505,8 +509,8 @@ impl PostgresAdminSessionStore {
         grant: &SessionGrant,
     ) -> Result<GrantOutcome, RepositoryError> {
         let session = &grant.session;
-        if session.user_id.is_empty()
-            || session.user_id.len() > MAX_PRINCIPAL_SUBJECT_BYTES
+        if !grant.actor.is_recordable()
+            || grant.actor.subject() != session.user_id
             || session
                 .issuer
                 .as_ref()
@@ -577,7 +581,15 @@ impl PostgresAdminSessionStore {
             withdraw_statement(
                 client,
                 WITHDRAW_SQL,
-                &[&vec![previous], &operation_id, &REASON_REPLACED],
+                &[
+                    &vec![previous],
+                    &operation_id,
+                    &REASON_REPLACED,
+                    &grant.actor.subject(),
+                    &grant.actor.kind().as_str(),
+                    &grant.actor.auth_mode(),
+                    &grant.actor.issuer(),
+                ],
                 OPERATION_GRANT,
             )
             .await?;
@@ -598,6 +610,9 @@ impl PostgresAdminSessionStore {
                 &self.config.ttl.as_secs_f64(),
                 &self.config.idle_timeout.as_secs_f64(),
                 &operation_id,
+                &grant.actor.kind().as_str(),
+                &grant.actor.auth_mode(),
+                &grant.actor.issuer(),
             ],
             OPERATION_GRANT,
         )
@@ -655,7 +670,15 @@ impl PostgresAdminSessionStore {
         withdraw_statement(
             client,
             WITHDRAW_SQL,
-            &[&targets, &operation_id, &REASON_LOGOUT],
+            &[
+                &targets,
+                &operation_id,
+                &REASON_LOGOUT,
+                &None::<&str>,
+                &None::<&str>,
+                &None::<&str>,
+                &None::<&str>,
+            ],
             OPERATION_WITHDRAW,
         )
         .await?;

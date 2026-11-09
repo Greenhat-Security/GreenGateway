@@ -173,6 +173,7 @@ pub enum Code {
     InvalidDecimal,
     NotApplicable,
     NotRepresentable,
+    InvalidEgressSetting,
     // References between bundle files.
     InvalidPath,
     ReservedPath,
@@ -184,6 +185,7 @@ pub enum Code {
     // Secret references.
     InlineSecretValue,
     InvalidSecretReference,
+    TooManySecretReferences,
     // Referenced policy and tools documents.
     UnsupportedSchemaVersion,
     SchemaVersionMismatch,
@@ -258,6 +260,7 @@ impl Code {
         Self::InvalidDecimal,
         Self::NotApplicable,
         Self::NotRepresentable,
+        Self::InvalidEgressSetting,
         Self::InvalidPath,
         Self::ReservedPath,
         Self::DuplicatePath,
@@ -267,6 +270,7 @@ impl Code {
         Self::Unresolved,
         Self::InlineSecretValue,
         Self::InvalidSecretReference,
+        Self::TooManySecretReferences,
         Self::UnsupportedSchemaVersion,
         Self::SchemaVersionMismatch,
         Self::ResourceUnknownMember,
@@ -528,6 +532,10 @@ impl Code {
                 "reference.source_unsupported",
                 "the resource cannot be supplied by this source in this document version",
             ),
+            Self::InvalidEgressSetting => (
+                "bundle.invalid_egress_setting",
+                "the egress configuration compiler refused this setting",
+            ),
             Self::Unresolved => (
                 "reference.unresolved",
                 "a value is an unresolved placeholder; supply a reference or value",
@@ -539,6 +547,10 @@ impl Code {
             Self::InvalidSecretReference => (
                 "secret.invalid_reference",
                 "a secret reference is not a single opaque alias ID",
+            ),
+            Self::TooManySecretReferences => (
+                "secret.too_many_references",
+                "the deployment exceeds the secret reference limit",
             ),
             Self::UnsupportedSchemaVersion => (
                 "resource.unsupported_schema_version",

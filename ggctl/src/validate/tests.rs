@@ -266,6 +266,61 @@ fn a_document_only_the_production_validator_refuses_is_refused_by_code_alone() {
 }
 
 #[test]
+fn validate_and_doctor_run_the_egress_compiler_on_a_bundle() {
+    let fixture = Fixture::valid();
+    let set_egress = |hosts: &str, prefixes: &str| {
+        let deployment = format!(
+            "apiVersion: greengateway.dev/v1alpha1\nkind: GatewayDeployment\nspec:\n  profile: production\n  egress:\n    allowed_hosts: [{hosts}]\n    nat64_prefixes: [{prefixes}]\n"
+        );
+        fixture.write("deployment.yaml", &deployment);
+        fixture.pin("      source: bundle\n      path: policy.json\n      schema_version: \"0.1.0\"\n      sha256: \"POLICY\"\n");
+    };
+    set_egress("\"API.example.test\"", "\"2001:db8:1::/96\"");
+    for command in ["validate", "doctor"] {
+        assert_eq!(run(&[command, fixture.path()]).0, Exit::Success);
+    }
+
+    // A port is invalid even on an otherwise well-formed hostname. The
+    // prefixes are each valid on their own, and overlap one another.
+    set_egress(
+        &format!("\"{CANARY}.example.test:443\""),
+        "\"2001:db8::/32\", \"2001:db8:1::/96\"",
+    );
+    for command in ["validate", "doctor"] {
+        let (exit, captured) = run(&[command, fixture.path(), "--format", "json"]);
+        assert_eq!(exit, Exit::Invalid);
+        assert_no_canary(&captured);
+        let result = report(&captured);
+        let locations: Vec<_> = result["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|diagnostic| diagnostic["code"] == "bundle.invalid_egress_setting")
+            .map(|diagnostic| diagnostic["location"].clone())
+            .collect();
+        assert_eq!(locations.len(), 2);
+        for (location, (path, line)) in locations.iter().zip([
+            ("/spec/egress/allowed_hosts", 6),
+            ("/spec/egress/nat64_prefixes", 7),
+        ]) {
+            assert_eq!(location["file"], "deployment.yaml");
+            assert_eq!(location["pointer"], path);
+            assert_eq!(location["line"], line);
+        }
+        if command == "doctor" {
+            let check = result["result"]["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["id"] == "bundle.structure")
+                .unwrap();
+            assert_eq!(check["status"], "fail");
+            assert_eq!(check["reason"], "bundle.invalid_egress_setting");
+        }
+    }
+}
+
+#[test]
 fn an_invalid_bundle_exits_3_with_located_value_free_diagnostics() {
     let fixture = Fixture::valid();
     // The policy changes after it was pinned, and its unknown member names a

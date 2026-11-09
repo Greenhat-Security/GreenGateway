@@ -197,6 +197,28 @@ pub(crate) struct StandaloneDiscovery {
 }
 
 impl StandaloneSource {
+    /// Import copies the stored catalog entries verbatim. Older replicas
+    /// reject even an explicitly false field in the closed mapping object.
+    pub(super) fn writes_repeated_query_mappings(&self) -> bool {
+        self.connections
+            .iter()
+            .filter_map(|connection| connection.openapi_catalog.as_ref())
+            .flat_map(|catalog| &catalog.entries)
+            .any(|entry| {
+                ["/upstream/query_params", "/target/mapping/query_params"]
+                    .iter()
+                    .any(|path| {
+                        entry
+                            .definition
+                            .pointer(path)
+                            .and_then(Value::as_array)
+                            .is_some_and(|params| {
+                                params.iter().any(|param| param.get("repeated").is_some())
+                            })
+                    })
+            })
+    }
+
     /// Whether the import writes a policy v1 document to the cluster: the
     /// policy it activates, or any history version it carries. Committing
     /// one is the gated operation `policy.document_v1`, so preflight asks

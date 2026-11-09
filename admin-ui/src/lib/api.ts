@@ -163,6 +163,17 @@ export async function adminFetchJsonResponse<T>(
   input: string,
   options: AdminFetchOptions = {},
 ): Promise<AdminJsonResponse<T>> {
+  return adminFetchResponse(input, options, async response => await parseJsonBody(response) as T);
+}
+
+// Canonical downloads read the original bytes. All readers go through the
+// same origin and CSRF checks and are checked for identity changes after
+// the entire body is read.
+export async function adminFetchResponse<T>(
+  input: string,
+  options: AdminFetchOptions,
+  readSuccess: (response: Response) => Promise<T>,
+): Promise<AdminJsonResponse<T>> {
   assertAdminRequestOrigin(input);
   const { answerStatuses = [], ...requestOptions } = options;
   const requestIdentity = getAdminIdentityVersion();
@@ -181,18 +192,19 @@ export async function adminFetchJsonResponse<T>(
     redirect: 'error',
     headers,
   });
-  const body = await parseJsonBody(response);
+  const answered =
+    response.status !== 401 &&
+    response.status !== 403 &&
+    answerStatuses.includes(response.status);
+  const failed = !response.ok && !answered;
+  const body = failed ? await parseJsonBody(response) : await readSuccess(response);
   if (requestOptions.signal?.aborted) {
     throw new DOMException('Admin request aborted.', 'AbortError');
   }
   if (requestIdentity !== getAdminIdentityVersion()) {
     throw new Error('Admin identity changed while the request was pending.');
   }
-  const answered =
-    response.status !== 401 &&
-    response.status !== 403 &&
-    answerStatuses.includes(response.status);
-  if (!response.ok && !answered) {
+  if (failed) {
     adminAuthorizationFailed(response.status, requestIdentity, input === adminApiUrl('/capabilities'));
     throw adminApiError(body, response);
   }
@@ -235,6 +247,7 @@ function changesLivePolicy(path: string): boolean {
     path.endsWith('/convert') ||
     path === adminApiUrl('/policy/simulations') ||
     path === adminApiUrl('/policy/analyses') ||
+    path === adminApiUrl('/policy/evidence') ||
     path === adminApiUrl('/policy/tests/runs')
   ) {
     return false;

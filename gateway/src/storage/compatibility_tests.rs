@@ -39,7 +39,7 @@ fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
     let rendered = advertisement(BINARY_CAPABILITIES).expect("the shipped set fits the column");
     assert_eq!(
         rendered,
-        "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
+        "delegated_token_purges,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
          operation_requirements,policy_document_v1,policy_role_descriptions,\
          policy_rule_conditions,policy_tool_argument_conditions"
     );
@@ -53,6 +53,7 @@ fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
         vec![
             "delegated_token_purges",
             "openapi_discovery_catalogs",
+            "openapi_repeated_query",
             "openapi_swagger2_catalogs",
             "operation_requirements",
             "policy_document_v1",
@@ -315,6 +316,7 @@ mod gate_tests {
                 POLICY_ROLE_DESCRIPTIONS,
                 OPENAPI_SWAGGER2_CATALOGS,
                 OPENAPI_DISCOVERY_CATALOGS,
+                OPENAPI_REPEATED_QUERY,
                 DELEGATED_TOKEN_PURGES,
                 POLICY_DOCUMENT_V1,
                 POLICY_RULE_CONDITIONS,

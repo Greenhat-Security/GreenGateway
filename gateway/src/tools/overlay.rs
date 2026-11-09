@@ -1610,6 +1610,7 @@ fn planned_source_request(
                     arg_name: name.clone(),
                     query_name: name.clone(),
                     required: false,
+                    repeated: false,
                 })
                 .collect::<Vec<_>>();
             Some(SourceRequestPlan {
@@ -2006,7 +2007,11 @@ pub fn compile_with_resolved_sources(
             }
             renames.insert(generated_name.clone(), target.to_owned());
         }
-        if let Some(definition) = generated_index.get(generated_name.as_str()) {
+        if let Some(definition) = bound_index
+            .get(generated_name)
+            .map(|index| &binding.definitions[*index])
+            .or_else(|| generated_index.get(generated_name.as_str()).copied())
+        {
             validate_parameter_names(
                 generated_name,
                 tool,
