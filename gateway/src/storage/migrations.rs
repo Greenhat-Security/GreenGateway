@@ -5254,7 +5254,7 @@ mod tests {
                 error,
                 PostgresFoundationError::SchemaNotReady {
                     applied: 24,
-                    missing: 8,
+                    missing: 9,
                     auto_migrate: false
                 }
             ),
