@@ -628,6 +628,37 @@ fn an_environment_fixture_with_no_document_form_converts_to_unresolved_placehold
 
 // --- reading the forms -------------------------------------------------------------------
 
+#[test]
+fn deployment_limits_secret_reference_occurrences_across_settings() {
+    let reference = json!({ "secret": CANARY });
+    let endpoints: Vec<_> = (0..509)
+        .map(|index| json!({ "id": format!("endpoint-{index}"), "url": reference }))
+        .collect();
+    let mut document = envelope();
+    document["spec"]["admin_login"] = json!({ "client_secret": reference });
+    document["spec"]["upstream"] = json!({
+        "routes": [{ "path_prefix": "/r", "upstreams": endpoints }],
+        "mcp_servers": [{ "name": "tools", "url": reference }],
+        "url": reference,
+    });
+    let (deployment, diagnostics) = read(&document);
+    assert!(deployment.is_some(), "{diagnostics:?}");
+    assert!(diagnostics.is_empty());
+
+    document["spec"]["upstream"]["mcp_servers"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "name": "more-tools", "url": reference }));
+    let (deployment, diagnostics) = read(&document);
+    assert!(deployment.is_none());
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = &diagnostics[0];
+    assert_eq!(diagnostic.code, Code::TooManySecretReferences);
+    assert_eq!(diagnostic.pointer.to_string(), "/spec");
+    assert!(diagnostic.position.is_some());
+    assert!(!format!("{diagnostic} {diagnostic:?}").contains(CANARY));
+}
+
 /// A document with one route that is `route` plus a valid matcher and URL.
 fn route(members: JsonValue) -> JsonValue {
     let mut route = json!({

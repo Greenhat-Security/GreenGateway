@@ -150,7 +150,8 @@ impl Stage {
             | Code::NotApplicable
             | Code::NotRepresentable
             | Code::InlineSecretValue
-            | Code::InvalidSecretReference => Self::Structure,
+            | Code::InvalidSecretReference
+            | Code::TooManySecretReferences => Self::Structure,
             Code::FileMissing
             | Code::DigestMismatch
             | Code::InvalidPath

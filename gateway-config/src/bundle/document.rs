@@ -537,6 +537,10 @@ pub(crate) fn deployment(
         &["apiVersion", "kind", "spec"],
     )?;
     let spec_pointer = root.member("spec");
+    if let Some(excess) = member(members, "spec").and_then(super::value::excess_secret_reference) {
+        checker.report(Code::TooManySecretReferences, spec_pointer, excess);
+        return None;
+    }
     let mut allowed = vec!["profile"];
     allowed.extend(settings::member_names("/spec"));
     let spec = member(members, "spec")
