@@ -641,7 +641,7 @@ Each refusal is a fixed string in the `failure_reason` of `tool.invoke_failure`
 | `caller_assertion_claim_invalid` | A value would not survive as a claim: a subject longer than 256 bytes, an issuer longer than 512 bytes or containing `#`, a role longer than 128 bytes, an email longer than 320 bytes, a request ID (a `jti`, with the sequence suffix of a managed MCP session's request or a composite tool's leaf) longer than 128 bytes or missing, with `bind_request` a request target longer than 2048 bytes or a method longer than 16 bytes, or any of them containing a control character. |
 | `caller_assertion_header_conflict` | Another header source had already set the assertion header. |
 | `caller_assertion_signature_failed`, `caller_assertion_token_too_long` | Signing failed, including on a host whose clock reads before 1970 and a managed MCP session asked to sign after its call ended, or the assertion would exceed 8 KiB. |
-| `caller_assertion_not_enforced` | The lane has no caller to attest (discovery, enum and label sources, stored tests), serves a `delegated_issuer_token` Connection other than through a manual tool or a stored test, or the stored block is one only an earlier release accepted: `bind_approval: true`, an assertion header that matches an additional header, or a plain HTTP endpoint. |
+| `caller_assertion_not_enforced` | Discovery and enum or label sources have no caller to attest. Stored tests of ordinary attested Connections are also refused. A delegated issuer token can serve only manual HTTP tools, managed OpenAPI tools and the testing principal's stored test. Any lane refuses a legacy block with `bind_approval: true`, an assertion header that matches an additional header, or a plain HTTP endpoint. |
 
 A signing key that cannot be read or loaded at call time also raises
 `connection.secret_resolution_failed` with the same reason. A proxied request
@@ -1094,10 +1094,10 @@ identity shared by every caller. It is for per-user systems -- a mailbox, a
 calendar, a document store, a chat workspace -- where a shared credential
 would let every caller read one account.
 
-The gateway never holds anybody's provider grant. A trusted issuer does: an
-identity provider or token broker that stores each user's grant for the
-upstream (Auth0, Keycloak, Entra or a small purpose-built service) and
-answers OAuth 2.0 token exchange ([RFC 8693](https://www.rfc-editor.org/rfc/rfc8693)).
+The trusted issuer stores each user's grant for the upstream. Its exchange
+endpoint must accept a gateway-signed JWT as the subject token and
+authenticate GreenGateway with `client_secret_basic`. Check that the issuer
+supports this combination when configuring [RFC 8693 token exchange](https://www.rfc-editor.org/rfc/rfc8693#section-2.1).
 For each caller the gateway asks it for that caller's access token, caches the
 answer for that caller only, and sends it upstream as
 `Authorization: Bearer`.
@@ -1151,9 +1151,11 @@ because the token it buys serves many requests. The issuer verifies it against
 looks up the stored grant for `caller_iss` and `caller_sub`. Set the block's
 `audience` to the value the issuer expects, never to an upstream's.
 
-The caller's own inbound bearer token is never forwarded to the issuer.
-Exchanging it would mean the gateway retaining a credential the caller gave to
-the gateway alone; that is a separate decision with its own security review.
+The caller's inbound bearer token authenticates the caller to GreenGateway.
+Setting `token_exchange_url` and allowing egress to its host do not authorize
+that endpoint to receive the token. GreenGateway presents its own client
+credentials and the signed subject token minted for that issuer.
+See the [delegated issuer token decision](../adr/0006-first-class-connections-and-credentials.md#delegated-issuer-tokens-issue-441-phase-8).
 
 On a delegated Connection the assertion goes to the issuer only. It is not sent
 upstream, and its `header_name` is only cleared from anything a caller sends.
@@ -1522,9 +1524,9 @@ must enforce because the gateway cannot, and what is out of scope. In short:
 
 - **The issuer's grant store is the most sensitive component in the
   deployment.** Whoever holds this Connection's client secret can exchange
-  any subject token the issuer accepts for that user's upstream token, and
-  with the signing key as well, any user's, so one leaked secret can unlock
-  every stored grant. Keep the secret in an external provider, restrict the issuer
+  any subject token the issuer accepts for that user's upstream token. With
+  the signing key as well, they can obtain a token for any user who has a
+  grant. Keep the secret in an external provider, restrict the issuer
   to this client's subject tokens and audience, have it store grants
   encrypted, grant read-only scopes wherever the upstream allows it, and
   have it log every hand-out.
@@ -1591,8 +1593,9 @@ The editor creates and edits delegated Connections:
 
 The detail page shows every field but the client secret's alias, which
 appears only as configured or not, the revocation endpoint included, and the
-caller assertion as the subject token. A principal's tokens are purged through
-the admin API only.
+caller assertion as the subject token. An operator can
+[purge a principal's cached tokens](#purging-a-principals-tokens) through
+the admin API.
 
 ### Google domain-wide delegation
 
