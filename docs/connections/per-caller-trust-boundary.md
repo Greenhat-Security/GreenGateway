@@ -622,10 +622,11 @@ through the setup step by step.
   forwarded: not to the issuer as a subject token, not to Google and not to an
   upstream. Proxy routes remove the inbound `Authorization` and `Cookie`
   headers, and tool requests are built without the caller's headers.
-  Exchanging the inbound token (for example an on-behalf-of flow) would make
-  the gateway retain and forward a credential presented to it alone; it needs
-  its own security review. `subject_token_source` is a closed enum whose only
-  value is `caller_assertion`, so adding another source is an explicit change.
+  A Connection's exchange endpoint must accept and verify a gateway-signed
+  JWT. The supported `subject_token_source` is `caller_assertion`.
+  [ADR-0006](../adr/0006-first-class-connections-and-credentials.md#delegated-issuer-tokens-issue-441-phase-8)
+  records the broker requirements and their implications for provider-specific
+  on-behalf-of flows.
   The `forward_cookie_session` route option, which passes on a validated
   browser session for one trusted upstream, is rejected on Connection routes
   and is not a per-caller credential mechanism.
@@ -715,18 +716,18 @@ cargo test --locked -p gateway --bin gateway issue_446_acceptance
 | Sanitised upstream errors (#445) | `tools/call` returns an upstream error with a numeric `statusCode` and bounded, redacted `messages`. Tests also cover malformed fields and the outer HTTP status. [MCP result tests](../../gateway/src/mcp.rs) and [router test](../../gateway/src/mcp_app_tests.rs) |
 | Signed caller assertion (#463) | Two users call an internal API with the same service bearer and different request-bound assertions. The router suite verifies both against the public JWKS. Executor tests cover ES256, RS256, key rotation and distinct assertion IDs for composite leaves. [Assertion tests](../../gateway/src/tools/executor_caller_assertion_tests.rs) |
 
-To verify catalog compatibility against the full provider documents, supply
-the two SHA-256-pinned snapshots and run the opt-in admin API tests. They
-preview and register Slack's `users_info` and `users_list` and Gmail's
-message and thread get/list operations. The normal workspace test run uses
-checked-in fixtures. Provider account access and production deployment
-qualification require separate evidence.
+The opt-in admin API tests verify two public snapshots by SHA-256. The
+fixture helper can fetch them into the ignored build directory or read
+operator-supplied copies offline. The tests register Slack's `users_info`
+and `users_list`, four Gmail reads with read-only scope, and all six Gmail
+thread methods on a separate synthetic Connection. The normal workspace test
+run uses checked-in fixtures. Provider account access and production
+deployment qualification require separate evidence.
 [Snapshot sources and verification command](operator-guide.md#verify-the-full-slack-and-gmail-documents)
 
-Two decisions remain on the [Phase 8 tracker](https://github.com/Greenhat-Security/GreenGateway/issues/446).
-The exchange supports `caller_assertion` as its subject token. Forwarding the
-raw inbound bearer remains an open scope decision in
-[#441](https://github.com/Greenhat-Security/GreenGateway/issues/441).
-An assertion with `bind_approval: true` is refused. Supporting it requires an
-approval subsystem, and [#463](https://github.com/Greenhat-Security/GreenGateway/issues/463)
-tracks that decision.
+The delegated exchange uses a signed caller assertion. The inbound bearer
+stays at the gateway. Approval-bound mutations require a separate authority
+that records who approved the exact action and verifies that decision before
+dispatch. Until that authority exists, `bind_approval: true` is refused.
+[Phase 8 scope](https://github.com/Greenhat-Security/GreenGateway/issues/446) ·
+[Approval authority follow-up](https://github.com/Greenhat-Security/GreenGateway/issues/757)
