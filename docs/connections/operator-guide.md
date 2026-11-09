@@ -2405,8 +2405,7 @@ repeated.
 The following acceptance tests upload the unmodified provider documents to a
 temporary gateway through its admin preview and registration endpoints. Each
 test checks the SHA-256 of its input and the names in the published catalog.
-Supply these exact public snapshots as local files. The tests do not download
-them or call either provider.
+The inputs are the following immutable public snapshots.
 
 | Document | SHA-256 | Read operations selected |
 | --- | --- | --- |
@@ -2418,13 +2417,20 @@ separate, temporary Connection with the synthetic `https://mail.google.com/`
 scope. It includes `delete`, `modify`, `trash` and `untrash` in that catalog.
 The test makes no Gmail requests.
 
-With the repository build tools on your path, run:
+With the repository build tools on your path, this command fetches the two
+snapshots, verifies them and runs both acceptance tests on Windows, macOS or
+Linux:
 
 ```sh
-export GGW_SLACK_SWAGGER_FILE=/absolute/path/to/slack_web_openapi_v2.json
-export GGW_GMAIL_DISCOVERY_FILE=/absolute/path/to/gmail.v1.json
-cargo test --locked -p gateway --bin gateway pinned_provider_document_ -- --ignored
+python scripts/provider_document_acceptance.py --fetch
 ```
+
+The command caches verified files in `target/provider-documents/`. Repeat it
+without `--fetch` to use the cached snapshots without contacting the providers. To supply your own local copies,
+set `GGW_SLACK_SWAGGER_FILE` and `GGW_GMAIL_DISCOVERY_FILE` to their file
+paths before running it. Explicit paths always take precedence. Use
+`--verify-only` to check the files without compiling or running the gateway.
+The default CI suite leaves these tests ignored.
 
 The full Slack snapshot is 1,237,332 bytes before JSON envelope escaping. A
 gateway receiving that upload needs a request body limit above the default
