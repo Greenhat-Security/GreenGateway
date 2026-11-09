@@ -994,7 +994,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "sse-stream",
+ "sse-stream 0.3.0",
  "syn 3.0.9",
  "time",
  "tokio",
@@ -2669,7 +2669,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "sse-stream",
+ "sse-stream 0.2.6",
  "thiserror",
  "tokio",
  "tokio-stream",
@@ -3210,6 +3210,22 @@ dependencies = [
  "http-body",
  "http-body-util",
  "pin-project-lite",
+]
+
+[[package]]
+name = "sse-stream"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d385160fc0fba84f7b9cc8ef3263e410d0e3ca7ab4927f1356df33145ace69a4"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "memchr",
+ "pin-project-lite",
+ "simdutf8",
+ "thiserror",
 ]
 
 [[package]]
