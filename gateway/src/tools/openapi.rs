@@ -1287,6 +1287,7 @@ fn generate_tools_from_document(
                 arg_name: parameter.name.clone(),
                 query_name: parameter.name.clone(),
                 required: parameter.required,
+                repeated: false,
             })
             .collect();
 
@@ -1518,10 +1519,31 @@ fn bind_generated_openapi_tools_internal(
                 continue;
             }
         };
+        let mut typed_definition = definition.clone();
         let mut mapping = definition.upstream.clone();
         mapping.path_template = path_template;
+        if generation
+            .conversion
+            .as_ref()
+            .is_some_and(|report| report.source_format == OpenApiSourceFormat::GoogleDiscovery)
+        {
+            // Only a Discovery parameter with repeated: true produces an items
+            // schema in google_discovery::convert_parameter. Its wire format
+            // is always one occurrence of the query key per scalar item.
+            for query in &mut mapping.query_params {
+                let schema = &mut typed_definition.input_schema["properties"][&query.arg_name];
+                query.repeated = schema.get("type").and_then(Value::as_str) == Some("array")
+                    && schema.get("items").is_some();
+                if query.repeated {
+                    schema["maxItems"] =
+                        Value::from(crate::tools::definitions::MAX_REPEATED_QUERY_ITEMS);
+                    if query.required {
+                        schema["minItems"] = Value::from(1);
+                    }
+                }
+            }
+        }
         let connection_id = connection_id.as_str().to_owned();
-        let mut typed_definition = definition.clone();
         typed_definition.upstream = mapping.clone();
         typed_definition.target = Some(ToolTarget::Http {
             connection_id: connection_id.clone(),
@@ -3870,6 +3892,7 @@ paths:
                 arg_name: "dryRun".to_owned(),
                 query_name: "dryRun".to_owned(),
                 required: false,
+                repeated: false,
             }]
         );
         assert_eq!(

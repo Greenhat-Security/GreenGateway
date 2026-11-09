@@ -703,6 +703,16 @@ pub(crate) async fn run(
         .await?;
     }
 
+    if source.writes_repeated_query_mappings() {
+        preflight::live_members_admit(
+            &pool,
+            &deployment_id,
+            target.cluster_member_stale_window(),
+            &crate::storage::compatibility::OPENAPI_REPEATED_QUERY,
+        )
+        .await?;
+    }
+
     let policy = sections::PolicySection::plan(&source)?;
     let tools = sections::ToolsSection::plan(&source)?;
     let connections = sections::ConnectionsSection::plan(&source)?;

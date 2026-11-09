@@ -10,13 +10,6 @@
 //! internal API, the delegated-token issuer and Gmail; the gateway reaches it
 //! through its egress like any other host. Every key is generated per test.
 //!
-//! The Gmail catalog registers `gmail.users.getProfile` alone. The preview
-//! binds all five reads `gmail.readonly` grants, but the list and get reads
-//! take repeated query parameters (`labelIds`, `metadataHeaders`), which the
-//! Discovery converter turns into arrays and the tool registry refuses as
-//! query arguments, so registering them fails today. The preview's offer is
-//! asserted in full; the registration is the read that can be served.
-//!
 //! Domain-wide delegation is not driven here: the router has no seam to stand
 //! in for Google's IAM `signJwt` and token endpoints, only the Connection
 //! runtime does. Its evidence is executor-level:
@@ -766,9 +759,7 @@ async fn register_gmail_catalog(router: &Router, token: &str, connection_id: &st
     for mutation in GMAIL_MUTATIONS {
         assert!(incompatible.contains(mutation), "{mutation}: {preview}");
     }
-    // Of the reads, only the one without a repeated query parameter can be
-    // registered today (see the module documentation).
-    let selected = [GMAIL_PROFILE];
+    let selected = GMAIL_READ_TOOLS;
     let confirmations = preview["security_confirmations"]
         .as_array()
         .expect("the preview lists security confirmations")
@@ -1204,7 +1195,9 @@ async fn e2e_delegated_gmail_catalog_acts_as_each_caller_and_refuses_a_denied_on
             )
         })
         .collect::<BTreeMap<_, _>>();
-    assert_eq!(listed.get(GMAIL_PROFILE), Some(&json!(true)), "{listed:?}");
+    for name in GMAIL_READ_TOOLS {
+        assert_eq!(listed.get(name), Some(&json!(true)), "{name}: {listed:?}");
+    }
     for mutation in GMAIL_MUTATIONS {
         assert!(!listed.contains_key(mutation), "{mutation} is served");
     }
@@ -1357,6 +1350,23 @@ async fn e2e_delegated_gmail_catalog_acts_as_each_caller_and_refuses_a_denied_on
             Some("bob")
         );
     }
+
+    let messages = call_tool(
+        &alice,
+        "gmail.users.messages.list",
+        json!({ "userId": "me", "labelIds": ["INBOX", "a&b=c"] }),
+    )
+    .await
+    .expect("a repeated label filter reaches Gmail");
+    assert_eq!(messages.is_error, Some(false));
+    let requests = harness.stub.requests_under(GMAIL_PATH_PREFIX);
+    assert_eq!(
+        requests
+            .last()
+            .expect("the filtered read reached Gmail")
+            .target,
+        "/gmail/v1/users/me/messages?labelIds=INBOX&labelIds=a%26b%3Dc"
+    );
 
     harness.assert_no_secret_material(&logs);
     alice.cancel().await.expect("alice's client should close");

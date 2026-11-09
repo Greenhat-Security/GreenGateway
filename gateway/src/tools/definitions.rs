@@ -1597,6 +1597,7 @@ mod tests {
                 arg_name: "include_details".to_owned(),
                 query_name: "include_details".to_owned(),
                 required: false,
+                repeated: false,
             }]
         );
 
@@ -2385,6 +2386,26 @@ mod tests {
             ),
             "unexpected error: {message}"
         );
+    }
+
+    #[test]
+    fn repeated_query_mappings_require_a_homogeneous_scalar_array() {
+        let mut tool = echo_tool("get_widget", "GET", "/v1/widgets");
+        tool["upstream"]["query_params"][0]["repeated"] = json!(true);
+        for invalid in [
+            json!({"type": "string"}),
+            json!({"type": "array"}),
+            json!({"type": "array", "items": {"type": ["string", "null"]}}),
+            json!({"type": "array", "items": {"type": "object"}}),
+            json!({"type": "array", "items": {"type": "string"}, "prefixItems": [{}]}),
+        ] {
+            tool["input_json_schema"]["properties"]["include_details"] = invalid;
+            let definition: ToolDefinition =
+                serde_json::from_value(tool.clone()).expect("typed tool");
+            assert!(tool_definition_problems(&[definition])
+                .iter()
+                .any(|problem| problem.contains("must be an array of scalar JSON Schema types")));
+        }
     }
 
     #[test]

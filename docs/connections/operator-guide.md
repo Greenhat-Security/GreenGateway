@@ -2232,6 +2232,22 @@ and the refusal is audited as `cluster.operation_refused`. Before rolling
 back, re-register those Connections with an OpenAPI 3.x document, or delete
 their overlays first.
 
+Discovery `repeated` query inputs such as Gmail's `labelIds` and
+`metadataHeaders` accept arrays of scalar values. Each item becomes one
+separately URL-encoded occurrence of the parameter, in input order. An empty
+optional array emits zero occurrences. Required arrays need at least one item.
+Each repeated parameter accepts up to 128 items and a query name of up to 256 bytes.
+
+Before publishing tools with these mappings in cluster mode, upgrade every
+live replica. The `connections.openapi_repeated_query` gate checks for
+`openapi_repeated_query` on registration, refresh and overlay edits that
+publish a repeated parameter. The standalone-to-cluster import checks the
+roster before copying catalog entries that use this mapping. Before rolling
+back to a build that predates
+this capability, re-register just the tools with scalar query mappings or
+delete the affected catalogs. An older replica refuses to load a persisted
+tool with the new mapping field.
+
 ## Security binding and read-only selection
 
 A preview binds every generated operation, whatever format it was imported
