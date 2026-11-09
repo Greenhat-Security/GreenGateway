@@ -97,6 +97,40 @@ describe('Policy Studio workbench', () => {
     expect(gateway.requests('POST', '/v1/admin/policy/evidence')).toEqual([]);
   });
 
+  it('discards a pending export on leaving Evidence and keeps refusal payloads private', async () => {
+    const gateway = fakeGateway({ permissions: [READ, 'admin:policy:evidence:read'] });
+    let finish!: (response: Response) => void;
+    const pending = new Promise<Response>(resolve => { finish = resolve; });
+    const fetchNormally = gateway.fetch.getMockImplementation()!;
+    let exportSignal: AbortSignal | null = null;
+    gateway.fetch.mockImplementation((input, init) => {
+      if (!exportSignal && String(input).endsWith('/policy/evidence')) {
+        exportSignal = init?.signal ?? null;
+        return pending;
+      }
+      return fetchNormally(input, init);
+    });
+    gateway.evidence = () => jsonResponse(503, { reason: 'opaque_example', error: 'private upstream text' });
+    renderStudio(gateway);
+    await studioLoaded();
+    openView('Evidence');
+    function requestPublication() {
+      const panel = viewPanel('Evidence');
+      fireEvent.change(within(panel).getByLabelText('Version from policy history'), { target: { value: '4' } });
+      fireEvent.click(within(panel).getByRole('button', { name: 'Generate evidence package' }));
+    }
+    requestPublication();
+    openView('Edit');
+    expect(exportSignal).toHaveProperty('aborted', true);
+    openView('Evidence');
+    finish(jsonResponse(200, {}));
+    requestPublication();
+    const alert = await within(viewPanel('Evidence')).findByRole('alert');
+    expect(alert.textContent).toContain('HTTP 503');
+    expect(alert.textContent).not.toMatch(/private upstream text|opaque_example/);
+    expect(within(viewPanel('Evidence')).queryByRole('link')).toBeNull();
+  });
+
   it('simulates the unsaved draft against the live revision and shows each answer as a waterfall', async () => {
     const gateway = fakeGateway();
     renderStudio(gateway);

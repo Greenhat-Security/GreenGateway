@@ -36,6 +36,14 @@ export function EvidencePanel({
   const pending = useRef<AbortController | null>(null);
   useEffect(() => () => pending.current?.abort(), []);
 
+  function discard() {
+    pending.current?.abort();
+    pending.current = null;
+    setBusy(false);
+    setResult(null);
+    setError('');
+  }
+
   const candidate: EvidenceCandidate | null = kind === 'draft'
     ? draft && !draftBlocked ? { draft: { draft_id: draft.summary.draft_id, draft_etag: draft.etag } } : null
     : /^[1-9]\d*$/.test(version) && Number.isSafeInteger(Number(version))
@@ -63,21 +71,20 @@ export function EvidencePanel({
       if (!request.signal.aborted) setResult(evidence);
     } catch (failure) {
       if (!request.signal.aborted) {
-        setError(failure instanceof AdminApiError
-          ? `${failure.message} (${failure.code})`
-          : failure instanceof Error ? failure.message : 'The package could not be read.');
+        setError(evidenceFailure(failure));
       }
     } finally {
-      pending.current = null;
-      if (!request.signal.aborted) setBusy(false);
+      if (pending.current === request) {
+        pending.current = null;
+        if (!request.signal.aborted) setBusy(false);
+      }
     }
   }
 
   return (
     <section className="workbench-panel">
       <h2>Policy evidence</h2>
-      <form className="workbench-options" onSubmit={(event) => void generate(event)}
-        onChange={() => { setResult(null); setError(''); }}>
+      <form className="workbench-options" onSubmit={(event) => void generate(event)} onChange={discard}>
         <fieldset className="rule-fieldset workbench-options" disabled={busy}>
           <legend>Evidence source</legend>
           <label className="rule-field"><span className="field-label">Candidate</span>
@@ -121,6 +128,21 @@ export function EvidencePanel({
       {result && <EvidenceResult result={result} />}
     </section>
   );
+}
+
+function evidenceFailure(error: unknown): string {
+  // The response can contain unreviewed diagnostic text, including values
+  // from an intermediate proxy. Only fixed UI text and HTTP status are shown.
+  if (!(error instanceof AdminApiError)) return 'The package could not be read for this candidate.';
+  switch (error.status) {
+    case 401: return 'Sign in again to generate evidence.';
+    case 403: return 'This session cannot generate evidence with the selected sections.';
+    case 404: case 410: return 'The selected candidate or replay job is unavailable.';
+    case 409: case 412: return 'The candidate or replay binding changed. Review your selection and try again.';
+    case 422: return 'The gateway could not generate a package from these inputs. Review the candidate and optional evidence.';
+    case 429: return 'The gateway is already generating evidence. Try again after the current request finishes.';
+    default: return `The gateway could not release the evidence package (HTTP ${error.status}).`;
+  }
 }
 
 function EvidenceResult({ result }: { result: EvidencePackage }) {
