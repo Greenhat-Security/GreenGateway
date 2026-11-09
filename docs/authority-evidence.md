@@ -107,7 +107,7 @@ or unconfigured individual stores.
 | Service-token issue | Token row with creator, row/shared revisions and outbox, plus since migration 27 a `service_token_change_evidence` row with action `service_token.issue` (actor, event/operation UUIDs, no prior revision and row revision 1, the create outbox row's shared revision, database-clock time) in the create's transaction, journaled and delivered. Standalone writes the same row in the token database's own create transaction. Neither store records the returned plaintext or its hash | A caller-bound operation identity and an issuer-scoped subject reference; tokens issued before the evidence existed keep only `created_by`; standalone records are delivered without a shared security revision |
 | Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction. In PostgreSQL the change also journals its evidence and is delivered since PR 3. Both stores record the actor's kind, auth mode and canonical issuer (migration 24 and the token database's own columns) | A caller-bound operation identity and an issuer-scoped subject reference; standalone records are delivered without a shared security revision |
 | JWT revocation | Scoped JTI digest, actor row, shared revision and outbox, plus one non-cascading `jwt_revocation_evidence` row per effective revoke (actor, JTI digest, resulting expiry, shared revision) that extension, reactivation and expiry cleanup never rewrite, journaled in the same transaction and delivered since PR 3; since migration 24 the CLI's actor is recorded as kind `system`, auth mode `system` and no issuer | The CLI actor stays system provenance, not a named human; a caller-bound operation identity |
-| Admin session grant/withdrawal (#424) | With `ADMIN_SESSION_MODE=cluster_postgres`, the session row, one non-cascading `admin_session_evidence` row (event/operation UUIDs, session ID, action, reason, subject and issuer, absolute deadline, database-clock time) and, since migration 26, its journal row commit together in one statement for each grant and each withdrawal; a replacement's withdrawal and grant share one operation ID. Delivered since migration 26 on the `session` axis with keyed safe references; a grant holds journal capacity for its withdrawal, so no withdrawal is refused at capacity ([Admin session withdrawals and journal capacity](#admin-session-withdrawals-and-journal-capacity)) | Actor kind and auth mode (the evidence records neither, so a withdrawal by the prune or a provider rejection is named by the session's subject, not as a system actor), an issuer-scoped subject reference, the withdrawal reason in the delivered record, and a caller-bound operation identity. Standalone sessions are process-local memory with no durable record and stay `unsupported_future_operation` |
+| Admin session grant/withdrawal (#424) | With `ADMIN_SESSION_MODE=cluster_postgres`, the session row, one non-cascading `admin_session_evidence` row (event/operation UUIDs, session ID, action, reason, subject and issuer, absolute deadline, database-clock time) and, since migration 26, its journal row commit together in one statement for each grant and each withdrawal; a replacement's withdrawal and grant share one operation ID. Delivered since migration 26 on the `session` axis with keyed safe references; a grant holds journal capacity for its withdrawal, so no withdrawal is refused at capacity ([Admin session withdrawals and journal capacity](#admin-session-withdrawals-and-journal-capacity)) | Migration 33 records and delivers the verified login on grant and replacement and the system on rejection and expiry. Logout accepts a cookie or login binding without authenticating a caller. An issuer-scoped subject reference, delivery of the withdrawal reason and a caller-bound operation identity remain open. Standalone sessions are process-local memory with no durable record and stay `unsupported_future_operation` |
 
 These foundations are already sufficient for their **existing atomic change-record
 purpose**. The inventory uses `missing_metadata` and `missing_delivery` for
@@ -186,10 +186,9 @@ rows carry the session's random ID, never the cookie, CSRF token, binding or
 access token, and an expiry's commit time is the prune's, not the deadline's.
 Since migration 26 the same statement journals each row, and the dispatcher
 delivers it ([Admin session withdrawals and journal capacity](#admin-session-withdrawals-and-journal-capacity)).
-The row stays `missing_metadata`: it has no actor kind or auth mode, so the
-delivered record names the session's own subject and says `null` for the kind,
-the auth mode and the issuer reference, even for an expiry or a provider
-rejection, which no person made; and the reason is not delivered.
+Migration 33 records and delivers the acting login for a grant or replacement
+and the system actor for expiry or rejection. The row stays incomplete while
+the operation ID lacks caller binding and delivery omits the withdrawal reason.
 
 ## Proposed authority event v1
 
@@ -569,7 +568,7 @@ Not covered by PR 3, and still open:
   evidence but delivers none. `required` refuses to start such a replica
   ([Required-durability mode](#required-durability-mode)).
 - **Admin session metadata.** Admin session evidence is journaled and delivered
-  since migration 26, but records no actor kind or auth mode, and the delivered
+  since migration 26, with actor attribution since migration 33. The delivered
   record has no field for the withdrawal's reason.
 - **Standalone mode** has no journal; its evidence is delivered straight from the
   SQLite stores that own it, after a cursor in each
@@ -705,8 +704,13 @@ of being looked for when it ends:
 The delivered record ([schema](schemas/authority_event_delivery.v1.schema.json)) of a
 session event is `admin_session.grant` or `admin_session.withdraw` on resource kind
 `admin_session`, keyed by the session's random ID under the `resource.admin_session`
-domain. Its actor is the session's own subject, the only identity the evidence
-records, under `actor.recorded`, with `null` kind, auth mode and issuer reference.
+domain. Migration 33 records the acting subject separately from the session owner.
+A grant and the session it replaces both name the principal that completed the new
+login, including its canonical issuer when available and its bearer authentication
+mode. A provider rejection or deadline expiry names the gateway's fixed system
+actor. An authentication-exempt logout, whether by cookie or pending-login binding,
+and every row committed before migration 33 retain the session owner's keyed
+reference with null actor kind, mode and issuer.
 Its revision is the v1 `session` axis: a session is granted once and withdrawn once,
 so its one revision, `1`, is created by the grant (`before: null`, `after: "1"`) and
 deleted by the withdrawal (`before: "1"`, `after: null`), and its shared security

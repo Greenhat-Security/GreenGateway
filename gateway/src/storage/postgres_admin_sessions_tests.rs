@@ -524,12 +524,12 @@ async fn every_grant_and_withdrawal_leaves_one_evidence_row() {
     // replaced
     let replaced = cookie_headers(&issue_across(&a, &a, &HeaderMap::new()).await.unwrap());
     let replaced_id = read(&b, &replaced).await.unwrap().session_id;
+    authority.outcome.store(3, Ordering::SeqCst);
     let replacement = cookie_headers(&issue_across(&b, &a, &replaced).await.unwrap());
     let replacement_id = read(&b, &replacement).await.unwrap().session_id;
-    // rejected
-    authority.outcome.store(3, Ordering::SeqCst);
-    assert!(is_invalid(&read(&a, &replacement).await));
+    // The provider now returns the original identity and rejects the replacement.
     authority.outcome.store(0, Ordering::SeqCst);
+    assert!(is_invalid(&read(&a, &replacement).await));
     // logout by binding, before the cookie was ever presented
     a.begin_login("undelivered", Duration::from_secs(30), &HeaderMap::new())
         .await
@@ -607,7 +607,9 @@ async fn every_grant_and_withdrawal_leaves_one_evidence_row() {
                 .expect("checkout")
                 .query(
                     "SELECT action || ':' || reason, operation_id::text, user_id, \
-                            coalesce(issuer, ''), (expires_at > committed_at)::text \
+                            coalesce(issuer, ''), (expires_at > committed_at)::text, \
+                            coalesce(actor_subject, ''), coalesce(actor_kind, ''), \
+                            coalesce(actor_auth_mode, ''), coalesce(actor_issuer, '') \
                      FROM greengateway.admin_session_evidence \
                      WHERE session_id = $1::text::uuid ORDER BY committed_at, action",
                     &[&id],
@@ -616,7 +618,7 @@ async fn every_grant_and_withdrawal_leaves_one_evidence_row() {
                 .expect("evidence for one session")
                 .iter()
                 .map(|row| {
-                    (0..5)
+                    (0..9)
                         .map(|column| row.get::<_, String>(column))
                         .collect::<Vec<_>>()
                 })
@@ -627,6 +629,16 @@ async fn every_grant_and_withdrawal_leaves_one_evidence_row() {
     assert_eq!(logged_out_rows.len(), 2);
     assert_eq!(logged_out_rows[0][0], "admin_session.grant:issued");
     assert_eq!(logged_out_rows[1][0], "admin_session.withdraw:logout");
+    assert_eq!(
+        &logged_out_rows[0][5..],
+        [
+            "operator",
+            "principal",
+            "bearer_token",
+            "https://issuer.example.test"
+        ]
+    );
+    assert_eq!(&logged_out_rows[1][5..], ["", "", "", ""]);
     for row in &logged_out_rows {
         assert_eq!(row[2], "operator");
         assert_eq!(row[3], "https://issuer.example.test");
@@ -640,8 +652,28 @@ async fn every_grant_and_withdrawal_leaves_one_evidence_row() {
         replaced_rows[1][1], replacement_rows[0][1],
         "one sign-in, one operation: the replacement and its grant"
     );
+    assert_eq!(replaced_rows[1][2], "operator", "the prior session owner");
+    assert_eq!(
+        &replaced_rows[1][5..],
+        [
+            "other",
+            "principal",
+            "bearer_token",
+            "https://issuer.example.test"
+        ],
+        "the new login withdrew the old session"
+    );
+    assert_eq!(&replacement_rows[0][5..], &replaced_rows[1][5..]);
     assert_eq!(replacement_rows[1][0], "admin_session.withdraw:rejected");
+    assert_eq!(
+        &replacement_rows[1][5..],
+        ["system:admin-session", "system", "system", ""]
+    );
     let stale_rows = for_session(stale_id).await;
+    assert_eq!(
+        &stale_rows[1][5..],
+        ["system:admin-session", "system", "system", ""]
+    );
     assert_eq!(
         stale_rows
             .iter()
@@ -953,17 +985,42 @@ async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
     let operator_ref = keyring
         .derive(ReferenceDomain::ActorRecorded, &["operator"])
         .expect("a recorded actor reference derives");
-    for record in delivered
+    let system_ref = keyring
+        .derive(ReferenceDomain::ActorRecorded, &["system:admin-session"])
+        .expect("the gateway actor reference derives");
+    let issuer_ref = keyring
+        .derive(
+            ReferenceDomain::ActorIssuer,
+            &["https://issuer.example.test"],
+        )
+        .expect("the login issuer reference derives");
+    let login = (
+        operator_ref.as_str(),
+        Some("principal"),
+        Some("bearer_token"),
+        Some(issuer_ref.as_str()),
+    );
+    let expected_actors = [
+        login,
+        login,
+        login,
+        (operator_ref.as_str(), None, None, None), // unauthenticated logout
+        (system_ref.as_str(), Some("system"), Some("system"), None), // rejected
+        (system_ref.as_str(), Some("system"), Some("system"), None), // expired
+    ];
+    let session_records = delivered
         .iter()
-        .filter(|record| record.resource.kind == "admin_session")
-    {
-        assert_eq!(record.actor.recorded_ref, operator_ref.as_str());
+        .filter(|record| record.resource.kind == "admin_session");
+    assert_eq!(session_records.clone().count(), expected_actors.len());
+    for (record, expected_actor) in session_records.zip(expected_actors) {
         assert_eq!(
             (
+                record.actor.recorded_ref.as_str(),
                 record.actor.kind.as_deref(),
-                record.actor.auth_mode.as_deref()
+                record.actor.auth_mode.as_deref(),
+                record.actor.issuer_ref.as_deref(),
             ),
-            (None, None)
+            expected_actor
         );
         assert_eq!(record.revision.axis, "session");
         assert_eq!(record.revision.security, None);
@@ -1329,10 +1386,15 @@ async fn the_schema_refuses_rows_that_break_the_session_invariants() {
         assert!(client.batch_execute(&refused).await.is_err(), "{refused}");
     }
     let insert_evidence = |session: &str, action: &str, reason: &str| {
+        let actor = match reason {
+            "issued" => "'operator', 'principal', 'bearer_token'",
+            "expired" => "'system:admin-session', 'system', 'system'",
+            _ => "NULL, NULL, NULL",
+        };
         format!(
             "INSERT INTO greengateway.admin_session_evidence (event_id, operation_id, \
-                 session_id, action, reason, user_id, issuer, expires_at) \
-             VALUES ('{}', '{}', '{session}', '{action}', '{reason}', 'operator', NULL, now())",
+                 session_id, action, reason, user_id, issuer, expires_at, actor_subject, actor_kind, actor_auth_mode) \
+             VALUES ('{}', '{}', '{session}', '{action}', '{reason}', 'operator', NULL, now(), {actor})",
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4()
         )
