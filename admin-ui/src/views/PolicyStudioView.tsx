@@ -14,6 +14,7 @@ import { AdminCapabilitiesNotice } from '../lib/AdminCapabilitiesNotice';
 import { subscribeAdminSession } from '../lib/adminSession';
 import { fetchPolicy, type PolicyDocument } from '../lib/policy';
 import { POLICY_ANALYZE_PERMISSION } from '../lib/policyAnalyses';
+import { POLICY_EVIDENCE_READ } from '../lib/policyEvidence';
 import {
   POLICY_DRAFT_BASE_STALE_REASON,
   POLICY_DRAFT_DEPLOYMENT_QUOTA_REASON,
@@ -99,6 +100,7 @@ import {
   type WorkbenchCandidate,
 } from './policy-studio/workbench/common';
 import { ImpactPanel } from './policy-studio/workbench/ImpactPanel';
+import { EvidencePanel } from './policy-studio/workbench/EvidencePanel';
 import { OptimizePanel } from './policy-studio/workbench/OptimizePanel';
 import { SimulatorPanel } from './policy-studio/workbench/SimulatorPanel';
 import { emptySuiteSource, parseSuite } from './policy-studio/workbench/suite';
@@ -129,7 +131,7 @@ const CASES_LEAVE_WARNING =
 // The Studio's views: the editors, the discovery suggestions that open into
 // drafts, and the workbench that simulates, tests, replays and reviews a
 // candidate without changing anything.
-type StudioView = 'edit' | 'suggestions' | 'simulate' | 'test' | 'impact' | 'optimize';
+type StudioView = 'edit' | 'suggestions' | 'simulate' | 'test' | 'impact' | 'optimize' | 'evidence';
 
 const STUDIO_VIEWS: ReadonlyArray<{ id: StudioView; label: string }> = [
   { id: 'edit', label: 'Edit' },
@@ -138,6 +140,7 @@ const STUDIO_VIEWS: ReadonlyArray<{ id: StudioView; label: string }> = [
   { id: 'test', label: 'Test' },
   { id: 'impact', label: 'Impact' },
   { id: 'optimize', label: 'Optimize' },
+  { id: 'evidence', label: 'Evidence' },
 ];
 
 type LivePolicy = { policy: PolicyDocument; etag: string };
@@ -199,6 +202,7 @@ export function PolicyStudioView() {
     canRead && hasAdminPermission(capabilities, POLICY_SIMULATE_PERMISSION);
   const canReplay = canSimulate && hasAdminPermission(capabilities, AUDIT_READ_PERMISSION);
   const canAnalyze = canRead && hasAdminPermission(capabilities, POLICY_ANALYZE_PERMISSION);
+  const canReadEvidence = canRead && hasAdminPermission(capabilities, POLICY_EVIDENCE_READ);
   const canReadSuggestions = hasAdminPermission(capabilities, SUGGESTIONS_READ_PERMISSION);
   const [suggestionWriteRejected, setSuggestionWriteRejected] = useState(false);
   const canWriteSuggestions =
@@ -1949,7 +1953,7 @@ export function PolicyStudioView() {
           </div>
         ) : null}
 
-        {canRead && view !== 'edit' && view !== 'suggestions' ? (
+        {canRead && view !== 'edit' && view !== 'suggestions' && view !== 'evidence' ? (
           <CandidatePicker
             choice={candidateChoice}
             draft={draft}
@@ -2364,6 +2368,25 @@ export function PolicyStudioView() {
                   onShowInEditor={showDiagnostic}
                 />
               ) : null}
+            </div>
+            <div
+              className="policy-studio-view"
+              role="tabpanel"
+              id="policy-studio-view-panel-evidence"
+              aria-labelledby="policy-studio-view-evidence"
+              hidden={view !== 'evidence'}
+            >
+              {view === 'evidence' && (canReadEvidence ? (
+                <EvidencePanel
+                  key={JSON.stringify([draft?.summary.draft_id, draft?.etag, live?.etag, dirty, canSimulate, canAnalyze, canReplay])}
+                  draft={draft}
+                  draftBlocked={dirty || baseStale || live === null || isPublished}
+                  suite={suite}
+                  canSimulate={canSimulate}
+                  canAnalyze={canAnalyze}
+                  canReplay={canReplay}
+                />
+              ) : <p role="note">Generating evidence requires {POLICY_EVIDENCE_READ}.</p>)}
             </div>
           </>
         ) : null}

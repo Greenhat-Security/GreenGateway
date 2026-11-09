@@ -75,6 +75,20 @@ offline ([below](#verifying-a-package)) and reports a package that passes as
 
 ## Requesting a package
 
+In **Policy Studio → Evidence**, choose a version number from Policy history
+or open a saved draft in the Edit tab. Save or rebase outstanding draft
+changes before generating its package. Choose which evidence to include.
+The Test and Simulate options use the cases on those tabs. Historical impact
+uses the ID of a completed replay you own. Each option requires the
+permissions listed below.
+
+Choose **Generate evidence package** to read its trust statement, limitations,
+report digest and Markdown report. **Download canonical JSON** saves the
+original gateway response for offline verification. Changing the inputs or
+leaving the Evidence tab discards the in-page download.
+
+To request the same format from the API:
+
 ```sh
 curl --fail-with-body -sS -X POST "$GATEWAY/v1/admin/policy/evidence" \
   -H "Authorization: Bearer $TOKEN" \
@@ -607,6 +621,4 @@ Not part of this work, and not to be inferred from it:
 - Signing (DSSE envelopes, in-toto statements, protected signer references,
   key rotation) and verifying a signature against a trust root (slice 21,
   #240, #242). `ggctl evidence verify` checks integrity only.
-- Packages about an inline or edited candidate rather than a publication or a
-  stored draft, stored or downloadable-later artifacts, and an Evidence tab in
-  the admin UI.
+- Packages about an inline candidate and server-side storage for later download.
