@@ -52,6 +52,6 @@
   "allowScripts": {
     "https://registry.npmjs.org/esbuild/-/esbuild-0.28.2.tgz": false,
     "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz": false,
-    "https://registry.npmjs.org/workerd/-/workerd-1.20261023.1.tgz": false
+    "https://registry.npmjs.org/workerd/-/workerd-1.20261104.1.tgz": false
   }
 }
