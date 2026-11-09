@@ -5166,7 +5166,13 @@ async fn register_pinned_provider_tools(
     let status = response.status();
     let result = json_body(response).await;
     assert_eq!(status, StatusCode::CREATED, "{result}");
-    assert_eq!(result["registered_tool_names"], json!(selected));
+    let mut registered: Vec<String> =
+        serde_json::from_value(result["registered_tool_names"].clone())
+            .expect("registration should return the names it published");
+    let mut expected = selected.to_vec();
+    registered.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(registered, expected);
 }
 
 #[tokio::test]
