@@ -950,7 +950,7 @@ fn actor_metadata_that_cannot_be_projected_faithfully_is_refused() {
     }
 }
 
-/// Admin session evidence (journaled since migration 26) records the
+/// Historical admin session evidence and unauthenticated logout record the
 /// session's own subject and nothing of the actor's kind, auth mode or
 /// issuer, and takes no shared revision: the record says `null` for all of
 /// them rather than a guess. A row that claims a shared revision, a version

@@ -242,8 +242,7 @@ pub(crate) struct JournaledEvidence {
     pub(crate) committed_at: Option<String>,
     /// The actor's issuer, kind and auth mode (migration 24, and migration 25
     /// for catalogs). All three are `None` for evidence committed before
-    /// those migrations, which recorded none of them, and for admin session
-    /// evidence, which records none of them; the issuer is also `None` for
+    /// those migrations and for an unauthenticated logout; the issuer is also `None` for
     /// an actor that has none. Document evidence always records all three,
     /// in migration 23's vocabulary for a row committed before migration 32,
     /// which the delivery projection reads in migration 24's.
@@ -485,9 +484,9 @@ impl PostgresAuthorityEventStore {
 /// `$1` the cursor position, `$2` the row limit. Every evidence join is
 /// keyed on the journal row's own table, so a row joins at most one
 /// evidence row; the evidence tables' primary keys are their event IDs.
-/// Admin session evidence names the session's own identity as its actor
-/// and records no actor kind, auth mode, version or shared revision, so
-/// those columns stay empty for it. Only Connection change evidence names a
+/// Session rows predating migration 33 and unauthenticated logout have no
+/// recorded actor, so their legacy reference continues to name the session owner.
+/// Session changes take no shared revision or stored version. Only Connection change evidence names a
 /// revision axis (migration 28). Document evidence names its singleton
 /// resource by its resource type and catalog evidence names its Connection;
 /// the overlay revision a catalog was compiled from is not read, because no
@@ -498,7 +497,7 @@ SELECT j.position,
        j.source,
        coalesce(c.operation_id, t.operation_id, r.operation_id, a.operation_id,
                 d.operation_id, g.operation_id)::text,
-       coalesce(c.actor_user_id, t.actor_user_id, r.actor_user_id, a.user_id,
+       coalesce(c.actor_user_id, t.actor_user_id, r.actor_user_id, a.actor_subject, a.user_id,
                 d.actor_user_id, g.actor_user_id),
        coalesce(c.action, t.action, r.action, a.action, d.action, g.action),
        r.issuer,
@@ -512,10 +511,10 @@ SELECT j.position,
                         d.committed_at, g.committed_at)
                    AT TIME ZONE 'UTC',
                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
-       coalesce(c.actor_issuer, t.actor_issuer, r.actor_issuer, d.actor_issuer,
+       coalesce(c.actor_issuer, t.actor_issuer, r.actor_issuer, a.actor_issuer, d.actor_issuer,
                 g.actor_issuer),
-       coalesce(c.actor_kind, t.actor_kind, r.actor_kind, d.actor_kind, g.actor_kind),
-       coalesce(c.actor_auth_mode, t.actor_auth_mode, r.actor_auth_mode,
+       coalesce(c.actor_kind, t.actor_kind, r.actor_kind, a.actor_kind, d.actor_kind, g.actor_kind),
+       coalesce(c.actor_auth_mode, t.actor_auth_mode, r.actor_auth_mode, a.actor_auth_mode,
                 d.actor_auth_mode, g.actor_auth_mode),
        c.revision_axis
 FROM greengateway.authority_event_journal j
