@@ -377,16 +377,22 @@ fn open_directory(path: &Path) -> Result<Dir, StateDirError> {
 fn open_lock_file(directory: &Dir) -> Result<fs::File, StateDirError> {
     let mut options = CapabilityOpenOptions::new();
     // Never truncated: the file's content is never read or written.
-    options.read(true).write(true).create(true).truncate(false);
+    options.read(true).write(true).truncate(false);
     options.follow(FollowSymlinks::No);
     // A FIFO planted under the lock's name must not block the open; the
     // handle check below then refuses it.
     options.nonblock(true);
     owner_only(&mut options);
-    let file = match directory.open_with(LOCK_FILE_NAME, &options) {
-        Ok(file) => file.into_std(),
-        Err(_) => return Err(classify_unopenable_lock_file(directory)),
-    };
+    // Arbitrate first creation atomically. If another opener created the
+    // file, open that same name without attempting to create it again.
+    let file = match directory.open_with(LOCK_FILE_NAME, options.create_new(true)) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            directory.open_with(LOCK_FILE_NAME, options.create_new(false))
+        }
+        result => result,
+    }
+    .map_err(|_| classify_unopenable_lock_file(directory))?
+    .into_std();
     let metadata = file.metadata().map_err(|_| StateDirError::Unavailable {
         operation: "lock file inspection",
     })?;
