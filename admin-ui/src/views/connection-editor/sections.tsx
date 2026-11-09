@@ -566,13 +566,16 @@ function DelegatedIssuerTokenNote() {
         every calling principal the gateway exchanges a caller assertion it
         signs for that principal&apos;s own access token at the issuer (RFC
         8693 token exchange), caches it for that principal only, and sends it
-        as the bearer token. Only manual HTTP tool calls are served, and a call
-        without a principal, such as a service token, is refused.
+        as the bearer token on manual HTTP and managed OpenAPI tool calls.
+        A stored connection test exchanges a token for your own account and
+        drops it after the test. A call without a principal, such as a service
+        token, is refused.
       </p>
       <p>
-        Whoever holds the client secret can ask the issuer for any
-        user&apos;s token. Keep it in an external provider, and request
-        read-only scopes where the upstream allows it.
+        The issuer checks both the client secret and the signed caller
+        assertion. Anyone with the secret and the signing key can obtain a
+        token for any user who has a grant. Protect both credentials and
+        request read-only scopes where the upstream allows it.
       </p>
     </div>
   );

@@ -18,8 +18,8 @@ export function DelegatedIssuerTokenSummary({
           every calling principal, the gateway exchanges a caller assertion
           for that principal&apos;s own access token at the issuer below
           (RFC 8693 token exchange), caches it for that principal only, and
-          sends it as the bearer token. Only manual HTTP tool calls are
-          served. A call without a principal, such as a service token, is
+          sends it as the bearer token on manual HTTP and managed OpenAPI
+          tool calls. A call without a principal, such as a service token, is
           refused with <code>delegated_token_no_principal</code>; an issuer
           that refuses the caller, with <code>delegated_token_denied</code>;
           and any other failed exchange, with{' '}
@@ -27,9 +27,10 @@ export function DelegatedIssuerTokenSummary({
           upstream for a refused call.
         </p>
         <p>
-          The issuer can hand out any user&apos;s token to whoever holds this
-          connection&apos;s client secret, so keep that secret in an external
-          provider and grant read-only scopes where the upstream allows it.
+          The issuer checks both the client secret and the signed caller
+          assertion. Anyone with the secret and the signing key can obtain a
+          token for any user who has a grant. Protect both credentials and
+          grant read-only scopes where the upstream allows it.
         </p>
         <p>
           <strong>Test connection runs as you.</strong> It exchanges a token
