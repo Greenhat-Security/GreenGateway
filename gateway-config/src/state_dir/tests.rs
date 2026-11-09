@@ -220,8 +220,15 @@ fn a_second_handle_in_this_process_is_refused_until_every_clone_drops() {
 
 #[test]
 fn threads_racing_for_the_lock_have_exactly_one_winner() {
+    for _ in 0..16 {
+        let state = TempDir::new("race");
+        assert_one_winner(&state); // Concurrent first creation.
+        assert_one_winner(&state); // Contenders reopen the retained file.
+    }
+}
+
+fn assert_one_winner(state: &TempDir) {
     const CONTENDERS: usize = 8;
-    let state = TempDir::new("race");
     let start = Arc::new(Barrier::new(CONTENDERS));
     let contenders: Vec<_> = (0..CONTENDERS)
         .map(|_| {
