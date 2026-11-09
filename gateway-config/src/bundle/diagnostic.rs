@@ -173,6 +173,7 @@ pub enum Code {
     InvalidDecimal,
     NotApplicable,
     NotRepresentable,
+    InvalidEgressSetting,
     // References between bundle files.
     InvalidPath,
     ReservedPath,
@@ -259,6 +260,7 @@ impl Code {
         Self::InvalidDecimal,
         Self::NotApplicable,
         Self::NotRepresentable,
+        Self::InvalidEgressSetting,
         Self::InvalidPath,
         Self::ReservedPath,
         Self::DuplicatePath,
@@ -529,6 +531,10 @@ impl Code {
             Self::SourceUnsupported => (
                 "reference.source_unsupported",
                 "the resource cannot be supplied by this source in this document version",
+            ),
+            Self::InvalidEgressSetting => (
+                "bundle.invalid_egress_setting",
+                "the egress configuration compiler refused this setting",
             ),
             Self::Unresolved => (
                 "reference.unresolved",

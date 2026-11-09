@@ -149,6 +149,7 @@ impl Stage {
             | Code::InvalidDecimal
             | Code::NotApplicable
             | Code::NotRepresentable
+            | Code::InvalidEgressSetting
             | Code::InlineSecretValue
             | Code::InvalidSecretReference
             | Code::TooManySecretReferences => Self::Structure,
