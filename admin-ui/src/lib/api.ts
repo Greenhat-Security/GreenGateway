@@ -163,6 +163,16 @@ export async function adminFetchJsonResponse<T>(
   input: string,
   options: AdminFetchOptions = {},
 ): Promise<AdminJsonResponse<T>> {
+  const response = await adminFetchTextResponse(input, options);
+  return { ...response, body: parseJsonBody(response.body) as T };
+}
+
+// Canonical JSON downloads need the gateway's original UTF-8 text. They use
+// the same origin, CSRF, identity and authorization checks as JSON callers.
+export async function adminFetchTextResponse(
+  input: string,
+  options: AdminFetchOptions = {},
+): Promise<AdminJsonResponse<string>> {
   assertAdminRequestOrigin(input);
   const { answerStatuses = [], ...requestOptions } = options;
   const requestIdentity = getAdminIdentityVersion();
@@ -181,7 +191,7 @@ export async function adminFetchJsonResponse<T>(
     redirect: 'error',
     headers,
   });
-  const body = await parseJsonBody(response);
+  const body = await response.text();
   if (requestOptions.signal?.aborted) {
     throw new DOMException('Admin request aborted.', 'AbortError');
   }
@@ -194,7 +204,7 @@ export async function adminFetchJsonResponse<T>(
     answerStatuses.includes(response.status);
   if (!response.ok && !answered) {
     adminAuthorizationFailed(response.status, requestIdentity, input === adminApiUrl('/capabilities'));
-    throw adminApiError(body, response);
+    throw adminApiError(parseJsonBody(body), response);
   }
   const method = (requestOptions.method ?? 'GET').toUpperCase();
   if (response.ok && !SAFE_METHODS.has(method)) {
@@ -209,7 +219,7 @@ export async function adminFetchJsonResponse<T>(
   }
 
   return {
-    body: body as T,
+    body,
     headers: response.headers,
     status: response.status,
     etag: response.headers.get('etag'),
@@ -235,6 +245,7 @@ function changesLivePolicy(path: string): boolean {
     path.endsWith('/convert') ||
     path === adminApiUrl('/policy/simulations') ||
     path === adminApiUrl('/policy/analyses') ||
+    path === adminApiUrl('/policy/evidence') ||
     path === adminApiUrl('/policy/tests/runs')
   ) {
     return false;
@@ -254,8 +265,7 @@ function changesLivePolicy(path: string): boolean {
   return true;
 }
 
-async function parseJsonBody(response: Response): Promise<unknown> {
-  const text = await response.text();
+function parseJsonBody(text: string): unknown {
   if (text.trim().length === 0) {
     return null;
   }
