@@ -2105,6 +2105,9 @@
                 "type": "string",
                 "minLength": 1
               },
+              "repeated": {
+                "type": "boolean"
+              },
               "required": {
                 "type": "boolean"
               }
@@ -4732,6 +4735,9 @@
                   },
                   "query_name": {
                     "type": "string"
+                  },
+                  "repeated": {
+                    "type": "boolean"
                   },
                   "required": {
                     "type": "boolean"

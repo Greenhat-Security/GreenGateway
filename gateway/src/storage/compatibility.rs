@@ -84,7 +84,8 @@
 //! `tool_argument` leaf ([`POLICY_TOOL_ARGUMENT_CONDITIONS`]): a gateway
 //! that enforces the other conditions but not that leaf refuses the whole
 //! document, so the write also waits until every live member advertises
-//! [`Capability::PolicyToolArgumentConditions`].
+//! [`Capability::PolicyToolArgumentConditions`]. Storing Discovery tools
+//! with repeated query mappings also needs [`OPENAPI_REPEATED_QUERY`].
 //! No operation changes the schema: migration 25, the one step that rolls,
 //! adds columns nothing writes yet, and the approved-extension list in
 //! `migrations.rs` is empty. Every other operation this binary performs
@@ -126,6 +127,9 @@ pub(crate) enum Capability {
     /// #443). A member without it cannot generate from one, so
     /// [`OPENAPI_DISCOVERY_CATALOGS`] waits for it.
     OpenApiDiscoveryCatalogs,
+    /// The member can read stored repeated query mappings and emit one
+    /// form-encoded key per scalar item.
+    OpenApiRepeatedQuery,
     /// The member generates, refreshes and replays a managed OpenAPI
     /// catalog whose specification is a Swagger 2.0 document (issue #443).
     /// A member without it cannot generate from one, so
@@ -163,9 +167,10 @@ pub(crate) enum Capability {
 
 impl Capability {
     /// Every capability, in name order.
-    pub(crate) const KNOWN: [Self; 8] = [
+    pub(crate) const KNOWN: [Self; 9] = [
         Self::DelegatedTokenPurges,
         Self::OpenApiDiscoveryCatalogs,
+        Self::OpenApiRepeatedQuery,
         Self::OpenApiSwagger2Catalogs,
         Self::OperationRequirements,
         Self::PolicyDocumentV1,
@@ -178,6 +183,7 @@ impl Capability {
         match self {
             Self::DelegatedTokenPurges => "delegated_token_purges",
             Self::OpenApiDiscoveryCatalogs => "openapi_discovery_catalogs",
+            Self::OpenApiRepeatedQuery => "openapi_repeated_query",
             Self::OpenApiSwagger2Catalogs => "openapi_swagger2_catalogs",
             Self::OperationRequirements => "operation_requirements",
             Self::PolicyDocumentV1 => "policy_document_v1",
@@ -198,6 +204,7 @@ impl Capability {
 pub(crate) const BINARY_CAPABILITIES: &[Capability] = &[
     Capability::DelegatedTokenPurges,
     Capability::OpenApiDiscoveryCatalogs,
+    Capability::OpenApiRepeatedQuery,
     Capability::OpenApiSwagger2Catalogs,
     Capability::OperationRequirements,
     Capability::PolicyDocumentV1,
@@ -282,8 +289,8 @@ pub(crate) use gate::{
     evaluate, evaluate_without_own_row, fence_target, Activation, Backfill, BackfillState,
     BinaryContract, ContractFence, FenceExclusion, FenceTarget, MemberAdvertisement,
     OperationAdmission, OperationRefusal, OperationRequirement, DELEGATED_TOKEN_PURGES,
-    OPENAPI_DISCOVERY_CATALOGS, OPENAPI_SWAGGER2_CATALOGS, OPERATION_REQUIREMENTS,
-    POLICY_DOCUMENT_V1, POLICY_ROLE_DESCRIPTIONS, POLICY_RULE_CONDITIONS,
+    OPENAPI_DISCOVERY_CATALOGS, OPENAPI_REPEATED_QUERY, OPENAPI_SWAGGER2_CATALOGS,
+    OPERATION_REQUIREMENTS, POLICY_DOCUMENT_V1, POLICY_ROLE_DESCRIPTIONS, POLICY_RULE_CONDITIONS,
     POLICY_TOOL_ARGUMENT_CONDITIONS,
 };
 
@@ -414,6 +421,17 @@ mod gate {
         activation: Activation::LiveMembers,
     };
 
+    /// Older members refuse the new field in a persisted query mapping.
+    /// Wait for live readers before writing such a catalog.
+    pub(crate) const OPENAPI_REPEATED_QUERY: OperationRequirement = OperationRequirement {
+        operation: "connections.openapi_repeated_query",
+        minimum_schema: 17,
+        document_format: None,
+        capability: Capability::OpenApiRepeatedQuery,
+        backfill: Backfill::NotRequired,
+        activation: Activation::LiveMembers,
+    };
+
     /// Recording a delegated-token purge at the authority for every replica
     /// to apply (issue #441): an operator's purge, or one a revoked
     /// credential started.
@@ -532,6 +550,7 @@ mod gate {
         POLICY_ROLE_DESCRIPTIONS,
         OPENAPI_SWAGGER2_CATALOGS,
         OPENAPI_DISCOVERY_CATALOGS,
+        OPENAPI_REPEATED_QUERY,
         DELEGATED_TOKEN_PURGES,
         POLICY_DOCUMENT_V1,
         POLICY_RULE_CONDITIONS,

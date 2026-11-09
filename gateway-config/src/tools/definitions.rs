@@ -330,6 +330,9 @@ impl HttpToolMapping {
     }
 }
 
+/// Limits amplification when a rendered HTTP query repeats a key per item.
+pub const MAX_REPEATED_QUERY_ITEMS: usize = 128;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryParamMapping {
@@ -337,6 +340,9 @@ pub struct QueryParamMapping {
     pub query_name: String,
     #[serde(default)]
     pub required: bool,
+    /// Emit one form-encoded pair per item in a scalar array.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repeated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -439,6 +445,9 @@ pub fn local_definition_provenance_problems(definitions: &[ToolDefinition]) -> V
             )),
             ToolSource::Mcp { .. } => Some(format!(
                 "tools[{index}].source must not claim managed MCP provenance in local definitions"
+            )),
+            ToolSource::Manual | ToolSource::Legacy if definition.upstream.query_params.iter().any(|param| param.repeated) => Some(format!(
+                "tools[{index}] repeated query mappings require a managed Discovery catalog"
             )),
             ToolSource::Manual | ToolSource::Legacy => None,
         })
@@ -1098,7 +1107,9 @@ fn tool_mapping_schema_problems(index: usize, definition: &ToolDefinition) -> Ve
                         definition.name, arg_name
                     ));
                 }
-                if let Some(problem) = mapped_arg_schema_problem(definition, "path", &arg_name) {
+                if let Some(problem) =
+                    mapped_arg_schema_problem(definition, "path", &arg_name, false)
+                {
                     problems.push(problem);
                 }
             }
@@ -1107,13 +1118,22 @@ fn tool_mapping_schema_problems(index: usize, definition: &ToolDefinition) -> Ve
     }
 
     for mapping in &definition.upstream.query_params {
+        // A repeated key appears once per item in the outbound URI.
+        if mapping.repeated && mapping.query_name.len() > 256 {
+            problems.push(format!(
+                "tool '{}' repeated query names must be at most 256 bytes",
+                definition.name
+            ));
+        }
         if mapping.required && !required_args.contains(mapping.arg_name.as_str()) {
             problems.push(format!(
                 "tool '{}' required query argument '{}' must be listed in input_json_schema.required",
                 definition.name, mapping.arg_name
             ));
         }
-        if let Some(problem) = mapped_arg_schema_problem(definition, "query", &mapping.arg_name) {
+        if let Some(problem) =
+            mapped_arg_schema_problem(definition, "query", &mapping.arg_name, mapping.repeated)
+        {
             problems.push(problem);
         }
     }
@@ -1180,6 +1200,7 @@ fn mapped_arg_schema_problem(
     definition: &ToolDefinition,
     location: &'static str,
     arg_name: &str,
+    repeated: bool,
 ) -> Option<String> {
     let Some(schema) = input_schema_property(&definition.input_schema, arg_name) else {
         return Some(format!(
@@ -1187,6 +1208,21 @@ fn mapped_arg_schema_problem(
             definition.name, arg_name
         ));
     };
+
+    if repeated {
+        if schema.get("type").and_then(Value::as_str) == Some("array")
+            && schema
+                .get("items")
+                .is_some_and(is_scalar_constrained_schema)
+            && schema.get("prefixItems").is_none()
+        {
+            return None;
+        }
+        return Some(format!(
+            "tool '{}' repeated query argument '{}' must be an array of scalar JSON Schema types",
+            definition.name, arg_name
+        ));
+    }
 
     if is_scalar_constrained_schema(schema) {
         None
