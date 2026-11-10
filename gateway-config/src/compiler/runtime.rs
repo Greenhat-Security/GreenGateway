@@ -20,7 +20,7 @@
 //! captures depends on the state backend, so that rule is checked in
 //! `storage`.
 
-use std::env::VarError;
+use std::{collections::BTreeSet, env::VarError};
 
 use super::{
     parse_comma_separated_header_values, parse_var,
@@ -760,6 +760,26 @@ pub(super) struct RuntimeBlocks {
     pub(super) request_bounds: RequestBounds,
     pub(super) content_types: ContentTypes,
     pub(super) tool_runtime: ToolRuntime,
+}
+
+/// Run all six runtime stages on a document's inputs. Each finding is a
+/// refusal of the field being parsed. Diagnostics leave environment-mode
+/// messages inside the compiler, where they can safely be discarded.
+pub(crate) fn collect_refusals(
+    mut get_var: impl FnMut(&str) -> Result<String, VarError>,
+    refused: &mut BTreeSet<&'static str>,
+) {
+    let blocks = RuntimeBlocks {
+        shutdown: compile_shutdown(ShutdownInputs::read(&mut get_var)).collect_refusals(refused),
+        signals: compile_signals(SignalInputs::read(&mut get_var)).collect_refusals(refused),
+        request_bounds: compile_request_bounds(RequestBoundInputs::read(&mut get_var))
+            .collect_refusals(refused),
+        content_types: compile_content_types(ContentTypeInputs::read(&mut get_var))
+            .collect_refusals(refused),
+        tool_runtime: compile_tool_runtime(ToolRuntimeInputs::read(&mut get_var))
+            .collect_refusals(refused),
+    };
+    compile(ToolTimeoutInputs::read(get_var), blocks).collect_refusals(refused);
 }
 
 /// The validated runtime bounds.

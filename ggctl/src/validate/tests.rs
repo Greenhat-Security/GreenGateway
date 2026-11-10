@@ -402,6 +402,139 @@ fn validate_and_doctor_run_the_egress_compiler_on_a_bundle() {
 }
 
 #[test]
+fn validate_and_doctor_refuse_wildcard_credentialed_cors_in_a_bundle() {
+    let fixture = Fixture::valid();
+    let write = |origins: Value| {
+        fixture.write("deployment.yaml", &format!(
+            "apiVersion: greengateway.dev/v1alpha1\nkind: GatewayDeployment\nspec:\n  profile: production\n  cors:\n    allowed_origins: {origins}\n"
+        ));
+        fixture.pin_policy_version("0.1.0");
+    };
+    let origin = format!("https://{CANARY}.example");
+    write(json!([origin]));
+    for command in ["validate", "doctor"] {
+        assert_eq!(run(&[command, fixture.path()]).0, Exit::Success);
+    }
+    write(json!([origin, "*"]));
+    for command in ["validate", "doctor"] {
+        let (exit, captured) = run(&[command, fixture.path(), "--format", "json"]);
+        assert_eq!(exit, Exit::Invalid);
+        assert_no_canary(&captured);
+        let result = report(&captured);
+        if command == "doctor" {
+            assert_eq!(
+                codes(&result),
+                [
+                    "bundle.invalid_runtime_setting",
+                    "doctor.required_check_failed"
+                ]
+            );
+            let checks = result["result"]["checks"].as_array().unwrap();
+            assert!(checks.iter().any(|check| check["id"] == "bundle.structure"
+                && check["status"] == "fail"
+                && check["reason"] == "bundle.invalid_runtime_setting"));
+        } else {
+            assert_eq!(codes(&result), ["bundle.invalid_runtime_setting"]);
+        }
+        let location = &result["diagnostics"][0]["location"];
+        assert_eq!(location["file"], "deployment.yaml");
+        assert_eq!(location["line"], 6);
+        assert_eq!(location["pointer"], "/spec/cors/allowed_origins");
+    }
+}
+
+#[test]
+fn validate_and_doctor_check_bundle_providers_and_admin_login_offline() {
+    let fixture = Fixture::valid();
+    let issuer = format!("https://{CANARY}.example");
+    let provider = json!({"name": CANARY, "type": "jwt", "issuer": issuer});
+    let mut client = json!({
+        "provider": CANARY,
+        "client_id": CANARY,
+        "redirect_uri": "https://admin.example/callback",
+        "client_secret": {"secret": CANARY}
+    });
+    let write = |providers: Value, login: &Value| {
+        fixture.write("deployment.yaml", &format!(
+            "apiVersion: greengateway.dev/v1alpha1\nkind: GatewayDeployment\nspec:\n  profile: production\n  authentication:\n    providers: {providers}\n  admin_login: {login}\n"
+        ));
+        fixture.pin_policy_version("0.1.0");
+    };
+    write(json!([provider]), &client);
+    for command in ["validate", "doctor"] {
+        let (exit, captured) = run(&[command, fixture.path(), "--format", "json"]);
+        assert_eq!(exit, Exit::Success, "{}", captured.stdout());
+        assert_no_canary(&captured);
+    }
+
+    // An alias on its own cannot select a login provider. A JWT provider
+    // with a JWKS URL alone can verify tokens, but login needs an issuer.
+    for (providers, login) in [
+        (
+            json!([provider]),
+            json!({"client_secret": {"secret": CANARY}}),
+        ),
+        (
+            json!([{"name": CANARY, "type": "jwt", "jwks_url": issuer}]),
+            client.clone(),
+        ),
+    ] {
+        write(providers, &login);
+        let (exit, captured) = run(&["validate", fixture.path(), "--format", "json"]);
+        assert_eq!(exit, Exit::Invalid);
+        assert_no_canary(&captured);
+        let result = report(&captured);
+        assert_eq!(codes(&result), ["bundle.invalid_admin_login"]);
+        assert_eq!(
+            result["diagnostics"][0]["location"]["pointer"],
+            "/spec/admin_login/provider"
+        );
+    }
+
+    client.as_object_mut().unwrap().remove("client_secret");
+    let mut duplicate_issuer = provider.clone();
+    duplicate_issuer["name"] = json!("secondary");
+    write(json!([provider, duplicate_issuer]), &client);
+    for command in ["validate", "doctor"] {
+        let (exit, captured) = run(&[command, fixture.path(), "--format", "json"]);
+        assert_eq!(exit, Exit::Invalid);
+        assert_no_canary(&captured);
+        let result = report(&captured);
+        let diagnostics = result["diagnostics"].as_array().unwrap();
+        for (code, pointer) in [
+            (
+                "bundle.invalid_auth_provider",
+                "/spec/authentication/providers",
+            ),
+            (
+                "bundle.invalid_admin_login",
+                "/spec/admin_login/client_secret",
+            ),
+        ] {
+            assert!(diagnostics.iter().any(|item| item["code"] == code
+                && item["location"]["pointer"] == pointer
+                && item["location"]["file"] == "deployment.yaml"));
+        }
+        if command == "doctor" {
+            let checks = result["result"]["checks"].as_array().unwrap();
+            assert!(checks
+                .iter()
+                .any(|check| check["id"] == "bundle.structure" && check["status"] == "fail"));
+        }
+    }
+    for providers in [
+        json!([{"name":CANARY,"type":"cookie_session"}]),
+        json!([provider, provider]),
+    ] {
+        write(providers, &json!({}));
+        let (exit, captured) = run(&["validate", fixture.path(), "--format", "json"]);
+        assert_eq!(exit, Exit::Invalid);
+        assert_eq!(codes(&report(&captured)), ["bundle.invalid_auth_provider"]);
+        assert_no_canary(&captured);
+    }
+}
+
+#[test]
 fn an_invalid_bundle_exits_3_with_located_value_free_diagnostics() {
     let fixture = Fixture::valid();
     // The policy changes after it was pinned, and its unknown member names a
