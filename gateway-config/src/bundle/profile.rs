@@ -21,7 +21,7 @@
 
 use super::{
     diagnostic::{BundleDiagnostic, Code, Pointer},
-    document::Profile,
+    document::{member, Profile},
     settings::{at_setting, SettingValue, Settings},
     source::FileName,
     syntax::{Node, Value},
@@ -119,6 +119,7 @@ pub(crate) fn deployment(
     file: &FileName,
     diagnostics: &mut Vec<BundleDiagnostic>,
 ) {
+    provider_transports(rules.profile, settings, node, file, diagnostics);
     if rules.profile == Profile::Development {
         return;
     }
@@ -136,6 +137,66 @@ pub(crate) fn deployment(
         };
         let path = setting.field.document_path().unwrap_or("/spec");
         diagnostics.push(rules.diagnostic(at_setting(code, file, node, path.split('/').skip(1))));
+    }
+}
+
+/// Only a cookie introspector or the selected interactive login provider
+/// receives a credential. A JWT issuer used just as a claim can be an opaque ID.
+fn provider_transports(
+    profile: Profile,
+    settings: &Settings,
+    document: &Node,
+    file: &FileName,
+    diagnostics: &mut Vec<BundleDiagnostic>,
+) {
+    fn field<'n>(node: &'n Node, key: &str) -> Option<&'n Node> {
+        member(node.as_object()?, key)
+    }
+    let providers = ["spec", "authentication", "providers"]
+        .into_iter()
+        .try_fold(document, field);
+    let Some(providers) = providers else { return };
+    let login = settings
+        .values
+        .iter()
+        .find_map(|setting| match &setting.value {
+            SettingValue::Text(name)
+                if setting.field.environment == crate::compiler::ADMIN_LOGIN_PROVIDER =>
+            {
+                Some(name.trim())
+            }
+            _ => None,
+        });
+    let pointer = Pointer::root()
+        .member("spec")
+        .member("authentication")
+        .member("providers");
+    for (index, provider) in elements(providers).iter().enumerate() {
+        let kind = field(provider, "type").and_then(Node::as_str);
+        let name = field(provider, "name")
+            .and_then(Node::as_str)
+            .map(str::trim);
+        let checked: &[_] = match kind {
+            Some("cookie_session") => &["introspection_url"],
+            Some("jwt") if login.is_some() && name == login => &["issuer", "jwks_url"],
+            _ => continue,
+        };
+        for key in checked {
+            let Some(endpoint) = field(provider, key) else {
+                continue;
+            };
+            let Some(value) = endpoint.as_str() else {
+                continue;
+            };
+            if !crate::compiler::identity_endpoint_allowed(value, profile == Profile::Development) {
+                diagnostics.push(BundleDiagnostic::at(
+                    Code::ProviderTransport,
+                    file,
+                    pointer.index(index).member(key),
+                    Some(endpoint.position),
+                ));
+            }
+        }
     }
 }
 

@@ -2894,6 +2894,19 @@ fn parse_optional_gateway_public_url(
     }
 }
 
+/// Whether an identity endpoint can receive credentials or establish trust.
+/// Development fixtures may explicitly admit HTTP on a loopback host.
+pub fn identity_endpoint_allowed(value: &str, allow_loopback_http: bool) -> bool {
+    url::Url::parse(value.trim()).is_ok_and(|url| {
+        url.has_host()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none()
+            && (url.scheme() == "https"
+                || (allow_loopback_http && url.scheme() == "http" && url_host_is_loopback(&url)))
+    })
+}
+
 fn url_host_is_loopback(url: &url::Url) -> bool {
     match url.host() {
         Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),

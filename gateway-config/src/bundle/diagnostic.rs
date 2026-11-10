@@ -206,6 +206,7 @@ pub enum Code {
     PrivateEgressAllowed,
     CsrfDisabled,
     AuditBestEffort,
+    ProviderTransport,
 }
 
 impl Code {
@@ -300,6 +301,7 @@ impl Code {
         Self::PrivateEgressAllowed,
         Self::CsrfDisabled,
         Self::AuditBestEffort,
+        Self::ProviderTransport,
     ];
 
     /// The stable code.
@@ -627,6 +629,7 @@ impl Code {
             Self::PrivateEgressAllowed => ("profile.private_egress_allowed", "the deployment profile requires private-address egress to be denied by default"),
             Self::CsrfDisabled => ("profile.csrf_disabled", "the deployment profile requires CSRF protection"),
             Self::AuditBestEffort => ("profile.audit_best_effort", "the deployment profile requires durable audit delivery"),
+            Self::ProviderTransport => ("profile.provider_transport", "the identity provider endpoint requires a secure transport"),
             Self::PolicyWildcardRole => (
                 "profile.wildcard_role",
                 "the deployment profile forbids a role that grants every permission",

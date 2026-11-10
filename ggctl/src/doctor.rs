@@ -173,6 +173,7 @@ impl Stage {
             | Code::PrivateEgressAllowed
             | Code::CsrfDisabled
             | Code::AuditBestEffort
+            | Code::ProviderTransport
             | Code::DevelopmentListenerNotLoopback
             | Code::PolicyDefaultAllow
             | Code::PolicyShadowMode
