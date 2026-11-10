@@ -680,9 +680,11 @@ pub(crate) fn check_document(
             }
         }
     }
+    let mut settings = Vec::new();
+    Checked::new((), findings).collect_refusals(&mut settings);
     refused.extend(
-        Checked::new((), findings)
-            .finding_inputs()
+        settings
+            .into_iter()
             .map(DocumentListenerRefusal::Configuration),
     );
     refused
