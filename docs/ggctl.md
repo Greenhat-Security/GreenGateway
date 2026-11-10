@@ -286,16 +286,39 @@ Compares the bundle in the directory `BUNDLE` with the one `--against` names, se
 - `--format sarif` writes one SARIF 2.1.0 log: the readers' diagnostics as `validate` writes them, then one rule per risk code (level `error` for a `high` code, `warning` for `medium`, `note` for `low`) and one result per risk code of each change, located at the change's field as a logical location. A change without a code is not a finding and has no result. This extends ADR-0008, which gave SARIF to `validate` only.
 - `--check` exits `4` when the bundles differ at all (`diff.drift_found`), whatever the risk. `--strict` applies to both bundles as it does for `validate`.
 
-With `--env FILE` and `--against-env FILE` instead, `diff` compiles both [environment files](#environment-files) as `validate --env` does and compares the two compiled configurations setting by setting with the same semantic diff (each change's `field` is the setting's name), so spelling, order, `export`, comments, whitespace a setting ignores and a spelled-out default never register. The result holds `environment` and `againstEnvironment` in place of `bundle` and `against`; `--check`, `--strict` and the formats behave as for two bundles. An environment file and a bundle are read and reported but never compared, in either direction: no front end maps a bundle onto the compiler's settings yet, and an environment configuration holds no policy or tools document, so there is nothing in common to compare (`diff.not_comparable`, exit `3`).
+With `--env FILE` and `--against-env FILE`, `diff` compiles both [environment files](#environment-files) and compares their settings. Each changed field uses the setting's name. Differences in spelling, order, `export`, comments, insignificant whitespace and spelled-out defaults disappear during compilation. The result identifies its inputs as `environment` and `againstEnvironment`. The options and report formats work as they do for two bundles. A mixed bundle/environment comparison returns `diff.not_comparable` (exit `3`). Bundles declare resource ownership and can include policy or tools. An environment file alone cannot supply that baseline.
 
 A bundle that is invalid is not compared: the readers' diagnostics are reported, BUNDLE's first, and the result says `valid: false`. Diagnostics name bundle-relative files, so a diagnostic about a file both bundles have does not say which bundle it concerns; read `bundle` and `against` in the result, or validate each bundle on its own.
 
-Exit codes: `0` when both were compared, `4` with `--check` when they differ, `3` when either is invalid or they cannot be compared, `1` when either could not be read, `2` without `--against` or `--against-env`, or with both. To gate a change in CI on the risk it carries, compare the proposed bundle with the deployed one and fail on what the codes say:
+Exit codes: `0` when both were compared, `4` with `--check` when they differ, `3` when either is invalid or they cannot be compared, `1` when either could not be read, `2` without `--against` or `--against-env`, or with both. Use the JSON report for a CI decision and SARIF for review annotations.
 
-```yaml
-- name: Review the configuration change
-  run: ggctl diff deploy/bundle --against deployed/bundle --format sarif > bundle-diff.sarif
+#### Review a bundle change in CI
+
+Have CI check out the exact deployed revision under `deployed/` and the proposed revision under `candidate/`. Both directories below hold the bundle from their respective checkout. Use the same release of `ggctl` for both. Keep generated reports outside the bundle directories so strict validation can flag unexpected input files.
+
+```sh
+ggctl validate deployed/bundle --strict --format json > baseline.json
+ggctl validate candidate/bundle --strict --format json > candidate.json
+ggctl diff candidate/bundle --against deployed/bundle --strict --format json > change.json
 ```
+
+Run each command as a CI step that fails on a nonzero exit. The comparison runs offline and exits successfully for both an unchanged bundle and a valid proposed change. To require review of every change carrying a risk code, run this Python step after the comparison.
+
+```python
+import json
+
+with open("change.json", "rb") as report:
+    result = json.load(report)["result"]
+if result["valid"] is not True:
+    raise SystemExit("Comparison failed")
+codes = result["diff"]["riskCodes"]
+if codes != []:
+    raise SystemExit(f"Review required for {codes}")
+```
+
+Inspect `result.diff.changes` in `change.json` to see which fields triggered the review. A drift check that must fail on **any** semantic difference can use `ggctl diff candidate/bundle --against deployed/bundle --strict --check` directly. That command exits `4` on drift. SARIF annotations are available separately through `--format sarif`.
+
+When editing a referenced document, run `ggctl pin` on the candidate during authoring and commit the manifest alongside the document. CI verifies those committed pins. A successful review checks the proposed files. Host-bound settings, state and activation still need verification on the deployment target.
 
 ### `ledger seed`
 
