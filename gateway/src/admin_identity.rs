@@ -432,7 +432,14 @@ pub(super) async fn admin_capabilities_endpoint(
     .into_iter()
     .filter(|permission| rbac.principal_has_permission(&principal, permission))
     .collect();
-    let mut response = Json(json!({ "permissions": permissions })).into_response();
+    let can_simulate = permissions.contains(&ADMIN_POLICY_READ_PERMISSION)
+        && permissions.contains(&ADMIN_POLICY_SIMULATE_PERMISSION);
+    let mut capabilities = json!({ "permissions": permissions });
+    if can_simulate {
+        capabilities["policy_simulation"] =
+            policy_simulation_capabilities(state.config.max_body_size);
+    }
+    let mut response = Json(capabilities).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
