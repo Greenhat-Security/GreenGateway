@@ -25,7 +25,9 @@
 
 #![cfg(feature = "postgres")]
 
+mod approved_mutation;
 mod harness;
+mod mutation_tls;
 
 use std::{collections::BTreeSet, time::Duration};
 
