@@ -955,8 +955,7 @@ async fn startup_interrupts_a_crashed_job_and_keeps_owner_and_retry_binding() {
     .await
     .expect("child admitted a replay");
     assert!(restart_router(path, startup_audit())
-        .err()
-        .expect("a second live owner is refused")
+        .expect_err("a second live owner is refused")
         .to_string()
         .contains("replay journal lock"));
     child.0.kill().unwrap();
@@ -1066,8 +1065,7 @@ async fn startup_retains_completed_results_until_their_original_expiry() {
     db.execute("UPDATE standalone_policy_replays_v1 SET result=(SELECT result FROM standalone_policy_replays_v1 WHERE id=?2) WHERE id=?1",
         [id, other_id]).unwrap();
     let error = restart_router(path, startup_audit())
-        .err()
-        .expect("an aggregate is bound to its owner and job");
+        .expect_err("an aggregate is bound to its owner and job");
     assert!(error
         .to_string()
         .contains("invalid standalone policy replay journal"));
@@ -1100,9 +1098,7 @@ async fn startup_retains_completed_results_until_their_original_expiry() {
         [],
     )
     .unwrap();
-    let error = restart_router(path, startup_audit())
-        .err()
-        .expect("corrupt bindings refuse startup");
+    let error = restart_router(path, startup_audit()).expect_err("corrupt bindings refuse startup");
     assert!(error
         .to_string()
         .contains("invalid standalone policy replay journal"));
@@ -1156,6 +1152,66 @@ async fn a_failed_journal_commit_withholds_the_result_after_audit() {
     assert_eq!(repaired["state"], "failed");
     assert_eq!(repaired["failure"]["reason"], "store_unavailable");
     assert!(repaired.get("result").is_none());
+}
+
+#[tokio::test]
+async fn a_refused_start_can_reuse_its_key_after_store_recovery() {
+    use audit::sink::tests::{DurableBehaviour, DurableCaptureSink};
+    let dir = ReplayTestDirectory::new();
+    let path = dir.0.as_path();
+    std::fs::write(
+        path.join("policy.json"),
+        replays_policy_document().to_string(),
+    )
+    .unwrap();
+    let sink = Arc::new(DurableCaptureSink::new());
+    let router = restart_router(
+        path,
+        audit::AuditLog::new_required(sink.clone(), Duration::from_secs(5)),
+    )
+    .unwrap();
+    let db = rusqlite::Connection::open(path.join("history.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER refuse_test_cleanup BEFORE DELETE ON standalone_policy_replays_v1
+                      BEGIN SELECT RAISE(FAIL, 'fixture'); END;",
+    )
+    .unwrap();
+    sink.set(DurableBehaviour::Refuse);
+    let mut body = replay_body(&registry_etag(), json!({"source": "active"}));
+    body["idempotency_key"] = json!("refused-retry");
+    let refused = start(&router, replayer(), body.to_string()).await;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(refused).await["reason"],
+        "policy_replay_store_unavailable"
+    );
+    let abandoned: String = db
+        .query_row("SELECT id FROM standalone_policy_replays_v1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        get_job(&router, replayer(), &abandoned).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    db.execute_batch("DROP TRIGGER refuse_test_cleanup")
+        .unwrap();
+    sink.set(DurableBehaviour::Store);
+    let retry = start(&router, replayer(), body.to_string()).await;
+    assert_eq!(retry.status(), StatusCode::ACCEPTED);
+    let id = job_id(&json_body(retry).await);
+    assert_ne!(id, abandoned);
+    finished(&router, replayer(), &id).await;
+    drop(router);
+    let router = restart_router(path, startup_audit()).unwrap();
+    assert_eq!(
+        get_job(&router, replayer(), &abandoned).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        json_body(start(&router, replayer(), body.to_string()).await).await["job_id"],
+        id
+    );
 }
 
 fn operator(subject: &str) -> Option<auth::Principal> {
