@@ -1081,12 +1081,72 @@ async fn draft_evidence_is_owner_and_revision_bound_across_replicas() {
             "replicas disagree on {member}"
         );
     }
+    assert_empty_replay_remains_incomplete(&cluster, &owner, &live_etag, draft_id, &saved_etag)
+        .await;
     let (status, headers, _) = send_settled(|| cluster.get("b", POLICY_ROUTE).bearer(&owner)).await;
     assert_eq!(status, 200);
     assert_eq!(
         etag(&headers, "live policy after evidence export"),
         live_etag
     );
+}
+
+/// A window before this disposable database existed has no records. Export
+/// its completed job on the other replica and retain that limitation.
+async fn assert_empty_replay_remains_incomplete(
+    cluster: &Cluster,
+    owner: &str,
+    base_etag: &str,
+    draft_id: &str,
+    draft_etag: &str,
+) {
+    let replays = format!("{POLICY_ROUTE}/replays");
+    let request = json!({
+        "schema_version": "policy-replay.v1",
+        "base_etag": base_etag,
+        "candidate": {"source":"draft", "draft_id":draft_id, "draft_etag":draft_etag},
+        "window": {"from":"2000-01-01T00:00:00Z", "to":"2000-01-02T00:00:00Z"},
+    });
+    let (status, _, started) =
+        send_settled(|| cluster.post("a", &replays).bearer(owner).json(&request)).await;
+    assert_eq!(status, 202, "{started}");
+    let id = started["job_id"].as_str().expect("accepted replay ID");
+    let job_path = format!("{replays}/{id}");
+    let deadline = std::time::Instant::now() + CONVERGENCE_BUDGET;
+    let job = loop {
+        let (status, _, job) = send_settled(|| cluster.get("b", &job_path).bearer(owner)).await;
+        assert_eq!(status, 200, "{job}");
+        if !matches!(job["state"].as_str(), Some("queued" | "running")) {
+            break job;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replay remained {}",
+            job["state"]
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(job["state"], "completed_incomplete", "{job}");
+    let digest = job["result_digest"]
+        .as_str()
+        .expect("completed replay digest");
+    let request = json!({
+        "schema_version": "policy-evidence-request.v1",
+        "draft": {"draft_id":draft_id, "draft_etag":draft_etag},
+        "replay_job_id": id
+    });
+    let evidence = format!("{POLICY_ROUTE}/evidence");
+    let (status, _, package) =
+        send_settled(|| cluster.post("b", &evidence).bearer(owner).json(&request)).await;
+    assert_eq!(status, 200, "{package}");
+    let report = &package["report"];
+    assert_eq!(report["replay"]["result_digest"], digest);
+    assert_eq!(report["replay"]["state"], "completed_incomplete");
+    assert_eq!(report["completeness"], "incomplete");
+    assert!(report["limitations"]
+        .as_array()
+        .expect("report limitations")
+        .contains(&json!("replay_incomplete")));
 }
 
 /// Two admins, two replicas, one ETag: the policy authority admits one.

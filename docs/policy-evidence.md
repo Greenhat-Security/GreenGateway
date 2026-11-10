@@ -616,8 +616,10 @@ an analysis reads them. The two-replica release gate creates a draft on one
 gateway, updates it on the other, and restarts the first. Both gateways must
 return the same report and artifact manifest for the saved draft. The gate
 also checks that another owner and a stale draft ETag cannot export it, and
-that the live policy ETag is unchanged. A replay job can be
-bound only in standalone mode, where replay jobs exist.
+that the live policy ETag is unchanged. An owner can bind a completed replay
+job in standalone or PostgreSQL mode. The cluster gate starts a replay on one
+replica and exports it from the other. An empty retained window must keep its
+incomplete status and its result digest in the evidence package.
 
 Not part of this work, and not to be inferred from it:
 
