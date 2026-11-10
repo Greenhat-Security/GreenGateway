@@ -6155,6 +6155,34 @@
           }
         }
       }
+    },
+    "MutationPrepareReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "occurrence_id",
+        "prepared_at",
+        "expires_at"
+      ],
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "occurrence_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "prepared_at": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expires_at": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
     }
   }
 }

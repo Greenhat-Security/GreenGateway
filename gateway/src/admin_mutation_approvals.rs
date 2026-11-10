@@ -2,7 +2,8 @@
 use super::*;
 
 use connections::mutation_approval::{
-    ApprovalDecision, ApprovalError, ApprovalPrincipal, MutationApproval,
+    ApprovalDecision, ApprovalError, ApprovalPrincipal, MutationApproval, PrepareBinding,
+    PrepareReceipt,
 };
 use connections::permissions::ADMIN_MUTATION_APPROVAL_REVIEW;
 
@@ -207,6 +208,121 @@ pub(super) fn audit_mutation_approval(
         Some(auth::actor_from_principal(principal)),
         payload,
     ));
+}
+
+/// Read the immutable receipt before resolving the current catalog. Returning
+/// a receipt cannot authorize an execution or recreate an expired occurrence.
+pub(super) async fn prepare_binding_or_receipt(
+    state: &ToolAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    tool_id: &str,
+    etag: &str,
+    body: &[u8],
+) -> ResponseResult<PrepareBinding> {
+    if connections::caller_assertion::AttestedCaller::from_principal(principal).is_none() {
+        return Err(Box::new(mutation_approval_denied(
+            state, parts, principal, "prepare",
+        )));
+    }
+    if parts.uri.query().is_some()
+        || parts
+            .headers
+            .keys()
+            .any(|name| name.as_str().starts_with("if-") && name != header::IF_MATCH)
+    {
+        return Err(Box::new(bad_request(
+            "keyed preparation accepts only If-Match and no query parameters",
+        )));
+    }
+    let id = caller_operation_id(&parts.headers).map_err(|reason| Box::new(bad_request(reason)))?;
+    let receipt_error = |error| {
+        Box::new(mutation_approval_receipt_result(
+            state,
+            parts,
+            principal,
+            Err(error),
+        ))
+    };
+    let binding = PrepareBinding::new(
+        id,
+        auth::change_actor::ChangeActor::from_principal(principal),
+        tool_id,
+        etag,
+        body,
+    )
+    .map_err(receipt_error)?;
+    if state.authority_evidence.has_prepare_receipts() {
+        let store = state
+            .connections
+            .managed_store()
+            .map_err(|_| receipt_error(ApprovalError::Unavailable))?;
+        if let Some(receipt) = store
+            .keyed_prepare_receipt(&binding)
+            .await
+            .map_err(receipt_error)?
+        {
+            return Err(Box::new(mutation_approval_receipt_result(
+                state,
+                parts,
+                principal,
+                Ok(receipt),
+            )));
+        }
+    }
+    if !state.authority_evidence.supports_keyed_prepare() {
+        admit_authority_change(
+            &state.authority_evidence,
+            authority_events::required::AuthorityOperation::MutationApprovalPrepare,
+            &state.audit,
+            parts,
+            principal,
+            &state.client_ip_policy,
+        )?;
+        return Err(Box::new(
+            (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "keyed preparation requires PostgreSQL and qualified_v1"})),
+            )
+                .into_response(),
+        ));
+    }
+    Ok(binding)
+}
+
+pub(super) fn mutation_approval_receipt_result(
+    state: &ToolAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    result: Result<PrepareReceipt, ApprovalError>,
+) -> Response {
+    match result {
+        Ok(receipt) => {
+            audit_mutation_approval(
+                state,
+                parts,
+                principal,
+                json!({
+                    "operation": "prepare", "outcome": "success", "approval_id": receipt.occurrence_id,
+                }),
+            );
+            (
+                StatusCode::OK,
+                [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+                Json(receipt),
+            )
+                .into_response()
+        }
+        Err(error) => mutation_approval_result(
+            state,
+            parts,
+            principal,
+            "prepare",
+            None,
+            Err(error),
+            StatusCode::OK,
+        ),
+    }
 }
 
 pub(super) fn mutation_approval_result(

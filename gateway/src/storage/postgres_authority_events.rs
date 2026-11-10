@@ -107,16 +107,18 @@ pub(crate) enum JournalSource {
     /// Migration 23's managed catalog publications, journaled since
     /// migration 32.
     CatalogChange,
+    MutationApprovalPrepare,
 }
 
 impl JournalSource {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::ConnectionChange,
         Self::ServiceTokenChange,
         Self::JwtRevocation,
         Self::AdminSession,
         Self::DocumentChange,
         Self::CatalogChange,
+        Self::MutationApprovalPrepare,
     ];
 
     pub(crate) const fn table(self) -> &'static str {
@@ -127,6 +129,7 @@ impl JournalSource {
             Self::AdminSession => "admin_session_evidence",
             Self::DocumentChange => "document_change_evidence",
             Self::CatalogChange => "catalog_change_evidence",
+            Self::MutationApprovalPrepare => "mutation_approval_prepare_evidence",
         }
     }
 
@@ -190,6 +193,24 @@ pub(crate) async fn append_to_journal(
     }
     report_capacity_refusal(source);
     Err(JournalAppendError::CapacityExhausted)
+}
+
+/// Reserve a caller ID in the owning transaction. The unique index serializes
+/// distinct authorities competing for the same key. Existing exact replays
+/// are answered from their immutable evidence before either writer gets here.
+pub(crate) async fn reserve_caller_operation(
+    client: &tokio_postgres::Client,
+    id: uuid::Uuid,
+    action: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    client
+        .execute(
+            "INSERT INTO greengateway.authority_caller_operation_ids (operation_id, action)
+         VALUES ($1::text::uuid, $2) ON CONFLICT (operation_id) DO NOTHING",
+            &[&id.to_string(), &action],
+        )
+        .await
+        .map(|count| count == 1)
 }
 
 /// Count and log one mutation refused because the journal was full. Every
@@ -453,7 +474,7 @@ impl PostgresAuthorityEventStore {
     /// singleton's dedicated connection): delete up to `limit` journal rows
     /// at or below every cursor's position and journaled at least
     /// `retention` ago on the database clock, lowest positions first, and
-    /// give their capacity back. Before any cursor exists, age alone decides.
+    /// give their capacity back. A keyed prepare keeps the pre-claim backlog for its negotiated consumer.
     /// The candidates come from a window of `limit x RETENTION_SCAN_FACTOR`
     /// rows walked by primary key, so the step never scans the backlog.
     pub(crate) async fn prune_with(
@@ -496,26 +517,28 @@ SELECT j.position,
        j.event_id::text,
        j.source,
        coalesce(c.operation_id, t.operation_id, r.operation_id, a.operation_id,
-                d.operation_id, g.operation_id)::text,
+                d.operation_id, g.operation_id, p.operation_id)::text,
        coalesce(c.actor_user_id, t.actor_user_id, r.actor_user_id, a.actor_subject, a.user_id,
-                d.actor_user_id, g.actor_user_id),
-       coalesce(c.action, t.action, r.action, a.action, d.action, g.action),
+                d.actor_user_id, g.actor_user_id, p.actor_user_id),
+       coalesce(c.action, t.action, r.action, a.action, d.action, g.action,
+                CASE WHEN p.event_id IS NOT NULL THEN 'mutation_approval.prepare' END),
        r.issuer,
        coalesce(c.connection_id::text, t.token_id, r.jti_hash, a.session_id::text,
-                d.resource_type, g.connection_id::text),
+                d.resource_type, g.connection_id::text, p.occurrence_id::text),
        coalesce(c.prior_version, t.prior_version, d.prior_version, g.prior_version),
        coalesce(c.new_version, t.new_version, d.new_version, g.new_version),
        coalesce(c.security_revision, t.security_revision, r.security_revision,
                 d.security_revision, g.security_revision),
        to_char(coalesce(c.committed_at, t.committed_at, r.committed_at, a.committed_at,
-                        d.committed_at, g.committed_at)
+                        d.committed_at, g.committed_at, p.committed_at)
                    AT TIME ZONE 'UTC',
                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
        coalesce(c.actor_issuer, t.actor_issuer, r.actor_issuer, a.actor_issuer, d.actor_issuer,
-                g.actor_issuer),
-       coalesce(c.actor_kind, t.actor_kind, r.actor_kind, a.actor_kind, d.actor_kind, g.actor_kind),
+                g.actor_issuer, p.actor_issuer),
+       coalesce(c.actor_kind, t.actor_kind, r.actor_kind, a.actor_kind, d.actor_kind, g.actor_kind,
+                CASE WHEN p.event_id IS NOT NULL THEN 'principal' END),
        coalesce(c.actor_auth_mode, t.actor_auth_mode, r.actor_auth_mode, a.actor_auth_mode,
-                d.actor_auth_mode, g.actor_auth_mode),
+                d.actor_auth_mode, g.actor_auth_mode, p.actor_auth_mode),
        c.revision_axis
 FROM greengateway.authority_event_journal j
 LEFT JOIN greengateway.connection_change_evidence c
@@ -530,6 +553,8 @@ LEFT JOIN greengateway.document_change_evidence d
     ON j.source = 'document_change_evidence' AND d.event_id = j.event_id
 LEFT JOIN greengateway.catalog_change_evidence g
     ON j.source = 'catalog_change_evidence' AND g.event_id = j.event_id
+LEFT JOIN greengateway.mutation_approval_prepare_evidence p
+    ON j.source = 'mutation_approval_prepare_evidence' AND p.event_id = j.event_id
 WHERE j.position > $1
 ORDER BY j.position
 LIMIT $2
@@ -561,7 +586,8 @@ WITH floor AS (
 candidates AS (
     SELECT j.position, j.journaled_at
     FROM greengateway.authority_event_journal j
-    WHERE (SELECT position FROM floor) IS NULL
+    WHERE ((SELECT position FROM floor) IS NULL
+           AND NOT EXISTS (SELECT 1 FROM greengateway.mutation_approval_prepare_evidence))
        OR j.position <= (SELECT position FROM floor)
     ORDER BY j.position
     LIMIT $3
@@ -654,10 +680,10 @@ mod tests {
     #[test]
     fn the_journal_sources_are_the_migrations_closed_vocabulary() {
         let journal = include_str!("migrations/0021_authority_event_journal.sql");
-        let migration = include_str!("migrations/0032_document_and_catalog_evidence_journal.sql");
+        let migration = include_str!("migrations/0035_mutation_approval_prepare_evidence.sql");
         let (_, check) = migration
             .split_once("ADD CONSTRAINT authority_event_journal_source_check CHECK (")
-            .expect("migration 32 replaces the source CHECK");
+            .expect("migration 35 replaces the source CHECK");
         let (check, _) = check.split_once(");").expect("the CHECK ends");
         assert_eq!(
             check.matches("_evidence'").count(),
@@ -667,7 +693,7 @@ mod tests {
         for source in JournalSource::ALL {
             assert!(
                 check.contains(&format!("'{}'", source.table())),
-                "migration 32 must allow {}",
+                "migration 35 must allow {}",
                 source.table()
             );
             assert_eq!(JournalSource::from_table(source.table()), Some(source));

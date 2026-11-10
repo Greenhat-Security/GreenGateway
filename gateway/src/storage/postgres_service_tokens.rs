@@ -346,7 +346,7 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
         actor: &ChangeActor,
         operation_id: Option<uuid::Uuid>,
     ) -> Result<Option<TokenRecord>, RepositoryError> {
-        if operation_id.is_some_and(|key| !crate::auth::tokens::valid_revoke_operation_id(key)) {
+        if operation_id.is_some_and(|key| !crate::auth::tokens::valid_caller_operation_id(key)) {
             return Err(RepositoryError::invalid_parameter(
                 OPERATION_REVOKE,
                 "operation_id",
@@ -382,6 +382,21 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
                     ));
                 }
                 return Ok(Some(current.record));
+            }
+            if let Some(key) = operation_id {
+                let reserved = super::postgres_authority_events::reserve_caller_operation(
+                    &client,
+                    key,
+                    crate::auth::tokens::TOKEN_CHANGE_ACTION_REVOKE,
+                )
+                .await
+                .map_err(|error| classify_query(error, OPERATION_REVOKE))?;
+                if !reserved {
+                    return Err(RepositoryError::new(
+                        RepositoryErrorKind::Conflict,
+                        crate::auth::tokens::REVOKE_OPERATION_BINDING,
+                    ));
+                }
             }
             let security_revision = reserve_shared_revision(&client, OPERATION_REVOKE).await?;
             let sql = format!(
@@ -605,12 +620,15 @@ async fn is_revoke_replay(
     let row = client
         .query_one(
             r#"
-            SELECT bool_and(
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM greengateway.authority_caller_operation_ids
+                WHERE operation_id = $1::text::uuid AND action <> $2
+            ) THEN false ELSE bool_and(
                 action = $2 AND token_id = $3 AND actor_user_id = $4
                 AND actor_issuer IS NOT DISTINCT FROM $5
                 AND actor_kind IS NOT DISTINCT FROM $6
                 AND actor_auth_mode IS NOT DISTINCT FROM $7
-            )
+            ) END
             FROM greengateway.service_token_change_evidence
             WHERE operation_id = $1::text::uuid
             "#,

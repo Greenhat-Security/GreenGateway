@@ -7017,9 +7017,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "f8d0e62f30c4f1ecfba8df51e050e3908c61a4e80d4072748bb07de049be5f71",
+      "sha256": "f504a0bfca63b6169d53aac87ca9ded3b82e3d904b790c04d3675ee71a85ed4f",
       "owner": "GreenGateway maintainers",
-      "purpose": "Registers authenticated mutation approval and keyed revocation routes and the owner-scoped replay registry used by policy analyses."
+      "purpose": "Registers authenticated approval, keyed preparation and token revocation routes alongside the owner-scoped policy replay registry."
     },
     {
       "file": "gateway/src/routing.rs",
@@ -8187,7 +8187,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::authority_events::delivery::file_attributes#1",
-      "sha256": "31ac4ee704e0ea74cd4cc1ed1843fee089d5a0e8081bc39f81f19b5ac899bb9a",
+      "sha256": "4e67f17b406b983fddfa6428cc61429567ab81243bf58bb7950bf3adcad8b38f",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
     },
@@ -8913,6 +8913,16 @@
       "purpose": "Connection configuration, shared storage or checked provider/MCP protocol handling in this exact scope."
     },
     {
+      "file": "gateway/src/connections/mutation_approval.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::connections::mutation_approval::PrepareBinding#1",
+      "sha256": "f7a00d12225890c41ba76ff9fab12daecfb420e500c104e27155d07c6bceaef6",
+      "owner": "GreenGateway approval authority maintainers",
+      "purpose": "The standalone unused-field allowance describes a caller operation binding stored only by the PostgreSQL authority."
+    },
+    {
       "file": "gateway/src/connections/oauth.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -9572,6 +9582,26 @@
       "sha256": "6c46afbe97141ccabc567488ba08d2d3ade98ca051fc32e4def92ec4d2b8d576",
       "owner": "GreenGateway maintainers",
       "purpose": "Read one immutable occurrence by identifier from the configured Connection authority, decode the row and verify its stored state."
+    },
+    {
+      "file": "gateway/src/connections/pg_mutation_approvals.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::mutation_approvals::read_receipt#1",
+      "sha256": "c42adb332d5b3421e8cb9bfd6b08da2f9de5ecca276d2ff04f92ee3ef386fd8e",
+      "owner": "GreenGateway Connection storage maintainers",
+      "purpose": "Reads an attributed immutable receipt using the existing authority client and checks its caller, request and action bindings."
+    },
+    {
+      "file": "gateway/src/connections/pg_mutation_approvals.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::mutation_approvals::insert_occurrence#1",
+      "sha256": "6a55e2401fce732cbd390909224c81fa024e55ba729f3be42d6b2a39637c8d35",
+      "owner": "GreenGateway Connection storage maintainers",
+      "purpose": "Reuses the existing Connection transaction to check the catalog, bound pending occurrences and insert one reviewed operation."
     },
     {
       "file": "gateway/src/connections/secret.rs",
@@ -14655,7 +14685,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_service_tokens::is_revoke_replay#1",
-      "sha256": "9b136aa885f01d9b5322578373521c80e1701abcc568a127ccb46697364f4aa2",
+      "sha256": "0612d49023bcecdbd951eaa6612d98d44da85a18772b680219eb0296d28c7cc2",
       "owner": "GreenGateway maintainers",
       "purpose": "Checks committed service-token operation bindings through the shared PostgreSQL infrastructure pool."
     },
@@ -16091,7 +16121,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::authority_events::required::impl  RequiredMode::as_str#1",
-      "sha256": "ff8d0c39fa232fa007b244c39cefc250cfa571d0e2c86354dd79eea5494720ac",
+      "sha256": "0a1b8a56db813d0c6f72ec76f2d2d866405e246390682165f0a1b44b92795c83",
       "owner": "GreenGateway maintainers",
       "purpose": "cfg_attr(not(test), allow(dead_code)) on the inventory spelling of a required mode, which only the required-mode tests compare; a constant string match with no transport, file or process capability (issue #425)."
     },
@@ -16121,7 +16151,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway_config::compiler::authority_events::AuthorityEventFormat#1",
-      "sha256": "ebe623b6f7c8ad97bb4813b9ececd856a2e2f65280cc8aead019dcdcb58b8d10",
+      "sha256": "128c65c3d249c3db90a4aacd041a4bff106e632cfe9d02da9c8655ad3b2ffed4",
       "owner": "GreenGateway maintainers",
       "purpose": "Closed wire-format vocabulary parsed from configuration. Changes to the generated enum inputs require review."
     },
@@ -16164,6 +16194,16 @@
       "sha256": "0dcc827762d86dd4b19883a1d8868a792dc47b0c73e1d7a627c0bbd1c447c42e",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::reserve_caller_operation#1",
+      "sha256": "f1c8a142d0c5e6732a9d6f5e3809b74dded9ff041b10ab8cc8d9cfa35fe3a653",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Inserts a caller UUID and operation family on the existing PostgreSQL transaction, serializing reuse across authority writers."
     },
     {
       "file": "gateway/src/storage/postgres_authority_events.rs",
@@ -16231,7 +16271,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::impl  PostgresAuthorityEventStore::prune_with#1",
-      "sha256": "0d1b6785542be8a5e490b7f4c53ce864720cea88a248814fc07d66b3f3ce2ad8",
+      "sha256": "469aa5bf9bd516c92003f99c8611f750a68b8bb1b41b0c69dbbc9ecfcf251041",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

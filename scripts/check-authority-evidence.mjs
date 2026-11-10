@@ -166,16 +166,22 @@ export function validateEvent(event) {
     : event.operation.startsWith("service_token.") ? "token"
     : event.operation === "jwt.revoke" ? "jwt_revocation" : "configuration";
   check(axis === expectedAxis, "operation/revision axis mismatch");
+  if (event.operation === "mutation_approval.prepare") {
+    check(event.operation_id[14] === "7", "prepare requires a caller-supplied UUIDv7");
+    check(event.actor.kind === "principal", "prepare requires an issuer-bound principal");
+    check(after === "1" && security === null, "prepare creates occurrence revision 1 without a security revision");
+  }
   return event;
 }
 
 // What AUTHORITY_EVIDENCE_DURABILITY=required does with a row (issue #425,
 // PR 4). `admitted` runs it with the atomic record the row describes;
+// `caller_key_required` admits the PostgreSQL qualified prepare only.
 // `refused` and `refused_at_startup` refuse it when asked or when the
 // configuration enables it; `unavailable` rows cannot run in the mode at
 // all; `outside_gateway` is a provider's write the gateway cannot refuse;
 // `not_refused` is the activation that starts the gateway.
-const REQUIRED_MODES = new Set(["admitted", "refused", "refused_at_startup", "unavailable", "outside_gateway", "not_refused"]);
+const REQUIRED_MODES = new Set(["admitted", "caller_key_required", "refused", "refused_at_startup", "unavailable", "outside_gateway", "not_refused"]);
 
 // The gateway's source, and the configuration compiler it links from the
 // shared gateway-config library (issue #242), which refuses the settings the
@@ -191,12 +197,16 @@ const qualifiedRevoke = {
   durable_sink: "file", filesystem: "unix_file_and_directory_sync", wire_schema: "authority_event.v1",
 };
 
+const qualifiedPrepare = {
+  ...qualifiedRevoke, operation: "mutation_approval.prepare", method: "PUT",
+  route: "/v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals",
+};
+
 export function validateInventory(inventory, readSource = (path) => readFileSync(resolve(ROOT, path), "utf8")) {
   check(inventory.version === 1 && inventory.issue === 425, "unknown inventory contract");
   check(/^[0-9a-f]{40}$/.test(inventory.reviewed_revision), "missing reviewed revision");
   assert.deepEqual(inventory.storage_modes, MODES, "storage modes changed without contract review");
-  // Required-mode admission and qualification of a specific delivery path
-  // are separate. No whole operation group qualifies.
+  // A deployment selects evidence durability and the consumer format independently.
   check(inventory.required_durability_mode === "refuses_unsupported", "inventory cannot enable runtime durability");
   const seen = new Set();
   const ids = new Set();
@@ -222,12 +232,25 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
     for (const field of ["boundary", "record", "actor", "identity", "follow_up", "test_claim"]) {
       check(typeof group[field] === "string" && group[field].trim().length >= 4, `${group.id}: missing ${field}`);
     }
-    check(group.required_durability_supported === false, `${group.id}: unproven durability claim`);
-    if (group.operations.includes("service_token.revoke") && group.modes.includes("postgres")) {
+    const pgPrepare = group.modes.includes("postgres") && group.operations.includes("mutation_approval.prepare");
+    const pgRevoke = group.modes.includes("postgres") && group.operations.includes("service_token.revoke");
+    if (pgPrepare) {
+      assert.deepEqual(group.operations, ["mutation_approval.prepare"], "qualified prepare must be its own operation");
+      assert.deepEqual(group.modes, ["postgres"], "qualified prepare must be its own mode");
+      assert.deepEqual(group.disposition, ["already_sufficient"], "qualified prepare disposition");
+      check(group.required_mode === "caller_key_required" && group.delivery === "journaled_dispatch",
+        "qualified prepare requires keyed admission and journal delivery");
+    } else {
+      check(group.required_mode !== "caller_key_required", "unreviewed caller-key admission");
+    }
+    check(group.required_durability_supported === pgPrepare, `${group.id}: unproven durability claim`);
+    if (pgPrepare || pgRevoke) {
+      const expected = pgPrepare ? qualifiedPrepare : qualifiedRevoke;
+      const name = pgPrepare ? "prepare" : "revoke";
       const paths = group.qualified_delivery_paths;
-      check(Array.isArray(paths) && paths.length === 1, "missing qualified revoke path");
+      check(Array.isArray(paths) && paths.length === 1, `missing qualified ${name} path`);
       const [path] = paths;
-      assert.deepEqual(path.criteria, qualifiedRevoke, "qualified revoke criteria changed without review");
+      assert.deepEqual(path.criteria, expected, `qualified ${name} criteria changed without review`);
       check(group.operations.includes(path.criteria.operation) && group.modes.includes(path.criteria.storage_mode), "qualified path outside its inventory group");
       check(typeof path.guarantee === "string" && path.guarantee.length > 0, "missing qualified path guarantee");
       check(path.sources.length > 0 && path.tests.length > 0, "missing qualified path evidence");
@@ -244,6 +267,7 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
     check(group.disposition.length > 0 && new Set(group.disposition).size === group.disposition.length, `${group.id}: missing/duplicate disposition`);
     for (const disposition of group.disposition) check(DISPOSITIONS.has(disposition), `${group.id}: unknown disposition`);
     check(!group.disposition.includes("already_sufficient") || group.disposition.length === 1, "sufficient contradicts a gap");
+    check(!group.disposition.includes("already_sufficient") || pgPrepare, "unreviewed sufficient disposition");
     check(Object.hasOwn(inventory.delivery_profiles, group.delivery), `${group.id}: missing delivery profile`);
     check(group.operations.length > 0 && group.modes.length > 0, "empty coverage row");
     for (const operation of group.operations) {
@@ -280,7 +304,7 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const result = validateInventory(readJson("docs/authority-evidence-inventory.json"));
-    console.log(`Authority evidence inventory valid: ${result.groups} groups, ${result.operationModePairs} operation/mode pairs, ${result.sourceReferences} source references. One PostgreSQL keyed-revoke delivery path qualifies. Required mode refuses unsupported rows.`);
+    console.log(`Authority evidence inventory valid: ${result.groups} groups, ${result.operationModePairs} operation/mode pairs, ${result.sourceReferences} source references. PostgreSQL keyed preparation qualifies in required mode. PostgreSQL keyed revocation has a qualified delivery path.`);
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;

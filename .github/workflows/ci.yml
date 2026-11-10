@@ -760,6 +760,7 @@ jobs:
             storage::contract_tests::postgres_audit_tests::an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction
             storage::contract_tests::postgres_audit_tests::a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity
             connections::pg_store::tests::
+            tests::issue_757_mutation_approvals::postgres::
             storage::postgres_documents::tests::
             storage::postgres_admin_sessions::tests::
             authority_events::dispatcher::tests::
@@ -770,6 +771,7 @@ jobs:
             storage::migrations::tests::migration_twenty_five_adds_catalog_actor_metadata_and_guesses_none
             storage::migrations::tests::migration_twenty_six_journals_session_evidence_and_holds_withdrawals
             storage::migrations::tests::migration_thirty_three_preserves_existing_session_evidence_and_checks_new_rows
+            storage::migrations::tests::migration_thirty_five_preserves_approvals_and_reserves_only_keyed_revocations
             storage::migrations::tests::migration_twenty_seven_admits_token_issue_evidence_and_backfills_nothing
             storage::migrations::tests::migration_twenty_eight_admits_connection_create_and_replace_evidence_and_backfills_nothing
             tests::admin_tokens_app_tests::admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_postgres

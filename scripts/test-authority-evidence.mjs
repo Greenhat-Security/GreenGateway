@@ -41,6 +41,31 @@ test("qualification stays within the negotiated issuer-bound PostgreSQL file del
   assert.throws(() => validateInventory(absent), /missing qualified revoke path/);
 });
 
+test("required PostgreSQL preparation is limited to its keyed operation and negotiated delivery", () => {
+  const prepare = (value) => value.groups.find((g) => g.id === "mutation_approval_prepare_postgres");
+  for (const [field, value] of Object.entries({
+    storage_mode: "standalone", method: "POST", issuer: "optional", actor_kind: "service_token",
+    operation_id_version: 4, format: "delivery_v1", durable_sink: "log", filesystem: "unknown",
+    wire_schema: "authority_event_delivery.v1",
+  })) {
+    const changed = inventory();
+    prepare(changed).qualified_delivery_paths[0].criteria[field] = value;
+    assert.throws(() => validateInventory(changed), /qualified prepare criteria/);
+  }
+  for (const [field, value] of Object.entries({
+    operations: ["mutation_approval.prepare", "mutation_approval.review"], modes: ["postgres", "standalone"],
+    required_mode: "admitted", delivery: "post_commit_telemetry", disposition: ["missing_metadata"],
+    qualified_delivery_paths: [],
+  })) {
+    const changed = inventory();
+    prepare(changed)[field] = value;
+    assert.throws(() => validateInventory(changed), /qualified prepare/);
+  }
+  const refused = inventory();
+  refused.groups.find((g) => g.id === "mutation_approval_prepare_standalone").required_mode = "caller_key_required";
+  assert.throws(() => validateInventory(refused), /unreviewed caller-key admission/);
+});
+
 test("evidence anchors only in the gateway or the compiler it links", () => {
   const anchored = (path) => {
     const value = inventory();
@@ -75,7 +100,6 @@ test("new mutation endpoint in a reviewed admin surface requires inventory revie
 
 test("resource creation and replacement retain distinct revision histories", () => {
   for (const [operation, kind, axis, creates] of [
-    ["mutation_approval.prepare", "mutation_approval", "mutation_approval", true],
     ["mutation_approval.review", "mutation_approval", "mutation_approval", false],
     ["mutation_approval.revoke", "mutation_approval", "mutation_approval", false],
     ["connection.create", "connection", "connection", true],
@@ -98,6 +122,22 @@ test("resource creation and replacement retain distinct revision histories", () 
   // Publication can initialize an authority or advance an existing snapshot.
   const firstPublish = fixture(); firstPublish.revision.before = null;
   assert.doesNotThrow(() => validateEvent(firstPublish));
+});
+
+test("qualified preparation represents an authenticated caller creating exactly one pending occurrence", () => {
+  const value = fixture();
+  value.operation = "mutation_approval.prepare";
+  value.operation_id = "30000000-0000-7000-8000-000000000001";
+  value.resource.kind = "mutation_approval";
+  value.revision = { axis: "mutation_approval", before: null, after: "1", security: null };
+  assert.doesNotThrow(() => validateEvent(value));
+  assert.throws(() => validateEvent({ ...value, operation_id: fixture().operation_id }), /UUIDv7/);
+  assert.throws(() => validateEvent({ ...value, actor: { ...value.actor, issuer_ref: null } }), /issuer_ref/);
+  const serviceActor = { ...value.actor, kind: "service_token", auth_mode: "service_token" };
+  assert.throws(() => validateEvent({ ...value, actor: serviceActor }), /issuer-bound/);
+  for (const changes of [{ after: "2" }, { security: "3" }]) {
+    assert.throws(() => validateEvent({ ...value, revision: { ...value.revision, ...changes } }), /occurrence revision/);
+  }
 });
 
 test("stale code and regression anchors fail with an actionable location", () => {

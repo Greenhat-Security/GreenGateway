@@ -31,7 +31,7 @@ use super::model::ConnectionId;
 use super::model::ConnectionWrite;
 use super::mutation_approval::{
     ApprovalDecision, ApprovalError, ApprovalPrincipal, ConsumedMutationApproval, MutationAction,
-    MutationApproval,
+    MutationApproval, PrepareBinding, PrepareReceipt,
 };
 #[cfg(feature = "postgres")]
 use super::pg_store::PostgresConnectionStore;
@@ -111,6 +111,37 @@ impl ManagedConnectionStore {
             }
             #[cfg(feature = "postgres")]
             Self::Postgres { store, .. } => store.create_mutation_approval(&action).await,
+        }
+    }
+
+    pub(crate) async fn keyed_prepare_receipt(
+        &self,
+        binding: &PrepareBinding,
+    ) -> Result<Option<PrepareReceipt>, ApprovalError> {
+        match self {
+            Self::Sqlite(_) => {
+                let _ = binding;
+                Err(ApprovalError::Unavailable)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres { store, .. } => store.keyed_prepare_receipt(binding).await,
+        }
+    }
+
+    pub(crate) async fn create_keyed_mutation_approval(
+        &self,
+        action: &MutationAction,
+        binding: &PrepareBinding,
+    ) -> Result<PrepareReceipt, ApprovalError> {
+        match self {
+            Self::Sqlite(_) => {
+                let _ = (action, binding);
+                Err(ApprovalError::Unavailable)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres { store, .. } => {
+                store.create_keyed_mutation_approval(action, binding).await
+            }
         }
     }
 

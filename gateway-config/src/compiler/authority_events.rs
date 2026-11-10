@@ -117,7 +117,7 @@ impl AuthorityEventSinkSetting {
 /// The record schemas that an authority-event consumer accepts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AuthorityEventFormat {
-    /// Emit every record as `authority_event_delivery.v1`.
+    /// Emit `authority_event_delivery.v1`. A queued qualified-only record holds the cursor.
     #[default]
     DeliveryV1,
     /// Emit qualifying records as `authority_event.v1` and the rest

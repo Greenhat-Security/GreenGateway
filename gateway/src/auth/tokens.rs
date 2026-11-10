@@ -183,7 +183,7 @@ pub(crate) const REVOKE_OPERATION_BINDING: &str = "service_token_revoke_binding"
 /// Unkeyed service-token operations, including historical ones, use v4.
 /// Reserving v7 for the caller prevents a legacy operation from ever being
 /// presented as a matching keyed request.
-pub(crate) fn valid_revoke_operation_id(id: uuid::Uuid) -> bool {
+pub(crate) fn valid_caller_operation_id(id: uuid::Uuid) -> bool {
     id.get_version() == Some(uuid::Version::SortRand) && id.get_variant() == uuid::Variant::RFC4122
 }
 
@@ -653,7 +653,7 @@ impl TokenStore for SqliteTokenStore {
         actor: &ChangeActor,
         operation_id: Option<uuid::Uuid>,
     ) -> Result<Option<TokenRecord>, TokenStoreError> {
-        if operation_id.is_some_and(|id| !valid_revoke_operation_id(id)) {
+        if operation_id.is_some_and(|id| !valid_caller_operation_id(id)) {
             return Err(TokenStoreError::InvalidRevokeOperationId);
         }
         if !is_valid_change_actor(actor) || (operation_id.is_some() && !actor.can_bind_operation())

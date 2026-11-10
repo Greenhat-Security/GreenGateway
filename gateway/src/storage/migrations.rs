@@ -405,6 +405,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("55acc97a426c487820b02c33c23720163ca54cb2c76b39d2f9f97a4dfbd49ef1"),
+        Migration::new(
+            35,
+            "mutation_approval_prepare_evidence",
+            include_str!("migrations/0035_mutation_approval_prepare_evidence.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("f8c7c10d1d4fe92e36debb396daafb300805d597a3e4f429b30e72e2710efc32"),
     ]
 });
 
@@ -437,9 +444,12 @@ impl SchemaCompatibility {
     }
 }
 
-// This build serves exactly schema 34. Mutation approvals use the new
+// This build serves exactly schema 35. Drain schema-34 replicas before
+// migration 35 reserves existing caller IDs. Later writes by an old keyed
+// revoke endpoint would bypass the shared namespace.
+// Schema 34 introduced mutation approvals in the
 // Connection-owned table, and schema 33 has no approved extension for it.
-// Drain the fleet before applying migration 34.
+// Drain schema-33 replicas before applying migration 34.
 // Schema 32 writers would omit the actor on grants, replacements and system
 // withdrawals. Drain the fleet before applying migration 33.
 // The move from 31 to 32 (policy, tools and catalog change evidence in the
@@ -482,7 +492,7 @@ impl SchemaCompatibility {
 // the same explicit column list (`connections::pg_store::
 // record_catalog_change_evidence`). This build is not that successor: it
 // carries migration 25 byte for byte, so its migrator records the approved
-// checksum, but it serves only schema 34, so from a prepared fleet it is a
+// checksum, but it serves only schema 35, so from a prepared fleet it is a
 // coordinated drain/migrate/restart like every other step.
 // That shared column list left out the three columns; this build's catalog
 // writer records all three.
@@ -513,8 +523,8 @@ impl SchemaCompatibility {
 // covering every binary that can serve this database: none that predates it
 // accepts this ledger either.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (34, 34),
-    write: (34, 34),
+    read: (35, 35),
+    write: (35, 35),
     approved_extensions: &[],
 };
 
@@ -549,7 +559,7 @@ const APPROVED_EXTENSION_SOURCES: &[ExtensionSource] = &[];
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 34.
+/// contract the schema. The shipped contract accepts only schema 35.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1469,18 +1479,18 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            34,
+            35,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (34, 34));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (34, 34));
-        assert_eq!(schema_version_range(), (34, 34));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (35, 35));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (35, 35));
+        assert_eq!(schema_version_range(), (35, 35));
         assert!(
             BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty(),
             "this build approves no migration above its manifest"
         );
         // Readiness samples the manifest and one row more.
-        assert_eq!(runtime_ledger_row_limit(), 35);
+        assert_eq!(runtime_ledger_row_limit(), 36);
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
             Ok(SchemaStatus::Current)
@@ -1488,19 +1498,15 @@ mod tests {
         // The next migration is refused whatever it is: nothing prepared this
         // build for one.
         let mut beyond = ledger_for(&MANIFEST, MANIFEST.len(), "");
-        beyond.push((35, hex_checksum("-- migration 35")));
+        beyond.push((36, hex_checksum("-- migration 36")));
         assert_eq!(
             validate_runtime_ledger(&beyond),
             Err(LedgerProblem::UnknownVersion)
         );
 
-        // The previous releases' schemas are not served: schemas 33, 32, 31, 30, 29, 28,
-        // 27, 26 and 25 are left by coordinated upgrades, and so are the
-        // prepared release's schema 24 and every earlier point. The overlap of
-        // the rolling step from 24 to 25 belonged to the prepared release and
-        // the schema-25 successor, both of which serve 25; this build serves
-        // none of 24 through 33.
-        for behind in 1..=16 {
+        // Every populated ledger prefix requires migration, including schema
+        // 24 and 25 from the separately qualified rolling upgrade.
+        for behind in 1..MANIFEST.len() {
             assert_eq!(
                 validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - behind, "")),
                 Ok(SchemaStatus::NeedsUpgrade {
@@ -2673,6 +2679,8 @@ mod tests {
                  DROP TABLE greengateway.policy_replay_jobs; \
                  DROP SEQUENCE greengateway.policy_replay_job_fence; \
                  DROP TABLE greengateway.policy_analysis_suppressions; \
+                 DROP TABLE greengateway.mutation_approval_prepare_evidence; \
+                 DROP TABLE greengateway.authority_caller_operation_ids; \
                  DROP TABLE greengateway.connection_mutation_approvals; \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
@@ -4782,6 +4790,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_thirty_five_preserves_approvals_and_reserves_only_keyed_revocations() {
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let config = migration_config(&dsn_file);
+        let foundation = establish(&config).await;
+        clean_database(foundation.pool()).await;
+        let client = foundation.pool().get().await.expect("checkout");
+        bootstrap_ledger(&client).await.expect("ledger");
+        for migration in MANIFEST.iter().take_while(|m| m.version <= 34) {
+            apply_one(&client, migration, &test_settings())
+                .await
+                .expect("apply schema 34");
+        }
+        client
+            .batch_execute(
+                "WITH connection AS (
+                 INSERT INTO greengateway.connection_records
+                 (id, schema_version, source, spec_json, connection_revision, credential_revision,
+                  tls_revision, discovery_revision, status_revision, created_at, updated_at)
+                 VALUES (gen_random_uuid(), 'v0', 'managed', '{}', 1, 0, 0, 0, 0,
+                         '2026-09-03T00:00:00Z', '2026-09-03T00:00:00Z') RETURNING id
+             )
+             INSERT INTO greengateway.connection_mutation_approvals
+             (id, connection_id, connection_etag, catalog_revision, tool_name, operation, method,
+              definition_sha256, target_sha256, body_sha256, caller_issuer, caller_subject,
+              status, created_at, expires_at)
+             SELECT gen_random_uuid(), id, 'existing-etag', 1, 'tool', 'update', 'POST',
+                    repeat('a', 64), repeat('b', 64), repeat('c', 64),
+                    'https://issuer.example', 'caller', 'pending', 100, 1000 FROM connection;
+
+             INSERT INTO greengateway.service_token_change_evidence
+             (event_id, operation_id, action, actor_user_id, actor_kind, actor_auth_mode,
+              actor_issuer, token_id, prior_version, new_version, security_revision)
+             SELECT gen_random_uuid(), id::uuid, action, 'caller', 'principal', 'bearer_token',
+                    'https://issuer.example', 'fixture', 1, 2, 1 FROM (VALUES
+                 ('00000000-0000-7000-8000-000000000001', 'service_token.revoke'),
+                 ('00000000-0000-4000-8000-000000000002', 'service_token.revoke'),
+                 ('00000000-0000-7000-c000-000000000003', 'service_token.revoke'),
+                 ('00000000-0000-7000-8000-000000000004', 'service_token.rotate')
+             ) AS evidence(id, action)",
+            )
+            .await
+            .expect("populate schema 34");
+        const APPROVAL: &str =
+            "SELECT row_to_json(a)::text FROM greengateway.connection_mutation_approvals a";
+        let before: String = client
+            .query_one(APPROVAL, &[])
+            .await
+            .expect("approval")
+            .get(0);
+        apply_one(&client, &MANIFEST[34], &test_settings())
+            .await
+            .expect("apply schema 35");
+        let after: String = client
+            .query_one(APPROVAL, &[])
+            .await
+            .expect("retained approval")
+            .get(0);
+        assert_eq!(after, before);
+        let reservation = client.query_one(
+            "SELECT operation_id::text, action FROM greengateway.authority_caller_operation_ids",
+            &[],
+        ).await.expect("only the keyed revoke was reserved");
+        assert_eq!(
+            reservation.get::<_, String>(0),
+            "00000000-0000-7000-8000-000000000001"
+        );
+        assert_eq!(reservation.get::<_, String>(1), "service_token.revoke");
+        let receipts: i64 = client
+            .query_one(
+                "SELECT count(*) FROM greengateway.mutation_approval_prepare_evidence",
+                &[],
+            )
+            .await
+            .expect("historical receipts")
+            .get(0);
+        assert_eq!(receipts, 0);
+        let conflict = client
+            .execute(
+                "INSERT INTO greengateway.authority_caller_operation_ids (operation_id, action)
+             VALUES ('00000000-0000-7000-8000-000000000001', 'mutation_approval.prepare')",
+                &[],
+            )
+            .await
+            .expect_err("a prepare cannot claim the historical revocation key");
+        assert_eq!(
+            conflict.code(),
+            Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+        );
+        drop(client);
+        clean_database(foundation.pool()).await;
+    }
+
+    #[tokio::test]
     async fn migration_thirty_three_preserves_existing_session_evidence_and_checks_new_rows() {
         let Some(dsn) = real_dsn() else {
             eprintln!("skipping: no test database locator; CI runs this test");
@@ -5191,7 +5297,7 @@ mod tests {
     /// refuses naming the missing migrations and readiness reports the schema
     /// incompatible, so a replica of it started before the migration stalls
     /// the rollout rather than serving. Its `migrate check` reports exactly
-    /// migrations 25 through 34 unapplied, and its `migrate up` applies them
+    /// migrations 25 through 35 unapplied, and its `migrate up` applies them
     /// and nothing else, recording for migration 25 exactly the checksum the
     /// prepared release approved. From then on it serves, with and without
     /// development auto-migration, and its migrator has nothing left to do.
@@ -5248,7 +5354,7 @@ mod tests {
 
         // The prepared release's schema: not served here.
         let missing = MANIFEST.len() - through_v24;
-        assert_eq!(missing, 10, "migrations 25 through 34");
+        assert_eq!(missing, 11, "migrations 25 through 35");
         let authority = PostgresReadinessAuthority::new(pool.clone());
         assert_eq!(
             read_and_validate_runtime(pool).await,
@@ -5281,7 +5387,7 @@ mod tests {
             })
         );
 
-        // The migration role's `migrate up`: migrations 25 through 34 and
+        // The migration role's `migrate up`: migrations 25 through 35 and
         // nothing else, migration 25 under the approved checksum.
         assert_eq!(
             execute(&strict, false).await,
@@ -5311,7 +5417,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 34 }
+            AuthorityObservation::Writable { schema_version: 35 }
         );
         assert_eq!(
             execute(&strict, true).await,
@@ -5351,7 +5457,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 34 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 35 }
         );
         drop(client);
         clean_database(pool).await;
