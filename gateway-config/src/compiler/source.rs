@@ -131,8 +131,11 @@ pub fn select(
         }
     };
     let mut refused = Vec::new();
-    let mut locator = |name: &'static str, allowed: bool, required: bool| {
-        let reason = match get_var(name) {
+    let mut locator = |name: &'static str,
+                       value: Result<String, VarError>,
+                       allowed: bool,
+                       required: bool| {
+        let reason = match value {
             Err(VarError::NotPresent) if required => SourceRefusal::MissingSelector,
             Err(VarError::NotPresent) => return None,
             _ if !allowed => SourceRefusal::SelectorWithoutMode,
@@ -144,11 +147,13 @@ pub fn select(
     };
     let directory = locator(
         GATEWAY_CONFIG_BUNDLE,
+        get_var(GATEWAY_CONFIG_BUNDLE),
         mode == Mode::Bundle,
         mode == Mode::Bundle,
     );
     let state_directory = locator(
         GATEWAY_STATE_DIR,
+        get_var(GATEWAY_STATE_DIR),
         mode != Mode::Environment,
         mode == Mode::Ledger,
     );
