@@ -60,6 +60,23 @@ upstream's own address among them -- proves none of that happened, and checks
 the audit, resolver, bucket and upstream against the live path afterwards
 (`admin_policy_simulations_tests`).
 
+### Discovering simulation limits
+
+`GET /v1{ADMIN_PREFIX}/capabilities` includes a `policy_simulation` object
+when the caller currently holds both `admin:policy:read` and
+`admin:policy:simulate`. Clients can use its `request_schema` and
+`result_schema` together with the limits below. An older gateway can omit
+the object. The simulation route checks both permissions on each request.
+
+| Field | What the gateway bounds |
+| --- | --- |
+| `max_request_bytes` | Request body bytes, including the candidate and cases. Reflects the smaller of the configured `MAX_BODY_SIZE` and the endpoint ceiling. |
+| `max_result_bytes` | Bytes in the serialized result. A larger result is refused in full. |
+| `max_cases`, `max_edits` | Cases in one batch and position-aware edits in one candidate. |
+| `max_trace_stages` | Stage steps across the whole report. The report indicates when stage details were truncated. |
+| `max_concurrent_per_replica`, `max_concurrent_per_actor` | Evaluations admitted on one replica and concurrently by one issuer/subject on that replica. |
+| `evaluation_deadline_ms` | Evaluation worker budget in milliseconds. The worker checks it between cases. Request receipt and response delivery fall outside this budget. |
+
 ### Control-plane metrics
 
 After both permission checks, the gateway counts each simulation response in

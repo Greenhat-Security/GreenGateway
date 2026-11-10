@@ -7487,9 +7487,9 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::admin_policy_simulations::simulate_authorized#1",
-      "sha256": "37f0cbac656b0f3c035a8fdb5a2d35099abc6fa3783e3987f07c84430b188606",
+      "sha256": "6a22b985c8f9f9ff7c16cbf001b2bf4562eb762006223608e7427515b28f06a9",
       "owner": "GreenGateway maintainers",
-      "purpose": "Count returned reports at the stage trace cap. The counter takes no labels and the evaluator emits no metric."
+      "purpose": "Enforce the advertised request size and count returned reports at the trace cap. The counter takes no labels."
     },
     {
       "file": "gateway/src/admin_policy_replays.rs",
