@@ -572,7 +572,7 @@ impl StandaloneAuthorityEventStartup {
         lifecycle: &GatewayLifecycle,
         audit_log: &audit::AuditLog,
     ) -> Result<(), StandaloneStartupError> {
-        let Some(sink) = configured_sink(&self.settings.sink)
+        let Some(sink) = configured_sink(&self.settings.sink, self.settings.format)
             .await
             .map_err(StandaloneStartupError::SinkFile)?
         else {

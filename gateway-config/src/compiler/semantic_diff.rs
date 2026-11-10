@@ -512,6 +512,7 @@ static AUTHORITY_EVENT_SINK: Field = setting(
     RiskCode::AuditDurabilityReduced,
     Rule::Ranked(&["file", "log", "none"]),
 );
+static AUTHORITY_EVENT_FORMAT: Field = neutral("AUTHORITY_EVENT_FORMAT", Section::Audit);
 static AUTHORITY_EVENT_FILE: Field = neutral("AUTHORITY_EVENT_FILE", Section::Audit);
 static AUTHORITY_PSEUDONYM_KEY_ALIAS: Field =
     credential("AUTHORITY_PSEUDONYM_KEY_ALIAS", Section::Audit);
@@ -838,6 +839,7 @@ pub static SETTINGS: &[&Field] = &[
     &DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS,
     &AUTHORITY_EVIDENCE_DURABILITY,
     &AUTHORITY_EVENT_SINK,
+    &AUTHORITY_EVENT_FORMAT,
     &AUTHORITY_EVENT_FILE,
     &AUTHORITY_PSEUDONYM_KEY_ALIAS,
     &AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS,
@@ -1733,18 +1735,23 @@ fn compare_authority_events(
     let AuthorityEventSettings {
         durability,
         sink,
+        format,
         pseudonym_key_alias,
         previous_pseudonym_key_alias,
         journal_capacity,
         retention_hours,
     } = base;
-    // Read in both deployment modes, unlike the delivery settings below.
     c.word(
         &AUTHORITY_EVIDENCE_DURABILITY,
         evidence_durability_word(*durability),
         evidence_durability_word(candidate.durability),
     );
     c.word(&AUTHORITY_EVENT_SINK, sink.kind(), candidate.sink.kind());
+    c.word(
+        &AUTHORITY_EVENT_FORMAT,
+        format.as_str(),
+        candidate.format.as_str(),
+    );
     c.value(
         &AUTHORITY_EVENT_FILE,
         event_file(sink),

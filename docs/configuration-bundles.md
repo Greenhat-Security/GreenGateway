@@ -610,6 +610,7 @@ Authority evidence and its event delivery.
 | --- | --- | --- | --- |
 | `authority_evidence.durability` | `required` or `best_effort` | `"best_effort"` | [`AUTHORITY_EVIDENCE_DURABILITY`](configuration.md#authority_evidence_durability) |
 | `authority_evidence.event_sink` | `none`, `log` or `file` | `"none"` | [`AUTHORITY_EVENT_SINK`](configuration.md#authority_event_sink) |
+| `authority_evidence.event_format` | `delivery_v1` or `qualified_v1` | `"delivery_v1"` | [`AUTHORITY_EVENT_FORMAT`](configuration.md#authority_event_format) |
 | `authority_evidence.pseudonym_key_alias` | string | unset | [`AUTHORITY_PSEUDONYM_KEY_ALIAS`](configuration.md#authority_pseudonym_key_alias) |
 | `authority_evidence.previous_pseudonym_key_alias` | string | unset | [`AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS`](configuration.md#authority_pseudonym_previous_key_alias) |
 | `authority_evidence.event_journal_capacity` | integer, 1 to 1000000000 | `1000000` | [`AUTHORITY_EVENT_JOURNAL_CAPACITY`](configuration.md#authority_event_journal_capacity) |

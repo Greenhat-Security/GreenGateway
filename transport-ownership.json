@@ -8147,7 +8147,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::authority_events::delivery::file_attributes#1",
-      "sha256": "67e21686f9e810201859562c3a9c3ef978cb300b6049f5e810176f8207924dea",
+      "sha256": "31ac4ee704e0ea74cd4cc1ed1843fee089d5a0e8081bc39f81f19b5ac899bb9a",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
     },
@@ -15896,6 +15896,16 @@
       "purpose": "Opens the operator-configured AUTHORITY_EVENT_FILE for appending with std::fs; a local file only, no network, socket or process capability."
     },
     {
+      "file": "gateway/src/authority_events/sink.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::authority_events::sink::sync_file_directories#1",
+      "sha256": "2b27683ad9b09cada5821a07b546f8fd194f4eafb5d8d8af873c905c8d488c23",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Sync the configured local event file directories on Unix and check the opened file identity before acknowledging an opted-in batch."
+    },
+    {
       "file": "gateway/src/authority_events/standalone.rs",
       "reasons": [
         "unexpanded-attribute"
@@ -15964,6 +15974,16 @@
       "sha256": "c74d0805c061ae897fa27c1a39da30ad9da3070ee5a7dc9e5b2a7e9684e217a3",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway-config/src/compiler/authority_events.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway_config::compiler::authority_events::AuthorityEventFormat#1",
+      "sha256": "ebe623b6f7c8ad97bb4813b9ececd856a2e2f65280cc8aead019dcdcb58b8d10",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Closed wire-format vocabulary parsed from configuration. Changes to the generated enum inputs require review."
     },
     {
       "file": "gateway-config/src/compiler/authority_events.rs",

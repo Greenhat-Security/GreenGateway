@@ -2197,6 +2197,20 @@ pub const FIELDS: &[Field] = &[
         },
         cloudflare: Cloudflare::Forwarded,
     },
+    Field {
+        id: "authority_event_format",
+        environment: "AUTHORITY_EVENT_FORMAT",
+        domain: Domain::Storage,
+        field_type: FieldType::Choice(&["delivery_v1", "qualified_v1"]),
+        default: DefaultValue::Literal("delivery_v1"),
+        blank: Blank::Refused,
+        sensitivity: Sensitivity::Public,
+        state_backends: StateBackends::Both,
+        bundle: BundleMapping::Deployment {
+            path: Some("/spec/authority_evidence/event_format"),
+        },
+        cloudflare: Cloudflare::Forwarded,
+    },
     // A host path, like AUDIT_LOG_FILE, that ADR-0008's bootstrap table does
     // not list.
     Field {

@@ -728,6 +728,107 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
 /// process died before the cursor advance committed. The next leader offers
 /// the same events again, under the same IDs and as identical records.
 #[tokio::test]
+async fn negotiated_file_sink_redelivers_qualified_revocation_and_legacy_records() {
+    use crate::config::{AuthorityEventFormat, AuthorityEventSinkSetting};
+    let (_guard, database) = database_or_skip!();
+    let pool = migrated_pool(&database).await;
+    let producers = Producers::new(&pool);
+    let token = producers.token().await;
+    let key = crate::auth::tokens::test_revoke_operation_id(1);
+    let actor = ChangeActor::for_test_with_issuer("qualified-admin", ACTOR_ISSUER);
+    for _ in 0..2 {
+        producers
+            .tokens
+            .revoke_with_operation(&token, &actor, Some(key))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
+    let keyring = keyring_for(&store).await;
+    let path = std::env::temp_dir().join(format!("gg-qualified-{}.jsonl", Uuid::new_v4()));
+    let setting = AuthorityEventSinkSetting::File(path.to_str().unwrap().to_owned());
+    let sink =
+        crate::authority_events::sink::configured_sink(&setting, AuthorityEventFormat::QualifiedV1)
+            .await
+            .unwrap()
+            .unwrap();
+    let mut first = DispatcherTerm::begin(
+        store.clone(),
+        sink.clone(),
+        keyring.clone(),
+        test_config(10),
+        1,
+        Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    assert!(first.fill().await.unwrap());
+    first.offer().await.unwrap();
+    drop(first);
+    assert_eq!(store.stats().await.unwrap().cursor, Some(0));
+    let mut successor = DispatcherTerm::begin(
+        store.clone(),
+        sink,
+        keyring.clone(),
+        test_config(10),
+        2,
+        Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        successor
+            .deliver_until_caught_up(&CancellationToken::new())
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    assert_eq!(store.stats().await.unwrap().cursor, Some(2));
+
+    let contents = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let lines: Vec<_> = contents.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), 4);
+    assert_eq!(
+        &lines[..2],
+        &lines[2..],
+        "recovery must redeliver byte-identical records"
+    );
+    let issue: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    let revoke: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(issue["schema_version"], "authority_event_delivery.v1");
+    assert_eq!(issue["operation"], "service_token.issue");
+    assert_eq!(revoke["schema_version"], "authority_event.v1");
+    assert_eq!(revoke["operation"], "service_token.revoke");
+    assert_eq!(revoke["operation_id"], key.to_string());
+    assert_eq!(issue["authority_id"], revoke["authority_id"]);
+    assert_ne!(issue["event_id"], revoke["event_id"]);
+    let subject = keyring
+        .derive(
+            ReferenceDomain::ActorSubject,
+            &[ACTOR_ISSUER, actor.subject()],
+        )
+        .unwrap();
+    assert_eq!(revoke["actor"]["subject_ref"], subject.as_str());
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/schemas/authority_event.v1.schema.json"
+    ))
+    .unwrap();
+    jsonschema::validator_for(&schema)
+        .unwrap()
+        .validate(&revoke)
+        .unwrap();
+    for marker in [token.as_str(), actor.subject(), ACTOR_ISSUER] {
+        assert!(
+            !contents.contains(marker),
+            "raw identity in delivered stream"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_crash_between_acceptance_and_the_cursor_commit_redelivers_identical_records() {
     let (_guard, database) = database_or_skip!();
     let pool = migrated_pool(&database).await;
