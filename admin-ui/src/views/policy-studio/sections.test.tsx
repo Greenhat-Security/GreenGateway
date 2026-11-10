@@ -86,6 +86,20 @@ describe('policy studio section editors', () => {
     });
   });
 
+  it('clears unstaged grants when the mapping changes issuer and labels exact padded subjects', () => {
+    const latest = renderSection(IdentityMappingsSection, {
+      schema_version: '1.0.0',
+      identity_mappings: [{ id: 'shared', issuer: 'https://one.example', subjects: [' sam '], grant_roles: ['reader'] }],
+    });
+    expect(screen.getByRole('button', { name: 'Remove "\\u0020sam\\u0020" from Subjects' })).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Granted roles'), { target: { value: 'writer' } });
+    fireEvent.change(screen.getByLabelText('Issuer'), { target: { value: 'https://two.example' } });
+    expect((screen.getByLabelText('Granted roles') as HTMLInputElement).value).toBe('');
+    expect(latest().identity_mappings).toEqual([
+      { id: 'shared', issuer: 'https://two.example', subjects: [' sam '], grant_roles: ['reader'] },
+    ]);
+  });
+
   it('cannot enable mappings in a v0 draft', () => {
     const document = { schema_version: '0.1.0' };
     const latest = renderSection(IdentityMappingsSection, document);

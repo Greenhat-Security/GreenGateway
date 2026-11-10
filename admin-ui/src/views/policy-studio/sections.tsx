@@ -418,7 +418,7 @@ export function IdentityMappingsSection({
               values={stringList(mapping.auth_methods)}
               onChange={values => list.replace(index, optionalList(mapping, 'auth_methods', values))} />
             {MAPPING_LISTS.map(field => (
-              <TokenListField {...fields} key={`${id}:${field.member}`} label={field.label}
+              <TokenListField {...fields} key={JSON.stringify([id, mapping.issuer, field.member])} label={field.label}
                 pointer={fieldPointer(field.member)} values={stringList(mapping[field.member])}
                 placeholder={field.placeholder} emptyText={field.emptyText} preserveWhitespace
                 suggestions={field.member === 'grant_roles' ? roleNames(document) : undefined}
@@ -1981,19 +1981,27 @@ function TokenListField({
         {values.length === 0 ? (
           <span className="badge neutral">{emptyText}</span>
         ) : (
-          values.map((value, index) => (
-            <span className="rule-chip" key={`${index}:${value}`}>
-              {value}
-              <button
-                type="button"
-                aria-label={`Remove ${value} from ${label}`}
-                disabled={disabled}
-                onClick={() => onChange(removeAt(values, index))}
-              >
-                x
-              </button>
-            </span>
-          ))
+          values.map((value, index) => {
+            // HTML collapses runs of whitespace. Show their code points when
+            // an exact matcher would otherwise look like a different value.
+            const name = preserveWhitespace && /^\s|\s$|\s{2}|["\\]/u.test(value)
+              ? JSON.stringify(value).replace(/\s/gu, space =>
+                  `\\u${space.charCodeAt(0).toString(16).padStart(4, '0')}`)
+              : value;
+            return (
+              <span className="rule-chip" key={`${index}:${value}`}>
+                {name}
+                <button
+                  type="button"
+                  aria-label={`Remove ${name} from ${label}`}
+                  disabled={disabled}
+                  onClick={() => onChange(removeAt(values, index))}
+                >
+                  x
+                </button>
+              </span>
+            );
+          })
         )}
       </div>
       <FieldProblems id={`${id}-problems`} diagnostics={problems} />
