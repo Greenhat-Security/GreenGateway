@@ -180,6 +180,11 @@ describe('RuleEditor', () => {
     );
 
     expect(await screen.findByDisplayValue('reports.export')).toBeTruthy();
+    expect(screen.getByText('Historical preview unavailable')).toBeTruthy();
+    vi.useFakeTimers();
+    await advanceTimersByTime(RULE_PREVIEW_DEBOUNCE_MS);
+    expect(previewRequests(fetchMock)).toHaveLength(0);
+    vi.useRealTimers();
     expect(
       (screen.getByLabelText('MCP tool') as HTMLInputElement).checked,
     ).toBe(true);
@@ -655,9 +660,10 @@ describe('RuleEditor', () => {
     });
   });
 
-  it('edits an existing rule with PATCH and the current policy ETag', async () => {
+  it('preserves a conditioned rule on PATCH and never previews its broader HTTP matcher', async () => {
     const existingRule: PolicyRule = {
       id: 'support-read',
+      conditions: { all: [{ source_network: { cidrs: ['192.0.2.0/24'] } }] },
       methods: ['GET'],
       path: '/api/users/{id}',
       principal: {
@@ -684,7 +690,16 @@ describe('RuleEditor', () => {
     renderRuleEditor('/policy/rules/editor?rule_id=support-read');
 
     expect(await screen.findByDisplayValue('/api/users/{id}')).toBeTruthy();
+    expect(screen.getByLabelText('Rule summary').textContent).toContain('additional policy condition');
+    expect(screen.getByLabelText('Policy expression').textContent).toContain('Review the complete rule');
+    expect(screen.getByRole('link', { name: /Review this condition/ }).getAttribute('href'))
+      .toBe('/policy/studio?rule_id=support-read');
+    expect(screen.getByText('Historical preview unavailable')).toBeTruthy();
+    vi.useFakeTimers();
     fireEvent.click(screen.getByRole('radio', { name: /Shadow/ }));
+    await advanceTimersByTime(RULE_PREVIEW_DEBOUNCE_MS);
+    expect(previewRequests(fetchMock)).toHaveLength(0);
+    vi.useRealTimers();
     fireEvent.click(screen.getByRole('button', { name: 'Save rule' }));
 
     expect(await screen.findByText('Rule saved.')).toBeTruthy();

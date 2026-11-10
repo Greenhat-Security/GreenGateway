@@ -90,6 +90,7 @@ type RuleFormState = {
   principalIdDraft: string;
   action: PolicyRuleAction;
   dispatch?: PolicyRuleDispatchMatcher;
+  conditions?: unknown;
 };
 
 type FormErrors = {
@@ -114,7 +115,7 @@ type PreviewState =
   | { kind: 'loading' }
   | { kind: 'ready'; response: PolicyRulePreviewResponse }
   | {
-      kind: 'unavailable' | 'forbidden' | 'unauthorized' | 'error';
+      kind: 'unsupported' | 'unavailable' | 'forbidden' | 'unauthorized' | 'error';
       title: string;
       message: string;
       tone: 'warning' | 'error';
@@ -151,6 +152,9 @@ export function RuleEditor() {
     if (requestedRuleId !== null && requestedRuleId === createdRuleIdRef.current) {
       createdRuleIdRef.current = null;
       return;
+    }
+    if (requestedRuleId === null && persistedRuleIdRef.current !== null) {
+      setForm({ ...emptyRuleForm(), ...formFromPrefillParams(searchParams) });
     }
     persistedRuleIdRef.current = requestedRuleId;
     let isCurrent = true;
@@ -236,6 +240,7 @@ export function RuleEditor() {
       form.roles,
       form.toolName,
       form.dispatch,
+      form.conditions,
     ],
   );
   const candidateKey = useMemo(
@@ -245,6 +250,11 @@ export function RuleEditor() {
   const matcherError = validateMatcher(form);
   const matcherValue =
     form.matcherType === 'tool' ? form.toolName.trim() : form.path.trim();
+  const previewLimitation = candidateRule.conditions != null
+    ? 'Retained observations lack the facts needed to evaluate this rule’s policy condition.'
+    : form.matcherType === 'tool'
+      ? 'Historical preview supports HTTP path rules. Use Policy Studio to simulate an MCP tool call.'
+      : null;
 
   // Invalidate stale preview promises before passive effect cleanup runs.
   useLayoutEffect(() => {
@@ -252,12 +262,16 @@ export function RuleEditor() {
     return () => {
       previewGenerationRef.current += 1;
     };
-  }, [candidateKey, candidateRule, matcherError, matcherValue, previewWindowHours]);
+  }, [candidateKey, candidateRule, matcherError, matcherValue, previewWindowHours, previewLimitation]);
 
   useEffect(() => {
     const previewGeneration = previewGenerationRef.current;
     const isCurrentPreview = () =>
       previewGenerationRef.current === previewGeneration;
+    if (previewLimitation !== null) {
+      setPreviewState({ kind: 'idle', message: previewLimitation });
+      return;
+    }
     if (matcherValue.length === 0) {
       setPreviewState({
         kind: 'idle',
@@ -314,7 +328,7 @@ export function RuleEditor() {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [candidateKey, candidateRule, matcherError, matcherValue, previewWindowHours]);
+  }, [candidateKey, candidateRule, matcherError, matcherValue, previewWindowHours, previewLimitation]);
 
   function updatePath(value: string) {
     setForm((current) => ({ ...current, path: value }));
@@ -762,6 +776,11 @@ export function RuleEditor() {
               </section>
 
               <RuleLogicSummary rule={candidateRule} />
+              {candidateRule.conditions != null && requestedRuleId !== null ? (
+                <Link to={`/policy/studio?rule_id=${encodeURIComponent(requestedRuleId)}`}>
+                  Review this condition in Policy Studio
+                </Link>
+              ) : null}
 
               {saveState.kind === 'error' ? (
                 <EditorAlert
@@ -792,7 +811,10 @@ export function RuleEditor() {
             </form>
 
             <RulePreviewPanel
-              state={previewState}
+              state={previewLimitation === null ? previewState : {
+                kind: 'unsupported', title: 'Historical preview unavailable',
+                message: previewLimitation, tone: 'warning',
+              }}
               windowHours={previewWindowHours}
               onWindowHoursChange={setPreviewWindowHours}
             />
@@ -908,6 +930,7 @@ function RulePreviewPanel({
         <label className="rule-preview-window">
           Window
           <select
+            disabled={state.kind === 'unsupported'}
             value={String(windowHours)}
             onChange={(event) =>
               onWindowHoursChange(Number(event.target.value))
@@ -934,7 +957,8 @@ function RulePreviewPanel({
         <PreviewResult response={state.response} windowHours={windowHours} />
       ) : null}
 
-      {state.kind === 'unavailable' ||
+      {state.kind === 'unsupported' ||
+      state.kind === 'unavailable' ||
       state.kind === 'forbidden' ||
       state.kind === 'unauthorized' ||
       state.kind === 'error' ? (
@@ -1214,10 +1238,14 @@ function plainEnglishRuleSummary(rule: PolicyRule): string {
   const principal = principalSummary(rule.principal);
   const dispatch = dispatchSummary(rule.dispatch);
 
-  return `${actionSummaryVerb(rule.action)} ${target}${principal}${dispatch}.`;
+  const condition = rule.conditions != null ? ' when its additional policy condition matches' : '';
+  return `${actionSummaryVerb(rule.action)} ${target}${principal}${dispatch}${condition}.`;
 }
 
 function generatedExpression(rule: PolicyRule): string {
+  if (rule.conditions != null) {
+    return 'The additional policy condition is defined in the policy document. Review the complete rule in Policy Studio.';
+  }
   const lines: string[] = [];
 
   if (rule.tool_name && rule.tool_name.trim().length > 0) {
@@ -1368,6 +1396,7 @@ function formFromRule(rule: PolicyRule): RuleFormState {
     principalIdDraft: '',
     action: rule.action,
     dispatch: rule.dispatch,
+    conditions: rule.conditions,
   };
 }
 
@@ -1379,6 +1408,7 @@ function ruleFromForm(form: RuleFormState): PolicyRule {
       principal: principalFromForm(form),
       action: form.action,
       dispatch: undefined,
+      conditions: form.conditions,
     };
   }
 
@@ -1388,6 +1418,7 @@ function ruleFromForm(form: RuleFormState): PolicyRule {
     principal: principalFromForm(form),
     action: form.action,
     dispatch: form.dispatch,
+    conditions: form.conditions,
   };
 }
 

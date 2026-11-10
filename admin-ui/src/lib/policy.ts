@@ -41,6 +41,7 @@ export type PolicyRule = {
   path?: string;
   tool_name?: string;
   dispatch?: PolicyRuleDispatchMatcher;
+  conditions?: unknown;
   principal?: PrincipalMatcher;
   action: PolicyRuleAction;
 };
