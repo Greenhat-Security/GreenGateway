@@ -135,18 +135,18 @@ pub(crate) async fn start_serving<S: StartupStages>(
             let state_path = mount
                 .state_directory(!bundle.deployment.standalone_stores.is_empty())
                 .map_err(StartupFailure::Configuration)?;
-            let _standalone_plan = if let Some(path) = state_path {
-                let directory = gateway_config::state_dir::StateDirectory::acquire_for_bundle(
-                    path,
-                    &mount.directory,
-                )
+            let directory = state_path
+                .map(|path| {
+                    gateway_config::state_dir::StateDirectory::acquire_for_bundle(
+                        path,
+                        &mount.directory,
+                    )
+                })
+                .transpose()
                 .map_err(StartupFailure::StateDirectory)?;
-                bundle
-                    .bind_standalone_stores(directory)
-                    .map_err(StartupFailure::Bundle)?
-            } else {
-                None
-            };
+            let _mounted_plan = bundle
+                .bind_mounted(directory, get_var)
+                .map_err(StartupFailure::Bundle)?;
             // Activation must install the validated resources as read-only
             // authorities before the gateway can serve this configuration.
             return Err(StartupFailure::Configuration(
