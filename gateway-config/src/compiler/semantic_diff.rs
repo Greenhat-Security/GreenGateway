@@ -42,12 +42,92 @@ use super::{
     McpUpstreamServerConfig, StateBackend, UpstreamRouteConfig,
 };
 use crate::{
+    catalog::{self, DefaultValue, FieldType},
     inbound_tls::ClientCertRequirement,
     semantic_diff::{
         ChangeClass, ChangeKind, Comparison, Display, Field, Impact, Redaction, RiskCode, Rule,
         Section, SemanticDiff,
     },
 };
+
+/// Compare the deployment settings checked by the profile using the same
+/// defaults and risk detectors as the environment compiler. Leave anything
+/// the catalog cannot interpret in the residual document for unknown-impact
+/// reporting. Only catalog words are eligible for display.
+pub(crate) fn compare_profile_settings(
+    comparison: &mut Comparison,
+    base: &mut serde_json::Value,
+    candidate: &mut serde_json::Value,
+) {
+    for field in [
+        &AUTH_ENABLED,
+        &AUTH_MODE,
+        &CSRF_ENABLED,
+        &EGRESS_DENY_PRIVATE_IPS,
+        &AUDIT_DURABILITY,
+    ] {
+        let Some(setting) = catalog::field(field.id) else {
+            continue;
+        };
+        let (Some(path), DefaultValue::Literal(default)) =
+            (setting.document_path(), setting.default)
+        else {
+            continue;
+        };
+        match setting.field_type {
+            FieldType::Boolean => {
+                let read = |document: &serde_json::Value| match document.pointer(path) {
+                    Some(value) => value.as_bool(),
+                    None => default.parse::<bool>().ok(),
+                };
+                let (Some(before), Some(after)) = (read(base), read(candidate)) else {
+                    continue;
+                };
+                comparison.flag(field, before, after);
+            }
+            FieldType::Choice(words) => {
+                let read = |document: &serde_json::Value| {
+                    let value = match document.pointer(path) {
+                        Some(value) => value.as_str()?,
+                        None => default,
+                    };
+                    words.iter().copied().find(|word| *word == value)
+                };
+                let (Some(before), Some(after)) = (read(base), read(candidate)) else {
+                    continue;
+                };
+                comparison.word(field, before, after);
+            }
+            _ => continue,
+        }
+        remove_compared_setting(base, path);
+        remove_compared_setting(candidate, path);
+    }
+}
+
+fn remove_compared_setting(document: &mut serde_json::Value, path: &str) {
+    let Some((parent, member)) = path.rsplit_once('/') else {
+        return;
+    };
+    let Some(section) = document
+        .pointer_mut(parent)
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    section.remove(member);
+    if section.is_empty() {
+        let Some((ancestor, name)) = parent.rsplit_once('/') else {
+            return;
+        };
+        if let Some(object) = document
+            .pointer_mut(ancestor)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            object.remove(name);
+        }
+    }
+}
 
 /// Compares two compiled environment configurations.
 pub fn plans(base: &ConfigPlan, candidate: &ConfigPlan) -> SemanticDiff {
