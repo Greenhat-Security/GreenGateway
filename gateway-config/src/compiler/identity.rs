@@ -892,8 +892,7 @@ fn validate(
         }
         // Logout is usable after expiry, but always checks its own exact
         // origin and configured CSRF pair before revoking/clearing anything.
-        for route in ["logout", "config"] {
-            let path = format!("{api_prefix}/auth/{route}");
+        for path in super::admin_session_exempt_paths(&admin_prefix) {
             auth_exempt_paths.push(path.clone());
             rbac_exempt_paths.push(path);
         }

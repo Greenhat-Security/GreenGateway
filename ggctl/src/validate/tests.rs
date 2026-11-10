@@ -415,20 +415,32 @@ fn validate_and_doctor_enforce_each_deployment_profile_control() {
         ),
         ("csrf_disabled", "/spec/csrf/enabled"),
         ("audit_best_effort", "/spec/audit/durability"),
+        (
+            "auth_exemptions_broadened",
+            "/spec/authentication/exempt_paths",
+        ),
+        (
+            "rbac_exemptions_broadened",
+            "/spec/authorization/exempt_paths",
+        ),
+        ("csrf_exemptions_broadened", "/spec/csrf/exempt_paths"),
     ];
     let all: Vec<_> = controls.iter().map(|(code, _)| *code).collect();
     for (profile, acknowledged) in [
         ("production", &[][..]),
         ("migration", &[][..]),
         ("migration", &all[..1]),
+        ("migration", &["auth_exemptions_broadened"][..]),
         ("migration", all.as_slice()),
         ("development", &[][..]),
     ] {
         let mut spec = json!({
             "profile": profile,
-            "authentication": {"enabled": false, "mode": "observe"},
+            "authentication": {"enabled": false, "mode": "observe", "exempt_paths": [format!("/{CANARY}")]},
+            "authorization": {"exempt_paths": [format!("/health/{CANARY}")]},
             "egress": {"deny_private_addresses": false},
-            "csrf": {"enabled": false},
+            "csrf": {"enabled": false, "exempt_paths": [format!("/readyz/{CANARY}")]},
+            "upstream": {"url": {"secret": CANARY}},
             "audit": {"durability": "best_effort"}
         });
         if !acknowledged.is_empty() {
@@ -444,6 +456,7 @@ fn validate_and_doctor_enforce_each_deployment_profile_control() {
         fixture.pin_policy_version("0.1.0");
         for command in ["validate", "doctor"] {
             let (exit, captured) = run(&[command, fixture.path(), "--format", "json"]);
+            assert_no_canary(&captured);
             let expected_exit = if profile == "development" || acknowledged.len() == all.len() {
                 Exit::Success
             } else {
@@ -456,6 +469,12 @@ fn validate_and_doctor_enforce_each_deployment_profile_control() {
                 captured.stdout()
             );
             let result = report(&captured);
+            if exit == Exit::Success {
+                assert_eq!(
+                    result["result"]["bundle"]["deployment"]["offlineCompiler"],
+                    "not_checked"
+                );
+            }
             let diagnostics = result["diagnostics"].as_array().expect("diagnostics");
             for (name, path) in controls {
                 let code = format!("profile.{name}");

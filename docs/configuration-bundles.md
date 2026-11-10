@@ -633,7 +633,7 @@ The compatibility behaviors a migration document acknowledges.
 
 | Member | Value | Default | Environment mode |
 | --- | --- | --- | --- |
-| `compatibility.acknowledged` | array of distinct `policy_default_allow`, `policy_shadow_mode`, `wildcard_role`, `auth_disabled`, `auth_observe_only`, `private_egress_allowed`, `csrf_disabled` and `audit_best_effort` | unset | none: environment mode has no profile |
+| `compatibility.acknowledged` | array of distinct `policy_default_allow`, `policy_shadow_mode`, `wildcard_role`, `auth_disabled`, `auth_observe_only`, `private_egress_allowed`, `csrf_disabled`, `audit_best_effort`, `auth_exemptions_broadened`, `rbac_exemptions_broadened` and `csrf_exemptions_broadened` | unset | none: environment mode has no profile |
 
 #### Authentication provider
 
@@ -887,6 +887,21 @@ its own diagnostic and migration acknowledgment. For example,
 acknowledging `auth_observe_only` leaves `auth_disabled` an error. Bundle
 diffs and revision plans use the same risk codes as the environment compiler
 for these five settings.
+
+Production accepts authentication, authorization and CSRF exemption lists
+that cover the same paths as their defaults or fewer. For authentication and
+authorization, probe entries match exactly. The configured admin UI prefix
+and any enabled admin login or session exemptions cover their own path and
+descendants at a segment boundary. With the admin prefix set to `/ops`,
+`/ops/assets` is already covered. Adding `/ops2` or `/health/orders` broadens
+the list. CSRF compares every entry exactly against its default probe paths.
+
+Migration can acknowledge each list independently with
+`auth_exemptions_broadened`, `rbac_exemptions_broadened` or
+`csrf_exemptions_broadened`. Findings identify the list and its source location.
+The profile can check it offline even when an unrelated setting requires host
+credentials. Bundle diffs and revision plans report `risk.exemptions_broadened`
+for newly covered paths and withhold path values.
 
 The gateway sends a session credential to a cookie provider's
 `introspection_url`. The interactive OIDC provider also uses its issuer and
@@ -1342,3 +1357,6 @@ can appear in one. A published code never changes meaning.
 | `profile.csrf_disabled` | The profile requires CSRF protection. |
 | `profile.audit_best_effort` | The profile requires durable audit delivery. |
 | `profile.provider_transport` | Cookie introspection and the selected interactive login provider require HTTPS. Development also accepts HTTP on loopback. The diagnostic identifies the provider field without exposing its URL. |
+| `profile.auth_exemptions_broadened` | The authentication exemption list covers paths outside the deployment defaults. |
+| `profile.rbac_exemptions_broadened` | The authorization exemption list covers paths outside the deployment defaults. |
+| `profile.csrf_exemptions_broadened` | The CSRF exemption list covers paths outside the deployment defaults. |

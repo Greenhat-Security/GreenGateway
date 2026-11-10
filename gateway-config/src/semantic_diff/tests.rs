@@ -712,8 +712,9 @@ fn bundle_diff(base: &BundleView<'_>, candidate: &BundleView<'_>) -> SemanticDif
 fn deployment_controls_use_the_compiler_risks_and_defaults_in_both_directions() {
     let base = bundle(ResourceView::Undeclared);
     let settings = json!({
-        "profile": "production", "authentication":{"enabled": false, "mode":"observe"},
-        "csrf":{"enabled":false}, "egress":{"deny_private_addresses":false},
+        "profile": "production", "authentication":{"enabled": false, "mode":"observe", "exempt_paths":["/"]},
+        "authorization":{"exempt_paths":["/"]},
+        "csrf":{"enabled":false,"exempt_paths":["/health","/livez","/startupz","/readyz","/version","/metrics","/tenant"]}, "egress":{"deny_private_addresses":false},
         "audit":{"durability":"best_effort"}
     });
     let document = serde_json::to_vec(
@@ -731,11 +732,12 @@ fn deployment_controls_use_the_compiler_risks_and_defaults_in_both_directions() 
             "risk.auth_observe_only",
             "risk.cookie_or_csrf_weakened",
             "risk.evidence_not_required",
+            "risk.exemptions_broadened",
             "risk.private_egress_allowed"
         ]
     );
     let reverse = bundle_diff(&candidate, &base);
-    assert_eq!(reverse.changes().len(), 5);
+    assert_eq!(reverse.changes().len(), 8);
     assert!(reverse
         .changes()
         .iter()
