@@ -886,8 +886,17 @@ The catalog defaults satisfy each requirement. Each explicit relaxation has
 its own diagnostic and migration acknowledgment. For example,
 acknowledging `auth_observe_only` leaves `auth_disabled` an error. Bundle
 diffs and revision plans use the same risk codes as the environment compiler
-for these five settings. Host credential checks and gateway bundle startup
-are still tracked in #242.
+for these five settings.
+
+The gateway sends a session credential to a cookie provider's
+`introspection_url`. The interactive OIDC provider also uses its issuer and
+optional explicit `jwks_url` to establish trust before the code exchange.
+These fields require HTTPS in production and migration. Development can use
+HTTP on a loopback host. Endpoints with embedded credentials or a fragment
+are refused. An ordinary JWT issuer used only as a claim may be opaque.
+The gateway checks the endpoints it learns from secure OIDC discovery before
+publishing the login configuration. Host secret resolution and bundle
+activation are tracked in #242.
 
 ## Generated bundles
 
@@ -1332,3 +1341,4 @@ can appear in one. A published code never changes meaning.
 | `profile.private_egress_allowed` | The profile requires private address blocking for egress. |
 | `profile.csrf_disabled` | The profile requires CSRF protection. |
 | `profile.audit_best_effort` | The profile requires durable audit delivery. |
+| `profile.provider_transport` | Cookie introspection and the selected interactive login provider require HTTPS. Development also accepts HTTP on loopback. The diagnostic identifies the provider field without exposing its URL. |

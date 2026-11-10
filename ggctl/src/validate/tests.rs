@@ -705,6 +705,96 @@ fn validate_and_doctor_refuse_wildcard_credentialed_cors_in_a_bundle() {
 }
 
 #[test]
+fn credential_bearing_provider_endpoints_are_validated_offline_with_safe_locations() {
+    let fixture = Fixture::valid();
+    let write = |profile, spec: Value| {
+        let mut spec = spec;
+        spec["profile"] = json!(profile);
+        fixture.write(
+            "deployment.yaml",
+            &json!({
+                "apiVersion":"greengateway.dev/v1alpha1","kind":"GatewayDeployment","spec":spec
+            })
+            .to_string(),
+        );
+        fixture.pin_policy_version("0.1.0");
+    };
+    for (profile, endpoint, valid) in [
+        (
+            "production",
+            "https://service.example.test/introspect",
+            true,
+        ),
+        ("production", "http://127.0.0.1/introspect", false),
+        ("migration", "http://service.example.test/introspect", false),
+        ("development", "http://[::1]/introspect", true),
+        (
+            "development",
+            "http://localhost.example.test/introspect",
+            false,
+        ),
+        (
+            "production",
+            "https://name@service.example.test/introspect",
+            false,
+        ),
+    ] {
+        write(
+            profile,
+            json!({"authentication":{"providers":[{
+                "name":CANARY,"type":"cookie_session","introspection_url":endpoint,"user_id_claim":"sub"
+            }]}}),
+        );
+        for command in ["validate", "doctor"] {
+            let (exit, captured) = run(&[command, fixture.path(), "--format", "json"]);
+            assert_eq!(
+                exit,
+                if valid { Exit::Success } else { Exit::Invalid },
+                "{}",
+                captured.stdout()
+            );
+            assert_no_canary(&captured);
+            assert!(!captured.stdout().contains(endpoint));
+            if !valid {
+                let result = report(&captured);
+                assert!(result["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|d| d["code"] == "profile.provider_transport"
+                        && d["location"]["pointer"]
+                            == "/spec/authentication/providers/0/introspection_url"));
+            }
+        }
+    }
+    let mut spec = json!({"authentication":{"providers":[
+        {"name":CANARY,"type":"jwt","issuer":"http://issuer.example.test","jwks_url":"http://keys.example.test/keys"}
+    ]}});
+    write("production", spec.clone());
+    assert_eq!(run(&["validate", fixture.path()]).0, Exit::Success);
+    spec["admin_login"] = json!({"provider":CANARY,"client_id":CANARY,"client_secret":{"secret":CANARY},"redirect_uri":"https://admin.example.test/callback"});
+    write("production", spec);
+    let (exit, captured) = run(&["validate", fixture.path(), "--format", "json"]);
+    assert_eq!(exit, Exit::Invalid);
+    assert_no_canary(&captured);
+    let result = report(&captured);
+    let pointers: BTreeSet<_> = result["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["code"] == "profile.provider_transport")
+        .map(|d| d["location"]["pointer"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        pointers,
+        BTreeSet::from([
+            "/spec/authentication/providers/0/issuer",
+            "/spec/authentication/providers/0/jwks_url"
+        ])
+    );
+}
+
+#[test]
 fn validate_and_doctor_check_bundle_providers_and_admin_login_offline() {
     let fixture = Fixture::valid();
     let issuer = format!("https://{CANARY}.example");

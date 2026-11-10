@@ -994,6 +994,36 @@ fn admin_oidc_login_provider_rejects_discovery_without_issuer() {
 }
 
 #[test]
+fn admin_oidc_login_provider_refuses_cleartext_remote_token_exchange_at_startup() {
+    let (issuer, server) = spawn_oidc_discovery_server_with(
+        |issuer| {
+            json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/keys"),
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": "http://remote.example.test/token"
+            })
+        },
+        1,
+    );
+    let mut config = admin_oidc_login_config(&issuer);
+    config.egress_deny_private_ips = false;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let error = app(
+        config,
+        recorder.handle(),
+        test_audit_log(),
+        test_audit_event_sender(),
+    )
+    .expect_err("a remote plaintext token exchange must be refused before login");
+    assert!(error
+        .to_string()
+        .contains("OIDC login requires secure provider endpoints"));
+    assert!(!error.to_string().contains("remote.example.test"));
+    server.finish();
+}
+
+#[test]
 fn admin_oidc_login_provider_requires_discovered_authorize_and_token_endpoints() {
     let (issuer, server) = spawn_oidc_discovery_server_with(
         |issuer| {

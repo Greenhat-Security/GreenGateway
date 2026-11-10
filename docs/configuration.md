@@ -1769,6 +1769,12 @@ When `AUTH_PROVIDERS` is set, it defines the ordered auth provider chain and tak
 
 OIDC discovery: when a provider has `issuer` but no `jwks_url`, startup fetches `{issuer}/.well-known/openid-configuration` through the egress client, adds the returned `jwks_uri` host to the effective egress allowlist, and uses that `jwks_uri` for later JWKS refreshes. Discovery failure or a discovery document without `jwks_uri` prevents the provider from being constructed. When the provider is selected by `ADMIN_LOGIN_PROVIDER`, the same discovery response must also contain `authorization_endpoint` and `token_endpoint`; the token endpoint host is added to the effective egress allowlist for the authorization-code exchange.
 
+For interactive login, an HTTPS issuer requires HTTPS for the effective key,
+authorization and token endpoints. A loopback HTTP issuer may also use
+loopback HTTP endpoints. Startup refuses an insecure endpoint before it
+installs the login provider or sends a client secret. Production and migration
+bundles also require an HTTPS cookie-session introspection endpoint.
+
 JWT algorithms: JWKS keys with `kty` `RSA` validate RS256 tokens, `kty` `EC` with `crv` `P-256` validates ES256 tokens, and `kty` `OKP` with `crv` `Ed25519` validates EdDSA tokens. Unsupported or incomplete keys are skipped during JWKS refresh.
 
 Egress trust: each JWT provider `jwks_url`, each JWT provider `issuer` when it is a URL with a host, each discovered OIDC `jwks_uri` host, the discovered admin-login `token_endpoint` host, and each cookie-session provider `introspection_url` host are automatically trusted for gateway-originated egress. Non-global-IP, scheme, port, and DNS-pinning checks still apply to every discovery, JWKS, token-exchange, and introspection request.
