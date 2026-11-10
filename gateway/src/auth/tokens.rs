@@ -178,6 +178,20 @@ pub struct SqliteTokenStore {
     connection: Arc<Mutex<Connection>>,
 }
 
+pub(crate) const REVOKE_OPERATION_BINDING: &str = "service_token_revoke_binding";
+
+/// Unkeyed service-token operations, including historical ones, use v4.
+/// Reserving v7 for the caller prevents a legacy operation from ever being
+/// presented as a matching keyed request.
+pub(crate) fn valid_revoke_operation_id(id: uuid::Uuid) -> bool {
+    id.get_version() == Some(uuid::Version::SortRand) && id.get_variant() == uuid::Variant::RFC4122
+}
+
+#[cfg(test)]
+pub(crate) fn test_revoke_operation_id(seed: u8) -> uuid::Uuid {
+    uuid::Builder::from_unix_timestamp_millis(1_700_000_000_000, &[seed; 10]).into_uuid()
+}
+
 pub trait TokenStore: Send + Sync {
     /// Issue a token on behalf of `actor`, who is recorded as the issue's
     /// evidence in the same transaction as the token row.
@@ -194,8 +208,21 @@ pub trait TokenStore: Send + Sync {
     /// Revoke on behalf of `actor`, who is recorded as the change's
     /// evidence in the same transaction. A repeat revoke changes nothing
     /// and records nothing.
-    fn revoke(&self, id: &str, actor: &ChangeActor)
-        -> Result<Option<TokenRecord>, TokenStoreError>;
+    #[cfg(test)]
+    fn revoke(
+        &self,
+        id: &str,
+        actor: &ChangeActor,
+    ) -> Result<Option<TokenRecord>, TokenStoreError> {
+        self.revoke_with_operation(id, actor, None)
+    }
+
+    fn revoke_with_operation(
+        &self,
+        id: &str,
+        actor: &ChangeActor,
+        operation_id: Option<uuid::Uuid>,
+    ) -> Result<Option<TokenRecord>, TokenStoreError>;
 
     /// Rotate on behalf of `actor`, who is recorded as the change's
     /// evidence in the same transaction. Rotating a revoked token is a
@@ -350,6 +377,9 @@ pub enum TokenStoreError {
     /// [`MAX_TOKEN_CHANGE_ACTOR_BYTES`], or an issuer evidence cannot record
     /// ([`ChangeActor::is_recordable`]); refused before anything changed.
     InvalidChangeActor,
+    InvalidRevokeOperationId,
+    RevokeOperationConflict,
+    InconsistentRevokeEvidence,
     /// The change's evidence could not be written, so the change was
     /// rolled back with it.
     ChangeEvidence {
@@ -539,6 +569,7 @@ impl TokenStore for SqliteTokenStore {
             &transaction,
             &self.path,
             &ChangeEvidence {
+                operation_id: None,
                 action: TOKEN_CHANGE_ACTION_ISSUE,
                 token_id: &id,
                 actor,
@@ -616,12 +647,17 @@ impl TokenStore for SqliteTokenStore {
         load_record_by_id(&connection, &self.path, id)
     }
 
-    fn revoke(
+    fn revoke_with_operation(
         &self,
         id: &str,
         actor: &ChangeActor,
+        operation_id: Option<uuid::Uuid>,
     ) -> Result<Option<TokenRecord>, TokenStoreError> {
-        if !is_valid_change_actor(actor) {
+        if operation_id.is_some_and(|id| !valid_revoke_operation_id(id)) {
+            return Err(TokenStoreError::InvalidRevokeOperationId);
+        }
+        if !is_valid_change_actor(actor) || (operation_id.is_some() && !actor.can_bind_operation())
+        {
             return Err(TokenStoreError::InvalidChangeActor);
         }
         let revoked_at = utc_timestamp_rfc3339()?;
@@ -634,7 +670,42 @@ impl TokenStore for SqliteTokenStore {
         let transaction = connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|source| self.sqlite_error(source))?;
-        let Some(record) = load_record_by_id(&transaction, &self.path, id)? else {
+        let record = load_record_by_id(&transaction, &self.path, id)?;
+        if let Some(operation_id) = operation_id {
+            // All token writers take the same SQLite write lock. Check every
+            // action sharing the key, including historical rows with no actor.
+            let matches: Option<bool> = transaction
+                .query_row(
+                    "SELECT min(CASE WHEN action = 'service_token.revoke' AND token_id = ?2
+                          AND actor_user_id = ?3 AND actor_issuer IS ?4
+                          AND actor_kind = ?5 AND actor_auth_mode = ?6 THEN 1 ELSE 0 END)
+                 FROM service_token_change_evidence WHERE operation_id = ?1",
+                    params![
+                        operation_id.to_string(),
+                        id,
+                        actor.subject(),
+                        actor.issuer(),
+                        actor.kind().as_str(),
+                        actor.auth_mode()
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            match matches {
+                Some(false) => return Err(TokenStoreError::RevokeOperationConflict),
+                Some(true) => {
+                    return record
+                        .filter(|row| row.revoked_at.is_some())
+                        .map(Some)
+                        .ok_or(TokenStoreError::InconsistentRevokeEvidence)
+                }
+                None if record.as_ref().is_some_and(|row| row.revoked_at.is_some()) => {
+                    return Err(TokenStoreError::RevokeOperationConflict)
+                }
+                None => {}
+            }
+        }
+        let Some(record) = record else {
             return Ok(None);
         };
         // Idempotent and monotonic: the first revoked_at stands, and a
@@ -658,6 +729,7 @@ impl TokenStore for SqliteTokenStore {
             &transaction,
             &self.path,
             &ChangeEvidence {
+                operation_id,
                 action: TOKEN_CHANGE_ACTION_REVOKE,
                 token_id: id,
                 actor,
@@ -716,6 +788,7 @@ impl TokenStore for SqliteTokenStore {
             &transaction,
             &self.path,
             &ChangeEvidence {
+                operation_id: None,
                 action: TOKEN_CHANGE_ACTION_ROTATE,
                 token_id: id,
                 actor,
@@ -857,6 +930,15 @@ impl fmt::Display for TokenStoreError {
             Self::RevokedToken { id } => {
                 write!(formatter, "cannot rotate revoked service token {id}")
             }
+            Self::InvalidRevokeOperationId => {
+                formatter.write_str("invalid revocation operation identifier")
+            }
+            Self::RevokeOperationConflict => {
+                formatter.write_str("revocation operation conflicts with committed evidence")
+            }
+            Self::InconsistentRevokeEvidence => {
+                formatter.write_str("revocation evidence disagrees with token state")
+            }
             Self::InvalidChangeActor => {
                 write!(
                     formatter,
@@ -886,7 +968,10 @@ impl Error for TokenStoreError {
             Self::Busy { .. }
             | Self::InvalidCursor { .. }
             | Self::RevokedToken { .. }
-            | Self::InvalidChangeActor => None,
+            | Self::InvalidChangeActor
+            | Self::InvalidRevokeOperationId
+            | Self::RevokeOperationConflict
+            | Self::InconsistentRevokeEvidence => None,
             Self::Random(source) => Some(source),
         }
     }
@@ -949,6 +1034,7 @@ impl RawTokenRecord {
 /// One committed change's evidence: identifiers and the actor, never the
 /// plaintext, hash, prefix or scopes of the token it describes.
 struct ChangeEvidence<'a> {
+    operation_id: Option<uuid::Uuid>,
     action: &'static str,
     token_id: &'a str,
     actor: &'a ChangeActor,
@@ -956,7 +1042,7 @@ struct ChangeEvidence<'a> {
 }
 
 /// Append one evidence row inside the caller's transaction. Its event and
-/// operation IDs are minted here, once per store call. Any failure is
+/// operation IDs are minted here unless a keyed revocation supplies its operation ID. Any failure is
 /// returned for the caller to roll back, so the change it describes never
 /// commits without it, and it is reported as an evidence failure rather
 /// than as whatever constraint class SQLite gave it: a rotate whose
@@ -969,7 +1055,10 @@ fn record_change_evidence(
     evidence: &ChangeEvidence<'_>,
 ) -> Result<(), TokenStoreError> {
     let event_id = uuid::Uuid::new_v4().to_string();
-    let operation_id = uuid::Uuid::new_v4().to_string();
+    let operation_id = evidence
+        .operation_id
+        .unwrap_or_else(uuid::Uuid::new_v4)
+        .to_string();
     connection
         .execute(
             r#"

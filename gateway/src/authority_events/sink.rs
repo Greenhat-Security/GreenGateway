@@ -36,7 +36,7 @@ use std::{
 use async_trait::async_trait;
 
 use super::delivery::DeliveryRecord;
-use crate::config::AuthorityEventSinkSetting;
+use crate::config::{AuthorityEventFormat, AuthorityEventSinkSetting};
 
 /// The tracing target the log sink writes under, so a log pipeline can route
 /// authority events without parsing messages.
@@ -82,6 +82,11 @@ pub(crate) trait AuthorityEventSink: Send + Sync {
     /// A fixed, label-safe name for logs.
     fn kind(&self) -> &'static str;
 
+    /// Which wire formats the destination explicitly accepts.
+    fn format(&self) -> AuthorityEventFormat {
+        AuthorityEventFormat::DeliveryV1
+    }
+
     /// Accept `batch`, in order. `Ok` must mean the sink holds every record
     /// as durably as it can; the dispatcher then advances its cursor past
     /// them and never offers them again unless that advance is lost.
@@ -93,12 +98,13 @@ pub(crate) trait AuthorityEventSink: Send + Sync {
 /// `None` for no sink. Only the error's kind is reported, never the path.
 pub(crate) async fn configured_sink(
     setting: &AuthorityEventSinkSetting,
+    format: AuthorityEventFormat,
 ) -> Result<Option<Arc<dyn AuthorityEventSink>>, io::ErrorKind> {
     match setting {
         AuthorityEventSinkSetting::None => Ok(None),
-        AuthorityEventSinkSetting::Log => Ok(Some(Arc::new(LogSink))),
+        AuthorityEventSinkSetting::Log => Ok(Some(Arc::new(LogSink { format }))),
         AuthorityEventSinkSetting::File(path) => {
-            let sink = FileSink::new(path.into());
+            let sink = FileSink::new(path.into(), format);
             sink.probe().await?;
             Ok(Some(Arc::new(sink)))
         }
@@ -106,7 +112,9 @@ pub(crate) async fn configured_sink(
 }
 
 /// One structured log line per record.
-pub(crate) struct LogSink;
+pub(crate) struct LogSink {
+    format: AuthorityEventFormat,
+}
 
 #[async_trait]
 impl AuthorityEventSink for LogSink {
@@ -114,10 +122,14 @@ impl AuthorityEventSink for LogSink {
         SINK_KIND_LOG
     }
 
+    fn format(&self) -> AuthorityEventFormat {
+        self.format
+    }
+
     async fn deliver(&self, batch: &[DeliveryRecord]) -> Result<(), SinkError> {
         // Serialize the whole batch first, so a record that cannot be
         // written refuses the batch before any of it is logged.
-        let lines = serialize_batch(batch)?;
+        let lines = serialize_batch(batch, self.format())?;
         for line in &lines {
             tracing::info!(target: LOG_TARGET, authority_event = %line, "authority event");
         }
@@ -128,14 +140,16 @@ impl AuthorityEventSink for LogSink {
 /// JSON lines appended to one file, synced before acceptance.
 pub(crate) struct FileSink {
     path: PathBuf,
+    format: AuthorityEventFormat,
     /// One batch at a time, so two lines never interleave.
     write: tokio::sync::Mutex<()>,
 }
 
 impl FileSink {
-    pub(crate) fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf, format: AuthorityEventFormat) -> Self {
         Self {
             path,
+            format,
             write: tokio::sync::Mutex::new(()),
         }
     }
@@ -158,15 +172,20 @@ impl AuthorityEventSink for FileSink {
         SINK_KIND_FILE
     }
 
+    fn format(&self) -> AuthorityEventFormat {
+        self.format
+    }
+
     async fn deliver(&self, batch: &[DeliveryRecord]) -> Result<(), SinkError> {
         let mut payload = String::new();
-        for line in serialize_batch(batch)? {
+        for line in serialize_batch(batch, self.format())? {
             payload.push_str(&line);
             payload.push('\n');
         }
         let _write = self.write.lock().await;
         let path = self.path.clone();
-        tokio::task::spawn_blocking(move || append_synced(&path, payload.as_bytes()))
+        let format = self.format();
+        tokio::task::spawn_blocking(move || append_synced(&path, payload.as_bytes(), format))
             .await
             .map_err(|_| SinkError::new("worker_unavailable"))?
             .map_err(|error| {
@@ -192,16 +211,27 @@ fn open_for_append(path: &std::path::Path) -> io::Result<std::fs::File> {
     options.open(path)
 }
 
-fn serialize_batch(batch: &[DeliveryRecord]) -> Result<Vec<String>, SinkError> {
+fn serialize_batch(
+    batch: &[DeliveryRecord],
+    format: AuthorityEventFormat,
+) -> Result<Vec<String>, SinkError> {
     batch
         .iter()
-        .map(|record| serde_json::to_string(record).map_err(|_| SinkError::new("serialize")))
+        .map(|record| {
+            record
+                .wire_json(format)
+                .map_err(|_| SinkError::new("serialize"))
+        })
         .collect()
 }
 
 /// Append `bytes` to `path`, starting on a fresh line, and sync the data
 /// before returning. The file is created owner-only on Unix.
-fn append_synced(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+fn append_synced(
+    path: &std::path::Path,
+    bytes: &[u8],
+    format: AuthorityEventFormat,
+) -> io::Result<()> {
     let mut file = open_for_append(path)?;
     if file.metadata()?.len() > 0 {
         // Writes in append mode always land at the end; the seek only
@@ -214,7 +244,40 @@ fn append_synced(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
         }
     }
     file.write_all(bytes)?;
-    file.sync_data()
+    if format == AuthorityEventFormat::DeliveryV1 {
+        return file.sync_data();
+    }
+    file.sync_all()?;
+    // The startup probe or an earlier failed attempt may already have
+    // created the file. Sync the directory on every accepted batch so the
+    // new entry also survives after first creation or rename/recreate.
+    #[cfg(unix)]
+    sync_file_directories(path, &file)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_file_directories(path: &std::path::Path, file: &std::fs::File) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let logical_parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .canonicalize()?;
+    let target = path.canonicalize()?;
+    let resolved = target.metadata()?;
+    let opened = file.metadata()?;
+    if (resolved.dev(), resolved.ino()) != (opened.dev(), opened.ino()) {
+        // Rotation moved the name while the batch was being appended.
+        return Err(io::ErrorKind::Interrupted.into());
+    }
+    let target_parent = target.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    std::fs::File::open(target_parent)?.sync_all()?;
+    if target_parent != logical_parent {
+        // The configured name is a symlink into a different directory.
+        std::fs::File::open(logical_parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -224,6 +287,7 @@ mod tests {
 
     fn record(sequence: &str) -> DeliveryRecord {
         DeliveryRecord {
+            qualified_actor: None,
             schema_version: crate::authority_events::delivery::DELIVERY_SCHEMA_VERSION.to_owned(),
             authority_id: uuid::Uuid::new_v4().to_string(),
             event_id: uuid::Uuid::new_v4().to_string(),
@@ -261,6 +325,27 @@ mod tests {
         (directory, path)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn qualified_file_sync_handles_a_symlink_and_refuses_a_replaced_name() {
+        let (directory, path) = scratch_file();
+        let destination = directory.join("logs");
+        std::fs::create_dir(&destination).unwrap();
+        let target = destination.join("events");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        append_synced(&path, b"one\n", AuthorityEventFormat::QualifiedV1).unwrap();
+        let opened = std::fs::File::open(&path).unwrap();
+        std::fs::rename(&target, destination.join("rotated")).unwrap();
+        std::fs::write(&target, b"").unwrap();
+        assert_eq!(
+            sync_file_directories(&path, &opened).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        append_synced(&path, b"two\n", AuthorityEventFormat::QualifiedV1).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"two\n");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     fn lines(path: &std::path::Path) -> Vec<String> {
         std::fs::read_to_string(path)
             .expect("the sink file should be readable")
@@ -272,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn the_file_sink_appends_one_parsable_line_per_record_in_order() {
         let (directory, path) = scratch_file();
-        let sink = FileSink::new(path.clone());
+        let sink = FileSink::new(path.clone(), AuthorityEventFormat::DeliveryV1);
         let first = vec![record("1"), record("2")];
         let second = vec![record("3")];
         sink.deliver(&first).await.expect("first batch accepted");
@@ -305,7 +390,7 @@ mod tests {
     async fn a_partial_line_left_by_a_crash_stands_alone() {
         let (directory, path) = scratch_file();
         std::fs::write(&path, b"{\"schema_version\":\"authority_ev").expect("partial write");
-        let sink = FileSink::new(path.clone());
+        let sink = FileSink::new(path.clone(), AuthorityEventFormat::DeliveryV1);
         let batch = vec![record("7")];
         sink.deliver(&batch).await.expect("batch accepted");
 
@@ -324,7 +409,7 @@ mod tests {
         let (directory, path) = scratch_file();
         // A directory where the file should be: the open fails.
         std::fs::create_dir_all(&path).expect("blocking directory");
-        let sink = FileSink::new(path);
+        let sink = FileSink::new(path, AuthorityEventFormat::DeliveryV1);
         assert!(
             sink.probe().await.is_err(),
             "the startup probe refuses it too"
@@ -339,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn the_startup_probe_creates_the_file_and_writes_nothing() {
         let (directory, path) = scratch_file();
-        let sink = FileSink::new(path.clone());
+        let sink = FileSink::new(path.clone(), AuthorityEventFormat::DeliveryV1);
         sink.probe().await.expect("a writable location probes");
         assert_eq!(
             std::fs::read(&path).expect("the probe created the file"),
@@ -350,9 +435,11 @@ mod tests {
 
     #[tokio::test]
     async fn the_log_sink_accepts_a_batch() {
-        assert_eq!(LogSink.kind(), SINK_KIND_LOG);
-        LogSink
-            .deliver(&[record("1"), record("2")])
+        let sink = LogSink {
+            format: AuthorityEventFormat::DeliveryV1,
+        };
+        assert_eq!(sink.kind(), SINK_KIND_LOG);
+        sink.deliver(&[record("1"), record("2")])
             .await
             .expect("the log sink accepts");
     }

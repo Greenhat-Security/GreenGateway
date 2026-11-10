@@ -6,13 +6,11 @@ versioned configuration bundle format and the reader that validates it (issue
 [`ggctl validate` and `ggctl doctor`](ggctl.md#validate) run the same code, and
 `ggctl` checks a bundle offline today. [`ggctl init`](ggctl.md#init) creates a
 new bundle for a deployment profile ([generated bundles](#generated-bundles)) and
-[`ggctl convert`](ggctl.md#convert) converts one between document versions. Nothing in a released gateway reads a
-bundle yet: there is no startup mode, environment variable, or admin route that
-selects one. Bundle mode, which maps a deployment document onto the
-configuration compiler, is a later #242 slice. Until it lands, environment
-configuration ([configuration.md](configuration.md)) is the only way to
-configure a gateway, and the format below may still change before it is
-released.
+[`ggctl convert`](ggctl.md#convert) converts one between document versions.
+Gateway startup currently uses [environment configuration](configuration.md).
+The gateway checks the ADR-0008 source selectors before startup. A request to
+activate a bundle or ledger fails with a [source diagnostic](ggctl.md#source-diagnostics)
+before it can open a file, store, or listener.
 
 The design this follows is
 [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md) (setup, operator
@@ -244,6 +242,11 @@ egress compiler on `spec.egress`. For example, it checks that allowlist entries
 are hostnames without ports and that NAT64 prefixes meet the gateway's IPv6
 prefix and overlap rules. A refusal points to the affected setting and omits
 the supplied value. This check runs offline.
+
+The same offline pass compiles the public runtime settings for request bounds,
+rate limits, CORS, shutdown, audit durability, payload capture, discovery
+signals and tool execution. For example, a wildcard in `cors.allowed_origins`
+is rejected because the gateway supports credentialed requests.
 
 The reader also applies the gateway's authentication-provider rules, including
 type-specific requirements, unique provider names, and unique effective issuers.
@@ -607,6 +610,7 @@ Authority evidence and its event delivery.
 | --- | --- | --- | --- |
 | `authority_evidence.durability` | `required` or `best_effort` | `"best_effort"` | [`AUTHORITY_EVIDENCE_DURABILITY`](configuration.md#authority_evidence_durability) |
 | `authority_evidence.event_sink` | `none`, `log` or `file` | `"none"` | [`AUTHORITY_EVENT_SINK`](configuration.md#authority_event_sink) |
+| `authority_evidence.event_format` | `delivery_v1` or `qualified_v1` | `"delivery_v1"` | [`AUTHORITY_EVENT_FORMAT`](configuration.md#authority_event_format) |
 | `authority_evidence.pseudonym_key_alias` | string | unset | [`AUTHORITY_PSEUDONYM_KEY_ALIAS`](configuration.md#authority_pseudonym_key_alias) |
 | `authority_evidence.previous_pseudonym_key_alias` | string | unset | [`AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS`](configuration.md#authority_pseudonym_previous_key_alias) |
 | `authority_evidence.event_journal_capacity` | integer, 1 to 1000000000 | `1000000` | [`AUTHORITY_EVENT_JOURNAL_CAPACITY`](configuration.md#authority_event_journal_capacity) |
@@ -1118,8 +1122,8 @@ mode, a standalone deployment will keep every local store beneath one
 directory, `GATEWAY_STATE_DIR`, under the fixed names below
 ([ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md#bundle-mode)). Those
 modes replace each store's environment variable with its fixed name, so they
-will refuse the variable. No gateway reads `GATEWAY_STATE_DIR` yet, and in
-environment mode every store stays where its variable puts it. The layout, the
+will refuse the variable. Environment mode rejects `GATEWAY_STATE_DIR` and
+uses each store's configured path. The layout, the
 admission rules and the lock are the shared `gateway-config` library's
 `state_dir` module, which the gateway and `ggctl` both use. Today the revision
 ledger, the `ggctl ledger` commands over it, and `ggctl backup create` and
@@ -1242,6 +1246,7 @@ can appear in one. A published code never changes meaning.
 | `bundle.invalid_egress_setting` | The gateway's egress compiler refused the setting at the reported deployment pointer. |
 | `bundle.invalid_listener_setting` | The listener compiler refused the address, TLS or client-certificate settings at the reported pointer. |
 | `profile.listener_not_loopback` | A development listener's bind address is outside the loopback range. |
+| `bundle.invalid_runtime_setting` | The gateway's runtime compiler refused the setting at the reported deployment pointer. |
 | `bundle.invalid_auth_provider` | The gateway's authentication compiler refused the provider list. |
 | `bundle.invalid_admin_login` | The selected login provider is unusable, or a required client setting is missing. |
 | `syntax.empty_document` | The document is empty. |

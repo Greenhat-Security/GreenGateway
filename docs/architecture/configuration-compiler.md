@@ -69,8 +69,10 @@ configuration.
 
 ### The inventory
 
-`inventory::CONFIG_INPUTS` (`gateway-config/src/compiler/inventory.rs`) lists
-every variable the compiler asks for, in the order it asks. The contract on
+`source::SELECTORS` lists the three inputs that select the configuration authority.
+Once environment mode is selected, `inventory::CONFIG_INPUTS`
+(`gateway-config/src/compiler/inventory.rs`) lists every variable the environment
+compiler asks for, in the order it asks. Its contract on
 reads:
 
 - Every inventoried variable is requested exactly once, and no other name is
@@ -291,6 +293,7 @@ holds this table to `diagnostic::ConfigRule`.
 | `AuthorityPseudonymKeysDistinct` | The current and previous pseudonym key aliases naming the same alias. |
 | `AuthorityEvidenceDeliveryRequired` | `AUTHORITY_EVIDENCE_DURABILITY=required` with `AUTHORITY_EVENT_SINK=none`, in either mode: a cluster replica would journal evidence that is never delivered, and a standalone gateway's stores would record evidence that is never delivered. |
 | `AuthorityEvidenceUnsupportedConfiguration` | `AUTHORITY_EVIDENCE_DURABILITY=required` with a setting that enables an authority change the evidence inventory marks unsupported in this mode: `ADMIN_SESSION_MODE=standalone_memory`. |
+| `SourceSelection` | The selected source is unavailable, its selectors are invalid or missing, or an ordinary environment setting would create a competing authority. |
 
 Codes and rules are Rust enums. `ConfigRule::as_str` gives every rule
 (`ConfigRule::ALL`) a stable name, its variant name in snake case
@@ -483,18 +486,20 @@ holding the string a reader returned, and `Source` has two variants,
 - record its own `Source` variant (the ADR names `bundle`, `ledger`,
   `bootstrap`, and `store`) instead of reporting bundle values as
   `Environment`;
-- apply the ADR's source rules (overlapping environment variables refused,
-  a documented bootstrap set allowed to coexist) before the stages, because
-  the stages assume one coherent source.
+- use the ADR's source-selection checks before the stages, because the stages
+  assume one coherent source. `compiler::source::compile_selected` performs those
+  checks for gateway startup, one-shot configuration and offline environment
+  files. Bundle and ledger activation are still unavailable.
 
 The bundle reader in `gateway-config` (`bundle::read_bundle`) validates a
 bundle's files, digests, documents, and profile today. Its deployment document
 carries the profile and every catalog field with a document path, in the
 closed sections those paths imply (`bundle::settings`), each held to its
 catalog type and its own bounds; the parity tests below hold those bounds to
-this compiler. The bundle reader maps `spec.egress` into the existing egress
-stage and uses its findings in offline validation. This covers the hostname
-grammar and NAT64 prefix and overlap checks. The reader also runs the shared
+this compiler. The bundle reader maps public egress and runtime fields into
+their existing stages for offline validation, including hostname grammar,
+NAT64 prefix and overlap checks, and credentialed CORS restrictions. Decimal
+runtime bounds and rates use their canonical spelling. The reader also runs the shared
 authentication-provider and admin-login validation. It passes the presence of
 the login client's typed secret reference to that rule without resolving it.
 The listener adapter runs the compiler's address and client-authentication

@@ -69,6 +69,7 @@ pub mod plan;
 pub mod proxy;
 pub mod runtime;
 pub mod semantic_diff;
+pub mod source;
 pub mod stage;
 #[cfg(test)]
 mod stage_tests;
@@ -77,7 +78,8 @@ pub mod storage;
 mod tests;
 
 pub use authority_events::{
-    AuthorityEventSettings, AuthorityEventSinkSetting, AuthorityEvidenceDurability,
+    AuthorityEventFormat, AuthorityEventSettings, AuthorityEventSinkSetting,
+    AuthorityEvidenceDurability,
 };
 pub use plan::{compile, ConfigPlan};
 

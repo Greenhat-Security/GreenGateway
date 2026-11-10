@@ -98,12 +98,11 @@ pub struct EgressPlan {
 
 /// Runs the same pure stage for offline bundle validation. Every finding in
 /// this block is attributed to the input being parsed.
-pub(crate) fn refused_settings(
+pub(crate) fn collect_refusals(
     get_var: impl FnMut(&str) -> Result<String, VarError>,
-) -> BTreeSet<&'static str> {
-    compile(EgressInputs::read(get_var))
-        .finding_inputs()
-        .collect()
+    refused: &mut BTreeSet<&'static str>,
+) {
+    compile(EgressInputs::read(get_var)).collect_refusals(refused);
 }
 
 /// Parses the egress block. Every input here is checked on its own.

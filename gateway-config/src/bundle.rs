@@ -605,7 +605,7 @@ fn read_deployment(
         profile, settings, ..
     } = document::deployment(&node, &reference.file, diagnostics)?;
     diagnostics.extend(settings.listener_diagnostics(profile, &node, &reference.file));
-    diagnostics.extend(settings.egress_diagnostics(&node, &reference.file));
+    diagnostics.extend(settings.public_diagnostics(&node, &reference.file));
     diagnostics.extend(settings.provider_diagnostics(&node, &reference.file));
     // Decimals take their shortest exact spelling and the word sets their
     // canonical order, so neither changes the canonical bytes.

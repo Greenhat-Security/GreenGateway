@@ -173,18 +173,18 @@ fn configuration_doc_matches_gateway_env_reads() {
     );
 }
 
-/// The field catalog (`gateway_config::catalog`) names every setting the
-/// gateway's configuration compiler reads; the source scan below finds every
-/// variable `gateway/src` and the compiler in `gateway-config/src` read by
-/// name. They are the same set, so nothing the gateway reads escapes the
-/// catalog's checks.
+/// The source selectors and environment field catalog together name every
+/// variable read by the gateway. Scan the source independently so a new
+/// read must be declared in one of those inventories and documented.
 #[test]
-fn field_catalog_matches_gateway_env_reads() {
+fn source_selectors_and_field_catalog_match_gateway_env_reads() {
     let gateway_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
     let catalog: BTreeSet<String> = catalog::FIELDS
         .iter()
-        .map(|field| field.environment.to_owned())
+        .map(|field| field.environment)
+        .chain(gateway_config::compiler::source::SELECTORS)
+        .map(str::to_owned)
         .collect();
     let code_reads = gateway_env_reads(&gateway_root);
 
@@ -193,9 +193,9 @@ fn field_catalog_matches_gateway_env_reads() {
 
     assert!(
         missing_from_catalog.is_empty() && missing_from_code.is_empty(),
-        "field catalog drift detected.\n\
-         Read in gateway/src or the gateway-config compiler but missing from gateway-config's catalog: {}\n\
-         In the catalog but not read in gateway/src or the gateway-config compiler: {}",
+        "source selector or field catalog drift detected.\n\
+         Read in gateway/src or the gateway-config compiler but missing from the inventories: {}\n\
+         In the inventories but not read in gateway/src or the gateway-config compiler: {}",
         format_vars(&missing_from_catalog),
         format_vars(&missing_from_code)
     );

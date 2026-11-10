@@ -241,9 +241,8 @@ pub struct Config {
     /// PostgreSQL audit retention in days, pruned by the maintenance
     /// singleton; `None` (or `0`) keeps everything. Cluster mode only.
     pub audit_postgres_retention_days: Option<u32>,
-    /// Authority-event delivery (issue #425, PR 3): the dispatcher's sink,
-    /// the pseudonym key aliases, the journal's capacity and retention.
-    /// Cluster mode only; every field is refused in standalone mode.
+    /// Authority evidence durability, sink, record format and pseudonym key
+    /// aliases in both modes, plus journal capacity and retention in cluster mode.
     pub authority_events: AuthorityEventSettings,
     pub tool_runtime_default_timeout_ms: u64,
     pub csrf_enabled: bool,
@@ -299,8 +298,8 @@ impl Config {
 
     // pub(crate) so sibling modules' tests can build configurations from
     // environment maps without going through process environment mutation;
-    // production reaches it only through `from_env`. Serving startup calls
-    // `compile` itself, which is this function without the conversion.
+    // the standalone importer uses the same path for its source environment
+    // file. Serving startup calls the same source-aware compiler.
     //
     // The configuration compiler (issue #433) reads every input block where
     // the legacy parser read it, parses and validates each block from those
@@ -309,7 +308,7 @@ impl Config {
     pub(crate) fn from_env_vars(
         get_var: impl FnMut(&str) -> Result<String, VarError>,
     ) -> Result<Self, ConfigError> {
-        compile(get_var).map(into_config)
+        source::compile_selected(get_var).map(into_config)
     }
 
     pub fn signal_detector_config(&self) -> SignalDetectorConfig {

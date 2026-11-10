@@ -7,6 +7,7 @@
 //! an unknown option is reported by its position, never by its spelling,
 //! because the spelling may be a mistyped secret.
 
+use gateway_config::compiler::source::SourceRefusal;
 use std::fmt;
 
 /// The process exit codes (ADR-0008, "Exit codes"). The numbers and names
@@ -245,6 +246,7 @@ pub(crate) enum Code {
     ConfigNotUnicode,
     ConfigRefused,
     ConfigUnattributed,
+    Source(SourceRefusal),
     // Initialization.
     AnswersUnreadable,
     AnswersNotRegularFile,
@@ -366,6 +368,7 @@ pub(crate) const FAMILIES: &[&str] = &[
     "diff",
     "env",
     "config",
+    "source",
     "init",
     "convert",
     "pin",
@@ -484,6 +487,11 @@ impl Code {
         Self::ConfigNotUnicode,
         Self::ConfigRefused,
         Self::ConfigUnattributed,
+        Self::Source(SourceRefusal::InvalidSelector),
+        Self::Source(SourceRefusal::SelectorWithoutMode),
+        Self::Source(SourceRefusal::MissingSelector),
+        Self::Source(SourceRefusal::ConflictingEnvironment),
+        Self::Source(SourceRefusal::ModeUnavailable),
         Self::AnswersUnreadable,
         Self::AnswersNotRegularFile,
         Self::AnswersUnsafePermissions,
@@ -618,6 +626,7 @@ impl Code {
             "diff" => "docs/ggctl.md#diff-diagnostics",
             "env" => "docs/ggctl.md#env-diagnostics",
             "config" => "docs/ggctl.md#config-diagnostics",
+            "source" => "docs/ggctl.md#source-diagnostics",
             "init" => "docs/ggctl.md#init-diagnostics",
             "convert" => "docs/ggctl.md#convert-diagnostics",
             "pin" => "docs/ggctl.md#pin-diagnostics",
@@ -1033,6 +1042,7 @@ impl Code {
                 "the configuration compiler refused the configuration for a reason that names no inventoried setting",
                 Invalid,
             ),
+            Self::Source(reason) => (reason.as_str(), reason.message(), Invalid),
             Self::AnswersUnreadable => ("init.answers_unreadable", "the answers file could not be opened or read", Failure),
             Self::AnswersNotRegularFile => ("init.answers_not_regular_file", "the answers file is not a regular file", Usage),
             Self::AnswersUnsafePermissions => (

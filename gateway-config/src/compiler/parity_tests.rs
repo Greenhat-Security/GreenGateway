@@ -93,6 +93,9 @@ fn expected_diagnostic(
     rule: ConfigRule,
 ) -> ConfigDiagnostic {
     let message = match code {
+        ConfigDiagnosticCode::Source(_) => {
+            panic!("legacy environment fixtures have no source selectors")
+        }
         ConfigDiagnosticCode::Unset => format!("{variable} is not set"),
         ConfigDiagnosticCode::Empty => format!("{variable} is set but empty"),
         ConfigDiagnosticCode::NotUnicode => format!("{variable} is not valid Unicode"),
@@ -1246,6 +1249,38 @@ fn storage_modes_keep_their_requirements_and_refuse_each_others_material() {
     );
 }
 
+#[test]
+fn authority_event_format_requires_an_exact_supported_schema_selection_in_both_modes() {
+    for mut fixture in [Vec::new(), postgres_fixture()] {
+        fixture.extend([
+            ("AUTHORITY_EVENT_SINK", "log"),
+            ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-current"),
+        ]);
+        assert_eq!(
+            accepted(&fixture).storage.authority_events.format,
+            AuthorityEventFormat::DeliveryV1
+        );
+        for (value, format) in [
+            ("delivery_v1", AuthorityEventFormat::DeliveryV1),
+            ("qualified_v1", AuthorityEventFormat::QualifiedV1),
+        ] {
+            fixture.push(("AUTHORITY_EVENT_FORMAT", value));
+            assert_eq!(accepted(&fixture).storage.authority_events.format, format);
+            fixture.pop();
+        }
+        for invalid in ["", "QUALIFIED_V1", "qualified_v1 ", "v2"] {
+            fixture.push(("AUTHORITY_EVENT_FORMAT", invalid));
+            let error = refused(&fixture);
+            assert_eq!(error.diagnostics().len(), 1);
+            assert_eq!(
+                error.diagnostics()[0].variable,
+                Some("AUTHORITY_EVENT_FORMAT")
+            );
+            fixture.pop();
+        }
+    }
+}
+
 /// Authority-event delivery (issue #425, PR 3) is read right after the
 /// PostgreSQL settings. Its values are refused as they are read, its alias
 /// shapes and sink rules once the block is read, and all of them before the
@@ -1438,6 +1473,7 @@ fn authority_event_problems_come_after_the_database_and_before_the_mode_rules() 
     // reported as material standalone mode never reads.
     for name in [
         "AUTHORITY_EVENT_SINK",
+        "AUTHORITY_EVENT_FORMAT",
         "AUTHORITY_EVENT_FILE",
         "AUTHORITY_PSEUDONYM_KEY_ALIAS",
         "AUTHORITY_EVENT_JOURNAL_CAPACITY",

@@ -5,6 +5,8 @@ const screenshotDir = path.join(process.cwd(), '.screenshots');
 const DRAFT_ID = `pd_${'d'.repeat(32)}`;
 const JOB_ID = `rpl_${'e'.repeat(32)}`;
 const LIVE_ETAG = '"sha256:workbench-live"';
+const PRIVATE_REPLAY_VALUE = 'workbench-private-request-canary';
+type ReplayFixture = 'observed' | 'incomplete' | 'incomplete-observed' | 'legacy';
 
 const policy = {
   schema_version: '1.0.0',
@@ -30,7 +32,7 @@ function decision(overrides: Record<string, unknown>) {
   return { lane: 'http', complete: true, reason: 'matched_rule', observation: null, ...overrides };
 }
 
-async function routeWorkbench(page: Page) {
+async function routeWorkbench(page: Page, replay: ReplayFixture = 'observed') {
   await page.route('**/v1/admin/capabilities', async (route) => {
     await route.fulfill({
       status: 200,
@@ -167,14 +169,18 @@ async function routeWorkbench(page: Page) {
     });
   });
   await page.route('**/v1/admin/policy/replays', async (route) => {
-    await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify(replayJob(false)) });
+    await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify(replayJob(false, replay)) });
   });
   await page.route(`**/v1/admin/policy/replays/${JOB_ID}`, async (route) => {
-    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(replayJob(true)) });
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(replayJob(true, replay)) });
   });
 }
 
-function replayJob(finished: boolean) {
+function replayJob(finished: boolean, fixture: ReplayFixture) {
+  const complete = fixture === 'observed' || fixture === 'legacy';
+  const selected = complete ? 412 : 413;
+  const bound = complete ? 100000 : 412;
+  const observed = fixture === 'observed' || fixture === 'incomplete-observed';
   const lane = (replayable: number, outcomes: unknown[]) => ({
     replayable,
     decided: replayable,
@@ -188,7 +194,7 @@ function replayJob(finished: boolean) {
   return {
     schema_version: 'policy-replay-job.v1',
     job_id: JOB_ID,
-    state: finished ? 'completed' : 'queued',
+    state: finished ? (complete ? 'completed' : 'completed_incomplete') : 'queued',
     cancel_requested: false,
     created_at: '2026-10-28T10:00:00Z',
     started_at: null,
@@ -198,25 +204,25 @@ function replayJob(finished: boolean) {
     base: { source: 'active', etag: LIVE_ETAG, current: true },
     candidate: { source: 'inline', etag: '"sha256:workbench-inline"' },
     window: { from: '2026-10-27T10:00:00Z', to: '2026-10-28T10:00:00Z' },
-    cutoff: { high_water: 1840, selected_records: 412 },
-    limits: { max_records: 100000, deadline_ms: 60000 },
-    progress: { scanned_records: finished ? 412 : 0, selected_records: 412 },
+    cutoff: { high_water: 1840, selected_records: selected },
+    limits: { max_records: bound, deadline_ms: 60000 },
+    progress: { scanned_records: finished ? 412 : 0, selected_records: selected },
     ...(finished
       ? {
           result_digest: 'sha256:workbench-result',
           result: {
             schema_version: 'policy-replay-results.v1',
             mode: 'historical_replay',
-            complete: true,
-            limitations: [],
+            complete,
+            limitations: complete ? [] : ['scan_truncated'],
             source: {
               kind: 'standalone_audit_log',
               window: { from: '2026-10-27T10:00:00Z', to: '2026-10-28T10:00:00Z' },
               high_water: 1840,
-              max_records: 100000,
+              max_records: bound,
             },
             records: {
-              selected: 412, scanned: 412, replayable: 380, duplicate: 20, not_policy_evaluated: 12,
+              selected, scanned: 412, replayable: 380, duplicate: 20, not_policy_evaluated: 12,
               unsupported: 0, malformed: 0, not_request_record: 0, unreadable: 0, oversized: 0,
               by_code: { duplicate_http_decision: 20, not_policy_evaluated: 12, replayable: 380 },
             },
@@ -232,11 +238,95 @@ function replayJob(finished: boolean) {
                 { logical: 'allow', enforcement: 'not_applicable', effective_action: 'would_forward', reason: 'allowed', count: 8 },
               ]),
             },
+            ...(fixture === 'legacy' ? {} : { impact: retainedImpact(observed) }),
             not_replayed: ['authentication', 'request_admission', 'rate_capacity', 'tool_leases', 'egress', 'transport', 'upstream'],
           },
         }
       : {}),
   };
+}
+
+function retainedImpact(observed: boolean) {
+  // Five HTTP denials change from enforced to shadowed, so forwarding and
+  // logical-allow counts differ even though the policy still denies them.
+  const http = {
+    records: 372, compared: 372,
+    transitions: {
+      newly_allowed: observed ? 2 : 0, newly_denied: observed ? 4 : 0,
+      enforcement_only_change: observed ? 5 : 0, attribution_only_change: 0,
+      unchanged_allow: observed ? 338 : 340, unchanged_deny: observed ? 23 : 32,
+      indeterminate: 0, unsupported_context: 0,
+    },
+    forwarding: { newly_forwarded: observed ? 7 : 0, newly_blocked: observed ? 4 : 0 },
+  };
+  const tool = {
+    records: 8, compared: 8,
+    transitions: {
+      newly_allowed: observed ? 1 : 0, newly_denied: 0, enforcement_only_change: 0,
+      attribution_only_change: 0, unchanged_allow: observed ? 7 : 8, unchanged_deny: 0,
+      indeterminate: 0, unsupported_context: 0,
+    },
+    forwarding: { newly_forwarded: observed ? 1 : 0, newly_blocked: 0 },
+  };
+  return {
+    candidate_is_base: false,
+    projections: {
+      as_authored: {
+        http, tool,
+        statement: observed
+          ? { code: 'newly_allowed_observed', newly_allowed: 3, newly_forwarded: 8, replayable_events: 380 }
+          : { code: 'not_established', reason: 'incomplete' },
+        raw_record: { path: `/private/${PRIVATE_REPLAY_VALUE}`, subject: PRIVATE_REPLAY_VALUE },
+      },
+    },
+  };
+}
+
+async function openImpact(page: Page, fixture: ReplayFixture) {
+  await routeWorkbench(page, fixture);
+  await page.goto('/admin/policy/studio');
+  await page.getByRole('button', { name: `Open draft ${DRAFT_ID}` }).click();
+  await expect(page.getByText('Valid, with 1 risk.')).toBeVisible();
+  await page.getByRole('tab', { name: 'Impact' }).click();
+  const panel = page.getByRole('tabpanel', { name: 'Impact' });
+  await panel.getByRole('button', { name: 'Start replay' }).click();
+  const comparison = panel.getByRole('region', { name: 'Pinned policy comparison' });
+  await expect(comparison).toBeVisible({ timeout: 10_000 });
+  await expect(panel.getByTitle(LIVE_ETAG, { exact: true })).toBeVisible();
+  await expect(panel.getByTitle('"sha256:workbench-inline"', { exact: true })).toBeVisible();
+  return comparison;
+}
+
+for (const fixture of ['observed', 'incomplete-observed'] as const) {
+  test(`Impact separates logical decisions from forwarding (${fixture})`, async ({ page }) => {
+    const comparison = await openImpact(page, fixture);
+    const table = comparison.getByRole('table', { name: 'Changes from the pinned base to the candidate' });
+    await expect(table.getByRole('columnheader', { name: 'HTTP', exact: true })).toBeVisible();
+    await expect(table.getByRole('columnheader', { name: 'Tools', exact: true })).toBeVisible();
+    for (const [label, http, tools] of [
+      ['Compared', '372', '8'], ['Newly allowed', '2', '1'], ['Newly denied', '4', '0'],
+      ['Newly forwarded', '7', '1'], ['Newly blocked', '4', '0'],
+    ]) {
+      const row = table.getByRole('row').filter({ has: page.getByRole('rowheader', { name: label, exact: true }) });
+      await expect(row.getByRole('cell')).toHaveText([http, tools]);
+    }
+    await expect(comparison).not.toContainText('This replay does not establish whether any requests would be newly allowed.');
+    await expect(page.locator('body')).not.toContainText(PRIVATE_REPLAY_VALUE);
+    expect(await page.evaluate(() => JSON.stringify([localStorage, sessionStorage]))).not.toContain(PRIVATE_REPLAY_VALUE);
+  });
+}
+
+for (const fixture of ['incomplete', 'legacy'] as const) {
+  test(`Impact qualifies retained replay evidence (${fixture})`, async ({ page }) => {
+    const comparison = await openImpact(page, fixture);
+    if (fixture === 'legacy') {
+      await expect(comparison.getByText('This result has no as-authored comparison.')).toBeVisible();
+      await expect(comparison.getByRole('table')).toHaveCount(0);
+    } else {
+      await expect(comparison.getByText('This replay does not establish whether any requests would be newly allowed.')).toBeVisible();
+    }
+    await expect(comparison).not.toContainText(/No newly allowed decisions were observed|safe to publish|policy is safe/i);
+  });
 }
 
 test('captures the Policy Studio simulator, replay and findings views', async ({ page }) => {

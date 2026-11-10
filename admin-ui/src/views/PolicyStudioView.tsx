@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
 } from 'react';
+import { useSearchParams } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
 import { hasAdminPermission, useAdminCapabilities } from '../lib/adminCapabilities';
@@ -65,6 +66,7 @@ import {
   diagnosticsInSection,
   egressChanged,
   formatCandidate,
+  isJsonObject,
   isPolicyV1,
   parseCandidate,
   pointerTo,
@@ -196,6 +198,8 @@ type PublishReview = Readonly<{
 }>;
 
 export function PolicyStudioView() {
+  const [searchParams] = useSearchParams();
+  const requestedRule = searchParams.get('rule_id');
   const capabilities = useAdminCapabilities();
   const [writeRejected, setWriteRejected] = useState(false);
   const canRead = hasAdminPermission(capabilities, POLICY_READ_PERMISSION);
@@ -230,6 +234,9 @@ export function PolicyStudioView() {
   const draftRef = useRef<PolicyDraft | null>(null);
   const serverSourceRef = useRef('');
   const sourceRef = useRef('');
+  // A manual Source edit can contain duplicate keys that JSON.parse drops.
+  // Verify that exact text before the condition editor rewrites the tree.
+  const sourceFromStructuredEditor = useRef(false);
   const [activeSection, setActiveSection] = useState<StudioSection>('overview');
   const [validation, setValidation] = useState<ValidationState>({ kind: 'idle' });
   const [busy, setBusy] = useState<BusyAction | null>(null);
@@ -264,7 +271,8 @@ export function PolicyStudioView() {
   const [bindingProblems, setBindingProblems] = useState<ReadonlyMap<string, string>>(new Map());
   const [reviewInto, setReviewInto] = useState<ReviewInto>('new');
 
-  const setSource = useCallback((next: string) => {
+  const setSource = useCallback((next: string, formatted = false) => {
+    sourceFromStructuredEditor.current = formatted;
     sourceRef.current = next;
     setSourceState(next);
   }, []);
@@ -737,6 +745,27 @@ export function PolicyStudioView() {
     }
   }
 
+  function selectDraftSection(policy: PolicyDocument) {
+    if (!requestedRule) {
+      setActiveSection('overview');
+      return;
+    }
+    setView('edit');
+    setActiveSection('rules');
+    const matches = Array.isArray(policy.rules)
+      ? policy.rules.filter((rule) => isJsonObject(rule) && rule.id === requestedRule)
+      : [];
+    if (matches.length === 1) {
+      setPendingFocus(pointerTo('rules', policy.rules.indexOf(matches[0]), 'conditions'));
+    } else {
+      setNotice({
+        title: 'Rule could not be selected',
+        message: 'This draft must contain exactly one rule with the id selected in the builder.',
+        tone: 'info',
+      });
+    }
+  }
+
   async function openDraft(id: string) {
     if (dirty || !beginBusy('open')) {
       return;
@@ -746,8 +775,9 @@ export function PolicyStudioView() {
     setConfirming(null);
     setConversion(null);
     try {
-      showServerDraft(await fetchPolicyDraft(id), true);
-      setActiveSection('overview');
+      const opened = await fetchPolicyDraft(id);
+      showServerDraft(opened, true);
+      selectDraftSection(opened.policy);
     } catch (error) {
       setProblem({ kind: 'alert', alert: readAlert(error, 'Draft could not be opened') });
       if (isDraftGone(error)) {
@@ -789,7 +819,7 @@ export function PolicyStudioView() {
         message: `Draft ${created.summary.draft_id} is pinned to live revision ${shortEtag(created.summary.base_etag)}. Nothing changes until it is published.`,
         tone: 'info',
       });
-      if (!fromLocal) setActiveSection('overview');
+      if (!fromLocal) selectDraftSection(created.policy);
     } catch (error) {
       noteWriteError(error);
       if (refusal(error) === POLICY_ETAG_MISMATCH_REASON) {
@@ -1087,7 +1117,7 @@ export function PolicyStudioView() {
         return;
       }
       if (result.converted && result.policy !== null) {
-        setSource(formatCandidate(result.policy));
+        setSource(formatCandidate(result.policy), true);
         setConversion(result);
         setNotice({
           title: 'Converted to policy v1',
@@ -1784,7 +1814,7 @@ export function PolicyStudioView() {
   }
 
   function updateDocument(next: JsonObject) {
-    setSource(formatCandidate(next));
+    setSource(formatCandidate(next), true);
   }
 
   function showDiagnostic(diagnostic: PolicyDiagnostic) {
@@ -2205,6 +2235,10 @@ export function PolicyStudioView() {
                     />
                   ) : activeSection === 'rules' ? (
                     <RulesSection
+                      key={`${draft.summary.draft_id}:${draft.etag}`}
+                      conditionSourceReady={
+                        source === serverSource || sourceFromStructuredEditor.current || currentInspection?.valid === true
+                      }
                       document={parsed.document}
                       diagnostics={diagnostics}
                       disabled={!editable}
@@ -2253,7 +2287,9 @@ export function PolicyStudioView() {
 
           {draft === null && draftList !== null && !isLoading ? (
             <div className="empty-state">
-              {draftList.drafts.length === 0
+              {requestedRule && draftList.drafts.length > 0
+                ? 'Open a draft to review the rule selected in the builder.'
+                : draftList.drafts.length === 0
                 ? 'You have no policy drafts. Create one from the live policy to start editing.'
                 : 'Open a draft to edit it.'}
             </div>

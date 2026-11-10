@@ -31,7 +31,7 @@
 //! - no field accepts an unresolved placeholder.
 //!
 //! The reader checks shape and per-field bounds here. It runs the compiler's
-//! listener, egress, authentication provider and admin login rules after reading these
+//! listener, egress, runtime, authentication provider and admin login rules after reading these
 //! settings. The other compiler rules still need their document mappings.
 //!
 //! Some members are the document's own rather than one field's
@@ -51,11 +51,14 @@ mod structured_tests;
 #[cfg(test)]
 mod tests;
 
-use std::{collections::BTreeMap, env::VarError};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env::VarError,
+};
 
 use crate::{
     catalog::{self, DecimalBound, DecimalRange, Domain, Field, FieldType, Sensitivity, FIELDS},
-    compiler::{self, egress, AdminClientPresence, AdminLoginRefusal},
+    compiler::{self, egress, runtime, AdminClientPresence, AdminLoginRefusal},
     state_dir::StateFile,
 };
 
@@ -422,53 +425,59 @@ pub(crate) struct Settings {
 }
 
 impl Settings {
-    /// Compile the document's public egress settings independently of the
-    /// process environment. A list entry cannot contain a comma, so joining
-    /// it preserves exactly the entries the egress stage will read.
-    pub(super) fn egress_diagnostics(
+    /// Compile the document's public runtime and egress settings. A list
+    /// entry cannot contain a comma, and the canonical decimal has the same
+    /// floating-point value as its source spelling.
+    pub(super) fn public_diagnostics(
         &self,
         document: &Node,
         file: &FileName,
     ) -> Vec<BundleDiagnostic> {
         let mut inputs = BTreeMap::new();
-        let mut unsupported = Vec::new();
-        for setting in self
-            .values
-            .iter()
-            .filter(|setting| setting.field.domain == Domain::Egress)
-        {
+        let mut refused = BTreeSet::new();
+        for setting in self.values.iter().filter(|setting| {
+            matches!(
+                setting.field.domain,
+                Domain::Egress | Domain::RuntimeSettings
+            )
+        }) {
+            if setting.field.sensitivity != Sensitivity::Public {
+                refused.insert(setting.field.environment);
+                continue;
+            }
             let input = match &setting.value {
                 SettingValue::Boolean(value) => value.to_string(),
                 SettingValue::Integer(value) => value.to_string(),
+                SettingValue::Decimal(value) => value.canonical().to_owned(),
+                SettingValue::Word(value) => (*value).to_owned(),
                 SettingValue::List(entries) => entries.join(","),
                 _ => {
-                    unsupported.push(setting.field.environment);
+                    refused.insert(setting.field.environment);
                     continue;
                 }
             };
             inputs.insert(setting.field.environment, input);
         }
-        if inputs.is_empty() && unsupported.is_empty() {
+        if inputs.is_empty() && refused.is_empty() {
             return Vec::new();
         }
-        let mut refused =
-            egress::refused_settings(|name| inputs.remove(name).ok_or(VarError::NotPresent));
+        let mut read = |name: &str| inputs.remove(name).ok_or(VarError::NotPresent);
+        egress::collect_refusals(&mut read, &mut refused);
+        runtime::collect_refusals(read, &mut refused);
         // The stage requests each input once. A new catalog field that it
         // never requested must not silently pass validation.
         refused.extend(inputs.into_keys());
-        refused.extend(unsupported);
         refused
             .into_iter()
             .map(|name| {
-                let path = catalog::field(name)
-                    .and_then(Field::document_path)
-                    .unwrap_or("");
-                at_setting(
-                    Code::InvalidEgressSetting,
-                    file,
-                    document,
-                    path.split('/').skip(1),
-                )
+                let field = catalog::field(name);
+                let code = match field.map(|field| field.domain) {
+                    Some(Domain::Egress) => Code::InvalidEgressSetting,
+                    Some(Domain::RuntimeSettings) => Code::InvalidRuntimeSetting,
+                    _ => Code::InvalidValue,
+                };
+                let path = field.and_then(Field::document_path).unwrap_or("");
+                at_setting(code, file, document, path.split('/').skip(1))
             })
             .collect()
     }

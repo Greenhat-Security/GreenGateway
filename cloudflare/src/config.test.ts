@@ -47,6 +47,45 @@ describe("buildGreenGatewayContainerEnv", () => {
     expect(env).not.toHaveProperty("RATE_LIMIT_READ_RPS");
   });
 
+  it("projects explicit environment mode the same way as the default", () => {
+    const settings = { ADMIN_PREFIX: "/control" };
+    expect(buildGreenGatewayContainerEnv({
+      ...settings,
+      GATEWAY_CONFIG_SOURCE: "environment",
+    })).toEqual(buildGreenGatewayContainerEnv(settings));
+  });
+
+  it.each(["bundle", "ledger"])("refuses %s mode before container startup", (source) => {
+    expect(() => buildGreenGatewayContainerEnv({
+      GATEWAY_CONFIG_SOURCE: source,
+      GATEWAY_CONFIG_BUNDLE: "/private/bundle",
+      GATEWAY_STATE_DIR: "/private/state",
+    })).toThrow(new Error("source.mode_unavailable: GATEWAY_CONFIG_SOURCE"));
+  });
+
+  it.each(["", " ", "environment ", "Environment", "private-value", 42])(
+    "refuses malformed source bindings without echoing the value",
+    (source) => {
+      expect(() => buildGreenGatewayContainerEnv({ GATEWAY_CONFIG_SOURCE: source }))
+        .toThrow(new Error("source.invalid_selector: GATEWAY_CONFIG_SOURCE"));
+    },
+  );
+
+  it.each(["GATEWAY_CONFIG_BUNDLE", "GATEWAY_STATE_DIR"])(
+    "refuses a present %s binding in implicit and explicit environment mode",
+    (locator) => {
+      for (const value of ["", "/private/locator"]) {
+        const bindings = { [locator]: value };
+        const error = new Error(`source.selector_without_mode: ${locator}`);
+        expect(() => buildGreenGatewayContainerEnv(bindings)).toThrow(error);
+        expect(() => buildGreenGatewayContainerEnv({
+          ...bindings,
+          GATEWAY_CONFIG_SOURCE: "environment",
+        })).toThrow(error);
+      }
+    },
+  );
+
   it("does not allow a split admin listener because the Worker exposes one container port", () => {
     expect(GREEN_GATEWAY_ENV_KEYS).not.toContain("ADMIN_LISTEN_ADDR");
   });
@@ -95,6 +134,7 @@ describe("buildGreenGatewayContainerEnv", () => {
     const env = buildGreenGatewayContainerEnv({
       AUTHORITY_EVIDENCE_DURABILITY: "required",
       AUTHORITY_EVENT_SINK: "file",
+      AUTHORITY_EVENT_FORMAT: "qualified_v1",
       AUTHORITY_EVENT_FILE: "/tmp/greengateway-authority-events.jsonl",
       AUTHORITY_PSEUDONYM_KEY_ALIAS: "pseudonym-current",
       AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS: "pseudonym-previous",
@@ -103,6 +143,7 @@ describe("buildGreenGatewayContainerEnv", () => {
     expect(env).toMatchObject({
       AUTHORITY_EVIDENCE_DURABILITY: "required",
       AUTHORITY_EVENT_SINK: "file",
+      AUTHORITY_EVENT_FORMAT: "qualified_v1",
       AUTHORITY_EVENT_FILE: "/tmp/greengateway-authority-events.jsonl",
       AUTHORITY_PSEUDONYM_KEY_ALIAS: "pseudonym-current",
       AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS: "pseudonym-previous",

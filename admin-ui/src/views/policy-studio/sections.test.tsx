@@ -240,6 +240,105 @@ describe('policy studio section editors', () => {
     });
   });
 
+  it('retains an empty network matcher until the operator explicitly removes the condition', () => {
+    const rule = { id: 'office', path: '/reports', action: 'deny' };
+    const latest = renderSection(RulesSection, { schema_version: '1.0.0', rules: [rule] });
+    fireEvent.click(screen.getByRole('button', { name: 'Add source network condition' }));
+    const input = screen.getByLabelText('Source networks');
+    fireEvent.change(input, { target: { value: '192.0.2.0/24' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(latest().rules).toEqual([
+      { ...rule, conditions: { source_network: { cidrs: ['192.0.2.0/24'] } } },
+    ]);
+    fireEvent.click(screen.getByRole('button', { name: 'Remove 192.0.2.0/24 from Source networks' }));
+    expect(latest().rules).toEqual([{ ...rule, conditions: { source_network: { cidrs: [] } } }]);
+    fireEvent.click(screen.getByRole('button', { name: 'Remove policy condition' }));
+    expect(latest().rules).toEqual([rule]);
+  });
+
+  it('exposes nested condition source without replacing the tree when another field changes', () => {
+    const conditions = { not: { any: [{ claim: { issuer: 'example', name: 'team', in: [true, 'true'] } }] } };
+    const rule = { id: 'nested', path: '/a', action: 'deny', conditions };
+    const latest = renderSection(RulesSection, { schema_version: '1.0.0', rules: [rule] });
+    expect(screen.getByText('View condition source')).toBeTruthy();
+    expect(screen.getByText('Negate this operand. An unknown result stays unknown.')).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Path pattern'), { target: { value: '/b' } });
+    expect(latest().rules).toEqual([{ ...rule, path: '/b' }]);
+  });
+
+  it('wraps, switches and unwraps groups without changing opaque matcher values or sibling order', () => {
+    const claim = { claim: { issuer: 'example', name: 'team', in: [true, 'true', 2, '2'] } };
+    const rule = { id: 'grouped', path: '/a', action: 'deny', conditions: claim };
+    const latest = renderSection(RulesSection, { schema_version: '1.0.0', rules: [rule] });
+    const condition = () => (latest().rules as JsonObject[])[0].conditions;
+    const action = (name: string) => {
+      const root = document.querySelector('[data-condition-pointer="/rules/0/conditions"]')!;
+      const details = root.querySelector<HTMLDetailsElement>(':scope > details')!;
+      if (!details.open) fireEvent.click(details.querySelector('summary')!);
+      fireEvent.click(within(details).getByRole('button', { name }));
+    };
+    action('Wrap in All');
+    action('Add time window operand');
+    fireEvent.change(screen.getByLabelText('Until (exclusive)'), { target: { value: '2027-01-01T00:00:00Z' } });
+    const time = { time_window: { until: '2027-01-01T00:00:00Z' } };
+    expect(condition()).toEqual({ all: [claim, time] });
+    action('Change to Any');
+    expect(condition()).toEqual({ any: [claim, time] });
+    expect(screen.queryByRole('button', { name: 'Unwrap single operand' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Remove operand 2' }));
+    expect(screen.queryByRole('button', { name: 'Remove operand 1' })).toBeNull();
+    action('Unwrap single operand');
+    action('Wrap in Not');
+    expect(condition()).toEqual({ not: claim });
+    action('Remove negation');
+    expect(condition()).toEqual(claim);
+  });
+
+  it('clears uncommitted operand text when removing a sibling', () => {
+    const network = { source_network: { cidrs: ['192.0.2.0/24'] } };
+    const rule = { id: 'networks', path: '/a', action: 'deny', conditions: { all: [network, network] } };
+    renderSection(RulesSection, { schema_version: '1.0.0', rules: [rule] });
+    const inputs = screen.getAllByLabelText('Source networks');
+    fireEvent.change(inputs[0], { target: { value: '198.51.100.0/24' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Remove operand 1' }));
+    expect((screen.getByLabelText('Source networks') as HTMLInputElement).value).toBe('');
+  });
+
+  it('keeps network removals available at the 32-value limit', () => {
+    const cidrs = Array.from({ length: 32 }, (_, index) => `192.0.2.${index}/32`);
+    const rule = { id: 'networks', path: '/', action: 'deny', conditions: { source_network: { cidrs } } };
+    renderSection(RulesSection, { schema_version: '1.0.0', rules: [rule] });
+    const input = screen.getByLabelText('Source networks') as HTMLInputElement;
+    expect(input.readOnly).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Remove 192.0.2.0/32 from Source networks' }));
+    expect(input.readOnly).toBe(false);
+  });
+
+  it('prevents wrapping an entire four-level subtree, while allowing it to shrink', () => {
+    const limit = { not: { not: { not: { time_window: {} } } } };
+    const latest = renderSection(RulesSection, {
+      schema_version: '1.0.0', rules: [{ id: 'bounded', path: '/', action: 'deny', conditions: limit }],
+    });
+    const actions = document.querySelector<HTMLDetailsElement>('[data-condition-pointer="/rules/0/conditions"] > details')!;
+    fireEvent.click(actions.querySelector('summary')!);
+    expect((within(actions).getByRole('button', { name: 'Wrap in All' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(within(actions).getByRole('button', { name: 'Remove negation' }));
+    expect((latest().rules as JsonObject[])[0].conditions).toEqual(limit.not);
+  });
+
+  it('disables every structural mutation for a read-only rule', () => {
+    const conditions = { all: [{ source_network: { cidrs: [] } }, { time_window: {} }] };
+    const rule = { id: 'read-only', path: '/', action: 'deny', conditions };
+    const latest = renderSection(RulesSection, { schema_version: '1.0.0', rules: [rule] }, [], true);
+    const actions = document.querySelector<HTMLDetailsElement>('[data-condition-pointer="/rules/0/conditions"] > details')!;
+    fireEvent.click(actions.querySelector('summary')!);
+    for (const button of within(actions).getAllByRole('button')) {
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+    }
+    expect((screen.getByRole('button', { name: 'Remove operand 1' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(latest().rules).toEqual([rule]);
+  });
+
   it('edits numbers as text, keeps text that is not a number for the gateway to judge, and drops an empty optional value', () => {
     const latest = renderSection(ToolsSection, {
       tools: { 'reports.export': { enabled: true, allowed_roles: [], timeout_ms: 1000 } },
@@ -274,7 +373,7 @@ describe('policy studio section editors', () => {
   it('shows the gateway diagnostics beside the field they point at', () => {
     renderSection(
       RulesSection,
-      { rules: [{ id: 'r', path: 'nope', methods: [], action: 'allow' }] },
+      { schema_version: '0.1.0', rules: [{ id: 'r', path: 'nope', methods: [], action: 'allow', conditions: {} }] },
       [
         {
           code: 'rule_path_invalid',
@@ -288,7 +387,7 @@ describe('policy studio section editors', () => {
         {
           code: 'rule_unknown_member',
           severity: 'warning',
-          pointer: '/rules/0/extra',
+          pointer: '/rules/0/conditions',
           message: 'Unknown member.',
           remediation: 'Remove it.',
           blocks: { simulation: false, tests: false, publication: false, evidence: true },
