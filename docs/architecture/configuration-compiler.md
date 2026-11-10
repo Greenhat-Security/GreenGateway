@@ -69,8 +69,10 @@ configuration.
 
 ### The inventory
 
-`inventory::CONFIG_INPUTS` (`gateway-config/src/compiler/inventory.rs`) lists
-every variable the compiler asks for, in the order it asks. The contract on
+`source::SELECTORS` lists the three inputs that select the configuration authority.
+Once environment mode is selected, `inventory::CONFIG_INPUTS`
+(`gateway-config/src/compiler/inventory.rs`) lists every variable the environment
+compiler asks for, in the order it asks. Its contract on
 reads:
 
 - Every inventoried variable is requested exactly once, and no other name is

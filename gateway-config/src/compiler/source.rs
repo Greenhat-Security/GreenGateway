@@ -84,19 +84,21 @@ pub fn compile_selected(
         }
     };
     let mut refused = Vec::new();
-    for (name, allowed, required) in [
+    for (name, value, allowed, required) in [
         (
             GATEWAY_CONFIG_BUNDLE,
+            get_var(GATEWAY_CONFIG_BUNDLE),
             mode == Mode::Bundle,
             mode == Mode::Bundle,
         ),
         (
             GATEWAY_STATE_DIR,
+            get_var(GATEWAY_STATE_DIR),
             mode != Mode::Environment,
             mode == Mode::Ledger,
         ),
     ] {
-        let reason = match get_var(name) {
+        let reason = match value {
             Err(VarError::NotPresent) if required => SourceRefusal::MissingSelector,
             Err(VarError::NotPresent) => continue,
             _ if !allowed => SourceRefusal::SelectorWithoutMode,

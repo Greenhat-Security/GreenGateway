@@ -2,16 +2,31 @@
 
 GreenGateway reads configuration from environment variables. Each variable is documented below with its own level-3 heading of the exact form `### VAR_NAME`. This document is kept in sync with the code by the drift test in `gateway/tests/env_example.rs`, so drift here is a test failure, not just a documentation staleness risk.
 
-The same variables are described, one per entry and in the order the gateway reads them, by the machine-readable [field catalog](configuration-catalog.json): each one's type and bounds, default, what a blank value means, how sensitive it is, which state backend reads it, what it becomes in a configuration bundle, and whether the Cloudflare wrapper forwards it. The catalog lives in the `gateway-config` library, and tests hold it to the configuration compiler itself and to this document: every entry here has a `Default:` line that states the catalog's default, and a stated `Range:` is the one the compiler enforces. The catalog describes the compiler and is never read at startup.
+After reading the three source selectors, the gateway uses the [field catalog](configuration-catalog.json) to identify settings that conflict with bundle or ledger mode. In environment mode it reads the cataloged settings in order. The catalog documents each setting's type, bounds, default, blank-value behavior, sensitivity, applicable state backends, bundle mapping and Cloudflare support. Tests check the catalog against the compiler and the defaults and ranges in this reference.
 
 The gateway compiles all of these settings once, before it opens a file, store, or connection. Every problem is reported in one pass, in the order the settings are read, and a configuration with any problem starts nothing: the gateway prints the problems and exits with status 1. A path or host name is not checked while compiling, so a missing file or an unreachable issuer fails startup later, when the gateway opens or contacts it. Unset and empty are different inputs: for most settings an empty or whitespace-only value is the same as unset, for some it is refused, and for `AUTH_EXEMPT_PATHS`, `RBAC_EXEMPT_PATHS`, `CSRF_EXEMPT_PATHS`, and `VALIDATION_ALLOWED_CONTENT_TYPES` it is an empty list that replaces the default. The [configuration compiler contract](architecture/configuration-compiler.md) describes what is read, what is validated, how secret material is carried, and what compiling never does.
 
-Startup defaults to environment configuration. You can also select it
-explicitly with `GATEWAY_CONFIG_SOURCE=environment`. Omit `GATEWAY_CONFIG_BUNDLE`
-and `GATEWAY_STATE_DIR` in this mode, including empty assignments. Bundle and
-ledger startup remain unavailable. The gateway rejects a conflicting or
-unavailable source before initializing stores or opening listeners. For the
-full list of refusal codes, see [source diagnostics](ggctl.md#source-diagnostics).
+## Source selection
+
+### GATEWAY_CONFIG_SOURCE
+
+Selects `environment`, `bundle` or `ledger`. Bundle and ledger startup remain unavailable. The gateway checks source conflicts before initializing stores or opening listeners. See [source diagnostics](ggctl.md#source-diagnostics).
+
+Default: `environment` when unset. An empty value is invalid.
+
+### GATEWAY_CONFIG_BUNDLE
+
+Bundle directory. Required in bundle mode. Environment and ledger modes refuse any assignment, including an empty value.
+
+Default: unset.
+
+### GATEWAY_STATE_DIR
+
+Standalone state directory. Required in ledger mode and optional in bundle mode. Environment mode refuses any assignment. A supplied path must be non-empty.
+
+Default: unset.
+
+## Environment settings
 
 ### LISTEN_ADDR
 
