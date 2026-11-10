@@ -321,6 +321,12 @@ async fn mutation_approval_dispatch_sends_one_signed_https_request() {
             events.iter().any(|event| {
                 event.event_type == audit::event::TOOL_INVOKE_FAILURE
                     && event.payload["failure_reason"] == *reason
+            }) && events.iter().any(|event| {
+                event.event_type == audit::event::CONNECTION_MUTATION_APPROVAL
+                    && event.payload["operation"] == "execute"
+                    && event.payload["outcome"] == "failure"
+                    && event.payload["approval_id"].is_string()
+                    && event.payload["reason"] == *reason
             })
         }) && events
             .iter()

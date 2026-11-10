@@ -343,7 +343,7 @@ async fn tool_invocation(
                 StatusCode::OK,
             );
         };
-        state
+        let result = state
             .executor
             .execute_approved_mutation(
                 &definition.name,
@@ -357,7 +357,36 @@ async fn tool_invocation(
                     principal: principal.clone(),
                 },
             )
-            .await
+            .await;
+        if let Err(error) = &result {
+            let reason = match error {
+                tools::runtime::ToolRuntimeError::WorkFailed {
+                    reason: Some(reason),
+                    ..
+                } if matches!(
+                    reason.as_str(),
+                    "mutation_approval_not_found"
+                        | "mutation_approval_mismatch"
+                        | "mutation_approval_state_conflict"
+                        | "mutation_approval_expired"
+                        | "mutation_approval_unavailable"
+                        | "mutation_approval_unsupported"
+                ) =>
+                {
+                    reason.as_str()
+                }
+                _ => "execution_failed",
+            };
+            audit_mutation_approval(
+                &state,
+                &parts,
+                &principal,
+                json!({
+                    "operation": "execute", "outcome": "failure", "approval_id": id.to_string(), "reason": reason,
+                }),
+            );
+        }
+        result
     } else {
         state
             .executor
