@@ -333,6 +333,113 @@ export function RolesSection({
   );
 }
 
+const MAPPING_LISTS = [
+  { member: 'grant_roles', label: 'Granted roles', placeholder: 'support', emptyText: 'At least one defined role is required' },
+  { member: 'subjects', label: 'Subjects', placeholder: 'caller-id', emptyText: 'Any subject from this issuer' },
+  { member: 'organizations', label: 'Organizations', placeholder: 'engineering', emptyText: 'Any verified organization or none' },
+  { member: 'claimed_roles', label: 'Claimed roles', placeholder: 'operator', emptyText: 'Any claimed roles' },
+  { member: 'scopes', label: 'Scopes', placeholder: 'reports:read', emptyText: 'Any verified scopes' },
+] as const;
+
+export function IdentityMappingsSection({
+  document,
+  diagnostics,
+  disabled,
+  register,
+  onChange,
+}: SectionProps) {
+  const member = 'identity_mappings';
+  const list = useOrderedList(document, member, onChange);
+  if (!isPolicyV1(document)) {
+    return <p className="rule-hint">Identity mappings require policy v1. Review the conversion in Overview.</p>;
+  }
+  if (document[member] === undefined) {
+    return (
+      <div className="studio-section-body">
+        <p>This policy uses claimed roles. Enabling mappings in the draft starts with no role grants.</p>
+        <div className="form-actions">
+          <button type="button" className="secondary-button" disabled={disabled}
+            onClick={() => onChange({ ...document, [member]: [] })}>
+            Use identity mappings
+          </button>
+        </div>
+      </div>
+    );
+  }
+  const mappings = document[member];
+  if (!Array.isArray(mappings) || !mappings.every(isJsonObject)) {
+    return <ShapeNotice member={member} />;
+  }
+  const fields = { disabled, diagnostics, register };
+  return (
+    <div className="studio-section-body" ref={list.containerRef}>
+      <p>
+        This policy grants the union of roles from every matching mapping. The issuer and each
+        configured constraint must match. Within a list, any one value matches. Service tokens
+        have no issuer and receive no mapped roles.
+      </p>
+      {mappings.length === 0 && (
+        <div className="empty-state">
+          No mapping grants any role. Switching to claimed roles lets the gateway use roles from
+          the principal again.
+          <div className="form-actions">
+            <button type="button" className="secondary-button" disabled={disabled}
+              onClick={() => onChange(withMember(document, member, undefined))}>
+              Use claimed roles
+            </button>
+          </div>
+        </div>
+      )}
+      {mappings.map((mapping, index) => {
+        const id = typeof mapping.id === 'string' ? mapping.id : '';
+        const pointer = pointerTo(member, index);
+        const fieldPointer = (field: string) => pointerTo(member, index, field);
+        const lists = ['auth_methods', ...MAPPING_LISTS.map(field => field.member)];
+        // A wrong-shaped value needs Source. Editing a projection of a malformed list
+        // could silently discard a matcher and broaden a grant.
+        const malformed = lists.some(field => mapping[field] !== undefined &&
+          !(Array.isArray(mapping[field]) && mapping[field].every(value => typeof value === 'string')));
+        if (malformed) return <ShapeNotice key={index} member={pointer} />;
+        return (
+          <ElementCard key={index} title={id || `Mapping ${index + 1}`} pointer={pointer}
+            diagnostics={diagnostics} register={register} covered={['id', 'issuer', ...lists].map(fieldPointer)}
+            tools={
+              <button type="button" className="rule-danger-button" disabled={disabled}
+                aria-label={`Remove mapping ${id || index + 1}`} onClick={() => list.remove(index)}>
+                Remove
+              </button>
+            }>
+            <TextField {...fields} label="Stable id" pointer={fieldPointer('id')} value={id}
+              onChange={value => list.replace(index, { ...mapping, id: value })} />
+            <TextField {...fields} label="Issuer" pointer={fieldPointer('issuer')}
+              value={typeof mapping.issuer === 'string' ? mapping.issuer : ''} placeholder="https://idp.example/"
+              onChange={value => list.replace(index, { ...mapping, issuer: value })} />
+            <AuthMethodsField {...fields} legend="Auth methods" pointer={fieldPointer('auth_methods')}
+              values={stringList(mapping.auth_methods)}
+              onChange={values => list.replace(index, optionalList(mapping, 'auth_methods', values))} />
+            {MAPPING_LISTS.map(field => (
+              <TokenListField {...fields} key={JSON.stringify([id, mapping.issuer, field.member])} label={field.label}
+                pointer={fieldPointer(field.member)} values={stringList(mapping[field.member])}
+                placeholder={field.placeholder} emptyText={field.emptyText} preserveWhitespace
+                suggestions={field.member === 'grant_roles' ? roleNames(document) : undefined}
+                onChange={values => list.replace(index, field.member === 'grant_roles'
+                  ? { ...mapping, grant_roles: values }
+                  : optionalList(mapping, field.member, values))} />
+            ))}
+          </ElementCard>
+        );
+      })}
+      <div className="form-actions">
+        <button ref={list.addRef} type="button" className="secondary-button"
+          disabled={disabled || mappings.length >= 256}
+          onClick={() => list.append({ id: nextElementId(document, 'mapping'), issuer: '', grant_roles: [] })}>
+          Add mapping
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function RoutesSection({
   document,
   diagnostics,
@@ -1791,6 +1898,7 @@ function TokenListField({
   emptyText,
   suggestions,
   normalize,
+  preserveWhitespace = false,
   disabled,
   diagnostics,
   register,
@@ -1803,6 +1911,7 @@ function TokenListField({
   emptyText: string;
   suggestions?: readonly string[];
   normalize?: (value: string) => string;
+  preserveWhitespace?: boolean;
   disabled: boolean;
   diagnostics: readonly PolicyDiagnostic[];
   register: FieldRegistrar;
@@ -1813,12 +1922,12 @@ function TokenListField({
   const problems = diagnosticsWithin(diagnostics, pointer);
   const hasError = problems.some((problem) => problem.severity === 'error');
 
+  const inputValue = preserveWhitespace ? draft : draft.trim();
   function add() {
-    const trimmed = draft.trim();
-    if (trimmed.length === 0) {
+    if (inputValue.length === 0) {
       return;
     }
-    const value = normalize ? normalize(trimmed) : trimmed;
+    const value = normalize ? normalize(inputValue) : inputValue;
     if (!values.includes(value)) {
       onChange([...values, value]);
     }
@@ -1855,7 +1964,7 @@ function TokenListField({
           type="button"
           className="secondary-button"
           aria-label={`Add to ${label}`}
-          disabled={disabled || draft.trim().length === 0}
+          disabled={disabled || inputValue.length === 0}
           onClick={add}
         >
           Add
@@ -1872,19 +1981,27 @@ function TokenListField({
         {values.length === 0 ? (
           <span className="badge neutral">{emptyText}</span>
         ) : (
-          values.map((value, index) => (
-            <span className="rule-chip" key={`${index}:${value}`}>
-              {value}
-              <button
-                type="button"
-                aria-label={`Remove ${value} from ${label}`}
-                disabled={disabled}
-                onClick={() => onChange(removeAt(values, index))}
-              >
-                x
-              </button>
-            </span>
-          ))
+          values.map((value, index) => {
+            // HTML collapses runs of whitespace. Show their code points when
+            // an exact matcher would otherwise look like a different value.
+            const name = preserveWhitespace && /^\s|\s$|\s{2}|["\\]/u.test(value)
+              ? JSON.stringify(value).replace(/\s/gu, space =>
+                  `\\u${space.charCodeAt(0).toString(16).padStart(4, '0')}`)
+              : value;
+            return (
+              <span className="rule-chip" key={`${index}:${value}`}>
+                {name}
+                <button
+                  type="button"
+                  aria-label={`Remove ${name} from ${label}`}
+                  disabled={disabled}
+                  onClick={() => onChange(removeAt(values, index))}
+                >
+                  x
+                </button>
+              </span>
+            );
+          })
         )}
       </div>
       <FieldProblems id={`${id}-problems`} diagnostics={problems} />

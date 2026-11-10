@@ -31,6 +31,45 @@ afterEach(() => {
 });
 
 describe('PolicyStudioView', () => {
+  it('takes an issuer-bound role mapping through diagnostics, draft save and publication review', async () => {
+    const gateway = fakeGateway();
+    gateway.validate = source => {
+      const { identity_mappings: mappings } = JSON.parse(source);
+      return mappings?.[0]?.issuer === ''
+        ? jsonResponse(400, { valid: false, schema_version: '1.0.0', diagnostics: [diagnostic({
+            code: 'issuer_empty', pointer: '/identity_mappings/0/issuer',
+            message: 'An issuer is required.', element_id: 'mapping-1',
+          })] })
+        : jsonResponse(200, validInspection());
+    };
+    renderStudio(gateway);
+    await openDraft();
+    fireEvent.click(screen.getByRole('tab', { name: 'Identity mappings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Use identity mappings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
+    await screen.findByRole('tab', { name: 'Identity mappings, 1 problem' }, WAIT);
+    fireEvent.click(screen.getByRole('tab', { name: 'Overview' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Show in editor: /identity_mappings/0/issuer' }));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText('Issuer')), WAIT);
+
+    fireEvent.change(screen.getByLabelText('Issuer'), { target: { value: 'https://idp.example' } });
+    fireEvent.change(screen.getByLabelText('Granted roles'), { target: { value: 'support' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add to Granted roles' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+    await screen.findByText('Revision 2 saved. The live policy is unchanged.', undefined, WAIT);
+    const publish = screen.getByRole('button', { name: 'Publish draft' }) as HTMLButtonElement;
+    await waitFor(() => expect(publish.disabled).toBe(false), WAIT);
+    fireEvent.click(publish);
+    const review = screen.getByRole('group', { name: 'Publish this draft?' });
+    expect(within(review).getByText(/every role grant must come from a matching identity mapping/)).toBeTruthy();
+    expect(gateway.live.policy.identity_mappings).toBeUndefined();
+    fireEvent.click(within(review).getByRole('button', { name: 'Confirm publish' }));
+    await screen.findByText('Draft published', undefined, WAIT);
+    expect(gateway.live.policy.identity_mappings).toEqual([
+      { id: 'mapping-1', issuer: 'https://idp.example', grant_roles: ['support'] },
+    ]);
+  });
+
   it('edits a rule in a structured editor and validates the exact text as it is typed', async () => {
     const gateway = fakeGateway();
     gateway.validate = (source) => {

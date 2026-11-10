@@ -36,6 +36,7 @@ describe('policy studio model', () => {
     expect(sectionForPointer('/default_action')).toBe('overview');
     expect(sectionForPointer('/schema_version')).toBe('overview');
     expect(sectionForPointer('/roles/admin/permissions/0')).toBe('roles');
+    expect(sectionForPointer('/identity_mappings/0/grant_roles/0')).toBe('identity_mappings');
     expect(sectionForPointer('/rules/3/path')).toBe('rules');
     expect(sectionForPointer('/rate_limits/0/burst')).toBe('rate_limits');
     expect(sectionForPointer('/tools/a~1b')).toBe('tools');
@@ -88,13 +89,22 @@ describe('policy studio model', () => {
     expect(egressChanged(live, { ...live, egress: {} })).toBe(false);
   });
 
-  it('chooses an element id unused across rules, routes and rate limits', () => {
+  it('shows a change of role source even when neither policy grants any mapped roles', () => {
+    const claimed = { schema_version: '1.0.0' };
+    const mapped = { ...claimed, identity_mappings: [] };
+    expect(changedMembers(claimed, mapped)).toEqual(['identity mappings']);
+    expect(changedMembers(mapped, claimed)).toEqual(['identity mappings']);
+    expect(changedMembers(mapped, { ...mapped })).toEqual([]);
+  });
+
+  it('chooses an element id unused across rules, routes, rate limits and identity mappings', () => {
     const document = {
       rules: [{ id: 'rule-1' }],
       routes: [{ id: 'rule-2' }],
       rate_limits: [{ id: 'rule-3' }],
+      identity_mappings: [{ id: 'rule-4' }],
     };
-    expect(nextElementId(document, 'rule')).toBe('rule-4');
+    expect(nextElementId(document, 'rule')).toBe('rule-5');
   });
 
   it('renames a map member in place and refuses a rename that would drop an entry', () => {
