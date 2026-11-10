@@ -19,9 +19,9 @@ replace, the gateway's configured MCP alias paths, the configured limits of the
 global rate lanes, and the resources a publication's
 [cross-resource checks](configuration.md#policy_file) read -- the tool
 registry, the Connections, the static egress lane and the configuration
-identity -- read once for the analysis. It never reads retained traffic, so it
-never says anything about what was or was not observed, and it never calls an
-element unreachable because it was not seen. A report with no findings is not
+identity -- read once for the analysis. An optional finished replay supplies a
+separate section of observations. Structural checks never label an element
+unreachable because it was absent from the replay window. A report with no findings is not
 a statement that a policy is safe: the analyzer reports only what it can prove
 or, for a heuristic, what it can name (see
 [False-positive bias](#false-positive-bias)), and a policy can be wrong in
@@ -36,6 +36,35 @@ resolution facts, and nothing is looked up.
 Beyond the access record every admin request gets, the only record it leaves
 is one `policy.analysis_run` audit event. It reads the deployment's
 [suppressions](#suppressions), which only change how a finding is labeled.
+
+## Observations from a completed replay
+
+In the Optimize tab, enter the ID of a completed replay when running the
+analysis. The API accepts the same ID in the optional `replay_job_id` field
+for JSON output. The caller needs `admin:policy:read`, `admin:policy:analyze`,
+`admin:policy:simulate` and `admin:audit:read`. The gateway checks ownership,
+retention and both policy ETags before attaching the result. It returns 404 for
+an unknown or inaccessible job, 409 for an unfinished result or a different
+policy pair, and 503 if the cluster replay store is unavailable. Requesting
+SARIF with a replay ID returns 422.
+
+The optional `observed_replay` section binds the observations to the replay
+result digest, the half-open window, its high-water cutoff and the record
+limit. It reports records selected, scanned and replayable, plus compared,
+indeterminate and unsupported counts for each requested projection and lane.
+Each positive finding has `proof_basis` inherited from this section
+(`bounded_replay`). `newly_allowed` counts logical deny-to-allow transitions.
+`newly_forwarded` counts changes from blocking to forwarding, including a
+deny that became shadow-only. The two counts can overlap. HTTP and tool
+decisions are reported separately for the as-authored policy and, when
+requested, the hypothetical enforce-all-shadow projection.
+
+Incomplete jobs retain their positive observations alongside the replay's
+limitation codes. An empty list reports zero observed expansions in the
+comparisons the gateway could make. It cannot establish what unrecorded
+traffic or a future request would do. Read `not_replayed` for the stages
+outside replay coverage. Observations carry no policy patch or suppression
+identity and do not contribute to structural severity totals.
 
 ## The request
 
@@ -244,8 +273,8 @@ reaches them, so a reachability claim says in which lanes it holds.
   unsafe, or an overlap whose witness an even earlier rule decides. It is
   reported, never dropped, and carries no patch.
 
-`bounded_replay`, the basis of a finding informed by retained traffic, is
-reserved: this analyzer reads no traffic.
+`bounded_replay` is the proof basis of observations attached from a finished
+replay. The result digest identifies the exact comparisons behind them.
 
 ### Finding codes
 
@@ -599,15 +628,15 @@ number of `edits`, for a stored candidate its `candidate_draft_id` and
 `complete`, the `limitations`, the `summary` counts (by severity, proof basis,
 code and suppression state), `suppressions_available`,
 `resource_snapshot_digest` and `resource_snapshot_complete`, and the analyzer
-and evaluator versions. It never carries a finding's element, pointer, id or
+and evaluator versions. A request that included a replay records
+`replay_attached: true`. The audit event never carries a finding's element, pointer, id or
 fingerprint, a suppression id or reason, a patch, or policy content. A refused
 request (`4xx`) is not recorded as an
 analysis.
 
 ## Not part of this slice
 
-- Findings informed by retained traffic (`bounded_replay`), and unused roles
-  and permissions.
+- Findings inferred from a lack of traffic, and unused roles and permissions.
 - Partial overlaps between routes or between rate overrides, and coverage by
   the union of several elements.
 - Issuer and provider names, admin permission spellings and secret

@@ -104,6 +104,15 @@ describe('policy analysis client', () => {
     }
   });
 
+  it('refuses a structural-only answer when the request selected replay evidence', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(jsonResponse(200, report()))));
+    await expect(runPolicyAnalysisReport({
+      baseEtag: LIVE_ETAG,
+      candidate: { kind: 'active' },
+      replayJobId: `rpl_${'1'.repeat(32)}`,
+    })).rejects.toThrow('unreadable analysis');
+  });
+
   it('reads every suppression state and refuses a report it cannot trust', () => {
     const mismatched = projectAnalysisReport(
       report({

@@ -2404,6 +2404,7 @@ export function PolicyStudioView() {
                   }}
                   canEditDraft={editable}
                   canAnalyze={canAnalyze}
+                  canReplay={canReplay}
                   canWritePolicy={canWrite}
                   onShowInEditor={showDiagnostic}
                 />

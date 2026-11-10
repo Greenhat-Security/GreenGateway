@@ -302,6 +302,21 @@ macro_rules! cluster {
 async fn a_takeover_after_a_lost_lease_counts_every_record_exactly_once() {
     let (cluster, _guard) = cluster!();
     let spec = cluster.admit(1, &engine_version(), None).await;
+    let mut caller = auth::Principal {
+        user_id: spec.owner.subject.clone(),
+        issuer: None,
+        email: None,
+        org_id: None,
+        roles: Vec::new(),
+        session_id: String::new(),
+        auth_method: auth::AuthMethod::Bearer,
+        scopes: None,
+        verified_claims: Vec::new(),
+    };
+    assert!(matches!(
+        cluster.replica_b.evidence(&caller, &spec.job_id).await,
+        Err(ReplayJobEvidenceRefusal::Unfinished(_))
+    ));
     let expected = cluster.uninterrupted(&spec).await;
     assert!(expected.complete);
     assert_eq!(expected.scanned, u64::try_from(RECORDS).expect("fits"));
@@ -360,6 +375,42 @@ async fn a_takeover_after_a_lost_lease_counts_every_record_exactly_once() {
     assert!(cluster.replica_b.run_one(&cluster.audit).await);
     let finished = cluster.record(&spec).await;
     assert_eq!(finished.status.state, "completed");
+    let evidence = cluster
+        .replica_a
+        .evidence(&caller, &spec.job_id)
+        .await
+        .unwrap_or_else(|_| panic!("the owner can read the result from the other replica"));
+    let observations =
+        crate::policy_analysis::observations::from_evidence(&evidence.view, evidence.complete)
+            .unwrap();
+    assert_eq!(observations["result_digest"], expected.digest);
+    assert_eq!(observations["cutoff"]["selected_records"], RECORDS);
+    assert_eq!(observations["findings"], json!([]));
+    let mut inconsistent = evidence.view;
+    inconsistent["result"]["impact"]["projections"]["as_authored"]["http"]["transitions"]
+        ["newly_allowed"] = json!(1);
+    assert!(
+        crate::policy_analysis::observations::from_evidence(&inconsistent, evidence.complete)
+            .is_err(),
+        "counts must still match the committed result digest"
+    );
+    inconsistent["result"]["records"]["replayable"] = json!(0);
+    inconsistent["result_digest"] = json!(crate::canonical_json::semantic_digest(
+        policy_replay::job::RESULT_MEDIA_TYPE,
+        policy_replay::job::RESULT_SCHEMA_VERSION,
+        &inconsistent["result"]
+    )
+    .unwrap());
+    assert!(
+        crate::policy_analysis::observations::from_evidence(&inconsistent, evidence.complete)
+            .is_err(),
+        "even a matching digest cannot make contradictory coverage a finding"
+    );
+    caller.issuer = Some("https://other.example.test".to_owned());
+    assert!(matches!(
+        cluster.replica_a.evidence(&caller, &spec.job_id).await,
+        Err(ReplayJobEvidenceRefusal::NotFound)
+    ));
     assert_eq!(
         finished.status.scanned_records,
         i64::try_from(RECORDS).expect("fits"),

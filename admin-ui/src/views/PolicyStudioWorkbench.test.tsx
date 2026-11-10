@@ -456,12 +456,35 @@ describe('Policy Studio workbench', () => {
     }
   });
 
+  it('shows only the observed expansion counts returned for the selected replay', async () => {
+    const gateway = fakeGateway({ permissions: [READ, ANALYZE, SIMULATE, AUDIT] });
+    renderStudio(gateway);
+    await studioLoaded();
+    openView('Optimize');
+    const panel = within(viewPanel('Optimize'));
+    const input = panel.getByLabelText('Completed replay ID (optional)');
+    fireEvent.change(input, { target: { value: JOB_ID } });
+    fireEvent.click(panel.getByRole('button', { name: 'Run analysis' }));
+    const replay = await panel.findByRole('region', { name: 'Observed replay expansions' }, WAIT);
+    const observed = within(replay);
+    expect(observed.getByText(/2 changed from blocked to forwarded/)).toBeTruthy();
+    expect(observed.queryByText(/changed from logical deny to allow/)).toBeNull();
+    expect(observed.getByText(/Incomplete replay.*scan_truncated/)).toBeTruthy();
+    expect(observed.getByText(SNAPSHOT_DIGEST)).toBeTruthy();
+    expect(observed.queryByRole('button')).toBeNull();
+    const [request] = gateway.requests('POST', '/v1/admin/policy/analyses');
+    expect(JSON.parse(request.body ?? '{}').replay_job_id).toBe(JOB_ID);
+    fireEvent.change(input, { target: { value: '' } });
+    expect(panel.getByText(/replay selection changed/)).toBeTruthy();
+  });
+
   it('analyzes the live policy, suppresses a finding and expires the suppression', async () => {
     const gateway = fakeGateway({ permissions: [READ, WRITE, SIMULATE, ANALYZE] });
     renderStudio(gateway);
     await studioLoaded();
     openView('Optimize');
     const optimize = viewPanel('Optimize');
+    expect(within(optimize).queryByLabelText('Completed replay ID (optional)')).toBeNull();
     fireEvent.click(within(optimize).getByRole('button', { name: 'Run analysis' }));
 
     expect(await within(optimize).findByText('rule_shadowed', undefined, WAIT)).toBeTruthy();
@@ -634,7 +657,21 @@ function fakeGateway({ permissions = [READ, WRITE, SIMULATE] }: { permissions?: 
         return jsonResponse(200, draftView(), { ETag: '"sha256:draft-r1"' });
       }
       if (path === '/v1/admin/policy/analyses' && method === 'POST') {
-        return jsonResponse(200, analysisReport(gateway.suppression));
+        const report = analysisReport(gateway.suppression);
+        if (JSON.parse(body ?? '{}').replay_job_id === JOB_ID) {
+          return jsonResponse(200, { ...report, observed_replay: {
+            proof_basis: 'bounded_replay', complete: false, result_digest: SNAPSHOT_DIGEST,
+            window: { from: '2026-11-01T00:00:00Z', to: '2026-11-02T00:00:00Z' },
+            cutoff: { high_water: 10, selected_records: 10 }, max_records: 3, scanned: 3, replayable: 3,
+            limitations: ['scan_truncated'], not_replayed: ['authentication', 'upstream'],
+            coverage: [
+              { projection: 'as_authored', lane: 'http', records: 3, compared: 2, indeterminate: 1, unsupported_context: 0 },
+              { projection: 'as_authored', lane: 'tool', records: 0, compared: 0, indeterminate: 0, unsupported_context: 0 },
+            ],
+            findings: [{ projection: 'as_authored', lane: 'http', code: 'newly_forwarded', count: 2 }],
+          } });
+        }
+        return jsonResponse(200, report);
       }
       if (path === '/v1/admin/policy/analyses/suppressions' && method === 'GET') {
         return jsonResponse(200, {

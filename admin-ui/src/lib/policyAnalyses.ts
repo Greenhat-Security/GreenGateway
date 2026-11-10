@@ -115,7 +115,7 @@ export async function runPolicyAnalysis(
   return { kind: 'result', result };
 }
 
-function analysisRequestBody(request: PolicyAnalysisRequest): string {
+function analysisRequestBody(request: PolicyAnalysisRequest & { replayJobId?: string }): string {
   const candidate =
     request.candidate.kind === 'active'
       ? '{"source":"active"}'
@@ -129,6 +129,7 @@ function analysisRequestBody(request: PolicyAnalysisRequest): string {
     JSON.stringify(request.baseEtag),
     ',"candidate":',
     candidate,
+    ...(request.replayJobId === undefined ? [] : [',"replay_job_id":', JSON.stringify(request.replayJobId)]),
     ',"format":"json"}',
   ].join('');
 }
@@ -275,7 +276,139 @@ export type AnalysisFinding = Readonly<{
   suppression: FindingSuppression | null;
 }>;
 
+type ReplayLane = Readonly<{
+  projection: 'as_authored' | 'enforce_all_shadow';
+  lane: 'http' | 'tool';
+}>;
+
+type ComparedLane = ReplayLane & Readonly<{
+  records: number;
+  compared: number;
+  indeterminate: number;
+  unsupported: number;
+}>;
+
+type ObservedFinding = ReplayLane & Readonly<{
+  code: 'newly_allowed' | 'newly_forwarded';
+  count: number;
+}>;
+
+export type ObservedReplay = Readonly<{
+  resultDigest: string;
+  complete: boolean;
+  from: string;
+  to: string;
+  highWater: number;
+  selected: number;
+  scanned: number;
+  replayable: number;
+  maxRecords: number;
+  limitations: readonly string[];
+  notReplayed: readonly string[];
+  coverage: readonly ComparedLane[];
+  findings: readonly ObservedFinding[];
+}>;
+
+function replayLane(row: Record<string, unknown>): ReplayLane | null {
+  const { projection, lane } = row;
+  if (projection !== 'as_authored' && projection !== 'enforce_all_shadow') return null;
+  if (lane !== 'http' && lane !== 'tool') return null;
+  return { projection, lane };
+}
+
+function projectObservedReplay(value: unknown): ObservedReplay | null {
+  if (
+    !isJsonObject(value) ||
+    value.proof_basis !== 'bounded_replay' ||
+    typeof value.complete !== 'boolean' ||
+    !isDigest(value.result_digest) ||
+    !isJsonObject(value.window) ||
+    !isBoundedText(value.window.from, 64) ||
+    !isBoundedText(value.window.to, 64) ||
+    !Number.isFinite(Date.parse(value.window.from)) ||
+    !Number.isFinite(Date.parse(value.window.to)) ||
+    !isJsonObject(value.cutoff) ||
+    !isCount(value.cutoff.high_water) ||
+    !isCount(value.cutoff.selected_records) ||
+    !isCount(value.scanned) ||
+    (value.complete && value.scanned !== value.cutoff.selected_records) ||
+    !isCount(value.replayable) ||
+    value.replayable > value.scanned ||
+    !isCount(value.max_records) ||
+    value.max_records < 1 ||
+    value.scanned > value.max_records ||
+    !Array.isArray(value.coverage) ||
+    value.coverage.length < 2 ||
+    value.coverage.length > 4 ||
+    !Array.isArray(value.findings) ||
+    value.findings.length > 8
+  ) return null;
+  const limitations = boundedCodes(value.limitations);
+  const notReplayed = boundedCodes(value.not_replayed);
+  if (limitations === null || notReplayed === null || value.complete !== (limitations.length === 0)) {
+    return null;
+  }
+  const coverage: ComparedLane[] = [];
+  for (const row of value.coverage) {
+    if (!isJsonObject(row)) return null;
+    const identity = replayLane(row);
+    if (
+      identity === null ||
+      !isCount(row.records) ||
+      !isCount(row.compared) ||
+      !isCount(row.indeterminate) ||
+      !isCount(row.unsupported_context) ||
+      row.records > value.scanned ||
+      row.records !== row.compared + row.indeterminate + row.unsupported_context ||
+      coverage.some((c) => c.lane === identity.lane && c.projection === identity.projection)
+    ) return null;
+    coverage.push({
+      ...identity,
+      records: row.records,
+      compared: row.compared,
+      indeterminate: row.indeterminate,
+      unsupported: row.unsupported_context,
+    });
+  }
+  for (const projection of new Set(coverage.map((row) => row.projection))) {
+    const lanes = coverage.filter((row) => row.projection === projection);
+    if (lanes.length !== 2 || lanes[0].records + lanes[1].records !== value.replayable) return null;
+  }
+  const findings: ObservedFinding[] = [];
+  for (const row of value.findings) {
+    if (!isJsonObject(row)) return null;
+    const identity = replayLane(row);
+    const basis = coverage.find((c) => c.lane === row.lane && c.projection === row.projection);
+    if (
+      identity === null ||
+      basis === undefined ||
+      (row.code !== 'newly_allowed' && row.code !== 'newly_forwarded') ||
+      !isCount(row.count) ||
+      row.count < 1 ||
+      row.count > basis.compared ||
+      findings.some((f) => f.lane === row.lane && f.projection === row.projection && f.code === row.code)
+    ) return null;
+    findings.push({ ...identity, code: row.code, count: row.count });
+  }
+  return {
+    resultDigest: value.result_digest,
+    complete: value.complete,
+    from: value.window.from,
+    to: value.window.to,
+    highWater: value.cutoff.high_water,
+    selected: value.cutoff.selected_records,
+    scanned: value.scanned,
+    replayable: value.replayable,
+    maxRecords: value.max_records,
+    coverage,
+    limitations,
+    notReplayed,
+    findings,
+  };
+}
+
 export type AnalysisReport = Readonly<{
+  observedReplay: ObservedReplay | null;
   analyzedEtag: string;
   complete: boolean;
   limitations: readonly string[];
@@ -350,7 +483,7 @@ export function isSuppressionReason(reason: string): boolean {
 // state, the resource snapshot the analysis read, and whether the
 // deployment's suppressions were consulted at all.
 export async function runPolicyAnalysisReport(
-  request: PolicyAnalysisRequest,
+  request: PolicyAnalysisRequest & { replayJobId?: string },
 ): Promise<AnalysisAnswer> {
   const response = await adminFetchJsonResponse<unknown>(adminApiUrl('/policy/analyses'), {
     method: 'POST',
@@ -367,7 +500,15 @@ export async function runPolicyAnalysisReport(
     return { kind: 'refused', refusal };
   }
   const report = projectAnalysisReport(response.body);
-  if (report === null) {
+  if (
+    report === null ||
+    (request.replayJobId !== undefined) !== (report.observedReplay !== null) ||
+    (report.observedReplay !== null && (
+      !isJsonObject(response.body) ||
+      !isJsonObject(response.body.base) ||
+      response.body.base.etag !== request.baseEtag
+    ))
+  ) {
     throw new AdminApiError(response.status, 'The gateway returned an unreadable analysis.');
   }
   return { kind: 'result', report };
@@ -476,8 +617,11 @@ export function projectAnalysisReport(body: unknown): AnalysisReport | null {
     }
     findings.push(finding);
   }
+  const observedReplay = body.observed_replay === undefined ? null : projectObservedReplay(body.observed_replay);
+  if (body.observed_replay !== undefined && observedReplay === null) return null;
   const digest = body.resource_snapshot.digest;
   return {
+    observedReplay,
     analyzedEtag: body.analyzed.etag,
     complete: body.complete,
     limitations,

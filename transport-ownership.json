@@ -7017,9 +7017,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "b37be21406f38b9c7d14260eecebe4ac624310914d6b22189e9e8cc5740a849e",
+      "sha256": "e91d8b654ccc0918e229a3555310e17e9c3758ffbaaff7ada915f3f5715f0089",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+      "purpose": "Registers the reviewed admin API handlers, including the policy analysis limiter and owner-scoped replay registry."
     },
     {
       "file": "gateway/src/routing.rs",

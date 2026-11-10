@@ -53,6 +53,7 @@ pub(crate) struct AnalysisRequest {
     pub(crate) base_etag: String,
     pub(crate) candidate: CandidateSource,
     pub(crate) format: AnalysisFormat,
+    pub(crate) replay_job_id: Option<String>,
 }
 
 /// Parse and validate a request body already read as `value` from `bytes`,
@@ -71,6 +72,7 @@ pub(crate) fn parse_request(bytes: &[u8], value: &Value) -> Result<AnalysisReque
             "base_etag",
             "candidate",
             "format",
+            "replay_job_id",
         ],
         &mut diagnostics,
     );
@@ -123,6 +125,21 @@ pub(crate) fn parse_request(bytes: &[u8], value: &Value) -> Result<AnalysisReque
             format
         }
     };
+    let replay_job_id = root.get("replay_job_id").and_then(|value| {
+        bounded_string(
+            value,
+            "/replay_job_id",
+            crate::policy_evidence::request::MAX_REPLAY_JOB_ID_BYTES,
+            &mut diagnostics,
+        )
+    });
+    if replay_job_id.is_some() && format == Some(AnalysisFormat::Sarif) {
+        diagnostics.push(
+            "invalid_value",
+            "/format",
+            "replay observations require JSON output",
+        );
+    }
     if !diagnostics.is_empty() {
         return Err(diagnostics);
     }
@@ -136,6 +153,7 @@ pub(crate) fn parse_request(bytes: &[u8], value: &Value) -> Result<AnalysisReque
             base_etag,
             candidate,
             format,
+            replay_job_id,
         }),
         // Every arm that yields `None` above records why; refused rather
         // than defaulted if one ever does not.
