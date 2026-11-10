@@ -11807,9 +11807,9 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::proxy::forward::forward_to_upstream#1",
-      "sha256": "d741b9d3ce983b60447cb7a66002368745949bf8aca8368f50ae11a9d2ca5873",
+      "sha256": "44fb585f3fa31be145d4bf1a4c5883e89e7a4a28c3b6a06b9ce76a42fc388dd0",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed exact GreenPM research byte budgets, bounded single-export buffering, retained admission lifetime and replica agreement; no additional transport authority. Caller-assertion admission, signing-key load and signing for attested Connection routes (#463), and buffering a body the assertion binds within the existing size and deadline bounds, add one header on the same checked destination; no additional transport authority."
+      "purpose": "Reviewed exact GreenPM research byte budgets, bounded single-export buffering, retained admission lifetime and replica agreement; no additional transport authority. Caller-assertion admission, signing-key load and signing for attested Connection routes (#463), and buffering a body the assertion binds within the existing size and deadline bounds, add one header on the same checked destination; no additional transport authority. Refuse unenforceable assertion settings before reading the body, with an audit record and zero egress attempts (#757)."
     },
     {
       "file": "gateway/src/proxy/forward.rs",

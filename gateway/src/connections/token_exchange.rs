@@ -1196,7 +1196,6 @@ impl DelegatedTokenRuntime {
             jti,
             issued_at,
             None,
-            None,
         )
         .map(Zeroizing::new)
         .map_err(|_| DelegatedTokenError::ExchangeFailed)

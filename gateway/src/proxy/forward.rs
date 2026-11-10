@@ -385,9 +385,30 @@ async fn forward_to_upstream(
     // binds the request covers the exact body sent: on a route that streams
     // bodies, such a request is held in full, within the route's size limit,
     // before anything is signed, and one over the limit is refused rather
-    // than signed in part. A refusal to build the target is still answered
-    // after the body is read, as it always was.
+    // than signed in part.
     let connection_target = proxy_connection_target(proxy, &upstream, &parts);
+    if let Err(error @ ConnectionHttpError::CallerAssertionNotEnforced) = &connection_target {
+        // There can be no signed request. Refuse before reading a mutation body
+        // or making it available to payload discovery.
+        if let Some(capture) = payload_capture.as_ref() {
+            capture.mark_body_capture_incomplete();
+        }
+        emit_caller_assertion_decision(
+            proxy,
+            &parts,
+            source_ip,
+            &upstream,
+            None,
+            Err(error.safe_reason()),
+        );
+        return connection_failure_response(
+            *error,
+            &upstream.pool.id,
+            request_id,
+            Vec::new(),
+            Duration::ZERO,
+        );
+    }
     let request_body_mode = match &connection_target {
         Ok(Some(target)) if target.caller_assertion_binds_request_body() => {
             RequestBodyMode::Buffered
@@ -557,9 +578,9 @@ async fn forward_to_upstream(
                             proxy,
                             &parts,
                             source_ip,
-                            &upstream.pool.id,
-                            target,
-                            Err(error),
+                            &upstream,
+                            Some(target),
+                            Err(error.safe_reason()),
                         );
                         return caller_assertion_failure_response(
                             error,
@@ -686,9 +707,9 @@ async fn forward_to_upstream(
                             proxy,
                             &parts,
                             source_ip,
-                            &upstream.pool.id,
-                            target,
-                            Err(error),
+                            &upstream,
+                            Some(target),
+                            Err(error.safe_reason()),
                         );
                         return caller_assertion_failure_response(
                             error,
@@ -788,9 +809,9 @@ async fn forward_to_upstream(
                     proxy,
                     &parts,
                     source_ip,
-                    &upstream.pool.id,
-                    target,
-                    decision.as_ref().map_err(|error| *error),
+                    &upstream,
+                    Some(target),
+                    decision.as_ref().map_err(|error| error.safe_reason()),
                 );
                 if let Err(error) = decision {
                     return caller_assertion_failure_response(
@@ -2213,9 +2234,9 @@ fn emit_caller_assertion_decision(
     proxy: &ProxyState,
     parts: &http::request::Parts,
     source_ip: &str,
-    route_id: &str,
-    target: &ConnectionHttpTarget,
-    decision: Result<&IssuedCallerAssertion, CallerAssertionError>,
+    upstream: &MatchedUpstream,
+    target: Option<&ConnectionHttpTarget>,
+    decision: Result<&IssuedCallerAssertion, &'static str>,
 ) {
     let request_id = parts
         .headers
@@ -2227,19 +2248,21 @@ fn emit_caller_assertion_decision(
         .get::<auth::Principal>()
         .map(auth::actor_from_principal);
     let mut payload = json!({
-        "connection_id": target.connection_id(),
-        "auth_type": target.authentication_kind(),
+        "connection_id": upstream.connection_id.as_deref(),
         "consumer_kind": "proxy_route",
-        "consumer_id": route_id,
+        "consumer_id": upstream.pool.id.as_ref(),
     });
+    if let Some(target) = target {
+        payload["auth_type"] = json!(target.authentication_kind());
+    }
     match decision {
         Ok(issued) => {
             payload["outcome"] = json!("success");
             payload["caller_assertion"] = json!(issued);
         }
-        Err(error) => {
+        Err(reason) => {
             payload["outcome"] = json!("failure");
-            payload["reason"] = json!(error.safe_reason());
+            payload["reason"] = json!(reason);
         }
     }
     proxy.audit.emit(audit::AuditEvent::new(
@@ -3503,9 +3526,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn unenforced_caller_assertion_is_refused_before_secret_or_upstream_io() {
         // A block only an earlier release accepted is honoured by no lane, the
-        // proxy included: a proxied call would otherwise leave carrying only
-        // the service credential. The proxy's only record of why is its
-        // fail-closed log line, so capture it.
+        // proxy included. Both the audit record and the log must identify the
+        // refusal before credential resolution or upstream I/O.
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -3621,14 +3643,20 @@ mod tests {
         let ProxyRoutes::RoutingTable { routes } = &mut proxy.routes else {
             panic!("assertion test proxy should use a routing table");
         };
-        routes[0].connection_id = Some(connection_id);
+        routes[0].connection_id = Some(connection_id.clone());
         proxy.connection_http = Some(runtime);
 
         let request = Request::builder()
-            .method(Method::GET)
+            .method(Method::POST)
             .uri("/charges")
             .header(REQUEST_ID_HEADER, "assertion-request")
-            .body(Body::empty())
+            .header("x-approval-id", "untrusted-review")
+            .extension(attested_principal("alice", auth::AuthMethod::Bearer))
+            .body(Body::from_stream(stream::poll_fn(
+                |_| -> std::task::Poll<Option<Result<bytes::Bytes, Infallible>>> {
+                    panic!("a refused approval-bound mutation must leave its body unread")
+                },
+            )))
             .expect("assertion request should build");
         let response = proxy.forward_request(request, "203.0.113.8").await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -3644,8 +3672,7 @@ mod tests {
             .expect("refusal body should read");
         assert_eq!(body.as_ref(), br#"{"error":"bad_gateway"}"#);
         drop(_guard);
-        // Any other target error would produce the same status and outcome;
-        // only the category on the fail-closed line names the refusal. Match
+        // Other target errors produce the same status and outcome. Match
         // that field on that line, so the reason appearing anywhere else in
         // the output, or a different category, cannot pass.
         let output = logs.contents();
@@ -3664,12 +3691,23 @@ mod tests {
             failed_closed[0]
         );
 
+        let decisions = wait_for_caller_assertion_events(&sink, 1).await;
+        assert_eq!(decisions.len(), 1);
+        let decision = &decisions[0];
+        assert_eq!(decision.request_id, "assertion-request");
+        assert_eq!(decision.actor.as_ref().unwrap().user_id, "alice");
+        assert_eq!(decision.payload["connection_id"], json!(connection_id));
+        assert_eq!(decision.payload["consumer_kind"], "proxy_route");
+        assert_eq!(decision.payload["outcome"], "failure");
+        assert_eq!(decision.payload["reason"], "caller_assertion_not_enforced");
+        assert!(decision.payload.get("caller_assertion").is_none());
+        assert!(decision.payload.get("auth_type").is_none());
         let events = sink.events();
         assert!(events.iter().all(|event| {
             event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED
         }));
         let rendered = serde_json::to_string(&events).expect("audits should serialize");
-        let mut secrets = vec!["primary-secret-canary"];
+        let mut secrets = vec!["primary-secret-canary", "untrusted-review"];
         secrets.extend(crate::connections::test_support::pem_body_lines(
             &signing_key,
         ));
@@ -4225,7 +4263,7 @@ mod tests {
             .as_bytes()
             .to_vec();
         let request = Request::builder()
-            .method(Method::POST)
+            .method("Reindex")
             .uri("/charges?idempotency=key+1")
             .header(REQUEST_ID_HEADER, "request-bound")
             .header(CONTENT_TYPE, "application/json")
@@ -4254,6 +4292,11 @@ mod tests {
             );
             // The upstream compares with the request line and the bytes it
             // received, never with a reconstruction of them.
+            assert_eq!(
+                request.method, "Reindex",
+                "extension methods are case-sensitive"
+            );
+            assert!(claims.get("approval_id").is_none());
             assert_eq!(claims["method"], json!(request.method));
             assert_eq!(claims["path"], json!(request.target));
             assert_eq!(request.target, "/v1/charges?idempotency=key+1");

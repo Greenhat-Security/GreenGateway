@@ -134,7 +134,7 @@
             },
             "schema_version": {
               "description": "Must equal the referenced document's schema_version exactly.",
-              "enum": ["0.1.0"]
+              "enum": ["0.1.0", "1.0.0"]
             },
             "sha256": {
               "$ref": "#/$defs/sha256"
