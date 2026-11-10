@@ -40,8 +40,8 @@
 //! writer of a directory above it can always redirect the path itself; the
 //! checks here refuse a directory others can write, not its owner.
 //!
-//! Nothing selects a state directory yet: `GATEWAY_STATE_DIR`, the source
-//! modes that read it and the stores' move beneath it are later #242 slices.
+//! Gateway startup checks the `GATEWAY_STATE_DIR` selector. Activating
+//! stores beneath that directory remains a later #242 slice.
 //! Today only the revision ledger opens through a held [`StateDirectory`],
 //! so nothing can open a ledger without holding its directory's lock.
 

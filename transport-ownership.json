@@ -7017,9 +7017,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "8124a348b5d8bbf78e356d7d6ae4c96df87a861abc59321b5c62886c4418c7b9",
+      "sha256": "0d182cd6f58424267f4835cafca702d60d33232274b531e2b0c3879b5b3959b9",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review. Registers authenticated mutation approval routes on the existing administrative router."
+      "purpose": "Reviewed the composed admin router with the keyed service-token revoke route and the authenticated mutation approval routes."
     },
     {
       "file": "gateway/src/routing.rs",
@@ -14568,6 +14568,16 @@
       "sha256": "d0b2da3fad3585ecbb1859b501774295f5148952024a775a619d6cabbd5a9b03",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_service_tokens.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_service_tokens::is_revoke_replay#1",
+      "sha256": "9b136aa885f01d9b5322578373521c80e1701abcc568a127ccb46697364f4aa2",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Checks committed service-token operation bindings through the shared PostgreSQL infrastructure pool."
     },
     {
       "file": "gateway/src/storage/postgres_service_tokens.rs",

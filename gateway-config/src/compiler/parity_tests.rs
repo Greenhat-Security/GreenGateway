@@ -93,6 +93,9 @@ fn expected_diagnostic(
     rule: ConfigRule,
 ) -> ConfigDiagnostic {
     let message = match code {
+        ConfigDiagnosticCode::Source(_) => {
+            panic!("legacy environment fixtures have no source selectors")
+        }
         ConfigDiagnosticCode::Unset => format!("{variable} is not set"),
         ConfigDiagnosticCode::Empty => format!("{variable} is set but empty"),
         ConfigDiagnosticCode::NotUnicode => format!("{variable} is not valid Unicode"),

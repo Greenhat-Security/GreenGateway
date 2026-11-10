@@ -115,7 +115,7 @@ pub(crate) async fn start_serving<S: StartupStages>(
     stages: &mut S,
     get_var: impl FnMut(&str) -> Result<String, std::env::VarError>,
 ) -> Result<(), StartupFailure> {
-    let plan = config::compile(get_var).map_err(StartupFailure::Configuration)?;
+    let plan = config::source::compile_selected(get_var).map_err(StartupFailure::Configuration)?;
     let config = config::into_config(plan);
     // Each stage's future is boxed: an unoptimized build would otherwise
     // hold all of them inline, and the main thread's stack on Windows is

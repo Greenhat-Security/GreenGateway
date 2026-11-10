@@ -240,7 +240,7 @@ With `--env FILE` instead of `BUNDLE`, the doctor reads the [environment file](#
 | --- | --- | --- |
 | `environment.file` | error | The environment file: a regular file of at most 1 MiB, not writable by group or other on Unix, UTF-8, and every line blank, a comment or an assignment. Its reason is the first `env` code found. |
 | `environment.duplicate_keys` | warning | No key is assigned twice (`env.duplicate_key`). |
-| `environment.compiler` | error | The gateway's configuration compiler accepts the variables the file sets. Its reason is the first `config` code found. |
+| `environment.compiler` | error | The gateway's configuration compiler accepts the variables the file sets. Its reason is the first `source` or `config` error code. |
 | `production.authentication` | warning | Authentication is on and required: `AUTH_ENABLED` is not `false` and `AUTH_MODE` is not `observe`. |
 | `production.policy` | warning | A policy is configured: `warning` without `POLICY_FILE`, `skipped` with one, because its invariants are in the policy document, which this check does not read. |
 | `production.csrf` | warning | CSRF protection is on (`CSRF_ENABLED`). |
@@ -780,6 +780,21 @@ The `rule` of a `config` diagnostic: the compiler check that refused it (`gatewa
 | `authority_pseudonym_keys_distinct` | The current and previous pseudonym key aliases naming the same alias. |
 | `authority_evidence_delivery_required` | `AUTHORITY_EVIDENCE_DURABILITY=required` in cluster mode with no authority-event sink to deliver it. |
 | `authority_evidence_unsupported_configuration` | `AUTHORITY_EVIDENCE_DURABILITY=required` with a setting that enables an authority change the evidence inventory marks unsupported in this mode. |
+| `source_selection` | A source selector is invalid or missing, the selected authority conflicts with an environment setting, or this build cannot load that authority. |
+
+### Source diagnostics
+
+`ggctl validate --env`, `doctor --env` and both environment-file inputs to
+`diff` apply the gateway's source checks. A source error names the setting and
+its effective line when present. These checks read only the supplied file.
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `source.invalid_selector` | 3 | The source mode is unknown or a supplied locator is empty or invalid. |
+| `source.selector_without_mode` | 3 | A location selector is present in a mode that cannot use it. |
+| `source.missing_selector` | 3 | Bundle selection requires `GATEWAY_CONFIG_BUNDLE`. Ledger selection requires `GATEWAY_STATE_DIR`. |
+| `source.conflicting_environment` | 3 | A non-bootstrap environment setting is present alongside bundle or ledger selection. An empty assignment still counts. |
+| `source.mode_unavailable` | 3 | This build cannot activate the selected bundle or ledger. For offline bundle checks pass the bundle directory directly to `ggctl validate`. |
 
 ### Init diagnostics
 

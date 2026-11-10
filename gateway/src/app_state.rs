@@ -78,6 +78,7 @@ pub(super) const POLICY_DRAFT_WARNING_HEADER: &str = "x-greengateway-policy-draf
 pub(super) const POLICY_DRAFT_STATE_NOT_RECORDED_WARNING: &str = "policy_draft_state_not_recorded";
 pub(super) const TOKENS_ADMIN_ROUTE: &str = "/v1/admin/tokens";
 pub(super) const TOKEN_ADMIN_ROUTE: &str = "/v1/admin/tokens/{id}";
+pub(super) const TOKEN_KEYED_REVOKE_ADMIN_ROUTE: &str = "/v1/admin/tokens/{id}/revoke";
 pub(super) const TOKEN_ROTATE_ADMIN_ROUTE: &str = "/v1/admin/tokens/{id}/rotate";
 pub(super) const CONNECTIONS_ADMIN_ROUTE: &str = "/v1/admin/connections";
 pub(super) const CONNECTION_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}";
@@ -304,6 +305,7 @@ pub(super) struct AdminRoutes {
     pub(super) policy_draft_publish_route: String,
     pub(super) tokens_route: String,
     pub(super) token_route: String,
+    pub(super) token_keyed_revoke_route: String,
     pub(super) token_rotate_route: String,
     pub(super) connections_route: String,
     pub(super) connection_route: String,
@@ -431,6 +433,7 @@ impl AdminRoutes {
             policy_draft_publish_route: format!("{api_prefix}/policy/drafts/{{id}}/publish"),
             tokens_route: format!("{api_prefix}/tokens"),
             token_route: format!("{api_prefix}/tokens/{{id}}"),
+            token_keyed_revoke_route: format!("{api_prefix}/tokens/{{id}}/revoke"),
             token_rotate_route: format!("{api_prefix}/tokens/{{id}}/rotate"),
             connections_route: format!("{api_prefix}/connections"),
             connection_route: format!("{api_prefix}/connections/{{id}}"),

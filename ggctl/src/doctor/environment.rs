@@ -130,7 +130,9 @@ pub(crate) fn checks(read: &EnvRead, took: Duration) -> Vec<CheckRecord> {
         }
         (Some(_), None) => CheckRecord::new(CHECKS[1], false, Status::Pass, Reason::Passed, took),
     });
-    let refused = first(read, |diagnostic| diagnostic.code().starts_with("config."));
+    let refused = first(read, |diagnostic| {
+        diagnostic.code().starts_with("config.") || diagnostic.code().starts_with("source.")
+    });
     checks.push(match (&read.compiled, refused) {
         (Some(Ok(_)), _) => CheckRecord::new(CHECKS[2], true, Status::Pass, Reason::Passed, took),
         (Some(Err(_)), Some(diagnostic)) => {

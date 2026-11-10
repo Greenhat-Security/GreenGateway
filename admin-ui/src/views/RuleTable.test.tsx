@@ -57,6 +57,7 @@ describe('RuleTable', () => {
           }),
           rule({
             id: 'shadow-admin',
+            conditions: { time_window: { until: '2026-12-01T00:00:00Z' } },
             methods: ['POST'],
             path: '/admin/**',
             principal: {},
@@ -108,6 +109,7 @@ describe('RuleTable', () => {
     expect(screen.getAllByText('API')).toHaveLength(2);
     expect(screen.getByText('Admin')).toBeTruthy();
     expect(screen.getByText('GET, HEAD requests to /billing/{id}')).toBeTruthy();
+    expect(screen.getByText('POST requests to /admin/** · Additional policy condition')).toBeTruthy();
     expect(screen.getAllByText('Enforcing')).toHaveLength(2);
     expect(screen.getByText('Draft')).toBeTruthy();
     expect(
