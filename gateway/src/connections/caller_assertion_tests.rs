@@ -129,7 +129,6 @@ fn an_assertion_carries_the_claims_an_upstream_verifies_on() {
         REQUEST_ID,
         1_757_000_000,
         None,
-        None,
     )
     .expect("signs");
 
@@ -164,7 +163,6 @@ fn a_call_without_a_principal_is_refused_rather_than_signed_anonymously() {
             REQUEST_ID,
             1_757_000_000,
             None,
-            None,
         ),
         Err(CallerAssertionError::NoPrincipal)
     );
@@ -190,7 +188,6 @@ fn configured_principal_claims_are_included_and_others_are_not() {
         REQUEST_ID,
         1_757_000_000,
         None,
-        None,
     )
     .expect("signs");
 
@@ -205,8 +202,9 @@ fn request_binding_covers_the_bytes_actually_sent() {
     let mut config = config();
     config.bind_request = true;
     let body = br#"{"b":2,"a":1}"#;
+    let method = http::Method::from_bytes(b"Reindex").expect("valid extension method");
     let binding = RequestBinding {
-        method: "post",
+        method: &method,
         path: "/api/v2/things",
         body,
     };
@@ -218,12 +216,11 @@ fn request_binding_covers_the_bytes_actually_sent() {
         REQUEST_ID,
         1_757_000_000,
         Some(&binding),
-        None,
     )
     .expect("signs");
 
     let (_, claims) = decode_unverified(&token);
-    assert_eq!(claims["method"], "POST");
+    assert_eq!(claims["method"], "Reindex");
     assert_eq!(claims["path"], "/api/v2/things");
     assert_eq!(claims["request_sha256"], body_digest(body));
 }
@@ -258,7 +255,6 @@ fn binding_without_a_request_is_refused() {
             REQUEST_ID,
             1_757_000_000,
             None,
-            None,
         ),
         Err(CallerAssertionError::InvalidClaim("request_binding"))
     );
@@ -276,7 +272,6 @@ fn an_approval_binding_without_an_approval_is_refused() {
             Some(&caller()),
             REQUEST_ID,
             1_757_000_000,
-            None,
             None,
         ),
         Err(CallerAssertionError::ApprovalRequired)
@@ -298,7 +293,6 @@ fn lifetimes_outside_the_issuable_window_are_refused() {
             REQUEST_ID,
             1_757_000_000,
             None,
-            None
         ),
         Err(CallerAssertionError::InvalidLifetime)
     );
@@ -313,7 +307,6 @@ fn lifetimes_outside_the_issuable_window_are_refused() {
             REQUEST_ID,
             1_757_000_000,
             None,
-            None
         ),
         Err(CallerAssertionError::InvalidLifetime)
     );
@@ -327,7 +320,6 @@ fn lifetimes_outside_the_issuable_window_are_refused() {
         REQUEST_ID,
         1_757_000_000,
         None,
-        None
     )
     .is_ok());
 }
@@ -351,7 +343,6 @@ fn control_characters_in_a_claim_are_refused_rather_than_escaped() {
             REQUEST_ID,
             1_757_000_000,
             None,
-            None
         ),
         Err(CallerAssertionError::InvalidClaim("sub"))
     );
@@ -366,7 +357,6 @@ fn an_es256_assertion_verifies_against_the_published_key() {
         Some(&caller()),
         REQUEST_ID,
         1_757_000_000,
-        None,
         None,
     )
     .expect("signs");
@@ -400,7 +390,6 @@ fn an_rs256_assertion_verifies_against_the_published_jwk() {
         Some(&caller()),
         REQUEST_ID,
         1_757_000_000,
-        None,
         None,
     )
     .expect("signs");
@@ -525,7 +514,6 @@ fn two_providers_issuing_the_same_subject_are_not_the_same_caller() {
             REQUEST_ID,
             1_757_000_000,
             None,
-            None,
         )
         .expect("signs");
         decode_unverified(&token).1
@@ -548,7 +536,6 @@ fn the_unscoped_identity_halves_travel_beside_the_scoped_subject() {
         Some(&caller()),
         REQUEST_ID,
         1_757_000_000,
-        None,
         None,
     )
     .expect("signs");
@@ -575,7 +562,6 @@ fn an_issuer_that_would_make_the_subject_ambiguous_is_refused() {
             Some(&caller),
             REQUEST_ID,
             1_757_000_000,
-            None,
             None,
         )
     };
@@ -692,7 +678,6 @@ fn sign_as(key: &AssertionSigningKey, subject: &str) -> String {
         Some(&caller),
         REQUEST_ID,
         1_757_000_000,
-        None,
         None,
     )
     .expect("signs")

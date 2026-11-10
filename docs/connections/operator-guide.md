@@ -469,7 +469,7 @@ The JOSE header carries `alg` (`ES256` or `RS256`, from `algorithm`), `kid`
 | `jti` | The gateway request ID of the call (`X-Request-Id`), the same ID its audit events carry. A call that sends several requests gives each its own: a managed MCP session's requests and a composite tool's leaves add `.` and a sequence number. |
 | `email` | With `email` in `claims`, the principal's email, when it has one. Copied from the principal as its identity provider gave it; see the note below the table. |
 | `roles` | With `roles` in `claims`, the principal's roles, as an array. |
-| `method`, `path`, `request_sha256` | With `bind_request: true`: the request method, the request target exactly as it appears on the request line (path, then `?` and the query when there is one), and the lowercase hexadecimal SHA-256 of the exact body bytes sent, which is the hash of empty input for a request without a body. |
+| `method`, `path`, `request_sha256` | With `bind_request: true`: the case-sensitive request method as sent, the request target exactly as it appears on the request line (path, then `?` and the query when there is one), and the lowercase hexadecimal SHA-256 of the exact body bytes sent, which is the hash of empty input for a request without a body. |
 
 Every identity claim comes from the authenticated principal, never from a tool
 argument or anything a proxied request carries; the bound request claims
@@ -528,8 +528,10 @@ forwards, with the request ID (`X-Request-Id`) as `jti`:
 - Every decision is audited as `connection.caller_assertion` with the caller
   as `actor`, `consumer_kind` `proxy_route` and the route as `consumer_id`:
   outcome `success` with the assertion's `kid` and `jti`, or outcome
-  `failure` with the `reason`. A key that cannot be read or loaded also raises
-  `connection.secret_resolution_failed`.
+  `failure` with the `reason`. A stored block requiring approval records
+  `caller_assertion_not_enforced` before reading the mutation body. The
+  event omits `auth_type` because target construction failed. A key that cannot be
+  read or loaded also raises `connection.secret_resolution_failed`.
 - An upstream `401` or `403` is answered `502` without the upstream's body,
   as for every credentialed Connection route. Any other response is returned
   to the client as on any proxy route, so an upstream that echoes request
