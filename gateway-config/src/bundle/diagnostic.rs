@@ -562,7 +562,7 @@ impl Code {
             ),
             Self::ResourceUnknownMember => (
                 "resource.unknown_member",
-                "the resource document has a top-level member its validator would ignore",
+                "the policy schema does not define this top-level member",
             ),
             Self::ResourceInvalid => (
                 "resource.invalid",

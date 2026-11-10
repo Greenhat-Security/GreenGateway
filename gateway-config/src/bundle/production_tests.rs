@@ -12,8 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::{
-    rbac::{policy::KNOWN_TOP_LEVEL_KEYS, DefaultAction},
-    semantic_diff::compare_production_bundles,
+    rbac::DefaultAction, semantic_diff::compare_production_bundles,
     tools::definitions::ToolDefinition,
 };
 
@@ -321,8 +320,7 @@ fn every_bundle_ggctl_init_writes_passes_the_production_validators() {
 }
 
 #[test]
-fn the_shared_reader_holds_the_gateway_limits_and_member_lists() {
-    assert_eq!(POLICY_TOP_LEVEL_MEMBERS, KNOWN_TOP_LEVEL_KEYS);
+fn the_shared_reader_holds_the_gateway_limits() {
     assert_eq!(
         crate::opaque_id::MAX_SECRET_ALIAS_ID_BYTES,
         crate::connections::MAX_SECRET_ID_BYTES

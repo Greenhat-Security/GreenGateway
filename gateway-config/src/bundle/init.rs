@@ -34,11 +34,11 @@
 
 use super::{
     diagnostic::{BundleDiagnostic, Code, Pointer, Position},
-    document::{envelope, is_dns_label, member, Checker, Profile},
+    document::{envelope, is_dns_label, member, Checker, Profile, POLICY_V0_VERSION},
     json,
     source::{FileName, MANIFEST_FILE_NAME},
     syntax::{decode_text, Node, SyntaxError, TextRules, Value, DOCUMENT_LIMITS},
-    yaml, FileRole, SourceFile, POLICY_SCHEMA_VERSIONS, TOOLS_SCHEMA_VERSIONS,
+    yaml, FileRole, SourceFile, TOOLS_SCHEMA_VERSIONS,
 };
 use crate::documents::{API_VERSION_V1ALPHA1, BUNDLE_KIND, DEPLOYMENT_KIND, INIT_ANSWERS_KIND};
 
@@ -411,7 +411,7 @@ pub fn scaffold(profile: Profile, answers: &Answers) -> Vec<SourceFile> {
                     "      sha256: \"{tools_pin}\"\n",
                 ),
                 policy_file = POLICY_FILE,
-                policy_version = policy_schema_version(),
+                policy_version = POLICY_V0_VERSION,
                 policy_pin = super::sha256_pin(&policy),
                 tools_file = TOOLS_FILE,
                 tools_version = tools_schema_version(),
@@ -541,7 +541,7 @@ fn policy_document(answers: &Answers) -> String {
             "  \"routes\": {routes}\n",
             "}}\n",
         ),
-        version = policy_schema_version(),
+        version = POLICY_V0_VERSION,
         id = answers.name,
         roles = roles,
         routes = routes,
@@ -553,11 +553,6 @@ fn tools_document() -> String {
         "{{\n  \"schema_version\": \"{}\",\n  \"tools\": []\n}}\n",
         tools_schema_version()
     )
-}
-
-/// The newest policy document version the bundle boundary implements.
-fn policy_schema_version() -> &'static str {
-    POLICY_SCHEMA_VERSIONS.last().copied().unwrap_or("0.1.0")
 }
 
 /// The newest tools document version the bundle boundary implements.
