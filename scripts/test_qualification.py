@@ -650,8 +650,17 @@ class ReconcileTests(unittest.TestCase):
             target = self.start + q.timedelta(seconds=target_second)
             with self.subTest(first=first, last=last), self.assertRaisesRegex(q.InputError, "PITR --cutoff"):
                 q.reconcile(dict(self.observation, markers=markers), [], cutoff=target, rpo_target=5)
-        at_target = q.reconcile(self.observation, self.lines(range(1, 21)), cutoff=cutoff, rpo_target=1)
-        self.assertEqual((at_target["restored_past_target"], at_target["verdict"]), (0, "passed"))
+
+    def test_pitr_treats_the_targets_millisecond_as_uncertain(self):
+        for target_microseconds in (0, 125):
+            cutoff = self.start + q.timedelta(seconds=20, microseconds=target_microseconds)
+            with self.subTest(cutoff=cutoff):
+                exact = q.reconcile(self.observation, self.lines(range(1, 20)), cutoff=cutoff, rpo_target=2)
+                self.assertEqual(q.parse_iso(exact["cutoff"], "cutoff"), cutoff)
+                self.assertEqual(exact["recovery_point_gap_seconds"], 1 + target_microseconds / 1_000_000)
+                self.assertEqual(exact["verdict"], "passed")
+                ambiguous = q.reconcile(self.observation, self.lines(range(1, 21)), cutoff=cutoff, rpo_target=2)
+                self.assertEqual((ambiguous["restored_past_target"], ambiguous["verdict"]), (1, "failed"))
 
     def test_foreign_or_unsent_markers_are_refused(self):
         for lines in (["ggq-other-run-000001"], [f"{self.run_id}-000999"], ["DROP TABLE"]):

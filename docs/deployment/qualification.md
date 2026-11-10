@@ -311,9 +311,11 @@ the production database.
    window. To pass, at least one pre-target acknowledged marker must survive.
    Its most recent acknowledgement must be within the agreed RPO
    (`recovery_point_gap_seconds`), and any missing acknowledged markers must
-   also fall within that RPO. A recorded marker sent strictly after the target
-   (`restored_past_target`) fails the drill. Space the probes closely enough
-   to measure the agreed gap.
+   also fall within that RPO. The observer records probe times to milliseconds.
+   A restored marker sent in the target's millisecond or later counts toward
+   `restored_past_target` and fails the drill because its write cannot be
+   shown to precede the target. Space the probes closely enough to measure
+   the agreed gap.
 5. **Destroy** the scratch environment and record that you did.
 
 ## 7. Upgrade
