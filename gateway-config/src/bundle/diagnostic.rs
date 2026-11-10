@@ -206,6 +206,9 @@ pub enum Code {
     PrivateEgressAllowed,
     CsrfDisabled,
     AuditBestEffort,
+    AuthExemptionsBroadened,
+    RbacExemptionsBroadened,
+    CsrfExemptionsBroadened,
 }
 
 impl Code {
@@ -300,6 +303,9 @@ impl Code {
         Self::PrivateEgressAllowed,
         Self::CsrfDisabled,
         Self::AuditBestEffort,
+        Self::AuthExemptionsBroadened,
+        Self::RbacExemptionsBroadened,
+        Self::CsrfExemptionsBroadened,
     ];
 
     /// The stable code.
@@ -627,6 +633,9 @@ impl Code {
             Self::PrivateEgressAllowed => ("profile.private_egress_allowed", "the deployment profile requires private-address egress to be denied by default"),
             Self::CsrfDisabled => ("profile.csrf_disabled", "the deployment profile requires CSRF protection"),
             Self::AuditBestEffort => ("profile.audit_best_effort", "the deployment profile requires durable audit delivery"),
+            Self::AuthExemptionsBroadened => ("profile.auth_exemptions_broadened", "the authentication exemption list covers paths outside the deployment defaults"),
+            Self::RbacExemptionsBroadened => ("profile.rbac_exemptions_broadened", "the authorization exemption list covers paths outside the deployment defaults"),
+            Self::CsrfExemptionsBroadened => ("profile.csrf_exemptions_broadened", "the CSRF exemption list covers paths outside the deployment defaults"),
             Self::PolicyWildcardRole => (
                 "profile.wildcard_role",
                 "the deployment profile forbids a role that grants every permission",

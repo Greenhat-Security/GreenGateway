@@ -63,6 +63,119 @@ fn codes(diff: &SemanticDiff) -> BTreeSet<&'static str> {
     diff.risks().into_iter().map(RiskCode::as_str).collect()
 }
 
+#[test]
+fn exemption_risk_measures_coverage_of_the_served_paths() {
+    for (field, before, after, effect) in [
+        (
+            "AUTH_EXEMPT_PATHS",
+            "/admin",
+            "/admin/assets",
+            Effect::Tightened,
+        ),
+        (
+            "RBAC_EXEMPT_PATHS",
+            "/admin",
+            "/admin,/admin/assets",
+            Effect::Neutral,
+        ),
+        ("AUTH_EXEMPT_PATHS", "/admin/", "/admin", Effect::Loosened),
+        ("RBAC_EXEMPT_PATHS", "/admin", "/adminx", Effect::Loosened),
+        (
+            "AUTH_EXEMPT_PATHS",
+            "/health",
+            "/health/x",
+            Effect::Loosened,
+        ),
+        ("RBAC_EXEMPT_PATHS", "/health", "/health/", Effect::Loosened),
+        (
+            "CSRF_EXEMPT_PATHS",
+            "/admin",
+            "/admin/assets",
+            Effect::Loosened,
+        ),
+    ] {
+        let strict = base();
+        let diff = diff(
+            &with(strict.clone(), &[(field, Some(before))]),
+            &with(strict, &[(field, Some(after))]),
+        );
+        let [change] = diff.changes() else {
+            panic!("expected one change for {field}")
+        };
+        assert_eq!(change.effect(), effect, "{field} {before} -> {after}");
+        assert_eq!(
+            change.risks().contains(&RiskCode::ExemptionsBroadened),
+            effect == Effect::Loosened
+        );
+        assert_eq!(change.display(), Display::Withheld);
+    }
+}
+
+#[test]
+fn profile_exemptions_follow_the_configured_admin_surface() {
+    let document = |prefix, auth, rbac, csrf| {
+        serde_json::json!({
+            "spec": {
+                "listeners": {"admin": {"prefix": prefix}},
+                "authentication": {"exempt_paths": auth},
+                "authorization": {"exempt_paths": rbac},
+                "csrf": {"exempt_paths": csrf}
+            }
+        })
+    };
+    let safe = document(
+        "/ops",
+        vec!["/ops/assets", "/readyz", "/ops/assets"],
+        vec![],
+        vec!["/metrics", "/health"],
+    );
+    assert_eq!(super::broadened_profile_exemptions(&safe).count(), 0);
+    // A probe used as the admin prefix still matches exactly in the middleware.
+    let probe_prefix = document("/health", vec!["/health/ui"], vec![], vec![]);
+    assert_eq!(
+        super::broadened_profile_exemptions(&probe_prefix).count(),
+        1
+    );
+    let mut changed = document(
+        "/ops",
+        vec!["/v1/ops/auth/login/child"],
+        vec!["/v1/ops/auth/config"],
+        vec!["/ops"],
+    );
+    let broadened = |doc: &serde_json::Value| {
+        super::broadened_profile_exemptions(doc)
+            .map(|(_, path)| path)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        broadened(&changed),
+        [
+            "/spec/authentication/exempt_paths",
+            "/spec/authorization/exempt_paths",
+            "/spec/csrf/exempt_paths"
+        ]
+    );
+    changed["spec"]["admin_login"] = serde_json::json!({"provider":"test"});
+    assert_eq!(
+        broadened(&changed),
+        [
+            "/spec/authorization/exempt_paths",
+            "/spec/csrf/exempt_paths"
+        ]
+    );
+    changed["spec"]["admin_sessions"] = serde_json::json!({"mode":"standalone_memory"});
+    assert_eq!(broadened(&changed), ["/spec/csrf/exempt_paths"]);
+    changed["spec"]["authentication"]["exempt_paths"] =
+        serde_json::json!(["/admin/assets", "/opsx", "/health/private"]);
+    assert_eq!(
+        broadened(&changed),
+        [
+            "/spec/authentication/exempt_paths",
+            "/spec/csrf/exempt_paths"
+        ]
+    );
+}
+
 fn fields(diff: &SemanticDiff) -> Vec<&'static str> {
     diff.changes().iter().map(|change| change.field()).collect()
 }

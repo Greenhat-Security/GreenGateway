@@ -841,7 +841,7 @@
               "type": "array",
               "uniqueItems": true,
               "items": {
-                "enum": ["policy_default_allow", "policy_shadow_mode", "wildcard_role", "auth_disabled", "auth_observe_only", "private_egress_allowed", "csrf_disabled", "audit_best_effort"]
+                "enum": ["policy_default_allow", "policy_shadow_mode", "wildcard_role", "auth_disabled", "auth_observe_only", "private_egress_allowed", "csrf_disabled", "audit_best_effort", "auth_exemptions_broadened", "rbac_exemptions_broadened", "csrf_exemptions_broadened"]
               }
             }
           }

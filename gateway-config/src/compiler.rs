@@ -4397,6 +4397,10 @@ fn admin_login_exempt_paths(admin_prefix: &str) -> [String; 2] {
     ]
 }
 
+fn admin_session_exempt_paths(admin_prefix: &str) -> [String; 2] {
+    ["logout", "config"].map(|route| format!("/v1{admin_prefix}/auth/{route}"))
+}
+
 fn append_admin_login_exempt_paths(paths: &mut Vec<String>, admin_prefix: &str, enabled: bool) {
     if !enabled {
         return;
