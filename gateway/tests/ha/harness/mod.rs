@@ -367,10 +367,8 @@ pub struct ClusterOptions {
     /// against it: what "an equal `jti` from two issuers" needs, because
     /// two issuers means two issuer URLs and so two servers.
     pub secondary_issuer: bool,
-    /// Give the runtime role a password, so the DSN the replicas read
-    /// actually carries a credential. Only the secret-leak suite wants
-    /// this: elsewhere a passwordless loopback DSN is one less thing to
-    /// go wrong.
+    /// An optional known canary for secret-leak checks. By default the
+    /// harness generates a password for the disposable runtime role.
     pub database_password: Option<String>,
     /// Attach the replicas to a database the caller created, migrated and
     /// populated itself, instead of creating and seeding one.
