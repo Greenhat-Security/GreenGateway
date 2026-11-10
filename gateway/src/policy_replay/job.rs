@@ -114,7 +114,8 @@ pub(crate) const NOT_REPLAYED: &[&str] = &[
 
 /// What one job reads: the window, the cutoff fixed when it was created, and
 /// its record bound.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReplayScope {
     /// The window's bounds as the job states them (RFC 3339, UTC).
     pub(crate) from: String,
@@ -200,6 +201,13 @@ pub(crate) struct ReplayControl {
 }
 
 impl ReplayControl {
+    pub(crate) fn restored(scanned: u64) -> Self {
+        Self {
+            scanned: AtomicU64::new(scanned),
+            ..Self::default()
+        }
+    }
+
     /// Ask the run to stop. It stops before its next record.
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);

@@ -1380,6 +1380,120 @@ fn only_codes<P, T>(report: &BundleReport<P, T>) -> Vec<Code> {
 }
 
 #[test]
+fn mounted_listener_paths_require_exact_declarations_and_keep_bootstrap_provenance() {
+    use crate::compiler::{self, stage::Source};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        env::VarError,
+    };
+    let files = TempBundle::complete("bound-listener-locators");
+    let deployment = concat!(
+        "apiVersion: greengateway.dev/v1alpha1\nkind: GatewayDeployment\nspec:\n",
+        "  profile: development\n",
+        "  listeners:\n",
+        "    public:\n      tls: required\n      client_certificates: optional\n      client_certificate_crl: required\n",
+        "    admin:\n      address: \"127.0.0.1:9090\"\n      tls: required\n      client_certificates: required\n      client_certificate_crl: required\n",
+        "    tls:\n      client_certificate_identity: spiffe\n",
+    );
+    files.write("deployment.yaml", deployment.as_bytes());
+    files.write("bundle.yaml", files.manifest().as_bytes());
+    let report = read_bundle(
+        &files.root,
+        ReadOptions::default(),
+        &super::ProductionValidators,
+    );
+    let mounted = report
+        .bundle
+        .expect("pinned listener intent is valid offline");
+    assert!(mounted.deployment.offline_plan().is_none());
+    let bindings = BTreeMap::from([
+        (compiler::TLS_CERT_FILE, "public-a,public-b"),
+        (
+            compiler::TLS_KEY_FILE,
+            "zqcanary-public-a,zqcanary-public-b",
+        ),
+        (compiler::CLIENT_CERT_CA_FILE, "public-ca"),
+        (compiler::CLIENT_CERT_CRL_FILE, "public-crl"),
+        (compiler::ADMIN_TLS_CERT_FILE, "admin-cert"),
+        (compiler::ADMIN_TLS_KEY_FILE, "zqcanary-admin"),
+        (compiler::ADMIN_CLIENT_CERT_CA_FILE, "admin-ca"),
+        (compiler::ADMIN_CLIENT_CERT_CRL_FILE, "admin-crl"),
+    ]);
+    let compile = |values: &BTreeMap<&str, &str>| {
+        mounted.bind_mounted(None, |name| {
+            values
+                .get(name)
+                .map(|value| value.to_string())
+                .ok_or(VarError::NotPresent)
+        })
+    };
+    let bound = compile(&bindings).unwrap().unwrap();
+    let plan = bound.plan();
+    let bootstrap: BTreeSet<_> = plan
+        .provenance()
+        .into_iter()
+        .filter(|field| field.source == Source::Bootstrap)
+        .map(|field| field.setting)
+        .collect();
+    assert_eq!(bootstrap, bindings.keys().copied().collect());
+    assert_eq!(
+        plan.listeners.data_tls.as_ref().unwrap().certificate_files,
+        ["public-a", "public-b"]
+    );
+    assert_eq!(
+        plan.listeners.admin_tls.as_ref().unwrap().certificate_files,
+        ["admin-cert"]
+    );
+    for (name, expected) in [
+        (compiler::TLS_CERT_FILE, "/spec/listeners/public/tls"),
+        (compiler::TLS_KEY_FILE, "/spec/listeners/public/tls"),
+        (
+            compiler::CLIENT_CERT_CA_FILE,
+            "/spec/listeners/public/client_certificates",
+        ),
+        (
+            compiler::CLIENT_CERT_CRL_FILE,
+            "/spec/listeners/public/client_certificate_crl",
+        ),
+        (compiler::ADMIN_TLS_CERT_FILE, "/spec/listeners/admin/tls"),
+        (compiler::ADMIN_TLS_KEY_FILE, "/spec/listeners/admin/tls"),
+        (
+            compiler::ADMIN_CLIENT_CERT_CA_FILE,
+            "/spec/listeners/admin/client_certificates",
+        ),
+        (
+            compiler::ADMIN_CLIENT_CERT_CRL_FILE,
+            "/spec/listeners/admin/client_certificate_crl",
+        ),
+    ] {
+        let mut missing = bindings.clone();
+        missing.remove(name);
+        let Err(issues) = compile(&missing) else {
+            panic!("missing {name} was accepted")
+        };
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.code == Code::InvalidListenerSetting
+                    && issue.pointer.to_string() == expected),
+            "{name}: {issues:?}"
+        );
+        assert!(!format!("{issues:?}").contains(CANARY));
+    }
+    for bad in [" ", "zqcanary,", "only-one"] {
+        let mut invalid = bindings.clone();
+        invalid.insert(compiler::TLS_KEY_FILE, bad);
+        let Err(issues) = compile(&invalid) else {
+            panic!("invalid key list was accepted")
+        };
+        assert!(issues
+            .iter()
+            .any(|issue| issue.pointer.to_string() == "/spec/listeners/public/tls"));
+        assert!(!format!("{issues:?}").contains(CANARY));
+    }
+}
+
+#[test]
 fn a_complete_bundle_is_read_with_its_digests() {
     let bundle = TempBundle::complete("complete");
     let report = bundle.read();

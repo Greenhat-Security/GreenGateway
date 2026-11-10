@@ -516,6 +516,11 @@ The reader retains the plan with its pinned deployment. A deployment that
 needs external bindings, including secret references or local store paths,
 can be validated offline only for the stages whose inputs are available.
 
+Native preflight binds the public and admin listener certificate, key, CA and
+CRL locators to the pinned deployment's requested TLS and client-certificate
+modes. Supplied locators carry `Bootstrap` provenance. The shared listener
+parser checks certificate lists and their key pairs before any TLS file opens.
+
 Native bundle preflight can supply the fixed SQLite filenames beneath a locked
 standalone state directory. The compiler marks these settings as `Bootstrap`,
 and the resulting standalone plan holds the directory lock. A second process
