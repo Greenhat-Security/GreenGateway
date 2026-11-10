@@ -384,7 +384,7 @@ impl MaintenanceJob for AuditRetention {
 ///
 /// The cursor is the floor: a row above it is undelivered and stays, however
 /// old, holding its unit of capacity. Only before any dispatcher has claimed
-/// the cursor -- when no consumer is required -- does age alone decide. The
+/// the cursor, and only while no keyed prepare has committed, may age alone decide. The
 /// evidence tables the journal indexes are never touched. Publishing the
 /// gauges here means a deployment with no sink configured, where no
 /// dispatcher runs, still sees its journal fill toward capacity.

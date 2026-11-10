@@ -48,7 +48,7 @@
       ]
     },
     "journaled_dispatch": {
-      "description": "Cluster mode (migration 21): the evidence row is journaled in authority_event_journal in its own transaction under its own event_id, reserving one unit of bounded capacity; a full journal refuses the mutation and evicts nothing. Since migration 32 the policy, tools and catalog evidence rows (document_change_evidence, catalog_change_evidence) are journaled the same way, and the document rows' actor reads in migration 24's vocabulary. Since migration 26 an admin session grant takes two units, one held for its withdrawal, and a withdrawal spends that unit and is never refused for capacity. With AUTHORITY_EVENT_SINK=log or file, one leased dispatcher reads the journal after a fenced, persisted cursor in bounded batches, delivers authority_event_delivery.v1 records whose actor and resource are keyed safe references, and advances the cursor only after the sink accepted: at least once, deduplicated on (authority_id, event_id). Retention prunes only delivered rows past AUTHORITY_EVENT_RETENTION_HOURS and never an evidence row. With AUTHORITY_EVENT_SINK=none nothing is delivered, and AUTHORITY_EVIDENCE_DURABILITY=required refuses to start such a replica. Since migration 24 the record also carries the actor's kind and auth mode and a keyed reference to a principal's issuer, each null where the evidence row recorded none. It is still not the proposed authority_event.v1: the subject reference is not issuer-scoped, actors without an issuer and rows committed before migration 24 cannot name one, and the operation identity is not caller-bound.",
+      "description": "Cluster mode (migration 21): the evidence row is journaled in authority_event_journal in its own transaction under its own event_id, reserving one unit of bounded capacity; a full journal refuses the mutation and evicts nothing. Since migration 32 the policy, tools and catalog evidence rows (document_change_evidence, catalog_change_evidence) are journaled the same way, and the document rows' actor reads in migration 24's vocabulary. Since migration 26 an admin session grant takes two units, one held for its withdrawal, and a withdrawal spends that unit and is never refused for capacity. With AUTHORITY_EVENT_SINK=log or file, one leased dispatcher reads the journal after a fenced, persisted cursor in bounded batches, delivers authority_event_delivery.v1 records whose actor and resource are keyed safe references, and advances the cursor only after the sink accepted: at least once, deduplicated on (authority_id, event_id). Retention prunes only delivered rows past AUTHORITY_EVENT_RETENTION_HOURS and never an evidence row. With AUTHORITY_EVENT_SINK=none nothing is delivered, and AUTHORITY_EVIDENCE_DURABILITY=required refuses to start such a replica. Since migration 24 the record also carries the actor's kind and auth mode and a keyed reference to a principal's issuer, each null where the evidence row recorded none. The default delivery_v1 envelope retains legacy metadata. With qualified_v1, eligible issuer-bound keyed revocations and keyed approval preparation receipts project authority_event.v1. Receipt rows require qualified_v1. Migration 35 adds mutation_approval_prepare_evidence as the seventh source.",
       "sources": [
         {
           "path": "gateway/src/storage/postgres_authority_events.rs",
@@ -2517,7 +2517,6 @@
     {
       "id": "mutation_approvals",
       "operations": [
-        "mutation_approval.prepare",
         "mutation_approval.review",
         "mutation_approval.revoke",
         "mutation_approval.consume"
@@ -2527,10 +2526,6 @@
         "standalone"
       ],
       "entrypoints": [
-        {
-          "path": "gateway/src/admin_tools.rs",
-          "anchor": "async fn tool_mutation_approval_create_endpoint("
-        },
         {
           "path": "gateway/src/admin_mutation_approvals.rs",
           "anchor": "async fn tool_mutation_approval_review_endpoint("
@@ -2544,7 +2539,7 @@
           "anchor": "async fn tool_mutation_approval_execute_endpoint("
         }
       ],
-      "boundary": "The Connection store creates each occurrence and serializes review, revocation and one-shot consumption against its current state. Both backends refuse these operations when required evidence is configured.",
+      "boundary": "The Connection store serializes review, revocation and one-shot consumption against the current approval state. Required mode refuses these transitions in both backends.",
       "record": "The mutable decision row expires and cascades with its Connection. Audit notifications are emitted after the transaction.",
       "actor": "The request and review use the authenticated issuer and subject. The reviewer identity in the latest decision row does not preserve each transition.",
       "identity": "The occurrence UUID identifies a decision. Its Connection and catalog revisions describe the requested target, not a durable sequence of approval events.",
@@ -2557,11 +2552,67 @@
       "sources": [
         {
           "path": "gateway/src/connections/store_mutation_approvals.rs",
-          "anchor": "pub fn create_mutation_approval("
+          "anchor": "pub fn decide_mutation_approval("
         },
         {
           "path": "gateway/src/connections/pg_mutation_approvals.rs",
-          "anchor": "pub(crate) async fn create_mutation_approval("
+          "anchor": "pub(crate) async fn decide_mutation_approval("
+        },
+        {
+          "path": "gateway/src/authority_events/required.rs",
+          "anchor": "Self::MutationApprovalReview"
+        },
+        {
+          "path": "gateway/src/connections/store_mutation_approvals.rs",
+          "anchor": "fn consume_mutation_approval("
+        },
+        {
+          "path": "gateway/src/connections/pg_mutation_approvals.rs",
+          "anchor": "fn consume_mutation_approval("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/tests/issue_757_mutation_approvals.rs",
+          "anchor": "async fn mutation_approval_binds_rendered_request_and_enforces_independent_review("
+        },
+        {
+          "path": "gateway/src/authority_events/required_tests.rs",
+          "anchor": "fn the_gate_enforces_exactly_what_the_evidence_inventory_says("
+        }
+      ],
+      "required_durability_supported": false,
+      "required_mode": "refused",
+      "test_claim": "Required mode refuses review, revocation and one-shot consumption. Reading an existing approval remains available in both modes."
+    },
+    {
+      "id": "mutation_approval_prepare_standalone",
+      "operations": [
+        "mutation_approval.prepare"
+      ],
+      "modes": [
+        "standalone"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_tools.rs",
+          "anchor": "async fn tool_mutation_approval_create_endpoint("
+        }
+      ],
+      "boundary": "Standalone POST creates one approval occurrence in the Connection store. Required mode refuses preparation.",
+      "record": "The mutable approval row expires and cascades with its Connection.",
+      "actor": "The approval records the canonical issuer and subject of the attested caller.",
+      "identity": "An ordinary prepare always allocates a fresh occurrence UUID. There is no caller-keyed prepare in standalone mode.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_delivery",
+        "missing_metadata"
+      ],
+      "follow_up": "Record and deliver caller-bound preparation evidence from the same SQLite transaction before admitting this operation.",
+      "sources": [
+        {
+          "path": "gateway/src/connections/store_mutation_approvals.rs",
+          "anchor": "pub fn create_mutation_approval("
         },
         {
           "path": "gateway/src/authority_events/required.rs",
@@ -2580,7 +2631,124 @@
       ],
       "required_durability_supported": false,
       "required_mode": "refused",
-      "test_claim": "Authenticated requests receive a refusal for prepare, review and revoke under required mode. Reading a pending occurrence still succeeds. The inventory parity test checks both storage modes."
+      "test_claim": "The required-mode gate refuses standalone preparation. The ordinary best-effort API creates a fresh occurrence."
+    },
+    {
+      "id": "mutation_approval_prepare_postgres",
+      "operations": [
+        "mutation_approval.prepare"
+      ],
+      "modes": [
+        "postgres"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_tools.rs",
+          "anchor": "async fn tool_mutation_approval_create_endpoint("
+        }
+      ],
+      "boundary": "New keyed PUTs require qualified_v1. Required mode refuses the ordinary POST. The best-effort POST creates a fresh occurrence on every call. Exact committed receipts remain readable after a consumer format downgrade.",
+      "record": "Schema 35 commits one prepare receipt and journal entry with the new occurrence. The receipt and operation reservation survive approval expiry and Connection deletion.",
+      "actor": "The preparation binds an attested principal by canonical issuer, subject and authentication mode. Qualified events carry keyed issuer-scoped subject, issuer and occurrence references.",
+      "identity": "The RFC UUIDv7 Idempotency-Key is shared across keyed prepares and token revocations. The receipt binds the tool, If-Match and request bytes, the committed action digest and the original occurrence. Its event ID and creation revision 1 remain stable across replay.",
+      "delivery": "journaled_dispatch",
+      "disposition": [
+        "already_sufficient"
+      ],
+      "follow_up": "Operate the Unix file sink on storage that honors file and directory sync and delivers to the same consumer across replicas. Deduplicate redelivery by authority ID and event ID.",
+      "sources": [
+        {
+          "path": "gateway/src/connections/pg_mutation_approvals.rs",
+          "anchor": "pub(crate) async fn create_keyed_mutation_approval("
+        },
+        {
+          "path": "gateway/src/connections/pg_mutation_approvals.rs",
+          "anchor": "async fn read_receipt("
+        },
+        {
+          "path": "gateway/src/storage/migrations/0035_mutation_approval_prepare_evidence.sql",
+          "anchor": "CREATE TABLE greengateway.authority_caller_operation_ids"
+        },
+        {
+          "path": "gateway/src/authority_events/required.rs",
+          "anchor": "Self::MutationApprovalPrepare => RequiredMode::CallerKeyRequired"
+        },
+        {
+          "path": "gateway/src/authority_events/delivery.rs",
+          "anchor": "fn qualified_principal_actor("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/tests/issue_757_mutation_approvals_cluster.rs",
+          "anchor": "async fn postgres_keyed_mutation_prepare_recovers_the_receipt_after_catalog_drift("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn keyed_prepare_evidence_survives_retries_failures_and_occurrence_cleanup("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn keyed_prepare_file_delivery_resumes_after_format_downgrade_and_cursor_loss("
+        },
+        {
+          "path": "gateway/src/storage/migrations.rs",
+          "anchor": "async fn migration_thirty_five_preserves_approvals_and_reserves_only_keyed_revocations("
+        },
+        {
+          "path": "gateway/src/authority_events/required_tests.rs",
+          "anchor": "fn the_gate_enforces_exactly_what_the_evidence_inventory_says("
+        }
+      ],
+      "required_durability_supported": true,
+      "required_mode": "caller_key_required",
+      "test_claim": "The PostgreSQL store tests check rollback, replay and receipt survival after cleanup. The file delivery test holds the cursor across a format downgrade and verifies redelivery after a lost cursor update. The migration test preserves historical approvals and reserves only existing client-supplied revocation IDs.",
+      "qualified_delivery_paths": [
+        {
+          "criteria": {
+            "operation": "mutation_approval.prepare",
+            "storage_mode": "postgres",
+            "method": "PUT",
+            "route": "/v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed PUT commits a new approval, its caller-key reservation, preparation receipt and one journal event in the same PostgreSQL transaction. A retry after losing the response returns the stored receipt. The Unix file sink syncs the event and its directory before checkpointing. Durable consumption across replicas requires shared storage or shipping to the same durable consumer. The log sink acknowledges local process-log acceptance only.",
+          "sources": [
+            {
+              "path": "gateway/src/connections/pg_mutation_approvals.rs",
+              "anchor": "pub(crate) async fn create_keyed_mutation_approval("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery.rs",
+              "anchor": "fn qualified_principal_actor("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn keyed_prepare_file_delivery_resumes_after_format_downgrade_and_cursor_loss("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery_tests.rs",
+              "anchor": "fn qualified_prepare_requires_negotiated_format_and_provider_attribution("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn qualified_file_sync_handles_a_symlink_and_refuses_a_replaced_name("
+            }
+          ]
+        }
+      ]
     }
   ]
 }

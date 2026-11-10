@@ -294,7 +294,6 @@ fn mounted_bundles_are_checked_before_any_startup_stage() {
         }
         let (result, stages) = start(&settings, None, nothing_to_check());
         assert!(stage_calls(&stages).is_empty());
-        assert!(!unused_state.exists());
         let error = result.unwrap_err();
         assert!(!format!("{error:?}").contains("state-canary"));
         error
@@ -327,9 +326,28 @@ fn mounted_bundles_are_checked_before_any_startup_stage() {
     write("", true);
     source_reason(false, "source.mode_unavailable");
     source_reason(true, "GATEWAY_STATE_DIR: source.selector_without_mode");
+    assert!(!unused_state.exists());
     write("  state:\n    stores: [\"audit\"]\n", true);
     source_reason(false, "GATEWAY_STATE_DIR: source.missing_selector");
+    assert!(matches!(
+        boot(true),
+        StartupFailure::StateDirectory(gateway_config::state_dir::StateDirError::Missing)
+    ));
+    std::fs::create_dir(&unused_state).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&unused_state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let holder = gateway_config::state_dir::StateDirectory::acquire(&unused_state).unwrap();
+    assert!(matches!(
+        boot(true),
+        StartupFailure::StateDirectory(gateway_config::state_dir::StateDirError::Locked)
+    ));
+    drop(holder);
     source_reason(true, "source.mode_unavailable");
+    drop(gateway_config::state_dir::StateDirectory::acquire(&unused_state).unwrap());
+    assert_eq!(std::fs::read_dir(&unused_state).unwrap().count(), 1);
 
     write("  state:\n    backend: postgres\n", true);
     source_reason(true, "GATEWAY_STATE_DIR: source.selector_without_mode");
@@ -353,6 +371,7 @@ fn mounted_bundles_are_checked_before_any_startup_stage() {
         .any(|issue| issue.code.as_str() == "bundle.digest_mismatch"));
     assert!(!format!("{issues:?}").contains("document-canary"));
     std::fs::remove_dir_all(&root).unwrap();
+    std::fs::remove_dir_all(&unused_state).unwrap();
 }
 
 #[test]

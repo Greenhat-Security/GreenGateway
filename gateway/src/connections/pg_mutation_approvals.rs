@@ -5,8 +5,8 @@ use crate::connections::{
     model::ConnectionId,
     mutation_approval::{
         ApprovalDecision, ApprovalError, ApprovalPrincipal, ApprovalStatus,
-        ConsumedMutationApproval, MutationAction, MutationApproval, APPROVAL_LIFETIME_SECS,
-        MAX_APPROVALS, MAX_APPROVALS_PER_CALLER,
+        ConsumedMutationApproval, MutationAction, MutationApproval, PrepareBinding, PrepareReceipt,
+        APPROVAL_LIFETIME_SECS, MAX_APPROVALS, MAX_APPROVALS_PER_CALLER,
     },
 };
 use uuid::Uuid;
@@ -171,6 +171,89 @@ async fn read(
     Ok((record, field(&row, "sampled_at")?))
 }
 
+const PREPARE_ACTION: &str = "mutation_approval.prepare";
+
+async fn read_receipt(
+    client: &impl deadpool_postgres::GenericClient,
+    binding: &PrepareBinding,
+    action_digest: Option<&str>,
+) -> Result<Option<PrepareReceipt>, ApprovalError> {
+    let row = client
+        .query_opt(
+            "SELECT k.action, e.occurrence_id::text, e.actor_user_id, e.actor_issuer,
+                e.actor_auth_mode, e.request_digest, e.action_digest, e.created_at, e.expires_at
+         FROM greengateway.authority_caller_operation_ids k
+         LEFT JOIN greengateway.mutation_approval_prepare_evidence e USING (operation_id)
+         WHERE k.operation_id = $1::text::uuid",
+            &[&binding.id.to_string()],
+        )
+        .await
+        .map_err(|_| ApprovalError::Unavailable)?;
+    let Some(row) = row else { return Ok(None) };
+    if field::<&str>(&row, "action")? != PREPARE_ACTION {
+        return Err(ApprovalError::Conflict);
+    }
+    // A reservation without its evidence is corrupt and cannot be reused.
+    let occurrence_id: String = field(&row, "occurrence_id")?;
+    if field::<&str>(&row, "actor_user_id")? != binding.actor.subject()
+        || Some(field::<&str>(&row, "actor_issuer")?) != binding.actor.issuer()
+        || field::<&str>(&row, "actor_auth_mode")? != binding.actor.auth_mode()
+        || field::<&str>(&row, "request_digest")? != binding.request_digest
+        || action_digest.is_some() && action_digest != Some(field::<&str>(&row, "action_digest")?)
+    {
+        return Err(ApprovalError::Conflict);
+    }
+    Ok(Some(PrepareReceipt {
+        operation_id: binding.id.to_string(),
+        occurrence_id,
+        prepared_at: field(&row, "created_at")?,
+        expires_at: field(&row, "expires_at")?,
+    }))
+}
+
+async fn insert_occurrence(
+    tx: &deadpool_postgres::Transaction<'_>,
+    action: &MutationAction,
+) -> Result<MutationApproval, ApprovalError> {
+    check_current(tx, action).await?;
+    let created_at = now(tx).await?;
+    let expires_at = created_at
+        .checked_add(APPROVAL_LIFETIME_SECS)
+        .ok_or(ApprovalError::Unavailable)?;
+    tx.execute(
+        "DELETE FROM greengateway.connection_mutation_approvals WHERE expires_at <= $1",
+        &[&created_at],
+    )
+    .await
+    .map_err(|_| ApprovalError::Unavailable)?;
+    let counts = tx
+        .query_one(
+            "SELECT count(*), count(*) FILTER (WHERE caller_issuer = $1 AND caller_subject = $2)
+             FROM greengateway.connection_mutation_approvals",
+            &[&action.caller.issuer, &action.caller.subject],
+        )
+        .await
+        .map_err(|_| ApprovalError::Unavailable)?;
+    let total: i64 = counts.try_get(0).map_err(|_| ApprovalError::Unavailable)?;
+    let caller_total: i64 = counts.try_get(1).map_err(|_| ApprovalError::Unavailable)?;
+    if total >= MAX_APPROVALS || caller_total >= MAX_APPROVALS_PER_CALLER {
+        return Err(ApprovalError::Capacity);
+    }
+    let id = Uuid::new_v4();
+    let revision = i64::try_from(action.catalog_revision).map_err(|_| ApprovalError::Invalid)?;
+    tx.execute(
+            "INSERT INTO greengateway.connection_mutation_approvals
+             (id, connection_id, connection_etag, catalog_revision, tool_name, operation, method,
+              definition_sha256, target_sha256, body_sha256, caller_issuer, caller_subject, status, created_at, expires_at)
+             VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending', $13, $14)",
+            &[&id.to_string(), &action.connection_id.as_str(), &action.connection_etag, &revision, &action.tool_name,
+            &action.operation, &action.method, &action.definition_sha256, &action.target_sha256,
+            &action.body_sha256, &action.caller.issuer, &action.caller.subject, &created_at, &expires_at],
+        ).await.map_err(|_| ApprovalError::Unavailable)?;
+    let (approval, _) = read(tx, id).await?;
+    Ok(approval)
+}
+
 impl PostgresConnectionStore {
     pub(crate) async fn create_mutation_approval(
         &self,
@@ -183,41 +266,78 @@ impl PostgresConnectionStore {
             .await
             .map_err(|_| ApprovalError::Unavailable)?;
         let tx = begin(&mut client).await?;
-        check_current(&tx, action).await?;
-        let created_at = now(&tx).await?;
-        let expires_at = created_at
-            .checked_add(APPROVAL_LIFETIME_SECS)
-            .ok_or(ApprovalError::Unavailable)?;
-        tx.execute(
-            "DELETE FROM greengateway.connection_mutation_approvals WHERE expires_at <= $1",
-            &[&created_at],
-        )
-        .await
-        .map_err(|_| ApprovalError::Unavailable)?;
-        let counts = tx.query_one(
-            "SELECT count(*), count(*) FILTER (WHERE caller_issuer = $1 AND caller_subject = $2)
-             FROM greengateway.connection_mutation_approvals", &[&action.caller.issuer, &action.caller.subject],
-        ).await.map_err(|_| ApprovalError::Unavailable)?;
-        let total: i64 = counts.try_get(0).map_err(|_| ApprovalError::Unavailable)?;
-        let caller_total: i64 = counts.try_get(1).map_err(|_| ApprovalError::Unavailable)?;
-        if total >= MAX_APPROVALS || caller_total >= MAX_APPROVALS_PER_CALLER {
-            return Err(ApprovalError::Capacity);
-        }
-        let id = Uuid::new_v4();
-        let revision =
-            i64::try_from(action.catalog_revision).map_err(|_| ApprovalError::Invalid)?;
-        tx.execute(
-            "INSERT INTO greengateway.connection_mutation_approvals
-             (id, connection_id, connection_etag, catalog_revision, tool_name, operation, method,
-              definition_sha256, target_sha256, body_sha256, caller_issuer, caller_subject, status, created_at, expires_at)
-             VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending', $13, $14)",
-            &[&id.to_string(), &action.connection_id.as_str(), &action.connection_etag, &revision, &action.tool_name,
-            &action.operation, &action.method, &action.definition_sha256, &action.target_sha256,
-            &action.body_sha256, &action.caller.issuer, &action.caller.subject, &created_at, &expires_at],
-        ).await.map_err(|_| ApprovalError::Unavailable)?;
-        let (approval, _) = read(&tx, id).await?;
+        let approval = insert_occurrence(&tx, action).await?;
         tx.commit().await.map_err(|_| ApprovalError::Unavailable)?;
         Ok(approval)
+    }
+
+    pub(crate) async fn keyed_prepare_receipt(
+        &self,
+        binding: &PrepareBinding,
+    ) -> Result<Option<PrepareReceipt>, ApprovalError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| ApprovalError::Unavailable)?;
+        read_receipt(&client, binding, None).await
+    }
+
+    pub(crate) async fn create_keyed_mutation_approval(
+        &self,
+        action: &MutationAction,
+        binding: &PrepareBinding,
+    ) -> Result<PrepareReceipt, ApprovalError> {
+        use crate::storage::postgres_authority_events::{
+            append_to_journal, record_evidence_failure, reserve_caller_operation, JournalSource,
+        };
+        action.validate()?;
+        if binding.actor.subject() != action.caller.subject
+            || binding.actor.issuer() != Some(action.caller.issuer.as_str())
+        {
+            return Err(ApprovalError::Conflict);
+        }
+        let action_digest = crate::connections::caller_assertion::body_digest(
+            &serde_json::to_vec(action).map_err(|_| ApprovalError::Unavailable)?,
+        );
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| ApprovalError::Unavailable)?;
+        let tx = begin(&mut client).await?;
+        if let Some(receipt) = read_receipt(&tx, binding, Some(&action_digest)).await? {
+            return Ok(receipt);
+        }
+        if !reserve_caller_operation(tx.client(), binding.id, PREPARE_ACTION)
+            .await
+            .map_err(|_| {
+                record_evidence_failure();
+                ApprovalError::Unavailable
+            })?
+        {
+            return Err(ApprovalError::Conflict);
+        }
+        let approval = insert_occurrence(&tx, action).await?;
+        let event = Uuid::new_v4().to_string();
+        let receipt = PrepareReceipt {
+            operation_id: binding.id.to_string(),
+            occurrence_id: approval.id.to_string(),
+            prepared_at: approval.created_at,
+            expires_at: approval.expires_at,
+        };
+        tx.execute(
+            "INSERT INTO greengateway.mutation_approval_prepare_evidence
+             (event_id,operation_id,occurrence_id,request_digest,action_digest,actor_user_id,actor_issuer,actor_auth_mode,created_at,expires_at)
+             VALUES ($1::text::uuid,$2::text::uuid,$3::text::uuid,$4,$5,$6,$7,$8,$9,$10)",
+            &[&event,&receipt.operation_id,&receipt.occurrence_id,&binding.request_digest,&action_digest,
+              &binding.actor.subject(),&action.caller.issuer,&binding.actor.auth_mode(),&receipt.prepared_at,&receipt.expires_at],
+        ).await.map_err(|_| { record_evidence_failure(); ApprovalError::Unavailable })?;
+        append_to_journal(tx.client(), JournalSource::MutationApprovalPrepare, &event)
+            .await
+            .map_err(|_| ApprovalError::Unavailable)?;
+        tx.commit().await.map_err(|_| ApprovalError::Unavailable)?;
+        Ok(receipt)
     }
 
     pub(crate) async fn mutation_approval(

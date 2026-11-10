@@ -268,6 +268,7 @@ pub(crate) enum Code {
     StateDirLink,
     StateDirUnsafePermissions,
     StateDirUnsafeLockFile,
+    StateDirInsideBundle,
     StateDirLocked,
     StateDirLockUnsupported,
     StateDirUnavailable,
@@ -509,6 +510,7 @@ impl Code {
         Self::StateDirLink,
         Self::StateDirUnsafePermissions,
         Self::StateDirUnsafeLockFile,
+        Self::StateDirInsideBundle,
         Self::StateDirLocked,
         Self::StateDirLockUnsupported,
         Self::StateDirUnavailable,
@@ -1114,6 +1116,11 @@ impl Code {
             Self::StateDirUnsafeLockFile => (
                 "state_dir.unsafe_lock_file",
                 "the state directory's lock file is a link, not a regular file, or writable by group or other",
+                Invalid,
+            ),
+            Self::StateDirInsideBundle => (
+                "state_dir.inside_bundle",
+                "the state directory must be outside the selected bundle",
                 Invalid,
             ),
             Self::StateDirLocked => (

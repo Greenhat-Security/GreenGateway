@@ -11,9 +11,11 @@ Gateway startup currently uses [environment configuration](configuration.md).
 When native startup selects bundle mode, it checks for competing environment
 settings before reading the mount. It verifies the bundle's pins and documents
 with the same reader as `ggctl validate`. It then requires `GATEWAY_STATE_DIR`
-exactly when the deployment enables standalone stores. Serving from a bundle
-or ledger remains unavailable. A valid bundle reaches `source.mode_unavailable`
-before any state directory, store or listener opens.
+exactly when the deployment enables standalone stores. With those stores
+enabled, it locks the existing state directory and compiles their fixed
+filenames. This may create its empty lock file. Bundle and ledger activation
+remain unavailable, so native startup releases the lock before exiting and
+opens no database or listener.
 
 The design this follows is
 [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md) (setup, operator
@@ -633,7 +635,7 @@ The compatibility behaviors a migration document acknowledges.
 
 | Member | Value | Default | Environment mode |
 | --- | --- | --- | --- |
-| `compatibility.acknowledged` | array of distinct `policy_default_allow`, `policy_shadow_mode`, `wildcard_role`, `auth_disabled`, `auth_observe_only`, `private_egress_allowed`, `csrf_disabled` and `audit_best_effort` | unset | none: environment mode has no profile |
+| `compatibility.acknowledged` | array of distinct `policy_default_allow`, `policy_shadow_mode`, `wildcard_role`, `auth_disabled`, `auth_observe_only`, `private_egress_allowed`, `csrf_disabled`, `audit_best_effort`, `auth_exemptions_broadened`, `rbac_exemptions_broadened` and `csrf_exemptions_broadened` | unset | none: environment mode has no profile |
 
 #### Authentication provider
 
@@ -886,8 +888,32 @@ The catalog defaults satisfy each requirement. Each explicit relaxation has
 its own diagnostic and migration acknowledgment. For example,
 acknowledging `auth_observe_only` leaves `auth_disabled` an error. Bundle
 diffs and revision plans use the same risk codes as the environment compiler
-for these five settings. Host credential checks and gateway bundle startup
-are still tracked in #242.
+for these five settings.
+
+Production accepts authentication, authorization and CSRF exemption lists
+that cover the same paths as their defaults or fewer. For authentication and
+authorization, probe entries match exactly. The configured admin UI prefix
+and any enabled admin login or session exemptions cover their own path and
+descendants at a segment boundary. With the admin prefix set to `/ops`,
+`/ops/assets` is already covered. Adding `/ops2` or `/health/orders` broadens
+the list. CSRF compares every entry exactly against its default probe paths.
+
+Migration can acknowledge each list independently with
+`auth_exemptions_broadened`, `rbac_exemptions_broadened` or
+`csrf_exemptions_broadened`. Findings identify the list and its source location.
+The profile can check it offline even when an unrelated setting requires host
+credentials. Bundle diffs and revision plans report `risk.exemptions_broadened`
+for newly covered paths and withhold path values.
+
+The gateway sends a session credential to a cookie provider's
+`introspection_url`. The interactive OIDC provider also uses its issuer and
+optional explicit `jwks_url` to establish trust before the code exchange.
+These fields require HTTPS in production and migration. Development can use
+HTTP on a loopback host. Endpoints with embedded credentials or a fragment
+are refused. An ordinary JWT issuer used only as a claim may be opaque.
+The gateway checks the endpoints it learns from secure OIDC discovery before
+publishing the login configuration. Host secret resolution and bundle
+activation are tracked in #242.
 
 ## Generated bundles
 
@@ -1137,18 +1163,14 @@ this limit before it builds the typed settings.
 
 ## The state directory
 
-**Not yet selectable.** In bundle mode with standalone stores, and in ledger
-mode, a standalone deployment will keep every local store beneath one
-directory, `GATEWAY_STATE_DIR`, under the fixed names below
-([ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md#bundle-mode)). Those
-modes replace each store's environment variable with its fixed name, so they
-will refuse the variable. Environment mode rejects `GATEWAY_STATE_DIR` and
-uses each store's configured path. The layout, the
-admission rules and the lock are the shared `gateway-config` library's
-`state_dir` module, which the gateway and `ggctl` both use. Today the revision
-ledger, the `ggctl ledger` commands over it, and `ggctl backup create` and
-`ggctl backup restore` ([standalone backups](standalone-backup.md)) are the only
-things that open through it.
+In native bundle preflight the operator supplies an existing
+`GATEWAY_STATE_DIR` for the declared standalone stores. The gateway takes its
+exclusive lock and compiles the fixed filenames below using the verified
+deployment bytes. The compiled plan owns the lock. Any refusal or outstanding
+host binding releases it. Offline bundle validation has no state-directory
+input and opens no lock. Environment mode uses each store's configured path.
+The revision ledger and the [standalone backup commands](standalone-backup.md)
+use the same admission and locking rules.
 
 | File | Store | Environment-mode variable |
 | --- | --- | --- |
@@ -1216,6 +1238,7 @@ of a local disk:
 | `state_dir.link` | The path is a symbolic link, junction or reparse point. | 3 |
 | `state_dir.unsafe_permissions` | On Unix, the directory is writable by group or other. | 3 |
 | `state_dir.unsafe_lock_file` | `state.lock` is a link, not a regular file, or on Unix writable by group or other. | 3 |
+| `state_dir.inside_bundle` | The standalone state directory is the selected bundle directory or lies beneath it. | 3 |
 | `state_dir.locked` | Another process, or another handle in this one, holds the lock. | 5 |
 | `state_dir.lock_unsupported` | The filesystem cannot take the lock, so exclusive use cannot be promised. | 3 |
 | `state_dir.unavailable` | The directory or the lock file could not be inspected, opened or locked. | 1 |
@@ -1332,3 +1355,7 @@ can appear in one. A published code never changes meaning.
 | `profile.private_egress_allowed` | The profile requires private address blocking for egress. |
 | `profile.csrf_disabled` | The profile requires CSRF protection. |
 | `profile.audit_best_effort` | The profile requires durable audit delivery. |
+| `profile.provider_transport` | Cookie introspection and the selected interactive login provider require HTTPS. Development also accepts HTTP on loopback. The diagnostic identifies the provider field without exposing its URL. |
+| `profile.auth_exemptions_broadened` | The authentication exemption list covers paths outside the deployment defaults. |
+| `profile.rbac_exemptions_broadened` | The authorization exemption list covers paths outside the deployment defaults. |
+| `profile.csrf_exemptions_broadened` | The CSRF exemption list covers paths outside the deployment defaults. |

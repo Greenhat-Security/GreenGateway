@@ -21,7 +21,7 @@
 
 use super::{
     diagnostic::{BundleDiagnostic, Code, Pointer},
-    document::Profile,
+    document::{member, Profile},
     settings::{at_setting, SettingValue, Settings},
     source::FileName,
     syntax::{Node, Value},
@@ -41,6 +41,9 @@ pub(crate) enum Compatibility {
     PrivateEgressAllowed,
     CsrfDisabled,
     AuditBestEffort,
+    AuthExemptionsBroadened,
+    RbacExemptionsBroadened,
+    CsrfExemptionsBroadened,
 }
 
 impl Compatibility {
@@ -54,6 +57,9 @@ impl Compatibility {
         Self::PrivateEgressAllowed,
         Self::CsrfDisabled,
         Self::AuditBestEffort,
+        Self::AuthExemptionsBroadened,
+        Self::RbacExemptionsBroadened,
+        Self::CsrfExemptionsBroadened,
     ];
 
     /// Its code in `spec.compatibility.acknowledged`: the reason segment of
@@ -68,6 +74,9 @@ impl Compatibility {
             Self::PrivateEgressAllowed => "private_egress_allowed",
             Self::CsrfDisabled => "csrf_disabled",
             Self::AuditBestEffort => "audit_best_effort",
+            Self::AuthExemptionsBroadened => "auth_exemptions_broadened",
+            Self::RbacExemptionsBroadened => "rbac_exemptions_broadened",
+            Self::CsrfExemptionsBroadened => "csrf_exemptions_broadened",
         }
     }
 
@@ -82,6 +91,9 @@ impl Compatibility {
             Self::PrivateEgressAllowed => Code::PrivateEgressAllowed,
             Self::CsrfDisabled => Code::CsrfDisabled,
             Self::AuditBestEffort => Code::AuditBestEffort,
+            Self::AuthExemptionsBroadened => Code::AuthExemptionsBroadened,
+            Self::RbacExemptionsBroadened => Code::RbacExemptionsBroadened,
+            Self::CsrfExemptionsBroadened => Code::CsrfExemptionsBroadened,
         }
     }
 }
@@ -115,12 +127,23 @@ impl ProfileRules {
 pub(crate) fn deployment(
     rules: &ProfileRules,
     settings: &Settings,
+    document: &serde_json::Value,
     node: &Node,
     file: &FileName,
     diagnostics: &mut Vec<BundleDiagnostic>,
 ) {
+    provider_transports(rules.profile, settings, node, file, diagnostics);
     if rules.profile == Profile::Development {
         return;
+    }
+    use crate::compiler::semantic_diff::{broadened_profile_exemptions, ExemptionList};
+    for (list, path) in broadened_profile_exemptions(document) {
+        let code = match list {
+            ExemptionList::Authentication => Code::AuthExemptionsBroadened,
+            ExemptionList::Authorization => Code::RbacExemptionsBroadened,
+            ExemptionList::Csrf => Code::CsrfExemptionsBroadened,
+        };
+        diagnostics.push(rules.diagnostic(at_setting(code, file, node, path.split('/').skip(1))));
     }
     for setting in &settings.values {
         use crate::compiler::{
@@ -136,6 +159,66 @@ pub(crate) fn deployment(
         };
         let path = setting.field.document_path().unwrap_or("/spec");
         diagnostics.push(rules.diagnostic(at_setting(code, file, node, path.split('/').skip(1))));
+    }
+}
+
+/// Only a cookie introspector or the selected interactive login provider
+/// receives a credential. A JWT issuer used just as a claim can be an opaque ID.
+fn provider_transports(
+    profile: Profile,
+    settings: &Settings,
+    document: &Node,
+    file: &FileName,
+    diagnostics: &mut Vec<BundleDiagnostic>,
+) {
+    fn field<'n>(node: &'n Node, key: &str) -> Option<&'n Node> {
+        member(node.as_object()?, key)
+    }
+    let providers = ["spec", "authentication", "providers"]
+        .into_iter()
+        .try_fold(document, field);
+    let Some(providers) = providers else { return };
+    let login = settings
+        .values
+        .iter()
+        .find_map(|setting| match &setting.value {
+            SettingValue::Text(name)
+                if setting.field.environment == crate::compiler::ADMIN_LOGIN_PROVIDER =>
+            {
+                Some(name.trim())
+            }
+            _ => None,
+        });
+    let pointer = Pointer::root()
+        .member("spec")
+        .member("authentication")
+        .member("providers");
+    for (index, provider) in elements(providers).iter().enumerate() {
+        let kind = field(provider, "type").and_then(Node::as_str);
+        let name = field(provider, "name")
+            .and_then(Node::as_str)
+            .map(str::trim);
+        let checked: &[_] = match kind {
+            Some("cookie_session") => &["introspection_url"],
+            Some("jwt") if login.is_some() && name == login => &["issuer", "jwks_url"],
+            _ => continue,
+        };
+        for key in checked {
+            let Some(endpoint) = field(provider, key) else {
+                continue;
+            };
+            let Some(value) = endpoint.as_str() else {
+                continue;
+            };
+            if !crate::compiler::identity_endpoint_allowed(value, profile == Profile::Development) {
+                diagnostics.push(BundleDiagnostic::at(
+                    Code::ProviderTransport,
+                    file,
+                    pointer.index(index).member(key),
+                    Some(endpoint.position),
+                ));
+            }
+        }
     }
 }
 

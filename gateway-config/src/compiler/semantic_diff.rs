@@ -59,6 +59,20 @@ pub(crate) fn compare_profile_settings(
     base: &mut serde_json::Value,
     candidate: &mut serde_json::Value,
 ) {
+    for (_, field) in EXEMPTIONS {
+        let Some(path) = catalog::field(field.id).and_then(catalog::Field::document_path) else {
+            continue;
+        };
+        let (Some((_, before)), Some((_, after))) = (
+            document_exemptions(field, path, base),
+            document_exemptions(field, path, candidate),
+        ) else {
+            continue;
+        };
+        compare_exemptions(comparison, field, &before, &after);
+        remove_compared_setting(base, path);
+        remove_compared_setting(candidate, path);
+    }
     for field in [
         &AUTH_ENABLED,
         &AUTH_MODE,
@@ -103,6 +117,111 @@ pub(crate) fn compare_profile_settings(
         remove_compared_setting(base, path);
         remove_compared_setting(candidate, path);
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ExemptionList {
+    Authentication,
+    Authorization,
+    Csrf,
+}
+
+const EXEMPTIONS: [(ExemptionList, &Field); 3] = [
+    (ExemptionList::Authentication, &AUTH_EXEMPT_PATHS),
+    (ExemptionList::Authorization, &RBAC_EXEMPT_PATHS),
+    (ExemptionList::Csrf, &CSRF_EXEMPT_PATHS),
+];
+
+/// Determine each surface's defaults and actual exemptions without resolving
+/// unrelated host inputs. The caller supplies a validated deployment document.
+fn document_exemptions(
+    field: &Field,
+    path: &str,
+    document: &serde_json::Value,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let configured = match document.pointer(path) {
+        None => None,
+        Some(list) => Some(
+            list.as_array()?
+                .iter()
+                .map(|item| item.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+    };
+    if field.id == super::CSRF_EXEMPT_PATHS {
+        let defaults = super::default_paths(super::DEFAULT_CSRF_EXEMPT_PATHS);
+        let effective = configured.unwrap_or_else(|| defaults.clone());
+        return Some((defaults, effective));
+    }
+    let setting = |name| {
+        document
+            .pointer(catalog::field(name)?.document_path()?)?
+            .as_str()
+    };
+    let prefix = setting(super::ADMIN_PREFIX)
+        .map(str::trim)
+        .filter(|value| super::is_valid_admin_prefix(value))
+        .unwrap_or(super::DEFAULT_ADMIN_PREFIX);
+    let login = setting(super::ADMIN_LOGIN_PROVIDER).is_some_and(|value| !value.trim().is_empty());
+    let mut defaults = super::default_admin_exempt_paths(prefix, login);
+    let mut effective = configured.unwrap_or_else(|| defaults.clone());
+    super::append_admin_login_exempt_paths(&mut effective, prefix, login);
+    if matches!(
+        setting(super::ADMIN_SESSION_MODE),
+        Some("standalone_memory" | "cluster_postgres")
+    ) {
+        let session = super::admin_session_exempt_paths(prefix);
+        defaults.extend(session.iter().cloned());
+        effective.extend(session);
+    }
+    Some((defaults, effective))
+}
+
+/// A covered entry can be the path itself or an enclosing segment prefix.
+/// Look up only potential ancestors; large lists need no all-pairs scan.
+fn exemptions_broadened(field: &Field, base: &[String], candidate: &[String]) -> bool {
+    let base: BTreeSet<&str> = base.iter().map(String::as_str).collect();
+    candidate.iter().any(|path| {
+        if base.contains(path.as_str()) {
+            return false;
+        }
+        if field.id == super::CSRF_EXEMPT_PATHS {
+            return true;
+        }
+        !path.match_indices('/').any(|(i, _)| {
+            [&path[..i], &path[..=i]].iter().any(|prefix| {
+                base.contains(prefix) && crate::path_match::exempt_path_matches(path, prefix)
+            })
+        })
+    })
+}
+
+pub(crate) fn broadened_profile_exemptions(
+    document: &serde_json::Value,
+) -> impl Iterator<Item = (ExemptionList, &'static str)> + '_ {
+    EXEMPTIONS.into_iter().filter_map(|(list, field)| {
+        let path = catalog::field(field.id)?.document_path()?;
+        document.pointer(path)?;
+        let (defaults, effective) = document_exemptions(field, path, document)?;
+        exemptions_broadened(field, &defaults, &effective).then_some((list, path))
+    })
+}
+
+fn compare_exemptions(
+    c: &mut Comparison,
+    field: &'static Field,
+    base: &[String],
+    candidate: &[String],
+) {
+    c.assessed_set(field, base, candidate, |counts| {
+        if field.id == super::CSRF_EXEMPT_PATHS || exemptions_broadened(field, base, candidate) {
+            field.rule.set(field.risk, counts)
+        } else if exemptions_broadened(field, candidate, base) {
+            Impact::Tightened
+        } else {
+            Impact::Neutral
+        }
+    });
 }
 
 fn remove_compared_setting(document: &mut serde_json::Value, path: &str) {
@@ -1265,7 +1384,8 @@ fn compare_identity(c: &mut Comparison, base: &IdentityPlan, candidate: &Identit
         gateway_public_url.as_ref(),
         candidate.gateway_public_url.as_ref(),
     );
-    c.set(
+    compare_exemptions(
+        c,
         &RBAC_EXEMPT_PATHS,
         rbac_exempt_paths,
         &candidate.rbac_exempt_paths,
@@ -1281,7 +1401,8 @@ fn compare_identity(c: &mut Comparison, base: &IdentityPlan, candidate: &Identit
         Some(auth_cookie_name),
         Some(&candidate.auth_cookie_name),
     );
-    c.set(
+    compare_exemptions(
+        c,
         &AUTH_EXEMPT_PATHS,
         auth_exempt_paths,
         &candidate.auth_exempt_paths,
@@ -1372,7 +1493,8 @@ fn compare_identity(c: &mut Comparison, base: &IdentityPlan, candidate: &Identit
         csrf_cookie_domain.as_ref(),
         candidate.csrf_cookie_domain.as_ref(),
     );
-    c.set(
+    compare_exemptions(
+        c,
         &CSRF_EXEMPT_PATHS,
         csrf_exempt_paths,
         &candidate.csrf_exempt_paths,

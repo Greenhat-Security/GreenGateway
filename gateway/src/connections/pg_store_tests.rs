@@ -12,7 +12,7 @@ use serde_json::json;
 #[tokio::test]
 async fn mutation_approvals_are_one_shot_across_postgres_replicas() {
     use crate::connections::mutation_approval::{
-        ApprovalDecision, ApprovalError, ApprovalPrincipal, ApprovalStatus, MutationAction,
+        ApprovalDecision, ApprovalError, ApprovalPrincipal, ApprovalStatus,
     };
 
     use crate::storage::{
@@ -27,62 +27,12 @@ async fn mutation_approvals_are_one_shot_across_postgres_replicas() {
     let database = create_test_database(&admin_dsn).await;
     let (first, pool) = migrated_store(&database.dsn, 64).await;
     let (second, _) = migrated_store(&database.dsn, 64).await;
+    let (api, action) = prepare_fixture(&first).await;
     let operator = ChangeActor::for_test("operator");
-    let mut candidate = http_candidate("Reviews");
-    candidate.enabled = true;
-    let api = first
-        .create(candidate, &operator, None)
-        .await
-        .expect("create");
-    let mapping =
-        json!({"method":"POST","path_template":"/invoices","body":{"mode":"whole_args_json"}});
-    let definition = json!({
-        "name":"create_invoice","description":"Creates an invoice","input_json_schema":{"type":"object"},
-        "upstream":mapping,
-        "source":{"type":"open_api","connection_id":api.id.as_str(),"operation_id":"createInvoice","catalog_revision":1},
-        "target":{"type":"http","connection_id":api.id.as_str(),"mapping":mapping}
-    });
-    let typed: crate::tools::definitions::ToolDefinition =
-        serde_json::from_value(definition.clone()).expect("typed definition");
-    let digest = hex::encode(crate::connections::openapi::definition_digest(&typed).unwrap());
-    let entries = [StoredOpenApiCatalogEntry {
-        tool_name: "create_invoice".to_owned(),
-        operation_id: Some("createInvoice".to_owned()),
-        definition,
-        selected_scheme_names: Vec::new(),
-    }];
-    first
-        .replace_openapi_catalog(
-            &api.id,
-            &api.etag(),
-            0,
-            0,
-            RESERVATION_SPEC,
-            &reservation_spec_digest(),
-            &entries,
-            &operator,
-        )
-        .await
-        .expect("publish");
-    let requester = ApprovalPrincipal {
-        issuer: "https://identity.example".into(),
-        subject: "requester".into(),
-    };
+    let requester = action.caller.clone();
     let reviewer = ApprovalPrincipal {
         issuer: "https://identity.example".into(),
         subject: "reviewer".into(),
-    };
-    let action = MutationAction {
-        caller: requester.clone(),
-        connection_id: api.id.clone(),
-        connection_etag: api.etag().to_string(),
-        catalog_revision: 1,
-        tool_name: "create_invoice".into(),
-        operation: "createInvoice".into(),
-        definition_sha256: digest,
-        method: "POST".into(),
-        target_sha256: "a".repeat(64),
-        body_sha256: "b".repeat(64),
     };
     let occurrence = first
         .create_mutation_approval(&action)
@@ -307,6 +257,361 @@ async fn mutation_approvals_are_one_shot_across_postgres_replicas() {
     assert_eq!(
         second.mutation_approval(stale.id).await.unwrap_err(),
         ApprovalError::NotFound
+    );
+}
+
+async fn prepare_fixture(
+    first: &PostgresConnectionStore,
+) -> (
+    StoredConnection,
+    crate::connections::mutation_approval::MutationAction,
+) {
+    use crate::connections::mutation_approval::{ApprovalPrincipal, MutationAction};
+    let operator = ChangeActor::for_test("operator");
+    let mut candidate = http_candidate("Reviews");
+    candidate.enabled = true;
+    let api = first
+        .create(candidate, &operator, None)
+        .await
+        .expect("create");
+    let mapping =
+        json!({"method":"POST","path_template":"/invoices","body":{"mode":"whole_args_json"}});
+    let definition = json!({
+        "name":"create_invoice","description":"Creates an invoice","input_json_schema":{"type":"object"},
+        "upstream":mapping,
+        "source":{"type":"open_api","connection_id":api.id.as_str(),"operation_id":"createInvoice","catalog_revision":1},
+        "target":{"type":"http","connection_id":api.id.as_str(),"mapping":mapping}
+    });
+    let typed: crate::tools::definitions::ToolDefinition =
+        serde_json::from_value(definition.clone()).expect("typed definition");
+    let digest = hex::encode(crate::connections::openapi::definition_digest(&typed).unwrap());
+    let entries = [StoredOpenApiCatalogEntry {
+        tool_name: "create_invoice".to_owned(),
+        operation_id: Some("createInvoice".to_owned()),
+        definition,
+        selected_scheme_names: Vec::new(),
+    }];
+    first
+        .replace_openapi_catalog(
+            &api.id,
+            &api.etag(),
+            0,
+            0,
+            RESERVATION_SPEC,
+            &reservation_spec_digest(),
+            &entries,
+            &operator,
+        )
+        .await
+        .expect("publish");
+    let requester = ApprovalPrincipal {
+        issuer: "https://identity.example".into(),
+        subject: "requester".into(),
+    };
+    let action = MutationAction {
+        caller: requester.clone(),
+        connection_id: api.id.clone(),
+        connection_etag: api.etag().to_string(),
+        catalog_revision: 1,
+        tool_name: "create_invoice".into(),
+        operation: "createInvoice".into(),
+        definition_sha256: digest,
+        method: "POST".into(),
+        target_sha256: "a".repeat(64),
+        body_sha256: "b".repeat(64),
+    };
+    (api, action)
+}
+
+#[tokio::test]
+async fn keyed_prepare_evidence_survives_retries_failures_and_occurrence_cleanup() {
+    use crate::auth::tokens::{test_revoke_operation_id, CreateTokenRequest};
+    use crate::connections::mutation_approval::{ApprovalError, PrepareBinding};
+    use crate::storage::{PostgresServiceTokenStore, ServiceTokenStore};
+    let Some(dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&dsn).await;
+    let (first, pool) = migrated_store(&database.dsn, 64).await;
+    let (second, _) = migrated_store(&database.dsn, 64).await;
+    let (api, action) = prepare_fixture(&first).await;
+    let actor = ChangeActor::for_test_with_issuer(&action.caller.subject, &action.caller.issuer);
+    let key = test_revoke_operation_id(10);
+    let bind = |id, actor: ChangeActor, body: &[u8]| {
+        PrepareBinding::new(id, actor, "opaque-tool", "strong-etag", body).unwrap()
+    };
+    let binding = bind(key, actor.clone(), b"private-argument-marker");
+    let client = pool.get().await.unwrap();
+    let counts = || async {
+        let row = client.query_one("SELECT
+          (SELECT count(*) FROM greengateway.authority_caller_operation_ids),
+          (SELECT count(*) FROM greengateway.connection_mutation_approvals),
+          (SELECT count(*) FROM greengateway.mutation_approval_prepare_evidence),
+          (SELECT count(*) FROM greengateway.authority_event_journal WHERE source='mutation_approval_prepare_evidence')", &[]).await.unwrap();
+        [row.get::<_, i64>(0), row.get(1), row.get(2), row.get(3)]
+    };
+    // Fail in the last write after the live occurrence, reservation and evidence inserts.
+    client.batch_execute("UPDATE greengateway.authority_event_state SET capacity = retained_events WHERE singleton").await.unwrap();
+    assert_eq!(
+        first
+            .create_keyed_mutation_approval(&action, &binding)
+            .await
+            .unwrap_err(),
+        ApprovalError::Unavailable
+    );
+    assert_eq!(counts().await, [0; 4]);
+    client
+        .batch_execute(
+            "UPDATE greengateway.authority_event_state SET capacity = 1000 WHERE singleton",
+        )
+        .await
+        .unwrap();
+    let mut stale = action.clone();
+    stale.catalog_revision += 1;
+    assert_eq!(
+        first
+            .create_keyed_mutation_approval(&stale, &binding)
+            .await
+            .unwrap_err(),
+        ApprovalError::Mismatch
+    );
+    assert_eq!(counts().await, [0; 4]);
+    let (left, right) = tokio::join!(
+        first.create_keyed_mutation_approval(&action, &binding),
+        second.create_keyed_mutation_approval(&action, &binding)
+    );
+    let committed = left.unwrap();
+    assert_eq!(right.unwrap(), committed);
+    assert_eq!(counts().await, [1; 4]);
+    assert_eq!(committed.expires_at - committed.prepared_at, 900);
+    for conflict in [
+        bind(key, actor.clone(), b"other argument"),
+        bind(
+            key,
+            ChangeActor::for_test_with_issuer(
+                &action.caller.subject,
+                "https://second-issuer.example",
+            ),
+            b"private-argument-marker",
+        ),
+    ] {
+        assert_eq!(
+            first.keyed_prepare_receipt(&conflict).await.unwrap_err(),
+            ApprovalError::Conflict
+        );
+    }
+    let mut changed = action.clone();
+    changed.body_sha256 = "c".repeat(64);
+    assert_eq!(
+        second
+            .create_keyed_mutation_approval(&changed, &binding)
+            .await
+            .unwrap_err(),
+        ApprovalError::Conflict
+    );
+    let tokens = PostgresServiceTokenStore::new(pool.clone());
+    let token = tokens
+        .create(
+            CreateTokenRequest {
+                scopes: vec!["admin:tokens:read".into()],
+                created_by: actor.subject().into(),
+                expires_at: None,
+            },
+            &actor,
+        )
+        .await
+        .unwrap()
+        .record
+        .id;
+    assert!(tokens
+        .revoke_with_operation(&token, &actor, Some(key))
+        .await
+        .is_err());
+    let contested = test_revoke_operation_id(11);
+    let other = bind(contested, actor.clone(), b"new occurrence");
+    let (prepared, revoked) = tokio::join!(
+        second.create_keyed_mutation_approval(&action, &other),
+        tokens.revoke_with_operation(&token, &actor, Some(contested))
+    );
+    assert_ne!(
+        prepared.is_ok(),
+        revoked.as_ref().is_ok_and(|row| row.is_some())
+    );
+    if prepared.is_err() {
+        assert_eq!(
+            second.keyed_prepare_receipt(&other).await.unwrap_err(),
+            ApprovalError::Conflict
+        );
+    } else {
+        assert!(tokens
+            .revoke_with_operation(&token, &actor, Some(contested))
+            .await
+            .is_err());
+    }
+    let saved: String = client.query_one("SELECT row_to_json(e)::text FROM greengateway.mutation_approval_prepare_evidence e WHERE operation_id=$1::text::uuid",&[&key.to_string()]).await.unwrap().get(0);
+    for marker in [
+        "private-argument-marker",
+        "opaque-tool",
+        "strong-etag",
+        "/invoices",
+        "create_invoice",
+    ] {
+        assert!(!saved.contains(marker));
+    }
+    first
+        .replace_openapi_catalog(
+            &api.id,
+            &api.etag(),
+            1,
+            1,
+            RESERVATION_SPEC,
+            &reservation_spec_digest(),
+            &[],
+            &actor,
+        )
+        .await
+        .expect("withdraw the Connection's published tools before deletion");
+    first.delete(&api.id, &api.etag(), &actor).await.unwrap();
+    assert_eq!(
+        second
+            .mutation_approval(uuid::Uuid::parse_str(&committed.occurrence_id).unwrap())
+            .await
+            .unwrap_err(),
+        ApprovalError::NotFound
+    );
+    assert_eq!(
+        second.keyed_prepare_receipt(&binding).await.unwrap(),
+        Some(committed)
+    );
+}
+
+#[tokio::test]
+async fn keyed_prepare_file_delivery_resumes_after_format_downgrade_and_cursor_loss() {
+    use crate::auth::tokens::test_revoke_operation_id;
+    use crate::authority_events::{
+        delivery,
+        dispatcher::{DispatcherTerm, StepError},
+        pseudonym::test_support::generated_keyring,
+        sink::configured_sink,
+    };
+    use crate::config::{AuthorityEventFormat, AuthorityEventSinkSetting};
+    use crate::connections::mutation_approval::PrepareBinding;
+    use crate::storage::postgres_authority_events::PostgresAuthorityEventStore;
+    let Some(dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&dsn).await;
+    let (first, pool) = migrated_store(&database.dsn, 64).await;
+    let (_, action) = prepare_fixture(&first).await;
+    let actor = ChangeActor::for_test_with_issuer(&action.caller.subject, &action.caller.issuer);
+    let binding = PrepareBinding::new(
+        test_revoke_operation_id(13),
+        actor,
+        "tool-marker",
+        "etag-marker",
+        b"input-marker",
+    )
+    .unwrap();
+    let receipt = first
+        .create_keyed_mutation_approval(&action, &binding)
+        .await
+        .unwrap();
+    let store = std::sync::Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
+    let client = pool.get().await.unwrap();
+    assert_eq!(
+        PostgresAuthorityEventStore::prune_with(&client, std::time::Duration::ZERO, 100)
+            .await
+            .unwrap(),
+        0,
+        "a required preparation cannot age out before the very first dispatcher claim"
+    );
+    let rows = store.read_after(0, 100).await.unwrap();
+    let head = rows.last().unwrap().position;
+    assert_eq!(
+        rows.last().unwrap().operation_id.as_deref(),
+        Some(receipt.operation_id.as_str())
+    );
+    let keyring = std::sync::Arc::new(generated_keyring(
+        store.authority_id(uuid::Uuid::new_v4()).await.unwrap(),
+    ));
+    let path = std::env::temp_dir().join(format!("gg-prepare-{}.jsonl", uuid::Uuid::new_v4()));
+    let setting = AuthorityEventSinkSetting::File(path.to_str().unwrap().into());
+    let legacy = configured_sink(&setting, AuthorityEventFormat::DeliveryV1)
+        .await
+        .unwrap()
+        .unwrap();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let mut paused = DispatcherTerm::begin(
+        store.clone(),
+        legacy,
+        keyring.clone(),
+        Default::default(),
+        1,
+        uuid::Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        paused.step(&stop).await,
+        Err(StepError::Projection {
+            error: delivery::ProjectionError::QualifiedFormatRequired,
+            ..
+        })
+    ));
+    assert_eq!(store.stats().await.unwrap().cursor, Some(0));
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    let format = AuthorityEventFormat::QualifiedV1;
+    let sink = configured_sink(&setting, format).await.unwrap().unwrap();
+    // Simulate a process death after the real file append and before cursor commit.
+    let batch: Vec<_> = rows
+        .iter()
+        .map(|row| delivery::project(row, &keyring, format).unwrap())
+        .collect();
+    sink.deliver(&batch).await.unwrap();
+    drop(paused);
+    let mut resume = DispatcherTerm::begin(
+        store.clone(),
+        sink,
+        keyring,
+        Default::default(),
+        2,
+        uuid::Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    resume.deliver_until_caught_up(&stop).await.unwrap();
+    assert_eq!(store.stats().await.unwrap().cursor, Some(head));
+    let bytes = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let lines: Vec<_> = bytes.lines().collect();
+    assert_eq!(lines.len(), rows.len() * 2);
+    assert_eq!(lines[..rows.len()], lines[rows.len()..]);
+    let event: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    assert_eq!(event["operation_id"], receipt.operation_id);
+    assert_eq!(event["event_id"], rows.last().unwrap().event_id);
+    assert_eq!(event["operation"], "mutation_approval.prepare");
+    assert_eq!(event["schema_version"], "authority_event.v1");
+    for marker in [
+        "tool-marker",
+        "etag-marker",
+        "input-marker",
+        &action.caller.issuer,
+        &action.caller.subject,
+        &receipt.occurrence_id,
+    ] {
+        assert!(!bytes.contains(marker));
+    }
+    assert_eq!(
+        PostgresAuthorityEventStore::prune_with(&client, std::time::Duration::ZERO, 100)
+            .await
+            .unwrap(),
+        rows.len() as u64
+    );
+    assert_eq!(
+        first.keyed_prepare_receipt(&binding).await.unwrap(),
+        Some(receipt)
     );
 }
 

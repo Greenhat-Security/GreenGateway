@@ -810,11 +810,25 @@ impl Comparison {
         base: impl IntoIterator<Item = T>,
         candidate: impl IntoIterator<Item = T>,
     ) {
+        self.assessed_set(field, base, candidate, |counts| {
+            field.rule.set(field.risk, counts)
+        });
+    }
+
+    /// Compare distinct entries by count with a domain-specific assessment
+    /// of the access they grant.
+    pub(crate) fn assessed_set<T: Ord>(
+        &mut self,
+        field: &'static Field,
+        base: impl IntoIterator<Item = T>,
+        candidate: impl IntoIterator<Item = T>,
+        assess: impl FnOnce(SetCounts) -> Impact,
+    ) {
         let base: BTreeSet<T> = base.into_iter().collect();
         let candidate: BTreeSet<T> = candidate.into_iter().collect();
         if base != candidate {
             let counts = SetCounts::of(&base, &candidate);
-            let impact = field.rule.set(field.risk, counts);
+            let impact = assess(counts);
             self.record(
                 field,
                 ChangeKind::Modified,

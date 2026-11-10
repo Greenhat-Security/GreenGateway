@@ -146,6 +146,35 @@ fn normalize_discovery_endpoint(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// A login issuer using HTTPS must not downgrade its key, authorization or
+/// token endpoint. A loopback development issuer may use loopback HTTP.
+pub(crate) fn validate_login_transports(
+    issuer: &str,
+    endpoints: [&str; 3],
+) -> Result<(), AuthError> {
+    use gateway_config::compiler::identity_endpoint_allowed;
+
+    let invalid =
+        || AuthError::Upstream("OIDC login requires secure provider endpoints".to_owned());
+    let parsed = url::Url::parse(issuer).map_err(|_| invalid())?;
+    let allow_loopback = match parsed.scheme() {
+        "https" if identity_endpoint_allowed(issuer, false) => false,
+        "http" if identity_endpoint_allowed(issuer, true) => true,
+        // A legacy environment can select a remote HTTP issuer. Bundle
+        // profiles refuse that issuer before discovery.
+        "http" => return Ok(()),
+        _ => return Err(invalid()),
+    };
+    if endpoints
+        .into_iter()
+        .all(|endpoint| identity_endpoint_allowed(endpoint, allow_loopback))
+    {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
+}
+
 pub(crate) fn normalize_issuer(issuer: &str) -> Option<String> {
     canonical_issuer(issuer)
 }
@@ -188,6 +217,33 @@ mod tests {
 
     use super::*;
     use crate::egress::EgressConfig;
+
+    #[test]
+    fn discovered_login_endpoints_preserve_the_issuers_transport() {
+        let secure = "https://id.example.test/endpoint";
+        let local = "http://[::1]/endpoint";
+        assert!(validate_login_transports(secure, [secure; 3]).is_ok());
+        assert!(validate_login_transports(local, [secure, local, local]).is_ok());
+        for value in [
+            local,
+            "http://remote.example.test/path",
+            "https://name@id.example.test/path",
+            "https://id.example.test/path#private",
+            "relative",
+        ] {
+            for index in 0..3 {
+                let mut endpoints = [secure; 3];
+                endpoints[index] = value;
+                let error = validate_login_transports(secure, endpoints).unwrap_err();
+                assert!(!error.to_string().contains(value));
+            }
+        }
+        assert!(validate_login_transports(
+            local,
+            [secure, local, "http://remote.example.test/path"]
+        )
+        .is_err());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn discovery_egress_failures_log_only_bounded_categories() {

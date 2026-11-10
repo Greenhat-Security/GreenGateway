@@ -686,6 +686,7 @@ fn every_state_directory_and_ledger_code_is_the_librarys() {
         StateDirError::Link,
         StateDirError::UnsafePermissions,
         StateDirError::UnsafeLockFile,
+        StateDirError::InsideBundle,
         StateDirError::Locked,
         StateDirError::LockUnsupported,
         StateDirError::Unavailable { operation: "test" },

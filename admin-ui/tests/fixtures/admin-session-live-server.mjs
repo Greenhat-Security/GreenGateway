@@ -23,7 +23,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createServer } from 'node:http';
-import { request as httpsRequest } from 'node:https';
+import { createServer as createHttpsServer, request as httpsRequest } from 'node:https';
 import { request as httpRequest } from 'node:http';
 import { isIP } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -46,7 +46,9 @@ const ISSUER = `http://${HOST}:${IDP_PORT}`;
 // scoped by host, not port, so serving it from 127.0.0.1 would hand it every
 // gateway cookie there; a separate host is what a production IdP has. The
 // gateways only use the issuer, token and JWKS URLs, which stay on 127.0.0.1.
-const IDP_BROWSER_AUTHORITY = `idp.admin-session-live.test:${IDP_PORT}`;
+const IDP_BROWSER_HOST = 'idp.admin-session-live.test';
+const IDP_BROWSER_PORT = 43216;
+const IDP_BROWSER_AUTHORITY = `${IDP_BROWSER_HOST}:${IDP_BROWSER_PORT}`;
 const PROVIDER_NAME = 'admin-session-live';
 const KEY_ID = 'admin-session-live-signing';
 const OPERATOR_SUBJECT = 'admin-session-operator';
@@ -168,7 +170,7 @@ const observed = {
   cookieNames: [],
 };
 
-const providerServer = createServer(async (request, response) => {
+async function serveProvider(request, response) {
   try {
     await handleProviderRequest(request, response);
   } catch (error) {
@@ -180,22 +182,39 @@ const providerServer = createServer(async (request, response) => {
       json(response, 400, { error: 'invalid_request' });
     }
   }
-});
+}
 
+const providerServer = createServer(serveProvider);
+let browserProviderServer;
 let shuttingDown = false;
 
-providerServer.on('error', (error) => {
+function providerFailed(error) {
   console.error(
     `[admin-session-fixture] provider failed: ${error.message}`,
   );
   void shutdown(1);
-});
+}
+providerServer.on('error', providerFailed);
 
 prepareRuntimeFiles()
-  .then(() => new Promise((resolve) => {
-    // The gateways read OIDC discovery at startup, so the provider must be up.
-    providerServer.listen(IDP_PORT, HOST, resolve);
-  }))
+  .then(async () => {
+    // The browser uses a separate HTTPS origin. The gateway's discovery
+    // and token endpoints use the original loopback socket.
+    browserProviderServer = createHttpsServer({
+      cert: readFileSync(tls.certificate),
+      key: readFileSync(tls.key),
+    }, (request, response) => {
+      if (request.method !== 'GET' || request.url?.split('?', 1)[0] !== '/authorize') {
+        return json(response, 404, { error: 'not_found' });
+      }
+      return serveProvider(request, response);
+    });
+    browserProviderServer.on('error', providerFailed);
+    await Promise.all([
+      new Promise((resolve) => providerServer.listen(IDP_PORT, HOST, resolve)),
+      new Promise((resolve) => browserProviderServer.listen(IDP_BROWSER_PORT, HOST, resolve)),
+    ]);
+  })
   .then(buildGateway)
   .then(startGateways)
   .then(waitForGateways)
@@ -236,7 +255,7 @@ async function handleProviderRequest(request, response) {
     return json(response, 200, {
       issuer: ISSUER,
       jwks_uri: `${ISSUER}/jwks.json`,
-      authorization_endpoint: `http://${IDP_BROWSER_AUTHORITY}/authorize`,
+      authorization_endpoint: `https://${IDP_BROWSER_AUTHORITY}/authorize`,
       token_endpoint: `${ISSUER}/token`,
       response_types_supported: ['code'],
       subject_types_supported: ['public'],
@@ -248,7 +267,7 @@ async function handleProviderRequest(request, response) {
     return json(response, 200, jwks);
   }
   if (request.method === 'GET' && url.pathname === '/authorize') {
-    if (request.headers.host !== IDP_BROWSER_AUTHORITY) {
+    if (!request.socket.encrypted || request.headers.host !== IDP_BROWSER_AUTHORITY) {
       observed.rejectedRequests += 1;
       return json(response, 400, { error: 'invalid_request' });
     }
@@ -469,7 +488,7 @@ async function issueCertificate() {
       'basicConstraints = critical,CA:FALSE',
       'keyUsage = critical,digitalSignature',
       'extendedKeyUsage = serverAuth',
-      `subjectAltName = IP:${HOST},DNS:localhost`,
+      `subjectAltName = IP:${HOST},DNS:localhost,DNS:${IDP_BROWSER_HOST}`,
       'authorityKeyIdentifier = keyid',
       '',
     ].join('\n'),
@@ -754,8 +773,10 @@ async function shutdown(exitCode) {
   }));
 
   // Keep-alive connections would otherwise hold close() open.
-  providerServer.closeAllConnections();
-  await new Promise((resolve) => providerServer.close(resolve));
+  await Promise.all([providerServer, browserProviderServer].filter(Boolean).map((server) => {
+    server.closeAllConnections();
+    return new Promise((resolve) => server.close(resolve));
+  }));
   cleanupRuntimeRoot();
   process.exit(exitCode);
 }

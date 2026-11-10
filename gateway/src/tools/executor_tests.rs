@@ -2451,6 +2451,9 @@ async fn connection_change_during_execution_precondition_fails_before_secret_or_
     let mut context = invocation_context();
     context.source = ToolInvocationSource::AdminPlayground;
 
+    // The SQLite edit runs on Tokio's blocking pool. Keep real disk latency
+    // from spending the tool deadline before the revision check can run.
+    tokio::time::pause();
     let error = executor
         .execute_with_precondition(
             "get_charge",
@@ -2495,12 +2498,16 @@ async fn connection_change_during_execution_precondition_fails_before_secret_or_
         )
         .await
         .expect_err("a Connection edit during validation must fail closed");
+    tokio::time::resume();
 
-    assert!(matches!(
-        error,
-        ToolRuntimeError::Rejected { ref reason, .. }
-            if reason == TOOL_PRECONDITION_FAILED_REASON
-    ));
+    assert!(
+        matches!(
+            error,
+            ToolRuntimeError::Rejected { ref reason, .. }
+                if reason == TOOL_PRECONDITION_FAILED_REASON
+        ),
+        "expected the edited Connection to fail its precondition, got {error:?}"
+    );
     let events = audit_events(&capture, 3).await;
     assert!(events.iter().any(|event| {
         event.event_type == audit::event::TOOL_INVOKE_REJECTED

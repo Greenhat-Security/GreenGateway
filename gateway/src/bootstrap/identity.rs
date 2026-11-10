@@ -303,6 +303,10 @@ pub(crate) fn discover_oidc_from_config(
         let token_endpoint = document.token_endpoint().ok_or_else(|| {
             auth::AuthError::Upstream("OIDC discovery response missing token_endpoint".to_owned())
         })?;
+        auth::oidc::validate_login_transports(
+            &issuer,
+            [&jwks_url, &authorization_endpoint, &token_endpoint],
+        )?;
         discovered.admin_login = Some(DiscoveredAdminLoginEndpoints {
             provider_name: provider.name.clone(),
             issuer,

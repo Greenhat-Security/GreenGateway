@@ -10,6 +10,7 @@ pub(crate) enum StartupFailure {
     Configuration(config::ConfigError),
     /// The pinned bundle failed the same reader as the offline tools.
     Bundle(Vec<gateway_config::bundle::BundleDiagnostic>),
+    StateDirectory(gateway_config::state_dir::StateDirError),
     /// Preflight, activation or serving failed.
     Stage(Box<dyn std::error::Error>),
 }
@@ -131,9 +132,21 @@ pub(crate) async fn start_serving<S: StartupStages>(
             for warning in report.diagnostics {
                 tracing::warn!(code = warning.code.as_str(), "configuration bundle warning");
             }
-            mount
+            let state_path = mount
                 .state_directory(!bundle.deployment.standalone_stores.is_empty())
                 .map_err(StartupFailure::Configuration)?;
+            let _standalone_plan = if let Some(path) = state_path {
+                let directory = gateway_config::state_dir::StateDirectory::acquire_for_bundle(
+                    path,
+                    &mount.directory,
+                )
+                .map_err(StartupFailure::StateDirectory)?;
+                bundle
+                    .bind_standalone_stores(directory)
+                    .map_err(StartupFailure::Bundle)?
+            } else {
+                None
+            };
             // Activation must install the validated resources as read-only
             // authorities before the gateway can serve this configuration.
             return Err(StartupFailure::Configuration(

@@ -568,7 +568,8 @@ pub(super) fn add_admin_api_routes(
                 )
                 .route(
                     routes.admin.tool_mutation_approval_create_route.as_str(),
-                    post(tool_mutation_approval_create_endpoint),
+                    post(tool_mutation_approval_create_endpoint)
+                        .put(tool_mutation_approval_create_endpoint),
                 )
                 .route(
                     routes.admin.tool_mutation_approval_execute_route.as_str(),
@@ -1093,6 +1094,7 @@ pub(super) fn cors_layer(config: &config::Config) -> CorsLayer {
         header::COOKIE,
         header::ACCEPT,
         HeaderName::from_static("idempotency-key"),
+        header::IF_MATCH,
         config
             .csrf_header_name
             .parse::<HeaderName>()

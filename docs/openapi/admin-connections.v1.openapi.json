@@ -1111,6 +1111,72 @@
             "csrfHeader": []
           }
         ]
+      },
+      "put": {
+        "operationId": "prepareToolMutationApprovalWithReceipt",
+        "tags": [
+          "Capabilities"
+        ],
+        "summary": "Prepare or reconcile one caller-bound mutation approval",
+        "description": "Requires PostgreSQL, a provider-authenticated admin:tools:execute caller, and an exact strong If-Match. First preparation requires AUTHORITY_EVENT_FORMAT=qualified_v1 and the current capability authorization. A matching retry returns the original receipt, including after expiry or catalog changes.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            },
+            "description": "Unique UUIDv7 bound to the exact tool ID, request bytes, If-Match and authenticated caller."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/PlaygroundRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Immutable receipt for the committed preparation.",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/MutationPrepareReceipt"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/ToolPlaygroundValidationError"
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
       }
     },
     "/v1/admin/mutation-approvals/{id}": {

@@ -855,6 +855,10 @@ durable contract fence, which remains in force after removing the enrollment.
    after consumption leaves the occurrence spent. The gateway makes no automatic
    resend. Check the upstream outcome before preparing a new occurrence.
 
+PostgreSQL clients that need to reconcile a lost preparation response can send `PUT` to the same tool preparation URL. Send one canonical lowercase RFC UUIDv7 in `Idempotency-Key`, the exact strong `If-Match` from the capability, and the original request body. Enable `AUTHORITY_EVENT_FORMAT=qualified_v1` on every replica before creating a keyed preparation. An authorized caller receives HTTP 200 and a private receipt with `operation_id`, `occurrence_id` and two Unix timestamps, `prepared_at` and `expires_at`. A fresh key prepares another occurrence. Separate ordinary POSTs still create independent occurrences in best-effort mode.
+
+Retry with the original provider issuer, subject, authentication method, tool ID, ETag and exact body bytes. The gateway checks current management permission on every request. A matching retry returns the original receipt after catalog changes, Connection deletion or expiry. It reports the original preparation time and never extends the approval window. Use the occurrence read endpoint for the current decision. Reusing a key from another preparation or service-token revocation returns `409`. The gateway commits the pending occurrence, operation reservation, actor evidence and journal entry together. A failed commit or a full evidence journal leaves the operation available for retry.
+
 **Verify at the upstream.** Verify the signature with the gateway's JWKS and
 the configured algorithm, key, issuer, audience and token type. Require a valid
 `approval_id`, a live `exp`, the expected caller, `method`, `path`,
@@ -882,11 +886,7 @@ cascades to its approvals. The gateway emits `connection.mutation_approval`
 with the actor, operation and outcome. It records successful consumption
 before attempting transport. It excludes token material, request and response
 bodies, raw URLs and signing keys from approval events. A consumption event
-does not establish that the upstream applied the mutation. With
-`AUTHORITY_EVIDENCE_DURABILITY=required`, preparation, review, revocation and
-consumption return `409 authority_evidence_unsupported` because these bounded
-records have no append-only transition history. Authorized reads remain
-available.
+does not establish that the upstream applied the mutation. With `AUTHORITY_EVIDENCE_DURABILITY=required`, PostgreSQL admits this keyed prepare route when the configured consumer accepts `qualified_v1`. Both modes refuse unkeyed preparation, review, revocation and consumption with `409 authority_evidence_unsupported`. Standalone also refuses keyed preparation in required mode and returns `501` for that route in best-effort mode. Authorized reads remain available.
 
 #### Signing keys
 

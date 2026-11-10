@@ -415,20 +415,32 @@ fn validate_and_doctor_enforce_each_deployment_profile_control() {
         ),
         ("csrf_disabled", "/spec/csrf/enabled"),
         ("audit_best_effort", "/spec/audit/durability"),
+        (
+            "auth_exemptions_broadened",
+            "/spec/authentication/exempt_paths",
+        ),
+        (
+            "rbac_exemptions_broadened",
+            "/spec/authorization/exempt_paths",
+        ),
+        ("csrf_exemptions_broadened", "/spec/csrf/exempt_paths"),
     ];
     let all: Vec<_> = controls.iter().map(|(code, _)| *code).collect();
     for (profile, acknowledged) in [
         ("production", &[][..]),
         ("migration", &[][..]),
         ("migration", &all[..1]),
+        ("migration", &["auth_exemptions_broadened"][..]),
         ("migration", all.as_slice()),
         ("development", &[][..]),
     ] {
         let mut spec = json!({
             "profile": profile,
-            "authentication": {"enabled": false, "mode": "observe"},
+            "authentication": {"enabled": false, "mode": "observe", "exempt_paths": [format!("/{CANARY}")]},
+            "authorization": {"exempt_paths": [format!("/health/{CANARY}")]},
             "egress": {"deny_private_addresses": false},
-            "csrf": {"enabled": false},
+            "csrf": {"enabled": false, "exempt_paths": [format!("/readyz/{CANARY}")]},
+            "upstream": {"url": {"secret": CANARY}},
             "audit": {"durability": "best_effort"}
         });
         if !acknowledged.is_empty() {
@@ -444,6 +456,7 @@ fn validate_and_doctor_enforce_each_deployment_profile_control() {
         fixture.pin_policy_version("0.1.0");
         for command in ["validate", "doctor"] {
             let (exit, captured) = run(&[command, fixture.path(), "--format", "json"]);
+            assert_no_canary(&captured);
             let expected_exit = if profile == "development" || acknowledged.len() == all.len() {
                 Exit::Success
             } else {
@@ -456,6 +469,12 @@ fn validate_and_doctor_enforce_each_deployment_profile_control() {
                 captured.stdout()
             );
             let result = report(&captured);
+            if exit == Exit::Success {
+                assert_eq!(
+                    result["result"]["bundle"]["deployment"]["offlineCompiler"],
+                    "not_checked"
+                );
+            }
             let diagnostics = result["diagnostics"].as_array().expect("diagnostics");
             for (name, path) in controls {
                 let code = format!("profile.{name}");
@@ -702,6 +721,96 @@ fn validate_and_doctor_refuse_wildcard_credentialed_cors_in_a_bundle() {
         assert_eq!(location["line"], 6);
         assert_eq!(location["pointer"], "/spec/cors/allowed_origins");
     }
+}
+
+#[test]
+fn credential_bearing_provider_endpoints_are_validated_offline_with_safe_locations() {
+    let fixture = Fixture::valid();
+    let write = |profile, spec: Value| {
+        let mut spec = spec;
+        spec["profile"] = json!(profile);
+        fixture.write(
+            "deployment.yaml",
+            &json!({
+                "apiVersion":"greengateway.dev/v1alpha1","kind":"GatewayDeployment","spec":spec
+            })
+            .to_string(),
+        );
+        fixture.pin_policy_version("0.1.0");
+    };
+    for (profile, endpoint, valid) in [
+        (
+            "production",
+            "https://service.example.test/introspect",
+            true,
+        ),
+        ("production", "http://127.0.0.1/introspect", false),
+        ("migration", "http://service.example.test/introspect", false),
+        ("development", "http://[::1]/introspect", true),
+        (
+            "development",
+            "http://localhost.example.test/introspect",
+            false,
+        ),
+        (
+            "production",
+            "https://name@service.example.test/introspect",
+            false,
+        ),
+    ] {
+        write(
+            profile,
+            json!({"authentication":{"providers":[{
+                "name":CANARY,"type":"cookie_session","introspection_url":endpoint,"user_id_claim":"sub"
+            }]}}),
+        );
+        for command in ["validate", "doctor"] {
+            let (exit, captured) = run(&[command, fixture.path(), "--format", "json"]);
+            assert_eq!(
+                exit,
+                if valid { Exit::Success } else { Exit::Invalid },
+                "{}",
+                captured.stdout()
+            );
+            assert_no_canary(&captured);
+            assert!(!captured.stdout().contains(endpoint));
+            if !valid {
+                let result = report(&captured);
+                assert!(result["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|d| d["code"] == "profile.provider_transport"
+                        && d["location"]["pointer"]
+                            == "/spec/authentication/providers/0/introspection_url"));
+            }
+        }
+    }
+    let mut spec = json!({"authentication":{"providers":[
+        {"name":CANARY,"type":"jwt","issuer":"http://issuer.example.test","jwks_url":"http://keys.example.test/keys"}
+    ]}});
+    write("production", spec.clone());
+    assert_eq!(run(&["validate", fixture.path()]).0, Exit::Success);
+    spec["admin_login"] = json!({"provider":CANARY,"client_id":CANARY,"client_secret":{"secret":CANARY},"redirect_uri":"https://admin.example.test/callback"});
+    write("production", spec);
+    let (exit, captured) = run(&["validate", fixture.path(), "--format", "json"]);
+    assert_eq!(exit, Exit::Invalid);
+    assert_no_canary(&captured);
+    let result = report(&captured);
+    let pointers: BTreeSet<_> = result["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["code"] == "profile.provider_transport")
+        .map(|d| d["location"]["pointer"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        pointers,
+        BTreeSet::from([
+            "/spec/authentication/providers/0/issuer",
+            "/spec/authentication/providers/0/jwks_url"
+        ])
+    );
 }
 
 #[test]

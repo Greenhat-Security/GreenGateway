@@ -620,6 +620,23 @@ pub(super) fn authority_evidence_unsupported(
         .into_response()
 }
 
+/// A caller-owned operation is one canonical RFC UUIDv7 header.
+pub(super) fn caller_operation_id(headers: &HeaderMap) -> Result<uuid::Uuid, &'static str> {
+    let mut values = headers.get_all("idempotency-key").iter();
+    let raw = values.next().and_then(|v| v.to_str().ok());
+    let id = raw
+        .and_then(|raw| {
+            uuid::Uuid::parse_str(raw).ok().filter(|id| {
+                auth::tokens::valid_caller_operation_id(*id) && id.hyphenated().to_string() == raw
+            })
+        })
+        .ok_or("Idempotency-Key must be one canonical lowercase UUIDv7")?;
+    if values.next().is_some() {
+        return Err("Idempotency-Key must occur exactly once");
+    }
+    Ok(id)
+}
+
 /// Ask the authority-evidence gate before an admin change, and record a
 /// refusal against the caller and the request that asked.
 pub(super) fn admit_authority_change(

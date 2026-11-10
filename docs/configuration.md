@@ -22,7 +22,7 @@ Default: unset.
 
 ### GATEWAY_STATE_DIR
 
-Standalone state directory. Ledger mode requires it. Native bundle startup requires it when the deployment enables standalone stores and refuses it otherwise. Environment mode refuses any assignment. A supplied path must be non-empty.
+Standalone state directory. Ledger mode requires it. Native bundle startup requires an existing directory when the deployment enables standalone stores and refuses the locator otherwise. Preflight locks the directory while binding the fixed store filenames. Environment mode refuses any assignment. A supplied path must be non-empty.
 
 Default: unset.
 
@@ -1769,6 +1769,12 @@ When `AUTH_PROVIDERS` is set, it defines the ordered auth provider chain and tak
 
 OIDC discovery: when a provider has `issuer` but no `jwks_url`, startup fetches `{issuer}/.well-known/openid-configuration` through the egress client, adds the returned `jwks_uri` host to the effective egress allowlist, and uses that `jwks_uri` for later JWKS refreshes. Discovery failure or a discovery document without `jwks_uri` prevents the provider from being constructed. When the provider is selected by `ADMIN_LOGIN_PROVIDER`, the same discovery response must also contain `authorization_endpoint` and `token_endpoint`; the token endpoint host is added to the effective egress allowlist for the authorization-code exchange.
 
+For interactive login, an HTTPS issuer requires HTTPS for the effective key,
+authorization and token endpoints. A loopback HTTP issuer may also use
+loopback HTTP endpoints. Startup refuses an insecure endpoint before it
+installs the login provider or sends a client secret. Production and migration
+bundles also require an HTTPS cookie-session introspection endpoint.
+
 JWT algorithms: JWKS keys with `kty` `RSA` validate RS256 tokens, `kty` `EC` with `crv` `P-256` validates ES256 tokens, and `kty` `OKP` with `crv` `Ed25519` validates EdDSA tokens. Unsupported or incomplete keys are skipped during JWKS refresh.
 
 Egress trust: each JWT provider `jwks_url`, each JWT provider `issuer` when it is a URL with a host, each discovered OIDC `jwks_uri` host, the discovered admin-login `token_endpoint` host, and each cookie-session provider `introspection_url` host are automatically trusted for gateway-originated egress. Non-global-IP, scheme, port, and DNS-pinning checks still apply to every discovery, JWKS, token-exchange, and introspection request.
@@ -2594,6 +2600,8 @@ Default: `delivery_v1`
 
 With `qualified_v1`, a PostgreSQL service-token revoke submitted through the keyed POST route by a provider-authenticated principal with a canonical issuer produces `authority_event.v1`. Its `actor.subject_ref` binds the subject to that issuer. It includes the committed token and security revisions. On a Unix filesystem that honors file and directory sync, the file sink syncs both the file and its parent directory before the dispatcher advances its cursor, including after first creation or file rotation. For a final symlink it also syncs the directory containing the configured name. If a sync fails or rotation changes the open file’s identity before the check, delivery retries the batch. Provision the log directories durably and keep rotated data until the consumer has accepted it. Other platforms can emit the same format and sync file contents, with no qualified directory-entry durability claim. A log sink accepts the batch when it hands it to the log writer.
 
+PostgreSQL also emits `authority_event.v1` for a keyed mutation-approval preparation. Before selecting `delivery_v1`, drain these events through a `qualified_v1` consumer. A legacy dispatcher reports `qualified_format_required` and holds the cursor at a queued preparation. Restore `qualified_v1` to resume delivery. After the first keyed prepare, the journal retains the unclaimed backlog until the dispatcher establishes a cursor. The PostgreSQL receipt and operation-ID reservation survive journal retention and approval cleanup.
+
 Unkeyed service-token revokes, gateway service-token callers, standalone evidence and other operations continue to produce `authority_event_delivery.v1`. An impossible actor or revision on a keyed PostgreSQL row stops the opted-in batch. Both representations use the same event and authority IDs for deduplication. A qualified record omits the delivery sequence. A format change applies to subsequent deliveries and can change the representation of a redelivered event after a restart. A cluster must agree on the selected format before the dispatcher changes it.
 
 ### AUTHORITY_EVENT_FILE
@@ -2630,9 +2638,11 @@ Default: `1000000`
 
 Format and validation: an integer between `1` and `1000000000`. A value below the number already retained admits nothing until retention frees room. Cluster mode only (rejected when `STATE_BACKEND=sqlite`, which has no journal: standalone evidence has no capacity bound); part of the static-configuration fingerprint.
 
+The journal capacity counts delivery units. The separate caller-operation and approval-receipt tables grow with distinct committed operations throughout the life of the authority. Monitor their PostgreSQL relation sizes and available disk space. [Receipt retention and capacity](authority-evidence.md#postgresql-approval-preparation).
+
 ### AUTHORITY_EVENT_RETENTION_HOURS
 
-How long, in hours, a delivered authority event stays in the journal. The maintenance leader's `authority_event_retention` job deletes a bounded batch (1000 rows) per pass of journal rows that are at or below the dispatcher's cursor and journaled at least this long ago, and gives their capacity back. An undelivered event is never pruned once a dispatcher has claimed the cursor, whatever its age. Before any dispatcher has ever run, there is no required consumer and events older than this are pruned by age alone. The evidence tables the journal indexes (`connection_change_evidence`, `service_token_change_evidence`, `jwt_revocation_evidence`) are never pruned. `0` prunes delivered events on the next pass.
+How long, in hours, a delivered authority event stays in the journal. The maintenance leader's `authority_event_retention` job deletes a bounded batch (1000 rows) per pass of journal rows that are at or below the dispatcher's cursor and journaled at least this long ago, and gives their capacity back. An undelivered event is never pruned once a dispatcher has claimed the cursor, whatever its age. With no cursor, age alone allows pruning only while the authority has never committed a caller-keyed approval preparation. Once one has committed, retention preserves the entire backlog whenever the cursor is absent, including after a cursor reset. Restore the qualified consumer and let it advance to reclaim capacity. The evidence tables the journal indexes and caller operation reservations are retained. `0` prunes delivered events on the next pass.
 
 Default: `168`
 

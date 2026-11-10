@@ -207,16 +207,21 @@ impl ConfigPlan {
 
     /// This plan was built from document values and defaults. The shared
     /// stages already distinguish supplied values from computed defaults.
-    pub(crate) fn mark_bundle_sources(&mut self, development_listen_default: bool) {
+    pub(crate) fn mark_bundle_sources(
+        &mut self,
+        development_listen_default: bool,
+        bootstrap: &std::collections::BTreeSet<&'static str>,
+    ) {
         for fields in self.provenance_blocks_mut() {
             for field in fields {
                 if field.source == super::stage::Source::Environment {
-                    field.source =
-                        if development_listen_default && field.setting == super::LISTEN_ADDR {
-                            super::stage::Source::Profile
-                        } else {
-                            super::stage::Source::Bundle
-                        };
+                    field.source = if bootstrap.contains(field.setting) {
+                        super::stage::Source::Bootstrap
+                    } else if development_listen_default && field.setting == super::LISTEN_ADDR {
+                        super::stage::Source::Profile
+                    } else {
+                        super::stage::Source::Bundle
+                    };
                 }
             }
         }

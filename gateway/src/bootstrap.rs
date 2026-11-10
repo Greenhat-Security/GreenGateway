@@ -46,19 +46,19 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // a stage's failure goes back to `main` like every other startup error.
     let mut stages = ProcessStartup { process_started_at };
     match start_serving(&mut stages, config::process_environment).await {
-        Ok(()) => Ok(()),
+        Ok(()) => return Ok(()),
         Err(StartupFailure::Configuration(err)) => {
             eprintln!("{err}");
-            std::process::exit(1);
         }
         Err(StartupFailure::Bundle(diagnostics)) => {
             for diagnostic in diagnostics {
                 eprintln!("{diagnostic}");
             }
-            std::process::exit(1);
         }
-        Err(StartupFailure::Stage(error)) => Err(error),
+        Err(StartupFailure::StateDirectory(error)) => eprintln!("{}: {error}", error.code()),
+        Err(StartupFailure::Stage(error)) => return Err(error),
     }
+    std::process::exit(1);
 }
 
 pub(super) fn production_tracing_filter() -> Targets {
