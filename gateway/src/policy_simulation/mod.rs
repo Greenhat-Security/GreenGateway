@@ -77,7 +77,8 @@ impl TraceLevel {
 }
 
 /// A non-mutating view of a policy a simulation evaluates.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Projection {
     /// The policy as written.
     AsAuthored,
