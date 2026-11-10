@@ -179,6 +179,84 @@ impl ResourceValidators for ProductionValidators {
 /// policy and tools documents as those validators built them.
 pub type ProductionBundle = Bundle<Policy, Vec<ToolDefinition>>;
 
+/// A standalone deployment compiled against fixed files under an exclusive
+/// state-directory lock. The lock is owned by this plan for its lifetime.
+pub struct StandalonePlan {
+    plan: Box<crate::compiler::ConfigPlan>,
+    directory: crate::state_dir::StateDirectory,
+}
+
+impl std::fmt::Debug for StandalonePlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StandalonePlan")
+            .finish_non_exhaustive()
+    }
+}
+
+impl StandalonePlan {
+    pub fn plan(&self) -> &crate::compiler::ConfigPlan {
+        &self.plan
+    }
+
+    pub fn directory(&self) -> &crate::state_dir::StateDirectory {
+        &self.directory
+    }
+}
+
+impl ProductionBundle {
+    /// Bind a deployment's declared standalone stores. Reuse the exact
+    /// pinned deployment bytes in memory, even if the mount has changed.
+    /// Other host requirements can still leave the plan pending. A refusal
+    /// or pending plan releases the directory and opens no store.
+    pub fn bind_standalone_stores(
+        &self,
+        directory: crate::state_dir::StateDirectory,
+    ) -> Result<Option<StandalonePlan>, Vec<BundleDiagnostic>> {
+        let Some(source) = self
+            .files
+            .iter()
+            .find(|source| source.role == FileRole::Deployment)
+        else {
+            return Err(vec![BundleDiagnostic::bundle(
+                Code::InvalidDeploymentSetting,
+            )]);
+        };
+        let mut diagnostics = Vec::new();
+        let Some(node) = parse_document(&source.bytes, &source.name, &mut diagnostics) else {
+            return Err(diagnostics);
+        };
+        let Some(Deployment {
+            profile, settings, ..
+        }) = document::deployment(&node, &source.name, &mut diagnostics)
+        else {
+            return Err(diagnostics);
+        };
+        let stores = settings
+            .standalone_stores(&node, &source.name)
+            .map_err(|issue| vec![issue])?;
+        if stores.is_empty() {
+            return Err(vec![BundleDiagnostic::file(
+                Code::InvalidDeploymentSetting,
+                &source.name,
+            )]);
+        }
+        let pinned_policy = self
+            .files
+            .iter()
+            .any(|source| source.role == FileRole::Policy);
+        Ok(settings
+            .compile_plan(
+                profile,
+                pinned_policy,
+                &node,
+                &source.name,
+                Some((&directory, &stores)),
+            )?
+            .map(|plan| StandalonePlan { plan, directory }))
+    }
+}
+
 /// Runs no production validator: a referenced document that passed the
 /// bundle's own checks and its published schema is accepted as its JSON
 /// value, as it was written.
@@ -640,7 +718,7 @@ fn read_deployment(
     diagnostics.extend(settings.listener_diagnostics(profile, &node, &reference.file));
     diagnostics.extend(settings.public_diagnostics(&node, &reference.file));
     diagnostics.extend(settings.provider_diagnostics(&node, &reference.file));
-    let plan = match settings.offline_plan(profile, bundled_policy, &node, &reference.file) {
+    let plan = match settings.compile_plan(profile, bundled_policy, &node, &reference.file, None) {
         Ok(plan) => plan,
         Err(found) => {
             // Keep the dedicated stage's more specific code at a pointer it

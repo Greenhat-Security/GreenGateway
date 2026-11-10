@@ -516,6 +516,12 @@ The reader retains the plan with its pinned deployment. A deployment that
 needs external bindings, including secret references or local store paths,
 can be validated offline only for the stages whose inputs are available.
 
+Native bundle preflight can supply the fixed SQLite filenames beneath a locked
+standalone state directory. The compiler marks these settings as `Bootstrap`,
+and the resulting standalone plan holds the directory lock. A second process
+receives `state_dir.locked` while the plan exists. A compilation refusal or
+pending host input releases the lock without opening a store.
+
 Serving from a mounted bundle still requires profile enforcement, resource
 ownership checks, secret resolution and activation.
 
