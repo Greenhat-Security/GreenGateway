@@ -150,6 +150,7 @@ impl Stage {
             | Code::NotApplicable
             | Code::NotRepresentable
             | Code::InvalidEgressSetting
+            | Code::InvalidRuntimeSetting
             | Code::InvalidAuthProvider
             | Code::InvalidAdminLogin
             | Code::InlineSecretValue

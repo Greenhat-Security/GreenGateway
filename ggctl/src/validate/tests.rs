@@ -402,6 +402,48 @@ fn validate_and_doctor_run_the_egress_compiler_on_a_bundle() {
 }
 
 #[test]
+fn validate_and_doctor_refuse_wildcard_credentialed_cors_in_a_bundle() {
+    let fixture = Fixture::valid();
+    let write = |origins: Value| {
+        fixture.write("deployment.yaml", &format!(
+            "apiVersion: greengateway.dev/v1alpha1\nkind: GatewayDeployment\nspec:\n  profile: production\n  cors:\n    allowed_origins: {origins}\n"
+        ));
+        fixture.pin_policy_version("0.1.0");
+    };
+    let origin = format!("https://{CANARY}.example");
+    write(json!([origin]));
+    for command in ["validate", "doctor"] {
+        assert_eq!(run(&[command, fixture.path()]).0, Exit::Success);
+    }
+    write(json!([origin, "*"]));
+    for command in ["validate", "doctor"] {
+        let (exit, captured) = run(&[command, fixture.path(), "--format", "json"]);
+        assert_eq!(exit, Exit::Invalid);
+        assert_no_canary(&captured);
+        let result = report(&captured);
+        if command == "doctor" {
+            assert_eq!(
+                codes(&result),
+                [
+                    "bundle.invalid_runtime_setting",
+                    "doctor.required_check_failed"
+                ]
+            );
+            let checks = result["result"]["checks"].as_array().unwrap();
+            assert!(checks.iter().any(|check| check["id"] == "bundle.structure"
+                && check["status"] == "fail"
+                && check["reason"] == "bundle.invalid_runtime_setting"));
+        } else {
+            assert_eq!(codes(&result), ["bundle.invalid_runtime_setting"]);
+        }
+        let location = &result["diagnostics"][0]["location"];
+        assert_eq!(location["file"], "deployment.yaml");
+        assert_eq!(location["line"], 6);
+        assert_eq!(location["pointer"], "/spec/cors/allowed_origins");
+    }
+}
+
+#[test]
 fn validate_and_doctor_check_bundle_providers_and_admin_login_offline() {
     let fixture = Fixture::valid();
     let issuer = format!("https://{CANARY}.example");

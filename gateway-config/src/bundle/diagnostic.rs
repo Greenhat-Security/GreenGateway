@@ -174,6 +174,7 @@ pub enum Code {
     NotApplicable,
     NotRepresentable,
     InvalidEgressSetting,
+    InvalidRuntimeSetting,
     InvalidAuthProvider,
     InvalidAdminLogin,
     // References between bundle files.
@@ -263,6 +264,7 @@ impl Code {
         Self::NotApplicable,
         Self::NotRepresentable,
         Self::InvalidEgressSetting,
+        Self::InvalidRuntimeSetting,
         Self::InvalidAuthProvider,
         Self::InvalidAdminLogin,
         Self::InvalidPath,
@@ -539,6 +541,10 @@ impl Code {
             Self::InvalidEgressSetting => (
                 "bundle.invalid_egress_setting",
                 "the egress configuration compiler refused this setting",
+            ),
+            Self::InvalidRuntimeSetting => (
+                "bundle.invalid_runtime_setting",
+                "the runtime configuration compiler refused this setting",
             ),
             Self::InvalidAuthProvider => (
                 "bundle.invalid_auth_provider",

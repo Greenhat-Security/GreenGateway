@@ -245,6 +245,11 @@ are hostnames without ports and that NAT64 prefixes meet the gateway's IPv6
 prefix and overlap rules. A refusal points to the affected setting and omits
 the supplied value. This check runs offline.
 
+The same offline pass compiles the public runtime settings for request bounds,
+rate limits, CORS, shutdown, audit durability, payload capture, discovery
+signals and tool execution. For example, a wildcard in `cors.allowed_origins`
+is rejected because the gateway supports credentialed requests.
+
 The reader also applies the gateway's authentication-provider rules, including
 type-specific requirements, unique provider names, and unique effective issuers.
 Admin login must select a JWT provider with an issuer and supply its client ID,
@@ -1241,6 +1246,7 @@ can appear in one. A published code never changes meaning.
 | `bundle.not_utf8` | A file is not valid UTF-8. |
 | `bundle.digest_mismatch` | A file's SHA-256 differs from its pin. |
 | `bundle.invalid_egress_setting` | The gateway's egress compiler refused the setting at the reported deployment pointer. |
+| `bundle.invalid_runtime_setting` | The gateway's runtime compiler refused the setting at the reported deployment pointer. |
 | `bundle.invalid_auth_provider` | The gateway's authentication compiler refused the provider list. |
 | `bundle.invalid_admin_login` | The selected login provider is unusable, or a required client setting is missing. |
 | `syntax.empty_document` | The document is empty. |
