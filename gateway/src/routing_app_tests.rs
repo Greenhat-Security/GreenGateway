@@ -655,6 +655,10 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
     );
     assert_eq!(default_routes.tokens_route, TOKENS_ADMIN_ROUTE);
     assert_eq!(default_routes.token_route, TOKEN_ADMIN_ROUTE);
+    assert_eq!(
+        default_routes.token_keyed_revoke_route,
+        TOKEN_KEYED_REVOKE_ADMIN_ROUTE
+    );
     assert_eq!(default_routes.token_rotate_route, TOKEN_ROTATE_ADMIN_ROUTE);
     assert_eq!(default_routes.connections_route, CONNECTIONS_ADMIN_ROUTE);
     assert_eq!(default_routes.connection_route, CONNECTION_ADMIN_ROUTE);
@@ -788,6 +792,10 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
     );
     assert_eq!(custom_routes.tokens_route, "/v1/ops/tokens");
     assert_eq!(custom_routes.token_route, "/v1/ops/tokens/{id}");
+    assert_eq!(
+        custom_routes.token_keyed_revoke_route,
+        "/v1/ops/tokens/{id}/revoke"
+    );
     assert_eq!(
         custom_routes.token_rotate_route,
         "/v1/ops/tokens/{id}/rotate"
@@ -4351,6 +4359,45 @@ async fn cors_preflight_to_non_exempt_path_succeeds_without_credential() {
         Some(&HeaderValue::from_static("http://localhost:3000"))
     );
     assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE));
+}
+
+#[tokio::test]
+async fn cors_preflight_allows_keyed_revocation_from_an_allowed_origin() {
+    let origin = "http://localhost:3000";
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let response = app(
+        test_config(vec![origin]),
+        recorder.handle(),
+        test_audit_log(),
+        test_audit_event_sender(),
+    )
+    .unwrap()
+    .oneshot(
+        Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/v1/admin/tokens/example/revoke")
+            .header(header::ORIGIN, origin)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "authorization,idempotency-key",
+            )
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(
+        response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    let headers = response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
+        .to_str()
+        .unwrap();
+    assert!(headers
+        .split(',')
+        .any(|name| name.trim() == "idempotency-key"));
 }
 
 #[tokio::test]
