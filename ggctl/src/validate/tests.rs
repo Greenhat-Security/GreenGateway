@@ -271,7 +271,7 @@ fn a_document_only_the_production_validator_refuses_is_refused_by_code_alone() {
 
 #[test]
 fn validate_and_diff_pinned_v1_policies() {
-    let mapping = json!({"id": "operators", "issuer": "https://issuer.example", "subjects": [CANARY], "grant_roles": ["reader"]});
+    let mapping = json!({"id": "operators", "issuer": "https://issuer.example", "subjects": [CANARY, "operator"], "grant_roles": ["reader"]});
     let mut policy =
         json!({"schema_version": "1.0.0", "roles": {"reader": {"permissions": ["read"]}}});
     let claimed = Fixture::with("production", &policy.to_string());
@@ -301,6 +301,31 @@ fn validate_and_diff_pinned_v1_policies() {
         );
         assert!(captured.stdout().contains("policy.identity_mappings"));
     }
+
+    let mut other = mapping.clone();
+    other["id"] = json!("others");
+    let mut reordered = mapping.clone();
+    reordered["subjects"] = json!(["operator", CANARY]);
+    for (fixture, mappings) in [
+        (&claimed, json!([mapping, other])),
+        (&mapped, json!([other, reordered])),
+    ] {
+        policy["identity_mappings"] = mappings;
+        fixture.write("policy.json", &policy.to_string());
+        fixture.pin_policy_version("1.0.0");
+    }
+    let (exit, captured) = run(&[
+        "diff",
+        mapped.path(),
+        "--against",
+        claimed.path(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(exit, Exit::Success);
+    assert_no_canary(&captured);
+    assert_eq!(report(&captured)["result"]["diff"]["riskCodes"], json!([]));
+    assert!(!captured.stdout().contains("policy.identity_mappings"));
 
     // Unique element IDs are enforced by the gateway beyond the published
     // schema. Both mappings have a valid shape.

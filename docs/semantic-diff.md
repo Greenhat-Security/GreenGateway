@@ -40,7 +40,8 @@ upstream routes) stay ordered; sets (hosts, CIDRs, ports, origins, exempt
 paths, permissions) are compared as sets, and host names case-insensitively.
 
 For policy v1, `policy.identity_mappings` reports a change with unknown impact
-and withholds the mapping contents. An omitted list uses claimed roles. A
+and withholds the mapping contents. Reordering mappings or their list members
+preserves the role grants and adds no risk. An omitted list uses claimed roles. A
 present, empty list enables mapped roles and grants none through mappings.
 
 `diff(a, a)` is empty for every configuration, and so is the diff of a policy

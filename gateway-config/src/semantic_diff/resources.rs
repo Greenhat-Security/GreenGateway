@@ -552,8 +552,13 @@ pub fn compare_policy(comparison: &mut Comparison, base: &Value, candidate: &Val
     opaque_member(
         comparison,
         &IDENTITY_MAPPINGS,
-        base.get("identity_mappings"),
-        candidate.get("identity_mappings"),
+        base.get("identity_mappings")
+            .map(normalized_mappings)
+            .as_ref(),
+        candidate
+            .get("identity_mappings")
+            .map(normalized_mappings)
+            .as_ref(),
     );
 
     let routes = |document: &Map<String, Value>| list(document.get("routes"));
@@ -694,6 +699,28 @@ fn entries(value: Option<&Value>, normalize: fn(&Value) -> Value) -> BTreeMap<St
 /// strings is left as given, and its assessor reports it as `unknown`.
 fn normalized_role(role: &Value) -> Value {
     normalized(role, &["permissions", "issuers", "auth_methods"], &[])
+}
+
+/// Every matching mapping contributes its grants. The mapping order and
+/// each list's order therefore have no effect on the granted roles.
+fn normalized_mappings(value: &Value) -> Value {
+    let Some(mappings) = value.as_array() else {
+        return value.clone();
+    };
+    let lists = [
+        "auth_methods",
+        "subjects",
+        "organizations",
+        "claimed_roles",
+        "scopes",
+        "grant_roles",
+    ];
+    let mut mappings: Vec<_> = mappings
+        .iter()
+        .map(|mapping| normalized(mapping, &lists, &[]))
+        .collect();
+    mappings.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    Value::Array(mappings)
 }
 
 /// A tool policy entry as the loader reads it: its role, issuer and auth
