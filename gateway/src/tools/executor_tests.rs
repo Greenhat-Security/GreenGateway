@@ -2603,6 +2603,7 @@ async fn live_http_deny_published_during_precondition_fails_before_secret_or_ups
             &context,
             &CancellationToken::new(),
             Some(&precondition),
+            ToolRequestPurpose::Execute,
         )
         .await
         .expect_err("the newly published direct HTTP Deny rule must fail closed");

@@ -30,7 +30,7 @@
         "lifetime_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "An assertion is a bearer credential for as long as it is valid, so this is a replay window rather than a convenience setting." },
         "claims": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["email", "roles"] }, "description": "Principal fields to attest beyond sub, which is always present. A closed set rather than free-form templating, so a configuration mistake cannot attest something a caller supplied." },
         "bind_request": { "type": "boolean", "description": "Include the method, path and a SHA-256 of the body actually sent, so an assertion cannot be lifted onto different arguments. The digest covers the transmitted bytes, not a canonical form, so an upstream verifies it with its standard library." },
-        "bind_approval": { "type": "boolean", "const": false, "description": "Reserved: would require, and include, the approval that authorised a mutation. No approval subsystem exists yet, so only false is accepted." },
+        "bind_approval": { "type": "boolean", "const": false, "description": "Reserved: would require, and include, the approval that authorised a mutation. The gateway can record a mutation review. Dispatch does not yet consume its decision, so writes accept only false." },
         "published_keys": {
           "type": "array",
           "maxItems": 4,
@@ -5127,6 +5127,208 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 8192
+        }
+      }
+    },
+    "MutationReview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision"
+      ],
+      "properties": {
+        "decision": {
+          "enum": [
+            "approve",
+            "reject"
+          ]
+        }
+      }
+    },
+    "MutationApprovalPrincipal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issuer",
+        "subject"
+      ],
+      "properties": {
+        "issuer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "MutationApprovalAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "caller",
+        "connection_id",
+        "connection_etag",
+        "catalog_revision",
+        "tool_name",
+        "operation",
+        "definition_sha256",
+        "method",
+        "target_sha256",
+        "body_sha256"
+      ],
+      "properties": {
+        "caller": {
+          "$ref": "#/$defs/MutationApprovalPrincipal"
+        },
+        "connection_id": {
+          "$ref": "#/$defs/StableId"
+        },
+        "connection_etag": {
+          "$ref": "#/$defs/Etag"
+        },
+        "catalog_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "tool_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "operation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Named OpenAPI operation ID in the served definition."
+        },
+        "definition_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Digest of the registered tool definition."
+        },
+        "method": {
+          "enum": [
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE"
+          ]
+        },
+        "target_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Digest of the resolved absolute destination URL, including path and query."
+        },
+        "body_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Digest of the rendered HTTP request body bytes."
+        }
+      }
+    },
+    "MutationApproval": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One occurrence of a server-prepared mutation. Only digests of the target URL and rendered body are retained.",
+      "required": [
+        "id",
+        "action",
+        "status",
+        "created_at",
+        "expires_at",
+        "reviewer",
+        "reviewed_at",
+        "revoked_by",
+        "revoked_at",
+        "consumed_at"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "action": {
+          "$ref": "#/$defs/MutationApprovalAction"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "approved",
+            "rejected",
+            "revoked",
+            "consumed",
+            "expired"
+          ]
+        },
+        "created_at": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Whole seconds since the Unix epoch on the approval authority."
+        },
+        "expires_at": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The approval deadline, 900 seconds after creation."
+        },
+        "reviewer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MutationApprovalPrincipal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reviewed_at": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Whole seconds since the Unix epoch on the approval authority."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revoked_by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MutationApprovalPrincipal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revoked_at": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Whole seconds since the Unix epoch on the approval authority."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "consumed_at": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Whole seconds since the Unix epoch on the approval authority."
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },

@@ -31,6 +31,7 @@ use crate::{
             IssuedCallerAssertion, IssuedSessionCallerAssertions,
         },
         mcp::McpConnectionCatalogRuntime,
+        mutation_approval::MutationAction,
         openapi::OpenApiConnectionCatalogRuntime,
     },
     egress::{EgressClient, EgressError, EgressRequestBody, EgressResponse},
@@ -300,6 +301,37 @@ pub enum ToolExecutionResult {
     Http(HttpToolExecutionResult),
     McpCallToolResult(CallToolResult),
     Composite(CompositeResult),
+}
+
+#[derive(Debug)]
+enum ToolWorkResult {
+    Executed(ToolExecutionResult),
+    Prepared(Box<MutationAction>),
+}
+
+impl ToolWorkResult {
+    fn application_failure_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Executed(result) => result.application_failure_reason(),
+            Self::Prepared(_) => None,
+        }
+    }
+
+    fn unexpected(tool_name: &str) -> ToolRuntimeError {
+        ToolRuntimeError::WorkFailed {
+            tool_name: tool_name.to_owned(),
+            message: "unexpected internal tool operation result".to_owned(),
+            reason: Some("tool_operation_failed".to_owned()),
+            details: None,
+        }
+    }
+}
+
+/// Only the authenticated management interface can request preparation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolRequestPurpose {
+    Execute,
+    PrepareMutation,
 }
 
 impl ToolExecutionResult {
@@ -1049,6 +1081,54 @@ impl ToolExecutor {
         cancel: CancellationToken,
         precondition: Option<ToolExecutionPrecondition>,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        match self
+            .run_tool(
+                tool_name,
+                args,
+                context,
+                cancel,
+                precondition,
+                ToolRequestPurpose::Execute,
+            )
+            .await?
+        {
+            ToolWorkResult::Executed(result) => Ok(result),
+            ToolWorkResult::Prepared(_) => Err(ToolWorkResult::unexpected(tool_name)),
+        }
+    }
+
+    pub(crate) async fn prepare_mutation(
+        &self,
+        tool_name: &str,
+        args: Value,
+        context: ToolInvocationContext,
+        precondition: ToolExecutionPrecondition,
+    ) -> Result<MutationAction, ToolRuntimeError> {
+        match self
+            .run_tool(
+                tool_name,
+                args,
+                context,
+                CancellationToken::new(),
+                Some(precondition),
+                ToolRequestPurpose::PrepareMutation,
+            )
+            .await?
+        {
+            ToolWorkResult::Prepared(action) => Ok(*action),
+            ToolWorkResult::Executed(_) => Err(ToolWorkResult::unexpected(tool_name)),
+        }
+    }
+
+    async fn run_tool(
+        &self,
+        tool_name: &str,
+        args: Value,
+        context: ToolInvocationContext,
+        cancel: CancellationToken,
+        precondition: Option<ToolExecutionPrecondition>,
+        purpose: ToolRequestPurpose,
+    ) -> Result<ToolWorkResult, ToolRuntimeError> {
         let started = Instant::now();
         if context.source != ToolInvocationSource::AdminPlayground
             && self
@@ -1098,11 +1178,12 @@ impl ToolExecutor {
                             &work_context,
                             &work_cancel,
                             precondition.as_ref(),
+                            purpose,
                         )
                         .await
                 },
                 executor_work_error_disposition,
-                ToolExecutionResult::application_failure_reason,
+                ToolWorkResult::application_failure_reason,
                 Some(move |pointers: &[String]| {
                     self.admission_arguments(
                         tool_name,
@@ -1359,8 +1440,34 @@ impl ToolExecutor {
         context: &ToolInvocationContext,
         cancel: &CancellationToken,
         precondition: Option<&ToolExecutionPrecondition>,
-    ) -> Result<ToolExecutionResult, ToolExecutorError> {
+        purpose: ToolRequestPurpose,
+    ) -> Result<ToolWorkResult, ToolExecutorError> {
         let tool = self.registered_tool(tool_name, context)?;
+        if purpose == ToolRequestPurpose::PrepareMutation
+            && (context.caller.is_none()
+                || tool.composite.is_some()
+                || !matches!(
+                    (&tool.source, &tool.target),
+                    (
+                        ToolSource::OpenApi {
+                            operation_id: Some(_),
+                            catalog_revision: Some(_),
+                            ..
+                        },
+                        Some(ToolTarget::Http { .. })
+                    )
+                )
+                || tool.upstream.mcp_proxy_mapping().is_some()
+                || !matches!(
+                    tool.upstream.method.as_str(),
+                    "POST" | "PUT" | "PATCH" | "DELETE"
+                ))
+        {
+            return Err(ToolExecutorError::Connection {
+                tool_name: tool.name.clone(),
+                reason: "mutation_approval_unsupported",
+            });
+        }
         let validation_started = Instant::now();
         self.validate_call(&tool, &args, context)?;
 
@@ -1384,7 +1491,8 @@ impl ToolExecutor {
                 .await?;
             return self
                 .execute_composite(&tool, composite, connection_id, &args, context, cancel)
-                .await;
+                .await
+                .map(ToolWorkResult::Executed);
         }
 
         if matches!(tool.target, Some(ToolTarget::Composite { .. })) {
@@ -1415,7 +1523,8 @@ impl ToolExecutor {
             }
             return self
                 .execute_mcp_proxy(context, &tool, mapping, args, captured_connection_target)
-                .await;
+                .await
+                .map(ToolWorkResult::Executed);
         }
 
         let wire_args = match apply_request_transform(tool.transform.as_ref(), &args) {
@@ -1564,6 +1673,46 @@ impl ToolExecutor {
             });
         }
 
+        if purpose == ToolRequestPurpose::PrepareMutation {
+            // No signing key, credential or network I/O has happened. All request
+            // transforms and the pinned and live authorization checks have completed.
+            let target =
+                captured_connection_target.ok_or_else(|| ToolExecutorError::Connection {
+                    tool_name: tool.name.clone(),
+                    reason: "mutation_approval_unsupported",
+                })??;
+            if !self
+                .openapi_catalog_runtime
+                .as_ref()
+                .is_some_and(|catalog| {
+                    catalog.definition_is_current(&tool, target.connection_etag())
+                })
+            {
+                return Err(ToolExecutorError::PreconditionFailed {
+                    tool_name: tool.name.clone(),
+                });
+            }
+            let caller =
+                context
+                    .caller
+                    .as_deref()
+                    .ok_or_else(|| ToolExecutorError::Connection {
+                        tool_name: tool.name.clone(),
+                        reason: "mutation_approval_no_principal",
+                    })?;
+            let action = MutationAction::for_http_tool(
+                caller,
+                &target,
+                &tool,
+                &request.method,
+                request.body.as_deref().unwrap_or_default(),
+            )
+            .map_err(|_| ToolExecutorError::Connection {
+                tool_name: tool.name.clone(),
+                reason: "mutation_approval_unsupported",
+            })?;
+            return Ok(ToolWorkResult::Prepared(Box::new(action)));
+        }
         let mut issued_assertion = None;
         let (result, connection_id) = match (&tool.target, captured_connection_target) {
             (Some(ToolTarget::Http { connection_id, .. }), target) => {
@@ -1647,10 +1796,9 @@ impl ToolExecutor {
                     },
                 );
                 let warnings = self.apply_http_response_transform(context, &tool, &mut response);
-                Ok(ToolExecutionResult::Http(HttpToolExecutionResult {
-                    response,
-                    warnings,
-                }))
+                Ok(ToolWorkResult::Executed(ToolExecutionResult::Http(
+                    HttpToolExecutionResult { response, warnings },
+                )))
             }
             Err(error) => {
                 let outcome = executor_failure_observation_outcome(latency_ms, &error);

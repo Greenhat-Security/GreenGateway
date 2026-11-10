@@ -250,7 +250,7 @@
         "lifetime_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "An assertion is a bearer credential for as long as it is valid, so this is a replay window rather than a convenience setting." },
         "claims": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["email", "roles"] }, "description": "Principal fields to attest beyond sub, which is always present. A closed set rather than free-form templating, so a configuration mistake cannot attest something a caller supplied." },
         "bind_request": { "type": "boolean", "description": "Include the method, path and a SHA-256 of the body actually sent, so an assertion cannot be lifted onto different arguments. The digest covers the transmitted bytes, not a canonical form, so an upstream verifies it with its standard library." },
-        "bind_approval": { "type": "boolean", "const": false, "description": "Reserved: would require, and include, the approval that authorised a mutation. No approval subsystem exists yet, so only false is accepted." },
+        "bind_approval": { "type": "boolean", "const": false, "description": "Reserved: would require, and include, the approval that authorised a mutation. The gateway can record a mutation review. Dispatch does not yet consume its decision, so writes accept only false." },
         "published_keys": {
           "type": "array",
           "maxItems": 4,

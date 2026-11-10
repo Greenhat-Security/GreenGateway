@@ -1249,6 +1249,7 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
         membership: build_overrides.pg_membership.clone(),
     };
     let tool_admin_state = ToolAdminState {
+        connections: connection_control_plane.clone(),
         tools_file: config.tools_file.as_ref().map(PathBuf::from),
         registry: tool_registry.clone(),
         inventory: capability_inventory,

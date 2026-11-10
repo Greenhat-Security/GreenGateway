@@ -632,7 +632,9 @@ through the setup step by step.
   and is not a per-caller credential mechanism.
 - **Approval binding (`bind_approval`).** The block reserves the field for an
   assertion that would also carry the approval that authorised a mutation.
-  No approval subsystem exists, so new and replacement writes refuse
+  An authenticated operator can record a decision on one prepared managed
+  OpenAPI mutation. Dispatch does not yet consume that decision. New and
+  replacement writes refuse
   `bind_approval: true` (`caller_assertion.bind_approval`,
   `unsupported_binding`), the published write schemas accept only `false`,
   and a block an earlier release stored with `true` is refused on every lane
@@ -728,6 +730,8 @@ deployment qualification require separate evidence.
 The delegated exchange uses a signed caller assertion. The inbound bearer
 stays at the gateway. Approval-bound mutations require a separate authority
 that records who approved the exact action and verifies that decision before
-dispatch. Until that authority exists, `bind_approval: true` is refused.
+dispatch. The management workflow records and reviews one prepared occurrence.
+Until dispatch consumes it, `bind_approval: true` stays refused. See
+[Preparing and reviewing a mutation](operator-guide.md#preparing-and-reviewing-a-mutation).
 [Phase 8 scope](https://github.com/Greenhat-Security/GreenGateway/issues/446) ·
 [Approval authority follow-up](https://github.com/Greenhat-Security/GreenGateway/issues/757)

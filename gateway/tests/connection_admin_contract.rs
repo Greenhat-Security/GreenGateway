@@ -169,6 +169,38 @@ const EXPECTED_OPERATIONS: &[ExpectedOperation] = &[
         success_status: "200",
         response_definition: "PlaygroundResult",
     },
+    ExpectedOperation {
+        path: "/v1/admin/tools/{id}/mutation-approvals",
+        method: "post",
+        operation_id: "prepareToolMutationApproval",
+        request_definition: Some("PlaygroundRequest"),
+        success_status: "201",
+        response_definition: "MutationApproval",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/mutation-approvals/{id}",
+        method: "get",
+        operation_id: "getMutationApproval",
+        request_definition: None,
+        success_status: "200",
+        response_definition: "MutationApproval",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/mutation-approvals/{id}/review",
+        method: "post",
+        operation_id: "reviewMutationApproval",
+        request_definition: Some("MutationReview"),
+        success_status: "200",
+        response_definition: "MutationApproval",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/mutation-approvals/{id}/revoke",
+        method: "post",
+        operation_id: "revokeMutationApproval",
+        request_definition: None,
+        success_status: "200",
+        response_definition: "MutationApproval",
+    },
 ];
 
 fn docs_root() -> PathBuf {

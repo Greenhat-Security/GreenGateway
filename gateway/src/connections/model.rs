@@ -1012,10 +1012,8 @@ fn validate_caller_assertion(
         }
     }
 
-    // There is no approval subsystem for a mutation to carry the id of, so an
-    // approval binding could only ever be unsatisfiable or quietly ignored.
-    // Refusing it now keeps a Connection from claiming a guarantee that nothing
-    // can provide.
+    // Reviews can be recorded, but dispatch cannot yet consume their decisions
+    // and sign the verified occurrence. Keep this write closed until it can.
     if settings.bind_approval && !allow_legacy {
         errors.push(ConnectionValidationError::new(
             "caller_assertion.bind_approval",

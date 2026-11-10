@@ -4683,7 +4683,7 @@ async fn load_record(
 }
 
 async fn load_record_for_update(
-    client: &deadpool_postgres::Object,
+    client: &impl deadpool_postgres::GenericClient,
     id: &ConnectionId,
     operation: &'static str,
 ) -> Result<Option<StoredConnection>, ConnectionStoreError> {
@@ -5344,7 +5344,7 @@ async fn begin_mutation(
 /// because deleting a row cannot exceed a bound; the SQLite store
 /// likewise runs `remove_dependency` outside a transaction.
 async fn lock_connection_state(
-    client: &deadpool_postgres::Object,
+    client: &impl deadpool_postgres::GenericClient,
     operation: &'static str,
 ) -> Result<(), ConnectionStoreError> {
     let locked = client
@@ -6213,6 +6213,9 @@ async fn import_enum_source_values(
 // Referenced types kept for the future snapshot reconciler.
 #[allow(dead_code)]
 type ConnectionSnapshot = BTreeMap<ConnectionId, StoredConnection>;
+
+#[path = "pg_mutation_approvals.rs"]
+mod mutation_approvals;
 
 #[cfg(test)]
 #[path = "pg_store_tests.rs"]
