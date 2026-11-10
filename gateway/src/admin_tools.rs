@@ -257,6 +257,16 @@ async fn tool_invocation(
         if context.caller.is_none() {
             return mutation_approval_denied(&state, &parts, &principal, "prepare");
         }
+        if let Err(response) = admit_authority_change(
+            &state.authority_evidence,
+            authority_events::required::AuthorityOperation::MutationApprovalPrepare,
+            &state.audit,
+            &parts,
+            &principal,
+            &state.client_ip_policy,
+        ) {
+            return *response;
+        }
         let action = match state
             .executor
             .prepare_mutation(&definition.name, args, context, precondition)

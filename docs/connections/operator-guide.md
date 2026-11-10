@@ -821,6 +821,8 @@ review IDs.
    Assign reviewer access to independently controlled identities. Service
    tokens cannot request or review mutations.
 
+With `AUTHORITY_EVIDENCE_DURABILITY=required`, both storage modes return `409 authority_evidence_unsupported` for preparation, review and revocation. The decision row expires and there is no append-only transition history. Authorized reads remain available.
+
 The approval window is 15 minutes from preparation. Review and revocation
 timestamps come from the storage authority. It rechecks the Connection and
 registered operation when approving, and deleting the Connection removes its

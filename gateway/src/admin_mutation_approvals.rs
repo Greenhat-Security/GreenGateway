@@ -83,6 +83,27 @@ async fn review_operation(
     {
         return mutation_approval_denied(&state, &parts, principal, operation.name());
     }
+    let evidence = match operation {
+        ApprovalOperation::Read => None,
+        ApprovalOperation::Review => {
+            Some(authority_events::required::AuthorityOperation::MutationApprovalReview)
+        }
+        ApprovalOperation::Revoke => {
+            Some(authority_events::required::AuthorityOperation::MutationApprovalRevoke)
+        }
+    };
+    if let Some(evidence) = evidence {
+        if let Err(response) = admit_authority_change(
+            &state.authority_evidence,
+            evidence,
+            &state.audit,
+            &parts,
+            principal,
+            &state.client_ip_policy,
+        ) {
+            return *response;
+        }
+    }
     let Ok(id) = uuid::Uuid::parse_str(raw_id) else {
         return not_found("mutation approval was not found");
     };

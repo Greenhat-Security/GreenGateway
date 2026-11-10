@@ -73,6 +73,9 @@ pub(crate) enum AuthorityOperation {
     ConfigurationImport,
     /// The stored policy test suite replaced or first stored (issue #243).
     PolicyTestsPublish,
+    MutationApprovalPrepare,
+    MutationApprovalReview,
+    MutationApprovalRevoke,
 }
 
 impl From<DocumentAction> for AuthorityOperation {
@@ -133,12 +136,16 @@ impl AuthorityOperation {
             Self::ToolsPublish => "tools.publish",
             Self::ConfigurationImport => "configuration.import",
             Self::PolicyTestsPublish => "policy_tests.publish",
+            Self::MutationApprovalPrepare => "mutation_approval.prepare",
+            Self::MutationApprovalReview => "mutation_approval.review",
+            Self::MutationApprovalRevoke => "mutation_approval.revoke",
         }
     }
 
     /// What required mode does with this operation in a deployment mode.
     ///
-    /// Cluster mode commits every change here with its evidence row in one
+    /// Approval rows are mutable and expire in both modes. Cluster mode
+    /// commits the other supported changes with evidence in one
     /// PostgreSQL transaction, and has no policy file to reload. Standalone
     /// mode records none of them: the policy and tools files, their reloads
     /// and their optional history are separate steps, and the stored
@@ -149,6 +156,9 @@ impl AuthorityOperation {
         match backend {
             StateBackend::Postgres => match self {
                 Self::PolicyFileReload => RequiredMode::Unavailable,
+                Self::MutationApprovalPrepare
+                | Self::MutationApprovalReview
+                | Self::MutationApprovalRevoke => RequiredMode::Refused,
                 Self::PolicyPublish
                 | Self::PolicyRollback
                 | Self::PolicyRuleCreate

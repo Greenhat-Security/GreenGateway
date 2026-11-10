@@ -21,6 +21,9 @@ export const OPERATIONS = [
   "connection.replace",
   "credential.binding_change",
   "jwt.revoke",
+  "mutation_approval.prepare",
+  "mutation_approval.review",
+  "mutation_approval.revoke",
   "policy.file_reload",
   "policy.publish",
   "policy.rollback",
@@ -42,8 +45,8 @@ export const OPERATIONS = [
 ];
 const MODES = ["postgres", "standalone"];
 const REVISION_OPERATIONS = {
-  create: ["admin_session.grant", "connection.create", "secret.create", "service_token.issue"],
-  advance: ["connection.replace", "credential.binding_change", "catalog.overlay.delete", "catalog.overlay.replace",
+  create: ["mutation_approval.prepare", "admin_session.grant", "connection.create", "secret.create", "service_token.issue"],
+  advance: ["mutation_approval.review", "mutation_approval.revoke", "connection.replace", "credential.binding_change", "catalog.overlay.delete", "catalog.overlay.replace",
     "policy.rollback", "policy.rule.create", "policy.rule.delete", "policy.rule.reorder", "policy.rule.update", "policy.suggestion.accept",
     "secret.rotate", "secret.external_rotate", "service_token.rotate", "service_token.revoke"],
   publish: ["catalog.mcp.publish", "catalog.openapi.publish", "configuration.activate", "configuration.import",
@@ -54,7 +57,7 @@ const REVISION_OPERATIONS = {
 };
 assert.deepEqual(Object.values(REVISION_OPERATIONS).flat().sort(), [...OPERATIONS].sort(), "every operation needs exactly one revision contract");
 const DISPOSITIONS = new Set(["already_sufficient", "missing_metadata", "missing_delivery", "unsupported_future_operation"]);
-const ADMIN_FILES = ["admin_policy.rs", "admin_tools.rs", "admin_connections.rs", "admin_tokens.rs"];
+const ADMIN_FILES = ["admin_policy.rs", "admin_tools.rs", "admin_mutation_approvals.rs", "admin_connections.rs", "admin_tokens.rs"];
 const SCHEMA_KEYWORDS = new Set(["$schema", "title", "description", "type", "const", "enum", "anyOf", "pattern", "maxLength", "additionalProperties", "required", "properties"]);
 export const readJson = (path) => JSON.parse(readFileSync(resolve(ROOT, path), "utf8"));
 export const schema = readJson("docs/schemas/authority_event.v1.schema.json");
@@ -111,7 +114,7 @@ function validateSchemaValue(value, definition, location = "$") {
 }
 
 const resourceFor = (operation) => ({
-  admin_session: "admin_session",
+  admin_session: "admin_session", mutation_approval: "mutation_approval",
   policy: "policy", policy_tests: "policy", tools: "tools", connection: "connection", credential: "credential_binding",
   catalog: "catalog", service_token: "service_token", jwt: "jwt_revocation", configuration: "configuration",
   secret: operation === "secret.external_rotate" ? "external_secret" : "local_secret",
@@ -150,6 +153,7 @@ export function validateEvent(event) {
   }
   if (event.operation === "jwt.revoke") check(security !== null && after === security, "JWT event axis must use the shared security revision");
   const expectedAxis = event.operation.startsWith("admin_session.") ? "session"
+    : event.operation.startsWith("mutation_approval.") ? "mutation_approval"
     : event.operation.startsWith("policy.") ? "policy"
     : event.operation.startsWith("policy_tests.") ? "policy_tests"
     : event.operation.startsWith("tools.") ? "tools"
@@ -239,7 +243,8 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
   for (const file of ADMIN_FILES) {
     const path = `gateway/src/${file}`;
     for (const match of source(path).matchAll(/pub\(super\) async fn ([a-z0-9_]+_endpoint)\(/g)) {
-      if (/(?:create|put|post|patch|delete|rollback|register|rotate|revoke|refresh|accept)_endpoint$/.test(match[1])) {
+      if (/(?:create|put|post|patch|delete|rollback|register|rotate|revoke|refresh|accept)_endpoint$/.test(match[1])
+          || file === "admin_mutation_approvals.rs" && /_review_endpoint$/.test(match[1])) {
         check(coveredEntries.has(`${path}::${match[1]}`), `unreviewed mutation entrypoint ${path}::${match[1]}`);
       }
     }

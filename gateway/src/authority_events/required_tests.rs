@@ -8,7 +8,7 @@ use serde_json::Value;
 use super::*;
 use crate::audit::sink::tests::CaptureSink;
 
-const EVERY_OPERATION: [AuthorityOperation; 11] = [
+const EVERY_OPERATION: [AuthorityOperation; 14] = [
     AuthorityOperation::PolicyPublish,
     AuthorityOperation::PolicyRollback,
     AuthorityOperation::PolicyRuleCreate,
@@ -20,6 +20,9 @@ const EVERY_OPERATION: [AuthorityOperation; 11] = [
     AuthorityOperation::ToolsPublish,
     AuthorityOperation::ConfigurationImport,
     AuthorityOperation::PolicyTestsPublish,
+    AuthorityOperation::MutationApprovalPrepare,
+    AuthorityOperation::MutationApprovalReview,
+    AuthorityOperation::MutationApprovalRevoke,
 ];
 
 /// The operation whose gate covers an inventory operation code, or `None`
@@ -115,18 +118,24 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
         .collect();
     assert_eq!(
         refused_in_cluster,
-        [AuthorityOperation::PolicyFileReload],
-        "cluster mode refuses only what it cannot perform anyway"
+        [
+            AuthorityOperation::PolicyFileReload,
+            AuthorityOperation::MutationApprovalPrepare,
+            AuthorityOperation::MutationApprovalReview,
+            AuthorityOperation::MutationApprovalRevoke
+        ],
+        "cluster mode refuses operations without durable authority evidence"
     );
     for operation in refused_in_cluster {
-        assert_eq!(
-            operation.required_mode(StateBackend::Postgres),
-            RequiredMode::Unavailable
-        );
+        let why = if operation == AuthorityOperation::PolicyFileReload {
+            "does not perform it"
+        } else {
+            "records no durable evidence of it"
+        };
         assert_eq!(
             cluster.refusal(operation).map(|refusal| refusal.message()),
             Some(format!(
-                "AUTHORITY_EVIDENCE_DURABILITY=required refuses {}: cluster mode does not perform it; nothing was changed",
+                "AUTHORITY_EVIDENCE_DURABILITY=required refuses {}: cluster mode {why}; nothing was changed",
                 operation.code()
             ))
         );
