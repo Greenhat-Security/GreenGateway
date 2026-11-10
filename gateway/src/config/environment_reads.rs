@@ -118,12 +118,6 @@ const ENVIRONMENT_READS: &[EnvironmentRead] = &[
         reads: 1,
     },
     EnvironmentRead {
-        file: "src/admin_policy_replays_tests.rs",
-        names: ReadNames::Fixed(&["GATEWAY_TEST_STANDALONE_REPLAY_CRASH_DIR"]),
-        purpose: ReadPurpose::TestHarness,
-        reads: 1,
-    },
-    EnvironmentRead {
         file: "src/admin_tools_app_tests.rs",
         names: ReadNames::Fixed(&["GATEWAY_TEST_POSTGRES_URL_FILE"]),
         purpose: ReadPurpose::TestHarness,
