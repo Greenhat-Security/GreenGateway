@@ -52,9 +52,10 @@
 //! to this reader before anything treats it as a bundle.
 //!
 //! The deployment document's settings come from the field catalog
-//! ([`settings`]): the reader checks their shape and their own bounds, then
-//! validates egress through the shared compiler stage. Gateway bundle startup
-//! and compiler integration for the other domains are later #242 slices.
+//! ([`settings`]). The reader checks their shape and bounds, runs the
+//! applicable shared stages, and retains the compiler's configuration plan
+//! when the deployment requires no host bindings. See
+//! [`DeploymentDocument::offline_plan`].
 
 pub mod convert;
 mod diagnostic;
@@ -320,7 +321,6 @@ pub struct SourceFile {
 }
 
 /// The deployment document.
-#[derive(Debug)]
 pub struct DeploymentDocument {
     pub file: FileName,
     pub sha256: String,
@@ -330,6 +330,28 @@ pub struct DeploymentDocument {
     /// spelling and the store list and acknowledged behaviors in canonical
     /// order.
     pub canonical_json: Vec<u8>,
+    plan: Option<Box<crate::compiler::ConfigPlan>>,
+}
+
+impl DeploymentDocument {
+    /// The shared compiler's plan when the document supplied every required
+    /// setting offline. Resource authority, profile checks and activation
+    /// still belong to their own stages.
+    pub fn offline_plan(&self) -> Option<&crate::compiler::ConfigPlan> {
+        self.plan.as_deref()
+    }
+}
+
+impl std::fmt::Debug for DeploymentDocument {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeploymentDocument")
+            .field("file", &self.file)
+            .field("sha256", &self.sha256)
+            .field("profile", &self.profile)
+            .field("plan_compiled", &self.plan.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// A policy or tools resource.
@@ -464,6 +486,7 @@ fn read<S: FileSource, V: ResourceValidators>(
     let deployment = read_deployment(
         directory,
         &manifest.deployment,
+        matches!(manifest.policy, Some(ResourceSource::Bundle { .. })),
         (&mut files, pins),
         diagnostics,
     );
@@ -590,6 +613,7 @@ fn read_pinned(
 fn read_deployment(
     directory: &mut impl FileSource,
     reference: &FileReference,
+    bundled_policy: bool,
     (files, pins): (&mut Vec<SourceFile>, &mut Pins),
     diagnostics: &mut Vec<BundleDiagnostic>,
 ) -> Option<(DeploymentDocument, ProfileRules)> {
@@ -604,9 +628,25 @@ fn read_deployment(
     let Deployment {
         profile, settings, ..
     } = document::deployment(&node, &reference.file, diagnostics)?;
+    let initial = diagnostics.len();
     diagnostics.extend(settings.listener_diagnostics(profile, &node, &reference.file));
     diagnostics.extend(settings.public_diagnostics(&node, &reference.file));
     diagnostics.extend(settings.provider_diagnostics(&node, &reference.file));
+    let plan = match settings.offline_plan(profile, bundled_policy, &node, &reference.file) {
+        Ok(plan) => plan,
+        Err(found) => {
+            // Keep the dedicated stage's more specific code at a pointer it
+            // already refused, and also return independent cross-domain findings.
+            for issue in found {
+                if !diagnostics[initial..].iter().any(|prior| {
+                    prior.severity == Severity::Error && prior.pointer == issue.pointer
+                }) {
+                    diagnostics.push(issue);
+                }
+            }
+            None
+        }
+    };
     // Decimals take their shortest exact spelling and the word sets their
     // canonical order, so neither changes the canonical bytes.
     let mut document = node.to_json();
@@ -635,6 +675,7 @@ fn read_deployment(
             sha256: reference.sha256.clone(),
             profile,
             canonical_json,
+            plan,
         },
         rules,
     ))

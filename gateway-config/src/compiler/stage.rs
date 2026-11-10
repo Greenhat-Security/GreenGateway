@@ -98,6 +98,10 @@ pub enum Source {
     Default,
     /// The process environment set it.
     Environment,
+    /// A field in the pinned deployment document set it.
+    Bundle,
+    /// The selected bundle profile supplied its default.
+    Profile,
 }
 
 /// The provenance of one setting: its name and its source, never its value.

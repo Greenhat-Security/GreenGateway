@@ -152,6 +152,7 @@ impl Stage {
             | Code::InvalidEgressSetting
             | Code::InvalidListenerSetting
             | Code::InvalidRuntimeSetting
+            | Code::InvalidDeploymentSetting
             | Code::InvalidAuthProvider
             | Code::InvalidAdminLogin
             | Code::InlineSecretValue

@@ -195,6 +195,7 @@ fn a_valid_bundle_exits_0_and_says_the_production_validators_passed() {
             "bundle payments-production (greengateway.dev/v1alpha1): valid\n\
              {digest}\n  \
              deployment     deployment.yaml (profile production)\n  \
+             compiler       compiled\n  \
              policy         policy.json (schema_version 0.1.0)\n  \
              tools          tools.json (schema_version 0.1.0)\n  \
              connections    server\n"
@@ -222,6 +223,7 @@ fn a_valid_bundle_exits_0_and_says_the_production_validators_passed() {
             "file": "deployment.yaml",
             "sha256": fixture.pin_of("deployment.yaml"),
             "profile": "production",
+            "offlineCompiler": "compiled",
         })
     );
     assert_eq!(
@@ -494,6 +496,93 @@ fn validate_and_doctor_check_listener_bindings_and_tls_intent_offline() {
                 *found == code || (command == "doctor" && *found == "doctor.required_check_failed")
             }));
         }
+    }
+}
+
+#[test]
+fn a_self_contained_bundle_builds_the_shared_plan_with_document_provenance() {
+    use gateway_config::compiler::stage::Source;
+    let fixture = Fixture::valid();
+    let write = |spec: &str| {
+        fixture.write(
+            "deployment.yaml",
+            &format!(
+                "apiVersion: greengateway.dev/v1alpha1\nkind: GatewayDeployment\nspec:\n{spec}"
+            ),
+        );
+        fixture.pin_policy_version("0.1.0");
+    };
+    write("  profile: development\n  trusted_proxies:\n    trust_headers: true\n    cidrs: [\"192.0.2.0/24\"]\n");
+    let bundle = super::read_path(std::ffi::OsStr::new(fixture.path()), false)
+        .bundle
+        .unwrap();
+    let plan = bundle.deployment.offline_plan().unwrap();
+    assert!(plan.proxy.trust_proxy_headers);
+    assert!(plan.listeners.listen_addr.ip().is_loopback());
+    assert_eq!(
+        plan.listeners.listen_addr.to_string(),
+        gateway_config::compiler::listeners::DEVELOPMENT_LISTEN_ADDR
+    );
+    let sources = plan.provenance();
+    for (setting, expected) in [
+        ("LISTEN_ADDR", Source::Profile),
+        ("TRUSTED_PROXY_CIDRS", Source::Bundle),
+        ("AUTH_ENABLED", Source::Default),
+    ] {
+        assert_eq!(
+            sources
+                .iter()
+                .find(|field| field.setting == setting)
+                .unwrap()
+                .source,
+            expected
+        );
+    }
+    assert!(!sources
+        .iter()
+        .any(|field| field.source == Source::Environment));
+
+    // Trusting proxy headers without a trusted network is a cross-field
+    // rule. Both CLI paths must refuse it and point to the missing setting.
+    write("  profile: production\n  trusted_proxies:\n    trust_headers: true\n");
+    for command in ["validate", "doctor"] {
+        let (exit, captured) = run(&[command, fixture.path(), "--format", "json"]);
+        assert_eq!(exit, Exit::Invalid);
+        let result = report(&captured);
+        assert_eq!(
+            result["diagnostics"][0]["code"],
+            "bundle.invalid_deployment_setting"
+        );
+        assert_eq!(
+            result["diagnostics"][0]["location"]["pointer"],
+            "/spec/trusted_proxies/cidrs"
+        );
+    }
+
+    write(&format!(
+        "  profile: production\n  trusted_proxies:\n    trust_headers: true\n    cidrs: [\"{CANARY}\"]\n"
+    ));
+    for command in ["validate", "doctor"] {
+        let (exit, captured) = run(&[command, fixture.path(), "--format", "json"]);
+        assert_eq!(exit, Exit::Invalid);
+        assert_no_canary(&captured);
+        assert_eq!(
+            report(&captured)["diagnostics"][0]["location"]["pointer"],
+            "/spec/trusted_proxies/cidrs"
+        );
+    }
+
+    write(&format!(
+        "  profile: production\n  upstream:\n    url: {{\"secret\":\"{CANARY}\"}}\n"
+    ));
+    for command in ["validate", "doctor"] {
+        let (exit, captured) = run(&[command, fixture.path(), "--format", "json"]);
+        assert_eq!(exit, Exit::Success);
+        assert_no_canary(&captured);
+        assert_eq!(
+            report(&captured)["result"]["bundle"]["deployment"]["offlineCompiler"],
+            "not_checked"
+        );
     }
 }
 

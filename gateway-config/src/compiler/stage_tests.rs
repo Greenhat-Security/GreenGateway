@@ -46,7 +46,7 @@ fn fixture_value(fixture: &[(&str, &str)], name: &str) -> Result<String, VarErro
 /// What the stages make of a fixture: the plan, built even when it is
 /// refused, and the report.
 fn compiled(fixture: &[(&str, &str)]) -> (ConfigPlan, Report) {
-    plan::compile_blocks(|name| fixture_value(fixture, name))
+    plan::compile_blocks(|name| fixture_value(fixture, name), false)
 }
 
 fn source_of(plan: &ConfigPlan, setting: &str) -> Source {
