@@ -493,19 +493,24 @@ impl Database {
         Self::create_with_password(admin_dsn, None).await
     }
 
-    /// [`Self::create`], optionally giving the runtime role a password
-    /// that then appears in the runtime DSN.
-    ///
-    /// The secret-leak suite needs a DSN that actually *carries* a
-    /// credential: a passwordless DSN cannot prove the gateway keeps
-    /// passwords out of its logs, because there is nothing to keep out.
-    /// The local server authenticates by trust, so the password is never
-    /// exchanged — it exists only to be a canary the replica must never
-    /// print.
+    /// Create the runtime role with a fresh password, or use a canary
+    /// supplied by the secret-leak suite so it can check the gateway's output.
     pub async fn create_with_password(admin_dsn: &str, password: Option<&str>) -> Self {
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let name = format!("ggw_ha_{suffix}");
         let role = format!("ggw_ha_r_{suffix}");
+        // Generate independently of the database and role names, which are
+        // visible in PostgreSQL's catalog. The password is also a DSN component.
+        let password = password
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+        assert!(
+            !password.is_empty()
+                && password
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "a harness database password must stay in the DSN-safe alphabet"
+        );
         let admin_pool = pool_for(admin_dsn, 2);
         // Before the first `CREATE`: every statement below panics on
         // failure, and this is the only thing that removes what they
@@ -523,22 +528,7 @@ impl Database {
                 .expect("harness admin connection should establish");
             // Single statements on the simple protocol: CREATE DATABASE
             // cannot run inside a transaction block.
-            let login = match password {
-                // The value is a per-run canary of the harness's own
-                // making, never caller input, and it is quoted as a
-                // literal; a password containing a quote would be a
-                // harness bug, so it is rejected rather than escaped.
-                Some(secret) => {
-                    assert!(
-                        secret
-                            .chars()
-                            .all(|character| character.is_ascii_alphanumeric() || character == '-'),
-                        "a harness database password must stay in the DSN-safe alphabet"
-                    );
-                    format!("CREATE ROLE {role} LOGIN PASSWORD '{secret}'")
-                }
-                None => format!("CREATE ROLE {role} LOGIN"),
-            };
+            let login = format!("CREATE ROLE {role} LOGIN PASSWORD '{password}'");
             client
                 .batch_execute(&login)
                 .await
@@ -561,10 +551,7 @@ impl Database {
         }
 
         let migrator_dsn = with_database(admin_dsn, &name);
-        let runtime_dsn = match password {
-            Some(secret) => with_user(&migrator_dsn, &format!("{role}:{secret}")),
-            None => with_user(&migrator_dsn, &role),
-        };
+        let runtime_dsn = with_user(&migrator_dsn, &format!("{role}:{password}"));
         let run_pool = pool_for(&migrator_dsn, 2);
         Self {
             admin_dsn: admin_dsn.to_owned(),
