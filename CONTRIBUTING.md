@@ -44,6 +44,13 @@ GATEWAY_TEST_POSTGRES_URL_FILE="$PWD/target/database-url" cargo test -p gateway 
 
 The `postgres-foundation-tls` shard runs the authority-evidence suites again against a server that accepts only TLS. Setting `GATEWAY_TEST_POSTGRES_TLS_CA_FILE` to the PEM bundle that server's certificate chains to makes the harness (`storage::postgres::test_support`) connect in `verify` mode through the gateway's own connector, and makes a missing DSN locator a failure instead of a skip. To reproduce the shard, run its `Generate a throwaway CA and server certificate` and `Start PostgreSQL with TLS required` steps from `.github/workflows/ci.yml` with `RUNNER_TEMP` set to a scratch directory, point `GATEWAY_TEST_POSTGRES_URL_FILE` at the DSN above and `GATEWAY_TEST_POSTGRES_TLS_CA_FILE` at `$RUNNER_TEMP/pg-tls/ca.crt`, and run its test step's `cargo test` with the same suite filters. Only those suites take the TLS locator into account; the other PostgreSQL tests still connect in plaintext and fail against a TLS-only server.
 
+For the two-replica release gate, set `GATEWAY_TEST_HA_GATE=1` as well as
+`GATEWAY_TEST_POSTGRES_URL_FILE`. Use a disposable loopback PostgreSQL server
+and a maintenance role allowed to create databases and roles. The harness
+assigns a new password to each test's restricted runtime role, so it also
+works with SCRAM authentication. Keep the maintenance DSN in the private
+locator file.
+
 ## Picking Up Work
 
 Project work is tracked in GitHub issues. Each feature area has an issue, and each checklist item in that issue is intended to be sized as one pull request.

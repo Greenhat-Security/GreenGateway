@@ -25,6 +25,13 @@ The Worker sends every request to a singleton GreenGateway container on port `80
 
 ## Runtime Configuration
 
+The Worker supports environment configuration. Leave `GATEWAY_CONFIG_SOURCE`
+unset or set it to `environment`. The Worker refuses `bundle` and `ledger`
+with `source.mode_unavailable` and rejects an unrecognized or blank source with
+`source.invalid_selector`. Leave `GATEWAY_CONFIG_BUNDLE` and `GATEWAY_STATE_DIR`
+unset. Either binding, even when blank, causes `source.selector_without_mode`
+in environment mode.
+
 The default deploy is intentionally conservative:
 
 - `AUTH_ENABLED=true`

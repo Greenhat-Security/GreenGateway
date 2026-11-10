@@ -1530,8 +1530,7 @@ jobs:
       - name: Write the test DSN file
         # The harness connects as this role to CREATE DATABASE and CREATE
         # ROLE per test, and hands its replicas a DSN for the disposable
-        # role it made. Trust auth means no password anywhere for gitleaks
-        # to flag.
+        # role it made. The harness generates each runtime role's password.
         run: |
           set -eu
           mkdir -p "${RUNNER_TEMP}/pg"

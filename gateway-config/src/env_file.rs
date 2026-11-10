@@ -111,7 +111,10 @@ impl EnvFile {
             if previous.is_some() {
                 duplicates.push(DuplicateKey {
                     line: number,
-                    setting: compiler::inventory::config_input(key),
+                    setting: compiler::source::SELECTORS
+                        .into_iter()
+                        .find(|name| *name == key)
+                        .or_else(|| compiler::inventory::config_input(key)),
                 });
             }
         }
@@ -159,12 +162,12 @@ impl EnvFile {
         self.variables.is_empty()
     }
 
-    /// The inventoried settings the file assigns, in the order the compiler
-    /// reads them, as the inventory spells them.
+    /// The source selectors and inventoried settings the file assigns, in
+    /// source-check and compiler order.
     pub fn settings(&self) -> Vec<&'static str> {
-        compiler::inventory::CONFIG_INPUTS
-            .iter()
-            .copied()
+        compiler::source::SELECTORS
+            .into_iter()
+            .chain(compiler::inventory::CONFIG_INPUTS.iter().copied())
             .filter(|setting| self.variables.contains_key(*setting))
             .collect()
     }
@@ -175,7 +178,7 @@ impl EnvFile {
     /// compiles from its other lines; the caller decides what the malformed
     /// line means for its verdict.
     pub fn compile(&self) -> Result<ConfigPlan, ConfigError> {
-        compiler::compile(|name| self.var(name))
+        compiler::source::compile_selected(|name| self.var(name))
     }
 
     /// Every key and its effective value, for a caller that keeps a map.

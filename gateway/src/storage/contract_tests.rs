@@ -1041,6 +1041,169 @@ async fn service_token_change_evidence_contract(
             "no email, organization, role or session in evidence: {stored}"
         );
     }
+    caller_bound_revocation_contract(store, evidence).await;
+}
+
+async fn caller_bound_revocation_contract(
+    store: &dyn ServiceTokenStore,
+    evidence: &dyn TokenChangeEvidenceReader,
+) {
+    use crate::auth::{tokens::test_revoke_operation_id, AuthMethod};
+
+    let owner = principal_actor(
+        "operator",
+        Some("https://one.example.test"),
+        AuthMethod::Bearer,
+    );
+    let other_issuer = principal_actor(
+        "operator",
+        Some("https://two.example.test"),
+        AuthMethod::Bearer,
+    );
+    let issue = || {
+        store.create(
+            CreateTokenRequest {
+                scopes: vec!["read".to_owned()],
+                created_by: owner.subject().to_owned(),
+                expires_at: None,
+            },
+            &owner,
+        )
+    };
+    let first = issue().await.expect("first token").record.id;
+    let second = issue().await.expect("second token").record.id;
+    let before = evidence.rows().await;
+    let key = test_revoke_operation_id(1);
+    // No mutation may race past the evidence lookup. Both calls report the
+    // same committed revoke even when the original response was lost.
+    let (a, b) = tokio::join!(
+        store.revoke_with_operation(&first, &owner, Some(key)),
+        store.revoke_with_operation(&first, &owner, Some(key))
+    );
+    let committed = a.expect("first response").expect("revoked token");
+    let replay = b.expect("second response").expect("revoked token");
+    assert!(committed.revoked_at.is_some());
+    assert_eq!(committed.revoked_at, replay.revoked_at);
+    let after = evidence.rows().await;
+    assert_eq!(after.len(), before.len() + 1);
+    let row = after.last().expect("one committed revoke");
+    assert_eq!(row.operation_id, key.to_string());
+    assert_eq!(row.token_id, first);
+    assert_eq!(row.action, "service_token.revoke");
+
+    let other_method = principal_actor(
+        "operator",
+        Some("https://one.example.test"),
+        AuthMethod::Cookie,
+    );
+    let other_subject =
+        ChangeActor::for_test_with_issuer("another operator", "https://one.example.test");
+    for (target, actor, reused) in [
+        (first.as_str(), &other_issuer, key),
+        (first.as_str(), &other_subject, key),
+        (first.as_str(), &other_method, key),
+        (second.as_str(), &owner, key),
+        ("unknown", &owner, key),
+        (first.as_str(), &owner, test_revoke_operation_id(2)),
+    ] {
+        let error = store
+            .revoke_with_operation(target, actor, Some(reused))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), RepositoryErrorKind::Conflict);
+    }
+    for (actor, key) in [
+        (
+            ChangeActor::for_test("operator"),
+            test_revoke_operation_id(3),
+        ),
+        (ChangeActor::system("operator"), test_revoke_operation_id(4)),
+        (owner.clone(), uuid::Uuid::nil()),
+        (owner.clone(), uuid::Uuid::new_v4()),
+    ] {
+        assert_eq!(
+            store
+                .revoke_with_operation(&second, &actor, Some(key))
+                .await
+                .unwrap_err()
+                .kind(),
+            RepositoryErrorKind::InvalidData
+        );
+    }
+    assert!(store
+        .get_by_id(&second)
+        .await
+        .unwrap()
+        .unwrap()
+        .revoked_at
+        .is_none());
+    assert_eq!(evidence.rows().await.len(), after.len());
+
+    let service = ChangeActor::service_token_for_test("service-token:example");
+    let unused = test_revoke_operation_id(5);
+    assert!(store
+        .revoke_with_operation("unknown", &service, Some(unused))
+        .await
+        .unwrap()
+        .is_none());
+    let changed = store
+        .revoke_with_operation(&second, &service, Some(unused))
+        .await
+        .unwrap()
+        .unwrap();
+    let replay = store
+        .revoke_with_operation(&second, &service, Some(unused))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.revoked_at, changed.revoked_at);
+    assert_eq!(evidence.rows().await.len(), after.len() + 1);
+
+    // Competing targets cannot both commit under one caller ID.
+    let left = issue().await.unwrap().record.id;
+    let right = issue().await.unwrap().record.id;
+    let key = test_revoke_operation_id(6);
+    let (a, b) = tokio::join!(
+        store.revoke_with_operation(&left, &owner, Some(key)),
+        store.revoke_with_operation(&right, &owner, Some(key))
+    );
+    let (winner, loser, conflict) = match (a, b) {
+        (Ok(Some(_)), Err(conflict)) => (&left, &right, conflict),
+        (Err(conflict), Ok(Some(_))) => (&right, &left, conflict),
+        outcomes => panic!("exactly one target may be revoked: {outcomes:?}"),
+    };
+    assert_eq!(
+        conflict.operation(),
+        crate::auth::tokens::REVOKE_OPERATION_BINDING
+    );
+    assert!(store
+        .get_by_id(loser)
+        .await
+        .unwrap()
+        .unwrap()
+        .revoked_at
+        .is_none());
+    let rows = evidence.rows().await;
+    let committed: Vec<_> = rows
+        .iter()
+        .filter(|r| r.operation_id == key.to_string())
+        .collect();
+    assert_eq!(committed.len(), 1);
+    assert_eq!(&committed[0].token_id, winner);
+
+    // Learning the old server-generated UUID cannot convert a legacy revoke
+    // into a caller-bound operation, even for the identical actor and token.
+    let legacy = issue().await.unwrap().record.id;
+    store.revoke(&legacy, &owner).await.unwrap().unwrap();
+    let rows = evidence.rows().await;
+    let generated = uuid::Uuid::parse_str(&rows.last().unwrap().operation_id).unwrap();
+    assert_eq!(generated.get_version(), Some(uuid::Version::Random));
+    let refused = store
+        .revoke_with_operation(&legacy, &owner, Some(generated))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.invalid_parameter_name(), Some("operation_id"));
+    assert_eq!(evidence.rows().await, rows);
 }
 
 #[tokio::test]
@@ -1308,6 +1471,40 @@ async fn service_token_issue_evidence_contract(
         ),
         ("service_token.issue", third.record.id.as_str())
     );
+
+    // The caller can reuse the same key after a failed evidence insert and
+    // reconcile the successful retry through a separate store connection.
+    let key = crate::auth::tokens::test_revoke_operation_id(1);
+    let actor = ChangeActor::for_test_with_issuer("admin", "https://issuer.example.test");
+    harness.fail_evidence_inserts(true).await;
+    let faulted = store
+        .revoke_with_operation(&third.record.id, &actor, Some(key))
+        .await;
+    harness.fail_evidence_inserts(false).await;
+    assert_eq!(faulted.unwrap_err().kind(), RepositoryErrorKind::Internal);
+    assert_eq!(evidence.rows().await, after);
+    assert!(store
+        .get_by_id(&third.record.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .revoked_at
+        .is_none());
+    let committed = store
+        .revoke_with_operation(&third.record.id, &actor, Some(key))
+        .await
+        .unwrap()
+        .unwrap();
+    let reopened = harness.reopen().await;
+    let replay = reopened
+        .revoke_with_operation(&third.record.id, &actor, Some(key))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay, committed);
+    let rows = evidence.rows().await;
+    assert_eq!(rows.len(), after.len() + 1);
+    assert_eq!(rows.last().unwrap().operation_id, key.to_string());
 }
 
 struct SqliteTokenIssueHarness {
@@ -3364,10 +3561,11 @@ impl ServiceTokenStore for GatedTokenStore {
         unimplemented!("not needed by the executor proof")
     }
 
-    async fn revoke(
+    async fn revoke_with_operation(
         &self,
         _id: &str,
         _actor: &ChangeActor,
+        _operation_id: Option<uuid::Uuid>,
     ) -> Result<Option<crate::auth::tokens::TokenRecord>, RepositoryError> {
         unimplemented!("not needed by the executor proof")
     }

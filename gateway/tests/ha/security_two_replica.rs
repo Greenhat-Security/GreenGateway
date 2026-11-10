@@ -996,6 +996,159 @@ fn marked_policy(marker: &str) -> Value {
     })
 }
 
+/// The same owner can edit a draft on either replica. Both replicas export
+/// evidence for the exact saved revision, even after a process restarts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn draft_evidence_is_owner_and_revision_bound_across_replicas() {
+    let Some(mut cluster) = start_secure_cluster(ClusterOptions::default()).await else {
+        return skipped();
+    };
+    let owner = admin_token(&cluster.oidc, "draft-owner@ha.test");
+    let other = admin_token(&cluster.oidc, "other-admin@ha.test");
+    let (status, headers, _) = send_settled(|| cluster.get("a", POLICY_ROUTE).bearer(&owner)).await;
+    assert_eq!(status, 200);
+    let live_etag = etag(&headers, "initial live policy");
+    let drafts = format!("{POLICY_ROUTE}/drafts");
+    let (status, headers, draft) = send_settled(|| {
+        cluster
+            .post("a", &drafts)
+            .bearer(&owner)
+            .if_match(&live_etag)
+            .json(&json!({}))
+    })
+    .await;
+    assert_eq!(status, 201, "{draft}");
+    let initial_etag = etag(&headers, "new draft");
+    let draft_id = draft["draft_id"].as_str().expect("created draft ID");
+    let path = format!("{drafts}/{draft_id}");
+    let mut candidate = draft["policy"].clone();
+    candidate["schema_version"] = json!("1.0.0");
+    candidate["id"] = json!("ha-draft");
+    let change = json!({"policy": candidate});
+    let (status, headers, updated) = send_settled(|| {
+        cluster
+            .request(reqwest::Method::PATCH, "b", &path)
+            .bearer(&owner)
+            .if_match(&initial_etag)
+            .json(&change)
+    })
+    .await;
+    assert_eq!(status, 200, "{updated}");
+    let saved_etag = etag(&headers, "updated draft");
+    assert_ne!(initial_etag, saved_etag);
+    assert_eq!(updated["revision"], 2);
+
+    cluster.restart("a").await;
+    cluster.wait_until_all_ready().await;
+    let evidence = format!("{POLICY_ROUTE}/evidence");
+    let export = |replica: &str, who: &str, at: &str| {
+        cluster.post(replica, &evidence).bearer(who).json(&json!({
+            "schema_version": "policy-evidence-request.v1",
+            "draft": {"draft_id": draft_id, "draft_etag": at}
+        }))
+    };
+    let (status, _, refused) = send_settled(|| export("a", &owner, &initial_etag)).await;
+    assert_eq!(
+        (status, refused["reason"].as_str()),
+        (412, Some("policy_draft_stale"))
+    );
+    let (status, _, refused) = send_settled(|| export("b", &other, &saved_etag)).await;
+    assert_eq!(
+        (status, refused["reason"].as_str()),
+        (404, Some("policy_draft_not_found"))
+    );
+
+    let (status, _, first) = send_settled(|| export("a", &owner, &saved_etag)).await;
+    assert_eq!(status, 200, "{first}");
+    assert_eq!(first["schema_version"], "policy-evidence.v1");
+    assert_eq!(first["report"]["candidate_kind"], "draft");
+    let binding = &first["report"]["draft"];
+    assert_eq!(binding["draft_id"], draft_id);
+    assert_eq!(binding["revision"], 2);
+    assert_eq!(binding["draft_etag"], saved_etag);
+    assert_eq!(
+        first["manifest"]
+            .as_array()
+            .expect("artifact manifest")
+            .len(),
+        2
+    );
+    let (status, _, second) = send_settled(|| export("b", &owner, &saved_etag)).await;
+    assert_eq!(status, 200, "{second}");
+    for member in ["report", "manifest", "report_markdown"] {
+        assert_eq!(
+            first[member], second[member],
+            "replicas disagree on {member}"
+        );
+    }
+    assert_empty_replay_remains_incomplete(&cluster, &owner, &live_etag, draft_id, &saved_etag)
+        .await;
+    let (status, headers, _) = send_settled(|| cluster.get("b", POLICY_ROUTE).bearer(&owner)).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        etag(&headers, "live policy after evidence export"),
+        live_etag
+    );
+}
+
+/// A window before this disposable database existed has no records. Export
+/// its completed job on the other replica and retain that limitation.
+async fn assert_empty_replay_remains_incomplete(
+    cluster: &Cluster,
+    owner: &str,
+    base_etag: &str,
+    draft_id: &str,
+    draft_etag: &str,
+) {
+    let replays = format!("{POLICY_ROUTE}/replays");
+    let request = json!({
+        "schema_version": "policy-replay.v1",
+        "base_etag": base_etag,
+        "candidate": {"source":"draft", "draft_id":draft_id, "draft_etag":draft_etag},
+        "window": {"from":"2000-01-01T00:00:00Z", "to":"2000-01-02T00:00:00Z"},
+    });
+    let (status, _, started) =
+        send_settled(|| cluster.post("a", &replays).bearer(owner).json(&request)).await;
+    assert_eq!(status, 202, "{started}");
+    let id = started["job_id"].as_str().expect("accepted replay ID");
+    let job_path = format!("{replays}/{id}");
+    let deadline = std::time::Instant::now() + CONVERGENCE_BUDGET;
+    let job = loop {
+        let (status, _, job) = send_settled(|| cluster.get("b", &job_path).bearer(owner)).await;
+        assert_eq!(status, 200, "{job}");
+        if !matches!(job["state"].as_str(), Some("queued" | "running")) {
+            break job;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replay remained {}",
+            job["state"]
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(job["state"], "completed_incomplete", "{job}");
+    let digest = job["result_digest"]
+        .as_str()
+        .expect("completed replay digest");
+    let request = json!({
+        "schema_version": "policy-evidence-request.v1",
+        "draft": {"draft_id":draft_id, "draft_etag":draft_etag},
+        "replay_job_id": id
+    });
+    let evidence = format!("{POLICY_ROUTE}/evidence");
+    let (status, _, package) =
+        send_settled(|| cluster.post("b", &evidence).bearer(owner).json(&request)).await;
+    assert_eq!(status, 200, "{package}");
+    let report = &package["report"];
+    assert_eq!(report["replay"]["result_digest"], digest);
+    assert_eq!(report["replay"]["state"], "completed_incomplete");
+    assert_eq!(report["completeness"], "incomplete");
+    assert!(report["limitations"]
+        .as_array()
+        .expect("report limitations")
+        .contains(&json!("replay_incomplete")));
+}
+
 /// Two admins, two replicas, one ETag: the policy authority admits one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn identical_if_match_policy_writes_admit_exactly_one() {

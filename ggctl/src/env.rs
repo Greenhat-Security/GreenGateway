@@ -198,6 +198,7 @@ fn compiler_diagnostic(
     argument: usize,
 ) -> EnvDiagnostic {
     let code = match diagnostic.code {
+        ConfigDiagnosticCode::Source(reason) => Code::Source(reason),
         ConfigDiagnosticCode::Unset => Code::ConfigUnset,
         ConfigDiagnosticCode::Empty => Code::ConfigEmpty,
         ConfigDiagnosticCode::NotUnicode => Code::ConfigNotUnicode,

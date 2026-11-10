@@ -5,6 +5,103 @@
 use super::*;
 
 #[tokio::test]
+async fn keyed_token_revocation_validates_and_reconciles_through_the_router() {
+    let token_db = TempDb::new("keyed-token-revoke");
+    let policy = TempPolicyFile::new(&token_policy_document_string());
+    let router = token_admin_router(&token_db, &policy, test_audit_log());
+    let mut owner = test_principal(&["superadmin"]);
+    owner.issuer = Some("https://issuer.example.test".to_owned());
+    let create = router
+        .clone()
+        .oneshot(token_admin_request(
+            Method::POST,
+            TOKENS_ADMIN_ROUTE,
+            Some(owner.clone()),
+            Some(json!({ "scopes": ["probe-reader"] }).to_string()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let token = json_body(create).await;
+    let id = token["token"]["id"].as_str().unwrap();
+    let route = format!("{TOKENS_ADMIN_ROUTE}/{id}/revoke");
+    let key = crate::auth::tokens::test_revoke_operation_id(1).to_string();
+    let request = |path: &str, who: auth::Principal, keys: &[&str], body: Option<&str>| {
+        let mut request =
+            token_admin_request(Method::POST, path, Some(who), body.map(str::to_owned));
+        for key in keys {
+            request
+                .headers_mut()
+                .append("idempotency-key", key.parse().unwrap());
+        }
+        request
+    };
+    let mut precondition = request(&route, owner.clone(), &[&key], None);
+    precondition
+        .headers_mut()
+        .insert(header::IF_MATCH, "*".parse().unwrap());
+    let upper = "AAAAAAAA-AAAA-7AAA-8AAA-AAAAAAAAAAAA";
+    for invalid in [
+        request(&route, owner.clone(), &[], None),
+        request(&route, owner.clone(), &[&key, &key], None),
+        request(&route, owner.clone(), &["not-a-uuid"], None),
+        request(
+            &route,
+            owner.clone(),
+            &["00000000-0000-0000-0000-000000000000"],
+            None,
+        ),
+        request(&route, owner.clone(), &[upper], None),
+        request(&route, owner.clone(), &[&key], Some("{}")),
+        request(&format!("{route}?revision=1"), owner.clone(), &[&key], None),
+        precondition,
+    ] {
+        assert_eq!(
+            router.clone().oneshot(invalid).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let denied = request(&route, test_principal(&["superadmin"]), &[&key], None);
+    assert_eq!(
+        router.clone().oneshot(denied).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let mut not_writer = owner.clone();
+    not_writer.roles.clear();
+    let denied = request(&route, not_writer, &[&key], None);
+    assert_eq!(
+        router.clone().oneshot(denied).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let first = router
+        .clone()
+        .oneshot(request(&route, owner.clone(), &[&key], None))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let replay = router
+        .clone()
+        .oneshot(request(&route, owner.clone(), &[&key], None))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let receipt = json_body(first).await;
+    assert_eq!(receipt["operation_id"], key);
+    assert_eq!(receipt["token_id"], id);
+    assert!(receipt["revoked_at"].is_string());
+    assert_eq!(receipt.as_object().unwrap().len(), 3);
+    assert_eq!(json_body(replay).await, receipt);
+    let mut other = owner;
+    other.issuer = Some("https://other.example.test".to_owned());
+    let refused = router
+        .oneshot(request(&route, other, &[&key], None))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert!(!body_string(refused).await.contains(&key));
+}
+
+#[tokio::test]
 async fn token_create_rejects_scopes_the_creator_does_not_hold() {
     let token_db = TempDb::new("token-create-rejects-escalation");
     let policy = TempPolicyFile::new(&token_policy_document_string());

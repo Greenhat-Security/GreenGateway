@@ -69,6 +69,7 @@ pub mod plan;
 pub mod proxy;
 pub mod runtime;
 pub mod semantic_diff;
+pub mod source;
 pub mod stage;
 #[cfg(test)]
 mod stage_tests;

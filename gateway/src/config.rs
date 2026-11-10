@@ -299,8 +299,8 @@ impl Config {
 
     // pub(crate) so sibling modules' tests can build configurations from
     // environment maps without going through process environment mutation;
-    // production reaches it only through `from_env`. Serving startup calls
-    // `compile` itself, which is this function without the conversion.
+    // the standalone importer uses the same path for its source environment
+    // file. Serving startup calls the same source-aware compiler.
     //
     // The configuration compiler (issue #433) reads every input block where
     // the legacy parser read it, parses and validates each block from those
@@ -309,7 +309,7 @@ impl Config {
     pub(crate) fn from_env_vars(
         get_var: impl FnMut(&str) -> Result<String, VarError>,
     ) -> Result<Self, ConfigError> {
-        compile(get_var).map(into_config)
+        source::compile_selected(get_var).map(into_config)
     }
 
     pub fn signal_detector_config(&self) -> SignalDetectorConfig {

@@ -2,9 +2,31 @@
 
 GreenGateway reads configuration from environment variables. Each variable is documented below with its own level-3 heading of the exact form `### VAR_NAME`. This document is kept in sync with the code by the drift test in `gateway/tests/env_example.rs`, so drift here is a test failure, not just a documentation staleness risk.
 
-The same variables are described, one per entry and in the order the gateway reads them, by the machine-readable [field catalog](configuration-catalog.json): each one's type and bounds, default, what a blank value means, how sensitive it is, which state backend reads it, what it becomes in a configuration bundle, and whether the Cloudflare wrapper forwards it. The catalog lives in the `gateway-config` library, and tests hold it to the configuration compiler itself and to this document: every entry here has a `Default:` line that states the catalog's default, and a stated `Range:` is the one the compiler enforces. The catalog describes the compiler and is never read at startup.
+After reading the three source selectors, the gateway uses the [field catalog](configuration-catalog.json) to identify settings that conflict with bundle or ledger mode. In environment mode it reads the cataloged settings in order. The catalog documents each setting's type, bounds, default, blank-value behavior, sensitivity, applicable state backends, bundle mapping and Cloudflare support. Tests check the catalog against the compiler and the defaults and ranges in this reference.
 
 The gateway compiles all of these settings once, before it opens a file, store, or connection. Every problem is reported in one pass, in the order the settings are read, and a configuration with any problem starts nothing: the gateway prints the problems and exits with status 1. A path or host name is not checked while compiling, so a missing file or an unreachable issuer fails startup later, when the gateway opens or contacts it. Unset and empty are different inputs: for most settings an empty or whitespace-only value is the same as unset, for some it is refused, and for `AUTH_EXEMPT_PATHS`, `RBAC_EXEMPT_PATHS`, `CSRF_EXEMPT_PATHS`, and `VALIDATION_ALLOWED_CONTENT_TYPES` it is an empty list that replaces the default. The [configuration compiler contract](architecture/configuration-compiler.md) describes what is read, what is validated, how secret material is carried, and what compiling never does.
+
+## Source selection
+
+### GATEWAY_CONFIG_SOURCE
+
+Selects `environment`, `bundle` or `ledger`. Bundle and ledger startup remain unavailable. The gateway checks source conflicts before initializing stores or opening listeners. See [source diagnostics](ggctl.md#source-diagnostics).
+
+Default: `environment` when unset. An empty value is invalid.
+
+### GATEWAY_CONFIG_BUNDLE
+
+Bundle directory. Required in bundle mode. Environment and ledger modes refuse any assignment, including an empty value.
+
+Default: unset.
+
+### GATEWAY_STATE_DIR
+
+Standalone state directory. Required in ledger mode and optional in bundle mode. Environment mode refuses any assignment. A supplied path must be non-empty.
+
+Default: unset.
+
+## Environment settings
 
 ### LISTEN_ADDR
 
@@ -1173,6 +1195,8 @@ Format and validation: unset, empty, or whitespace-only values become `None`. No
 - Simulations, policy test runs and evidence packages describe a synthetic principal's organization with an optional `organization` member (1 to 8192 bytes; omitted, the principal has none) in the principal objects of [`policy-simulation.v1`](schemas/policy-simulation.v1.schema.json) and [`policy-tests.v1`](schemas/policy-tests.v1.schema.json), and decide it exactly as the live lanes do: read only when an identity mapping or an `organization` condition reads it. Historical replay leaves the organization not recorded, because retained observations never recorded one, so a replayed request whose roles turn on an organization mapping is indeterminate (`missing_matcher_fact`), never a guess.
 - A fact a mapping or condition reads that was not captured -- a retained request whose headers were not kept, say -- is unknown, never a guessed no-match: `all`, `any` and `not` use three-valued logic, and an evaluation that reaches an unknown rule, or a principal whose internal roles turn on an unknown organization, is indeterminate (`missing_matcher_fact`), never an allow. A captured fact that is absent, such as a header the request did not carry, is a certain no-match. Fact values never appear in a decision trace, diagnostic message, audit record or metric; a trace given with captured facts says only that it was, and is never reused for another question. Scopes and other verified claims are not matcher inputs yet, because authentication keeps no verified fact for them apart from the claimed roles. Cluster mode judges such a document exactly as standalone mode does.
 
+In the rule builder, a rule with a typed condition links to Policy Studio. Open an existing draft or create one from the live revision to focus that rule by ID. In **HTTP and MCP rules**, add or edit a top-level source network or time window. Clearing the last CIDR or UTC bound leaves an incomplete condition for the gateway to validate. **Remove policy condition** explicitly removes it from the draft. The Source tab edits every condition tree. For a conditioned rule or an MCP tool rule, use Studio simulation with the necessary facts. The historical preview only counts HTTP path rules without conditions.
+
 Route rules in a policy's `routes` array are evaluated in document order. The first rule whose `path_prefix` matches the request path, whose `methods` match the request method, and whose optional `hosts` list matches the request host determines the required permission. `hosts` entries are exact hostnames without ports and match case-insensitively; ports in the request `Host` header are ignored. Duplicate hosts in one rule are rejected case-insensitively.
 
 When proxy fallback selects a host-qualified `UPSTREAM_ROUTES` entry, authorization requires a matching policy route with a non-empty `hosts` list. Gateway-owned handlers such as `/mcp`, probes, and admin routes are not proxy fallbacks and keep their normal path policy even when their host and path would match an upstream entry. A route rule with omitted or empty `hosts` cannot authorize the fallback request. Direct firewall `deny` rules still apply, but direct `allow` and `shadow` rules and `default_action: "allow"` cannot bypass this binding. A first-matching direct shadow still emits `authz.would_deny` before host-route evaluation. If no matching host-bound route exists, the gateway returns `403 Forbidden` and audits `reason: "host_policy_required"` together with the selected upstream host, path prefix, and origin.
@@ -1830,6 +1854,16 @@ Default: `5000`
 Format and validation: must parse as a positive `u64` millisecond duration. The validator caches successful and failed `ggw_` bearer-token verification results in-process so normal requests do not require a fresh SQLite lookup every time. Revocations or rotations performed by this process's admin API invalidate that process's cached entry immediately; in standalone mode, revocations made outside this process or in another process take effect no later than this TTL. In cluster mode (`STATE_BACKEND=postgres`) a cached entry is additionally served only while the shared security revision still reads what it read when the entry was made — and every token create, revoke, or rotation advances that revision inside its own transaction — so a revoke committed on any replica is refused by the very next request on every replica; the TTL then bounds only repeated lookups of an unchanged token. Keep the value short for security-sensitive deployments.
 
 Service token admin API: when `SERVICE_TOKEN_SQLITE_PATH` and `POLICY_FILE` are configured (in cluster mode the PostgreSQL authority is the store, and `SERVICE_TOKEN_SQLITE_PATH` is rejected), `POST /v1{ADMIN_PREFIX}/tokens` creates a service token and requires `admin:tokens:write`; `GET /v1{ADMIN_PREFIX}/tokens` and `GET /v1{ADMIN_PREFIX}/tokens/{id}` require `admin:tokens:read`; `DELETE /v1{ADMIN_PREFIX}/tokens/{id}` revokes a token and requires `admin:tokens:write`; `POST /v1{ADMIN_PREFIX}/tokens/{id}/rotate` rotates a token and requires `admin:tokens:write`. Create and rotate responses include the plaintext `ggw_` token exactly once with a notice that it will not be shown again. List and get responses return only token metadata. Create, revoke, and rotate emit `service_token.changed` audit events with actor attribution, token id, display prefix, scopes, and lifecycle timestamps, never plaintext tokens or token hashes.
+
+To reconcile a lost revocation response, send `POST /v1{ADMIN_PREFIX}/tokens/{id}/revoke` with one `Idempotency-Key` header containing a fresh, lowercase, hyphenated UUIDv7. Send an empty body and omit query parameters and conditional (`If-*`) headers. The caller needs `admin:tokens:write` and either a provider identity with a canonical issuer or a gateway-issued service token. After a timeout, repeat the request with the same key, token ID and caller (including authentication method).
+
+If a management token revokes itself, its credential loses access as soon as the change commits. Use a different authorized identity to submit the original request when you need to reconcile a lost response.
+
+Both storage modes return a receipt containing the operation UUID, token ID and permanent revocation time with `200` and write evidence once. The request-level `service_token.changed` audit event can repeat on each successful retry. The durable evidence row identifies the single committed change.
+
+Reusing a committed caller key for another token or caller returns `409`. A new key for an already revoked token also returns `409`. Server-generated operation IDs (UUIDv4), including those from earlier releases, cannot be submitted as caller keys. An unknown token with an unused key returns `404` and leaves the key available. Malformed requests return `400`. A body that does not finish within five seconds returns `408`.
+
+During a rolling upgrade, send keyed requests only to replicas that serve this route. Older replicas do not support it. The DELETE endpoint continues to revoke without a caller key.
 
 Token scope delegation is bounded by the caller's live RBAC authority for both creation and rotation. A caller with an identity-matched role that grants `*` may delegate any scope. Otherwise, every requested scope (or existing scope when rotating) must name a policy role that the caller both carries and can activate for its current issuer and authentication method. Unknown, unheld, or identity-inactive roles return `403 Forbidden` before a token is created or rotated. A denied rotation leaves the existing credential and metadata unchanged. Holding `admin:tokens:write` alone is insufficient to rotate a token whose scopes the caller cannot delegate; revocation still requires only that management permission. This also means a non-wildcard caller may create or rotate a token with the `mcp:tools` marker only when it is a defined, active role the caller carries; use a wildcard administrator if the deployment intentionally treats that marker outside the role map. Rejections emit `service_token.delegation_rejected` with the actor and requested/disallowed role names, but no token secret. Existing tokens are not narrowed automatically; review and revoke any token whose scopes should not have been delegatable by its creator.
 

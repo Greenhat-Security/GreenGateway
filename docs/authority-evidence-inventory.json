@@ -1680,12 +1680,12 @@
       "boundary": "rotate/revoke refuse an actor the evidence cannot record exactly (ChangeActor::is_recordable) before checkout, then serialize on the token high-water mark and row, change the token row, reserve the shared revision, append the outbox row and one service_token_change_evidence row carrying the same revision and row-revision step, and commit once. An evidence insert failure rolls the whole change back and is reported as a store failure, never as the rotate conflict. Repeated revoke, rotate of a revoked token (a conflict) and an unknown ID write no outbox or evidence row.",
       "record": "Outbox revision chain unchanged. service_token_change_evidence (migration 18) has no foreign key, so it survives removal of the token row and a restart; it holds the actor (subject and, since migration 24, kind, auth mode and canonical issuer), action, event/operation UUIDs, prior/new row revision, shared revision and database-clock committed_at, never the plaintext, hash, display prefix or scopes. The token row still names only its creator.",
       "actor": "The authenticated principal the admin endpoint passes through ServiceTokenStore as a ChangeActor, committed with each rotate and revoke and retained after it: actor_user_id (the subject, 1 to 4096 bytes, the principal bound) and, since migration 24, actor_kind (principal for a session cookie, bearer JWT or client certificate; service_token for a service token, whose service-token:<id> subject would otherwise read like a person's), actor_auth_mode and actor_issuer (the canonical issuer of a principal that has one, 1 to 4096 bytes). Rows committed before migration 24 record none of the three. A keyed safe actor reference exists only in what is delivered.",
-      "identity": "Generated event_id and operation_id UUIDs per store call (not bound to a client idempotency key), token ID, from/to row revisions and shared revision equal to the outbox row, database-clock committed_at; the action distinguishes rotate from revoke. A lost revoke response is reconciled from the token's evidence, and the repeat revoke records nothing. A lost rotate response cannot return its plaintext: the evidence shows the rotation committed, and rotating again records a second row.",
+      "identity": "Keyed POST revocation binds the caller-supplied UUIDv7 to the revoke action, token ID and recorded actor (subject, kind, canonical issuer and authentication method) in the transaction. A matching retry returns the revoked token without another change or evidence row. A mismatched binding or a fresh key on an already revoked token conflicts. Rotation and unkeyed revocation generate their operation UUIDs. Every event has its own generated event UUID. PostgreSQL records the previous and new row revisions, shared outbox revision and database-clock commit time.",
       "delivery": "journaled_dispatch",
       "disposition": [
         "missing_metadata"
       ],
-      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the store and derive an issuer-scoped subject reference. Token issue is recorded and journaled in the same table since migration 27 (token_issue_postgres). Issuer, actor kind and auth mode are recorded since migration 24. Delivery (PR3) journals each row in the change's transaction and dispatches it as authority_event_delivery.v1 behind a persisted cursor; AUTHORITY_EVIDENCE_DURABILITY=required makes a configured sink mandatory and admits this row; nothing qualifies it yet.",
+      "follow_up": "PR2 follow-up: extend caller-bound operation identity to rotation and derive an issuer-scoped subject reference. Token issue is recorded and journaled in the same table since migration 27 (token_issue_postgres). Issuer, actor kind and auth mode are recorded since migration 24. Delivery (PR3) journals each row in the change's transaction and dispatches it as authority_event_delivery.v1 behind a persisted cursor; AUTHORITY_EVIDENCE_DURABILITY=required makes a configured sink mandatory and admits this row; nothing qualifies it yet.",
       "sources": [
         {
           "path": "gateway/src/storage/migrations/0018_service_token_and_jwt_evidence.sql",
@@ -1792,6 +1792,10 @@
         {
           "path": "gateway/src/auth/change_actor.rs",
           "anchor": "fn the_recordable_bounds_are_the_principal_bounds_exactly("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn caller_bound_revocation_contract("
         }
       ],
       "required_durability_supported": false,
@@ -1820,12 +1824,12 @@
       "boundary": "SqliteTokenStore rotate/revoke refuse an actor the evidence cannot record exactly (ChangeActor::is_recordable), then run one IMMEDIATE transaction on the SERVICE_TOKEN_SQLITE_PATH database: read the revoked guard, update the guarded row, append one service_token_change_evidence row, reload and commit. An evidence insert failure rolls the change back and is reported as a store failure, never as the rotate conflict. A second connection to the file waits rather than interleaving.",
       "record": "Current hash/revoked_at replaces earlier state and the creator is unchanged. The same database's service_token_change_evidence table (created on open, no foreign key) keeps one append-only row per committed rotate/revoke: actor (subject, kind, auth mode and canonical issuer, the last three in columns the store adds to an older database on open, with the same CHECK as PostgreSQL migration 24), action, event/operation UUIDs and committed_at, never token material. Repeated revoke, rotate of a revoked token and an unknown ID write none. import-standalone does not carry these rows.",
       "actor": "The authenticated principal the admin endpoint passes through ServiceTokenStore as a ChangeActor, committed with the change: the subject (1 to 4096 bytes), actor_kind (principal or service_token), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). Rows written before the store added those columns record none of the three, and none is guessed.",
-      "identity": "Generated event_id/operation_id UUIDs, token ID, a store sequence and the process-clock committed_at (the revoke's own revoked_at). SQLite token rows have no revision chain, so the row records no prior/new revision; no caller-bound operation ID.",
+      "identity": "Keyed POST revocation binds the caller-supplied UUIDv7 to the revoke action, token ID and recorded actor (subject, kind, canonical issuer and authentication method) in the transaction. A matching retry returns the revoked token without another change or evidence row. A mismatched binding or a fresh key on an already revoked token conflicts. Rotation and unkeyed revocation generate their operation UUIDs. Every event has its own generated event UUID. SQLite records the sequence and process-clock commit time. Token rows have no revision chain.",
       "delivery": "standalone_cursor_dispatch",
       "disposition": [
         "missing_metadata"
       ],
-      "follow_up": "PR4: a store-owned revision per change (the delivered record says null before and after rather than inventing one). Delivered from this same database after a cursor created on open (standalone_cursor_dispatch), with no audit-database dual write. Token issue is recorded in the same table (token_issue_standalone). Issuer, actor kind and auth mode are recorded.",
+      "follow_up": "PR4: a store-owned revision per change (the delivered record says null before and after rather than inventing one). Delivered from this same database after a cursor created on open (standalone_cursor_dispatch), with no audit-database dual write. Token issue is recorded in the same table (token_issue_standalone). Issuer, actor kind and auth mode are recorded. Rotation still needs caller-bound operation identity.",
       "sources": [
         {
           "path": "gateway/src/auth/tokens.rs",
@@ -1896,6 +1900,14 @@
         {
           "path": "gateway/src/authority_events/standalone_tests.rs",
           "anchor": "async fn a_crash_between_acceptance_and_the_cursor_advance_redelivers_identical_records("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn caller_bound_revocation_contract("
+        },
+        {
+          "path": "gateway/src/admin_tokens_app_tests.rs",
+          "anchor": "async fn keyed_token_revocation_validates_and_reconciles_through_the_router("
         }
       ],
       "required_durability_supported": false,

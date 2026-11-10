@@ -1291,11 +1291,15 @@ fn rule_fixture(rule: ConfigRule) -> (&'static [(&'static str, &'static str)], &
             ],
             "AUTHORITY_EVIDENCE_DURABILITY",
         ),
+        ConfigRule::SourceSelection => (
+            &[("GATEWAY_CONFIG_SOURCE", "unrecognized")],
+            "GATEWAY_CONFIG_SOURCE",
+        ),
     }
 }
 
 /// Every rule, in declaration order.
-const EVERY_RULE: [ConfigRule; 30] = ConfigRule::ALL;
+const EVERY_RULE: [ConfigRule; 31] = ConfigRule::ALL;
 
 /// Every rule is reachable, and a refusal under it is reported as a
 /// diagnostic naming the rule, the variable its problem begins with and how
@@ -1304,13 +1308,15 @@ const EVERY_RULE: [ConfigRule; 30] = ConfigRule::ALL;
 fn every_rule_is_reported_by_name_in_the_diagnostics() {
     for rule in EVERY_RULE {
         let (fixture, variable) = rule_fixture(rule);
-        let error = plan::compile(|name| fixture_value(fixture, name))
+        let error = super::source::compile_selected(|name| fixture_value(fixture, name))
             .expect_err("each rule fixture is refused");
         assert_eq!(error.diagnostics().len(), 1, "{rule:?}: {error}");
         let diagnostic = &error.diagnostics()[0];
         assert_eq!(diagnostic.rule, rule, "{rule:?}: {error}");
         assert_eq!(diagnostic.variable, Some(variable), "{rule:?}: {error}");
-        let code = if fixture_value(fixture, variable).is_ok() {
+        let code = if rule == ConfigRule::SourceSelection {
+            ConfigDiagnosticCode::Source(super::source::SourceRefusal::InvalidSelector)
+        } else if fixture_value(fixture, variable).is_ok() {
             ConfigDiagnosticCode::Refused
         } else {
             ConfigDiagnosticCode::Unset
