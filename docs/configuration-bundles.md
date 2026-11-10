@@ -257,9 +257,17 @@ client secret reference and redirect URI. Offline validation checks the form
 and presence of the reference. The secret value and alias availability are
 checked only when a resolver is used.
 
-The remaining domains still need compiler integration for checks such as
-session lifetime bounds, client-certificate requirements and cookie-name
-syntax. Profile requirements on the deployment settings are also pending (see
+A deployment that can supply every compiler input offline also runs the full
+environment-mode compiler. It keeps the resulting configuration plan, marks
+document values as bundle inputs, and uses the development profile's loopback
+default for an omitted public address. Cross-field refusals identify the
+affected setting without printing its value. A pinned policy satisfies the
+compiler's policy-presence check without supplying a writable policy path.
+
+A deployment that needs secret resolution, host TLS material, standalone
+store paths or PostgreSQL bootstrap configuration still runs the available
+offline checks. Its complete plan is reported as `not_checked`. Deployment
+profile enforcement and activation are separate stages (see
 [deployment profiles](#deployment-profiles)).
 
 Some environment variables have no document form:
@@ -1247,6 +1255,7 @@ can appear in one. A published code never changes meaning.
 | `bundle.digest_mismatch` | A file's SHA-256 differs from its pin. |
 | `bundle.invalid_egress_setting` | The gateway's egress compiler refused the setting at the reported deployment pointer. |
 | `bundle.invalid_runtime_setting` | The gateway's runtime compiler refused the setting at the reported deployment pointer. |
+| `bundle.invalid_deployment_setting` | The shared compiler refused a deployment setting or a combination of settings. |
 | `bundle.invalid_auth_provider` | The gateway's authentication compiler refused the provider list. |
 | `bundle.invalid_admin_login` | The selected login provider is unusable, or a required client setting is missing. |
 | `syntax.empty_document` | The document is empty. |

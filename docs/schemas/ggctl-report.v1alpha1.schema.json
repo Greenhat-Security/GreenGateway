@@ -593,7 +593,8 @@
           "properties": {
             "file": {"type": "string"},
             "sha256": {"$ref": "#/$defs/sha256"},
-            "profile": {"enum": ["production", "migration", "development"]}
+            "profile": {"enum": ["production", "migration", "development"]},
+            "offlineCompiler": {"enum": ["compiled", "not_checked"]}
           }
         },
         "policy": {"$ref": "#/$defs/resource"},

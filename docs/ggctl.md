@@ -142,6 +142,13 @@ ggctl validate deploy/bundle --strict
 
 ### `validate`
 
+For a valid bundle, `result.bundle.deployment.offlineCompiler` reports
+`compiled` when the gateway's shared configuration compiler built the
+deployment plan. It reports `not_checked` when building the full plan needs
+host bindings, such as a secret reference, TLS files, a state directory or
+PostgreSQL bootstrap settings. The available domain checks still run. The
+same status appears in the bundle summary from `doctor`.
+
 Reads the bundle in the directory `BUNDLE` with the bundle reader the gateway uses ([configuration bundles](configuration-bundles.md)) and reports every problem it finds, not just the first: unsafe or oversized files, the YAML subset and strict JSON, exact document versions, closed documents, the deployment settings' types and bounds, the gateway compiler's egress, runtime, authentication-provider and admin-login checks, references and SHA-256 pins, the published policy and tools schemas, and the deployment profile's policy invariants. It reads only beneath `BUNDLE`, writes nothing, makes no network request and reads no environment variable. `BUNDLE` must be valid UTF-8.
 
 - The human result names the bundle and says `valid` or `invalid` with counts; for a valid bundle it adds the source digest, the files and the profile, marking a `development` profile `non-production`. Each diagnostic goes to standard error with its file, line, column and JSON Pointer.

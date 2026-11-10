@@ -498,10 +498,16 @@ NAT64 prefix and overlap checks, and credentialed CORS restrictions. Decimal
 runtime bounds and rates use their canonical spelling. The reader also runs the shared
 authentication-provider and admin-login validation. It passes the presence of
 the login client's typed secret reference to that rule without resolving it.
-Other domains and profile
-invariants on deployment settings still need compiler integration. A front end
-gives a decimal setting the `f64` its text parses to, which is the value the
-same text gives in the environment.
+When a deployment supplies all inputs offline, the reader runs the shared
+`ConfigPlan` compiler on the complete projection. Document and profile
+values have their own provenance. A mounted policy satisfies the host-route
+requirement by presence, and the plan carries no writable policy path for it.
+The reader retains the plan with its pinned deployment. A deployment that
+needs external bindings, including secret references or local store paths,
+can be validated offline only for the stages whose inputs are available.
+
+Serving from a mounted bundle still requires profile enforcement, resource
+ownership checks, secret resolution and activation.
 
 ### Reports
 
