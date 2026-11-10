@@ -794,7 +794,7 @@ fn every_environment_cli_input_honors_the_same_source_selection() {
         file.assert_not_echoed(&captured);
         if words[0] == "doctor" {
             let check = &found["result"]["checks"][2];
-            assert_eq!(check["id"], "env.compiler");
+            assert_eq!(check["id"], "environment.compiler");
             assert_eq!(check["status"], "fail");
             assert_eq!(check["reason"], "source.conflicting_environment");
         }

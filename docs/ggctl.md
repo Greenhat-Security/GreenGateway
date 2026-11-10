@@ -240,7 +240,7 @@ With `--env FILE` instead of `BUNDLE`, the doctor reads the [environment file](#
 | --- | --- | --- |
 | `environment.file` | error | The environment file: a regular file of at most 1 MiB, not writable by group or other on Unix, UTF-8, and every line blank, a comment or an assignment. Its reason is the first `env` code found. |
 | `environment.duplicate_keys` | warning | No key is assigned twice (`env.duplicate_key`). |
-| `environment.compiler` | error | The gateway's configuration compiler accepts the variables the file sets. Its reason is the first `config` code found. |
+| `environment.compiler` | error | The gateway's configuration compiler accepts the variables the file sets. Its reason is the first `source` or `config` error code. |
 | `production.authentication` | warning | Authentication is on and required: `AUTH_ENABLED` is not `false` and `AUTH_MODE` is not `observe`. |
 | `production.policy` | warning | A policy is configured: `warning` without `POLICY_FILE`, `skipped` with one, because its invariants are in the policy document, which this check does not read. |
 | `production.csrf` | warning | CSRF protection is on (`CSRF_ENABLED`). |
@@ -790,7 +790,7 @@ its effective line when present. These checks read only the supplied file.
 
 | Code | Exit | Meaning |
 | --- | --- | --- |
-| `source.invalid_selector` | 3 | The source mode is unknown or a required locator is empty or invalid. |
+| `source.invalid_selector` | 3 | The source mode is unknown or a supplied locator is empty or invalid. |
 | `source.selector_without_mode` | 3 | A location selector is present in a mode that cannot use it. |
 | `source.missing_selector` | 3 | Bundle selection requires `GATEWAY_CONFIG_BUNDLE`. Ledger selection requires `GATEWAY_STATE_DIR`. |
 | `source.conflicting_environment` | 3 | A non-bootstrap environment setting is present alongside bundle or ledger selection. An empty assignment still counts. |
