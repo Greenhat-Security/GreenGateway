@@ -690,7 +690,7 @@ fn rfc3339(time: Option<OffsetDateTime>) -> Value {
 /// The three permissions every replay route needs. Checked before a body is
 /// read or a job looked up, so an unauthorized caller learns nothing about
 /// any job.
-fn authorized_replay_state<'a>(
+pub(super) fn authorized_replay_state<'a>(
     state: &'a PolicyAdminState,
     principal: &auth::Principal,
 ) -> ResponseResult<&'a middleware::rbac::RbacState> {

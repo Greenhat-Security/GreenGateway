@@ -6,11 +6,14 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "base_etag", "candidate"],
+  "if": {"required": ["replay_job_id"]},
+  "then": {"properties": {"format": {"const": "json"}}},
   "properties": {
     "schema_version": {"const": "policy-analysis.v1"},
     "description": {"$ref": "#/$defs/description"},
     "base_etag": {"type": "string", "minLength": 1, "maxLength": 256},
     "candidate": {"$ref": "#/$defs/candidate"},
+    "replay_job_id": {"type": "string", "minLength": 1, "maxLength": 64},
     "format": {"enum": ["json", "sarif"]}
   },
   "$defs": {

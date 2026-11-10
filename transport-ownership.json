@@ -7017,9 +7017,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "054794847c63324030cd39f932f21c7f002080af0a83140748e96827dc4ac195",
+      "sha256": "f8d0e62f30c4f1ecfba8df51e050e3908c61a4e80d4072748bb07de049be5f71",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed the composed admin router with the keyed service-token revoke route and the authenticated mutation approval routes."
+      "purpose": "Registers authenticated mutation approval and keyed revocation routes and the owner-scoped replay registry used by policy analyses."
     },
     {
       "file": "gateway/src/routing.rs",
