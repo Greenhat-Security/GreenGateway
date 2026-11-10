@@ -2684,6 +2684,22 @@ textarea:focus-visible {
   gap: var(--gh-ref-space-6);
 }
 
+.studio-condition-operands {
+  display: grid;
+  gap: var(--gh-ref-space-3);
+  margin: 0;
+  padding-inline-start: var(--gh-ref-space-5);
+}
+
+.studio-condition-operands > li {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.studio-condition-actions[open] > .form-actions {
+  margin-block-start: var(--gh-ref-space-2);
+}
+
 /* The live region stays in the page so announcements reach assistive
    technology; while it is empty it takes no gap of its own. */
 .policy-studio-status:empty {
