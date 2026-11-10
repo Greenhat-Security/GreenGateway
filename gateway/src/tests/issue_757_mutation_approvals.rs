@@ -30,7 +30,7 @@ paths:
       responses: { '200': { description: Updated } }
 "#;
 
-async fn call(
+pub(super) async fn call(
     router: &Router,
     method: Method,
     uri: &str,
@@ -55,7 +55,7 @@ async fn call(
     (headers, serde_json::from_str(&wire).unwrap_or(Value::Null))
 }
 
-async fn prepare_route(router: &Router, token: &str, name: &str) -> (String, String) {
+pub(super) async fn prepare_route(router: &Router, token: &str, name: &str) -> (String, String) {
     let (_, inventory) = call(
         router,
         Method::GET,
@@ -82,6 +82,39 @@ async fn prepare_route(router: &Router, token: &str, name: &str) -> (String, Str
         format!("{detail}/mutation-approvals"),
         headers[header::ETAG].to_str().unwrap().to_owned(),
     )
+}
+
+pub(super) async fn register_widgets(router: &Router, operator: &str, connection_id: &str, connection_etag: &str) -> Value {
+    let catalog = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi");
+    let (_, preview) = call(
+        router,
+        Method::POST,
+        &format!("{catalog}/preview"),
+        operator,
+        None,
+        Some(json!({"spec":SPEC})),
+        StatusCode::OK,
+    )
+    .await;
+    let registration = json!({
+        "spec": SPEC,
+        "spec_digest": preview["spec_digest"],
+        "expected_spec_revision": preview["spec_revision"],
+        "expected_catalog_revision": preview["catalog_revision"],
+        "security_confirmations": preview["security_confirmations"],
+        "selected_tool_names": ["getWidget", "updateWidget"]
+    });
+    let (_, registered) = call(
+        router,
+        Method::POST,
+        &format!("{catalog}/register"),
+        operator,
+        Some(connection_etag),
+        Some(registration),
+        StatusCode::CREATED,
+    )
+    .await;
+    registered
 }
 
 #[tokio::test]
@@ -161,35 +194,7 @@ async fn mutation_approval_binds_rendered_request_and_enforces_independent_revie
     .await;
     let connection_id = connection["id"].as_str().unwrap();
     let connection_etag = headers[header::ETAG].to_str().unwrap();
-    let catalog = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi");
-    let (_, preview) = call(
-        &router,
-        Method::POST,
-        &format!("{catalog}/preview"),
-        &operator,
-        None,
-        Some(json!({"spec":SPEC})),
-        StatusCode::OK,
-    )
-    .await;
-    let registration = json!({
-        "spec": SPEC,
-        "spec_digest": preview["spec_digest"],
-        "expected_spec_revision": preview["spec_revision"],
-        "expected_catalog_revision": preview["catalog_revision"],
-        "security_confirmations": preview["security_confirmations"],
-        "selected_tool_names": ["getWidget", "updateWidget"]
-    });
-    let (_, registered) = call(
-        &router,
-        Method::POST,
-        &format!("{catalog}/register"),
-        &operator,
-        Some(connection_etag),
-        Some(registration),
-        StatusCode::CREATED,
-    )
-    .await;
+    let registered = register_widgets(&router, &operator, connection_id, connection_etag).await;
     let (read_only, read_etag) = prepare_route(&router, &requester, "getWidget").await;
     let (_, unsupported) = call(
         &router,
