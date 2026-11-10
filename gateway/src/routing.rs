@@ -496,6 +496,10 @@ pub(super) fn add_admin_api_routes(
                     get(token_get_endpoint).delete(token_revoke_endpoint),
                 )
                 .route(
+                    routes.admin.token_keyed_revoke_route.as_str(),
+                    post(token_revoke_endpoint),
+                )
+                .route(
                     routes.admin.token_rotate_route.as_str(),
                     post(token_rotate_endpoint),
                 )
@@ -1046,6 +1050,7 @@ pub(super) fn cors_layer(config: &config::Config) -> CorsLayer {
         header::AUTHORIZATION,
         header::COOKIE,
         header::ACCEPT,
+        HeaderName::from_static("idempotency-key"),
         config
             .csrf_header_name
             .parse::<HeaderName>()

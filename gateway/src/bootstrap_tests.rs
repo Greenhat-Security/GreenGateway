@@ -248,6 +248,27 @@ fn a_refused_configuration_stops_startup_before_any_stage() {
 }
 
 #[test]
+fn source_conflicts_stop_startup_before_preflight_or_activation() {
+    let (result, stages) = start(
+        &[
+            ("GATEWAY_CONFIG_SOURCE", "bundle"),
+            ("GATEWAY_CONFIG_BUNDLE", "source-canary"),
+            ("AUTH_ENABLED", ""),
+        ],
+        None,
+        nothing_to_check(),
+    );
+    let Err(StartupFailure::Configuration(error)) = result else {
+        panic!("serving must refuse the competing configuration");
+    };
+    assert!(error
+        .to_string()
+        .contains("AUTH_ENABLED: source.conflicting_environment"));
+    assert!(!error.to_string().contains("source-canary"));
+    assert!(stage_calls(&stages).is_empty());
+}
+
+#[test]
 fn a_preflight_failure_activates_nothing() {
     let (result, stages) = start(STANDALONE, Some(Stage::Preflight), nothing_to_check());
     assert_eq!(stage_error(result), "the database did not answer");

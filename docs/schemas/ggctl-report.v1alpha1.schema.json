@@ -198,7 +198,7 @@
         "code": {
           "description": "The stable family.reason code. docs/ggctl.md lists every ggctl code by family, docs/configuration-bundles.md every bundle reader code, and docs/archive-admission.md every archive admission code.",
           "type": "string",
-          "pattern": "^(usage|credential|trust|remote|input|policy|evidence|compat|schema|mcp|validate|doctor|diff|env|config|init|convert|pin|state_dir|ledger|backup|restore|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile|archive)\\.[a-z][a-z0-9_]*$"
+          "pattern": "^(usage|credential|trust|remote|input|policy|evidence|compat|schema|mcp|validate|doctor|diff|env|config|source|init|convert|pin|state_dir|ledger|backup|restore|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile|archive)\\.[a-z][a-z0-9_]*$"
         },
         "severity": {
           "enum": ["error", "warning", "info"]
@@ -557,7 +557,8 @@
         "authority_event_material_unused",
         "authority_pseudonym_keys_distinct",
         "authority_evidence_delivery_required",
-        "authority_evidence_unsupported_configuration"
+        "authority_evidence_unsupported_configuration",
+        "source_selection"
       ]
     },
     "doctorResult": {
@@ -653,14 +654,15 @@
         "status": {"enum": ["pass", "warning", "fail", "skipped"]},
         "reason": {
           "type": "string",
-          "pattern": "^(doctor|bundle|syntax|json|yaml|compat|schema|reference|secret|resource|profile|env|config)\\.[a-z][a-z0-9_]*$"
+          "pattern": "^(doctor|bundle|syntax|json|yaml|compat|schema|reference|secret|resource|profile|env|config|source)\\.[a-z][a-z0-9_]*$"
         },
         "remediation": {
           "enum": [
             "docs/ggctl.md#doctor-checks",
             "docs/configuration-bundles.md#diagnostics",
             "docs/ggctl.md#env-diagnostics",
-            "docs/ggctl.md#config-diagnostics"
+            "docs/ggctl.md#config-diagnostics",
+            "docs/ggctl.md#source-diagnostics"
           ]
         },
         "durationMs": {

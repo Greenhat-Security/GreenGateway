@@ -9,6 +9,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Production readiness fixes
 
+- Service-token administrators can retry a revocation after a lost response using a caller-bound UUIDv7. Both SQLite and PostgreSQL return the same revocation receipt on a matching retry and reject conflicting use of the key. [Service token admin API](docs/configuration.md#service_token_cache_ttl_ms). Part of #425.
+
 - Update the MCP SDK to rmcp 3.9.0, the first release that fixes [RUSTSEC-2026-0462](https://rustsec.org/advisories/RUSTSEC-2026-0462.html). The gateway keeps the response-size limits in its custom MCP client.
 - Update bundled SQLite from 3.53.2 to 3.54.1 through rusqlite 0.41.1. Update hyper-util to 0.1.21 for connection-pool and proxy fixes, tokio-util to 0.7.20 for cancellation and stream handling fixes, and the property-test runner to proptest 1.12.0. The gateway keeps its existing HTTP protocol and proxy settings.
 - Cluster admin-session evidence records who signed in or replaced a session and attributes provider rejection and expiry to the gateway. Logout retains its unauthenticated status. [Migration 33 requires a coordinated upgrade](docs/deployment/postgres.md#coordinated-upgrade-schema-32-to-33). Part of #425.

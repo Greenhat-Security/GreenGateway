@@ -752,10 +752,11 @@ mod tests {
             unimplemented!("not needed by this validator test")
         }
 
-        async fn revoke(
+        async fn revoke_with_operation(
             &self,
             _id: &str,
             _actor: &crate::auth::change_actor::ChangeActor,
+            _operation_id: Option<uuid::Uuid>,
         ) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
@@ -806,10 +807,11 @@ mod tests {
             unimplemented!("not needed by this validator test")
         }
 
-        async fn revoke(
+        async fn revoke_with_operation(
             &self,
             _id: &str,
             _actor: &crate::auth::change_actor::ChangeActor,
+            _operation_id: Option<uuid::Uuid>,
         ) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
@@ -880,10 +882,11 @@ mod tests {
             unimplemented!("not needed by this validator test")
         }
 
-        async fn revoke(
+        async fn revoke_with_operation(
             &self,
             _id: &str,
             _actor: &crate::auth::change_actor::ChangeActor,
+            _operation_id: Option<uuid::Uuid>,
         ) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
@@ -941,10 +944,11 @@ mod tests {
             unimplemented!("not needed by this validator test")
         }
 
-        async fn revoke(
+        async fn revoke_with_operation(
             &self,
             _id: &str,
             _actor: &crate::auth::change_actor::ChangeActor,
+            _operation_id: Option<uuid::Uuid>,
         ) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
@@ -1008,10 +1012,11 @@ mod tests {
                 unimplemented!("not needed by this validator test")
             }
 
-            async fn revoke(
+            async fn revoke_with_operation(
                 &self,
                 _id: &str,
                 _actor: &crate::auth::change_actor::ChangeActor,
+                _operation_id: Option<uuid::Uuid>,
             ) -> Result<Option<TokenRecord>, RepositoryError> {
                 unimplemented!("not needed by this validator test")
             }

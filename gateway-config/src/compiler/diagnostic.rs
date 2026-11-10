@@ -71,6 +71,8 @@ impl Lookups {
 /// What a diagnostic records about the input its problem names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigDiagnosticCode {
+    /// The requested authority failed its source-selection checks.
+    Source(super::source::SourceRefusal),
     /// The variable is not set.
     Unset,
     /// The variable is set to an empty or whitespace-only value.
@@ -185,11 +187,13 @@ pub enum ConfigRule {
     /// an authority change the evidence inventory marks unsupported in this
     /// deployment mode, such as `ADMIN_SESSION_MODE=standalone_memory`.
     AuthorityEvidenceUnsupportedConfiguration,
+    /// The source selectors or the selected authority prevent compilation.
+    SourceSelection,
 }
 
 impl ConfigRule {
     /// Every rule, in declaration order.
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::Value,
         Self::AdminListenerCollision,
         Self::GrpcListenerCollision,
@@ -220,6 +224,7 @@ impl ConfigRule {
         Self::AuthorityPseudonymKeysDistinct,
         Self::AuthorityEvidenceDeliveryRequired,
         Self::AuthorityEvidenceUnsupportedConfiguration,
+        Self::SourceSelection,
     ];
 
     /// The rule's stable name: its variant name in lowercase snake case.
@@ -263,6 +268,7 @@ impl ConfigRule {
             Self::AuthorityEvidenceUnsupportedConfiguration => {
                 "authority_evidence_unsupported_configuration"
             }
+            Self::SourceSelection => "source_selection",
         }
     }
 }

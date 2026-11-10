@@ -124,6 +124,26 @@ async function routeStudio(page: Page) {
   });
 }
 
+test('opens the selected rule condition and edits a CIDR by keyboard on a narrow screen', async ({ page }) => {
+  await routeStudio(page);
+  await page.setViewportSize({ width: 390, height: 900 });
+  await page.goto('/admin/policy/studio?rule_id=deny-exports');
+  await page.getByRole('button', { name: `Open draft ${DRAFT_ID}` }).click();
+  const rule = page.getByRole('article', { name: '#2 deny-exports' });
+  const condition = rule.getByRole('group', { name: 'Additional policy condition' });
+  await expect(condition).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(condition.getByRole('button', { name: 'Add source network condition' })).toBeFocused();
+  await page.keyboard.press('Enter');
+  const networks = condition.getByLabel('Source networks', { exact: true });
+  await page.keyboard.press('Tab');
+  await expect(networks).toBeFocused();
+  await page.keyboard.type('192.0.2.0/24');
+  await networks.press('Enter');
+  await expect(condition.getByRole('button', { name: 'Remove 192.0.2.0/24 from Source networks' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Save draft' })).toBeEnabled();
+});
+
 test('captures the Policy Studio rule editor with live diagnostics', async ({ page }) => {
   await routeStudio(page);
   await page.goto('/admin/policy/studio');

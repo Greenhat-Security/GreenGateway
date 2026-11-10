@@ -207,7 +207,7 @@ fn mcp_candidate() -> ConnectionWrite {
 }
 
 /// Issue, rotate and revoke one token: three token-table rows.
-fn change_a_token(tokens: &SqliteTokenStore) -> String {
+fn change_a_token(tokens: &SqliteTokenStore, revoke_id: Option<uuid::Uuid>) -> String {
     let created = tokens
         .create(
             CreateTokenRequest {
@@ -224,7 +224,7 @@ fn change_a_token(tokens: &SqliteTokenStore) -> String {
         .expect("the token rotates")
         .expect("the token exists");
     tokens
-        .revoke(&id, &actor())
+        .revoke_with_operation(&id, &actor(), revoke_id)
         .expect("the token revokes")
         .expect("the token exists");
     id
@@ -328,7 +328,8 @@ async fn every_owning_stores_evidence_is_delivered_in_commit_order_under_its_own
     let tokens = SqliteTokenStore::open(&tokens_path).expect("the token store opens");
     let connections =
         SqliteConnectionStore::open(&connections_path).expect("the Connections store opens");
-    let token_id = change_a_token(&tokens);
+    let revoke_id = crate::auth::tokens::test_revoke_operation_id(1);
+    let token_id = change_a_token(&tokens, Some(revoke_id));
     let connection_ids = change_a_connection(&connections);
 
     let material = generated_key_hex();
@@ -362,6 +363,7 @@ async fn every_owning_stores_evidence_is_delivered_in_commit_order_under_its_own
             "catalog.mcp.publish",
         ]
     );
+    assert_eq!(records[2].operation_id, revoke_id.to_string());
     // Batches of at most two per table; an empty table offers none.
     assert_eq!(
         sink.batches().iter().map(Vec::len).collect::<Vec<_>>(),
@@ -466,7 +468,7 @@ async fn a_crash_between_acceptance_and_the_cursor_advance_redelivers_identical_
     let scratch = Scratch::new("crash");
     let path = scratch.path("tokens.sqlite");
     let tokens = SqliteTokenStore::open(&path).expect("the token store opens");
-    change_a_token(&tokens);
+    change_a_token(&tokens, None);
     let material = generated_key_hex();
 
     let crashing: Arc<dyn StandaloneEvidenceAuthority> = Arc::new(CrashingAdvance {
@@ -585,7 +587,7 @@ async fn a_restart_resumes_after_the_cursor_under_the_persisted_authority() {
     let scratch = Scratch::new("restart");
     let path = scratch.path("tokens.sqlite");
     let tokens = SqliteTokenStore::open(&path).expect("the token store opens");
-    let first_token = change_a_token(&tokens);
+    let first_token = change_a_token(&tokens, None);
     let material = generated_key_hex();
     let authority: Arc<dyn StandaloneEvidenceAuthority> = Arc::new(tokens);
     let before = RecordingSink::default();
@@ -598,7 +600,7 @@ async fn a_restart_resumes_after_the_cursor_under_the_persisted_authority() {
     drop(authority);
 
     let reopened = SqliteTokenStore::open(&path).expect("the token store reopens");
-    let second_token = change_a_token(&reopened);
+    let second_token = change_a_token(&reopened, None);
     let authority: Arc<dyn StandaloneEvidenceAuthority> = Arc::new(reopened);
     let after = RecordingSink::default();
     for mut lane in lanes_for(&authority, &material).await {
@@ -698,7 +700,7 @@ async fn the_file_sink_holds_the_records_and_no_identifier() {
     let scratch = Scratch::new("file");
     let path = scratch.path("tokens.sqlite");
     let tokens = SqliteTokenStore::open(&path).expect("the token store opens");
-    let token_id = change_a_token(&tokens);
+    let token_id = change_a_token(&tokens, None);
     let authority: Arc<dyn StandaloneEvidenceAuthority> = Arc::new(tokens);
     let events = scratch.path("authority-events.jsonl");
     let sink = FileSink::new(events.clone());
@@ -814,7 +816,7 @@ async fn the_running_dispatcher_delivers_every_lane_and_stops_on_shutdown() {
     let tokens = SqliteTokenStore::open(scratch.path("tokens.sqlite")).expect("opens");
     let connections =
         SqliteConnectionStore::open(scratch.path("connections.sqlite")).expect("opens");
-    change_a_token(&tokens);
+    change_a_token(&tokens, None);
     change_a_connection(&connections);
     let material = generated_key_hex();
     let mut lanes = Vec::new();

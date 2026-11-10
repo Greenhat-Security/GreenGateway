@@ -136,6 +136,17 @@ impl ChangeActor {
         self.auth_mode
     }
 
+    /// A keyed admin mutation needs a verifiable, unambiguous caller within
+    /// this authority. Provider subjects are scoped by their canonical issuer.
+    pub(crate) fn can_bind_operation(&self) -> bool {
+        self.is_recordable()
+            && match self.kind {
+                ActorKind::Principal => self.issuer.is_some(),
+                ActorKind::ServiceToken => true,
+                ActorKind::System => false,
+            }
+    }
+
     /// Whether evidence can record this actor exactly as it is: a subject of
     /// 1 to [`MAX_PRINCIPAL_SUBJECT_BYTES`] bytes and, only for a principal,
     /// an issuer of 1 to [`MAX_PRINCIPAL_ISSUER_BYTES`] bytes. Those are the

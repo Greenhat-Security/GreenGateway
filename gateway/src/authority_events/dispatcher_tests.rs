@@ -458,12 +458,17 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
             &ChangeActor::for_test_with_issuer("rotating-admin", ACTOR_ISSUER),
         )
         .await;
+    let revoke_id = crate::auth::tokens::test_revoke_operation_id(1);
     producers
-        .revoke(
+        .tokens
+        .revoke_with_operation(
             &revoked,
             &ChangeActor::service_token_for_test("service-token:revoking-token"),
+            Some(revoke_id),
         )
-        .await;
+        .await
+        .expect("the keyed revoke commits")
+        .expect("the token exists");
     producers.revoke_jwt("withdrawn-jti").await;
     producers
         .create_rebind_and_delete_connection(&ChangeActor::for_test("deleting-admin"))
@@ -512,6 +517,7 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
     );
 
     let delivered = sink.delivered();
+    assert_eq!(delivered[3].operation_id, revoke_id.to_string());
     assert_eq!(
         delivered
             .iter()
