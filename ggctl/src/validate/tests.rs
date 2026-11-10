@@ -402,6 +402,102 @@ fn validate_and_doctor_run_the_egress_compiler_on_a_bundle() {
 }
 
 #[test]
+fn validate_and_doctor_check_listener_bindings_and_tls_intent_offline() {
+    let fixture = Fixture::valid();
+    let write = |profile: &str, listeners: Value| {
+        fixture.write("deployment.yaml", &format!(
+            "apiVersion: greengateway.dev/v1alpha1\nkind: GatewayDeployment\nspec:\n  profile: {profile}\n  listeners: {listeners}\n"
+        ));
+        fixture.pin_policy_version("0.1.0");
+    };
+    write(
+        "development",
+        json!({
+            "public":{"tls":"required","client_certificates":"required","client_certificate_crl":"required"},
+            "tls":{"client_certificate_identity":"spiffe"},
+            "grpc":{"address":"[::1]:8090"},
+            "admin":{"address":"127.0.0.2:8090","tls":"required"}
+        }),
+    );
+    for command in ["validate", "doctor"] {
+        assert_eq!(run(&[command, fixture.path()]).0, Exit::Success);
+    }
+    for (profile, listeners, code, pointer) in [
+        (
+            "development",
+            json!({"admin":{"address":"127.0.0.1:8080"}}),
+            "bundle.invalid_listener_setting",
+            "/spec/listeners/admin/address",
+        ),
+        (
+            "development",
+            json!({"grpc":{"address":"[::]:8443"}}),
+            "profile.listener_not_loopback",
+            "/spec/listeners/grpc/address",
+        ),
+        (
+            "development",
+            json!({"public":{"address":"0.0.0.0:8080"}}),
+            "profile.listener_not_loopback",
+            "/spec/listeners/public/address",
+        ),
+        (
+            "production",
+            json!({"public":{"address":CANARY}}),
+            "bundle.invalid_listener_setting",
+            "/spec/listeners/public/address",
+        ),
+        (
+            "production",
+            json!({"admin":{"tls":"required"}}),
+            "bundle.invalid_listener_setting",
+            "/spec/listeners/admin/tls",
+        ),
+        (
+            "production",
+            json!({"public":{"client_certificate_crl":"required"}}),
+            "bundle.invalid_listener_setting",
+            "/spec/listeners/public/client_certificate_crl",
+        ),
+        (
+            "production",
+            json!({"public":{"tls":"required","client_certificates":"optional"}}),
+            "bundle.invalid_listener_setting",
+            "/spec/listeners/public/client_certificates",
+        ),
+        (
+            "production",
+            json!({"public":{"client_certificates":"required"},"tls":{"client_certificate_identity":"dns"}}),
+            "bundle.invalid_listener_setting",
+            "/spec/listeners/public/client_certificates",
+        ),
+        (
+            "production",
+            json!({"tls":{"client_certificate_identity":"uri"}}),
+            "bundle.invalid_listener_setting",
+            "/spec/listeners/tls/client_certificate_identity",
+        ),
+    ] {
+        write(profile, listeners);
+        for command in ["validate", "doctor"] {
+            let (exit, captured) = run(&[command, fixture.path(), "--format", "json"]);
+            assert_eq!(exit, Exit::Invalid, "{}", captured.stdout());
+            assert_no_canary(&captured);
+            let result = report(&captured);
+            let diagnostics = result["diagnostics"].as_array().unwrap();
+            let finding = diagnostics
+                .iter()
+                .find(|item| item["code"] == code)
+                .unwrap();
+            assert_eq!(finding["location"]["pointer"], pointer);
+            assert!(codes(&result).iter().all(|found| {
+                *found == code || (command == "doctor" && *found == "doctor.required_check_failed")
+            }));
+        }
+    }
+}
+
+#[test]
 fn validate_and_doctor_refuse_wildcard_credentialed_cors_in_a_bundle() {
     let fixture = Fixture::valid();
     let write = |origins: Value| {

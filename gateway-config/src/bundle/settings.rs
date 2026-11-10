@@ -31,7 +31,7 @@
 //! - no field accepts an unresolved placeholder.
 //!
 //! The reader checks shape and per-field bounds here. It runs the compiler's
-//! egress, runtime, authentication provider and admin login rules after reading these
+//! listener, egress, runtime, authentication provider and admin login rules after reading these
 //! settings. The other compiler rules still need their document mappings.
 //!
 //! Some members are the document's own rather than one field's
@@ -43,6 +43,7 @@
 //! (ADR-0008, "Bootstrap inputs"): the document states the intent, and the
 //! locators stay in the environment.
 
+mod listeners;
 mod render;
 pub(crate) mod structured;
 #[cfg(test)]

@@ -150,6 +150,7 @@ impl Stage {
             | Code::NotApplicable
             | Code::NotRepresentable
             | Code::InvalidEgressSetting
+            | Code::InvalidListenerSetting
             | Code::InvalidRuntimeSetting
             | Code::InvalidAuthProvider
             | Code::InvalidAdminLogin
@@ -166,9 +167,10 @@ impl Stage {
             | Code::SourceUnsupported
             | Code::Unresolved => Self::References,
             Code::ResourceUnknownMember | Code::ResourceInvalid => Self::Resources,
-            Code::PolicyDefaultAllow | Code::PolicyShadowMode | Code::PolicyWildcardRole => {
-                Self::Profile
-            }
+            Code::DevelopmentListenerNotLoopback
+            | Code::PolicyDefaultAllow
+            | Code::PolicyShadowMode
+            | Code::PolicyWildcardRole => Self::Profile,
             Code::UnreferencedEntry => Self::UnreferencedEntries,
         }
     }

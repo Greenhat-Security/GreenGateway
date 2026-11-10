@@ -1403,88 +1403,92 @@ impl InboundClientAuthConfig {
 }
 
 /// The raw, still-unchecked client-certificate inputs for one listener.
-struct RawInboundClientAuth {
+struct RawInboundClientAuth<Locator> {
     mode_setting: &'static str,
     mode: ClientCertMode,
     ca_setting: &'static str,
-    ca_file: Option<String>,
+    ca_file: Option<Locator>,
     crl_setting: &'static str,
-    crl_file: Option<String>,
+    crl_file: Option<Locator>,
     identity_source: Option<ClientCertIdentitySource>,
     tls_certificate_setting: &'static str,
     tls_configured: bool,
 }
 
-/// Turns one listener's client-certificate settings into a configuration, or
-/// into the reasons it is not one.
-///
-/// Every failure path returns `None` *and* records a problem, so a
-/// half-configured listener aborts startup rather than silently accepting
-/// anonymous connections on a listener an operator believes requires
-/// certificates.
+/// Offline validation supplies the presence of a required host locator.
+/// Environment compilation supplies its actual path. Both use the same
+/// checks, and only the latter can construct a loadable TLS configuration.
+impl<Locator> RawInboundClientAuth<Locator> {
+    fn validated_identity(
+        &self,
+        problems: &mut Vec<String>,
+    ) -> Option<(ClientCertRequirement, ClientCertIdentitySource)> {
+        let Self {
+            mode_setting,
+            ca_setting,
+            crl_setting,
+            tls_certificate_setting,
+            ..
+        } = self;
+        let Some(requirement) = self.mode.requirement() else {
+            // Material configured against a mode that will never read it is the
+            // shape that makes an operator believe mutual TLS is on.
+            for (setting, value) in [
+                (ca_setting, self.ca_file.is_some()),
+                (crl_setting, self.crl_file.is_some()),
+            ] {
+                if value {
+                    problems.push(format!(
+                        "{setting} is set while {mode_setting} is `off`; set {mode_setting} to `optional` or `required`, or unset {setting}"
+                    ));
+                }
+            }
+            return None;
+        };
+
+        let mut usable = true;
+        if !self.tls_configured {
+            problems.push(format!(
+                "{mode_setting} requires {tls_certificate_setting}; a listener that terminates no TLS never sees a client certificate"
+            ));
+            usable = false;
+        }
+        // Fail closed on the trust anchors. Falling back to the platform trust
+        // store here would mean any certificate any public CA has ever issued
+        // authenticates, which is never what configuring client certificates
+        // means.
+        if self.ca_file.is_none() {
+            problems.push(format!(
+                "{mode_setting} requires {ca_setting}; client certificates are verified only against an explicitly configured CA bundle, never the platform trust store"
+            ));
+            return None;
+        }
+        let Some(identity_source) = self.identity_source else {
+            problems.push(format!(
+                "{mode_setting} requires CLIENT_CERT_IDENTITY_SOURCE; the certificate field that carries a caller's identity is a deployment decision the gateway will not guess"
+            ));
+            return None;
+        };
+        if !usable {
+            return None;
+        }
+
+        Some((requirement, identity_source))
+    }
+}
+
 fn compose_inbound_client_auth(
-    raw: RawInboundClientAuth,
+    raw: RawInboundClientAuth<String>,
     problems: &mut Vec<String>,
 ) -> Option<InboundClientAuthConfig> {
-    let RawInboundClientAuth {
-        mode_setting,
-        mode,
-        ca_setting,
-        ca_file,
-        crl_setting,
-        crl_file,
-        identity_source,
-        tls_certificate_setting,
-        tls_configured,
-    } = raw;
-
-    let Some(requirement) = mode.requirement() else {
-        // Material configured against a mode that will never read it is the
-        // shape that makes an operator believe mutual TLS is on.
-        for (setting, value) in [(ca_setting, &ca_file), (crl_setting, &crl_file)] {
-            if value.is_some() {
-                problems.push(format!(
-                    "{setting} is set while {mode_setting} is `off`; set {mode_setting} to `optional` or `required`, or unset {setting}"
-                ));
-            }
-        }
-        return None;
-    };
-
-    let mut usable = true;
-    if !tls_configured {
-        problems.push(format!(
-            "{mode_setting} requires {tls_certificate_setting}; a listener that terminates no TLS never sees a client certificate"
-        ));
-        usable = false;
-    }
-    // Fail closed on the trust anchors. Falling back to the platform trust
-    // store here would mean any certificate any public CA has ever issued
-    // authenticates, which is never what configuring client certificates
-    // means.
-    let Some(ca_file) = ca_file else {
-        problems.push(format!(
-            "{mode_setting} requires {ca_setting}; client certificates are verified only against an explicitly configured CA bundle, never the platform trust store"
-        ));
-        return None;
-    };
-    let Some(identity_source) = identity_source else {
-        problems.push(format!(
-            "{mode_setting} requires CLIENT_CERT_IDENTITY_SOURCE; the certificate field that carries a caller's identity is a deployment decision the gateway will not guess"
-        ));
-        return None;
-    };
-    if !usable {
-        return None;
-    }
-
+    let (requirement, identity_source) = raw.validated_identity(problems)?;
     Some(InboundClientAuthConfig {
-        mode_setting,
+        mode_setting: raw.mode_setting,
         requirement,
-        ca_setting,
-        ca_file,
-        crl_setting,
-        crl_file,
+        ca_setting: raw.ca_setting,
+        ca_file: raw.ca_file?,
+        crl_setting: raw.crl_setting,
+        crl_file: raw.crl_file,
         identity_source,
     })
 }
