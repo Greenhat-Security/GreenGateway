@@ -87,7 +87,7 @@ impl CircuitBreaker {
         )
     }
 
-    fn new_with_clock(
+    pub(super) fn new_with_clock(
         pool_id: Arc<str>,
         endpoint_id: Arc<str>,
         config: config::UpstreamCircuitBreakerConfig,
@@ -407,29 +407,30 @@ impl Drop for CircuitPermit {
 }
 
 #[cfg(test)]
+pub(super) struct FakeClock(Mutex<Instant>);
+
+#[cfg(test)]
+impl FakeClock {
+    pub(super) fn new() -> Self {
+        Self(Mutex::new(Instant::now()))
+    }
+
+    pub(super) fn advance(&self, duration: Duration) {
+        let mut now = self.0.lock().expect("fake clock should not be poisoned");
+        *now += duration;
+    }
+}
+
+#[cfg(test)]
+impl CircuitClock for FakeClock {
+    fn now(&self) -> Instant {
+        *self.0.lock().expect("fake clock should not be poisoned")
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
-
-    struct FakeClock(Mutex<Instant>);
-
-    impl FakeClock {
-        fn new() -> Self {
-            Self(Mutex::new(Instant::now()))
-        }
-
-        fn advance(&self, duration: Duration) {
-            let mut now = self.0.lock().expect("fake clock should not be poisoned");
-            *now += duration;
-        }
-    }
-
-    impl CircuitClock for FakeClock {
-        fn now(&self) -> Instant {
-            *self.0.lock().expect("fake clock should not be poisoned")
-        }
-    }
 
     fn breaker(
         clock: Arc<FakeClock>,
