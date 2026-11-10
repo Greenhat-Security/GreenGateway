@@ -118,6 +118,52 @@ describe('PolicyStudioView', () => {
     expect(screen.queryByText('Stale answer.')).toBeNull();
   });
 
+  it('opens the selected rule, edits its time window and saves only the draft revision', async () => {
+    const gateway = fakeGateway();
+    renderStudio(gateway, '/policy/studio?rule_id=allow-billing');
+    await openDraft();
+    const condition = screen.getByRole('group', { name: 'Additional policy condition' });
+    expect(document.activeElement).toBe(condition);
+    expect(gateway.requests('POST', '/v1/admin/policy/drafts')).toHaveLength(0);
+    fireEvent.click(within(condition).getByRole('button', { name: 'Add time window condition' }));
+    fireEvent.change(within(condition).getByLabelText('Until (exclusive)'), {
+      target: { value: '2027-01-01T00:00:00Z' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+    await screen.findByText('Revision 2 saved. The live policy is unchanged.', undefined, WAIT);
+    const patch = gateway.requests('PATCH', `/v1/admin/policy/drafts/${DRAFT_ID}`)[0];
+    expect(patch.headers.get('If-Match')).toBe(draftEtag(DRAFT_ID, 1));
+    expect(JSON.parse(patch.body ?? '{}').policy.rules).toEqual([
+      { ...draftPolicy().rules[0], conditions: { time_window: { until: '2027-01-01T00:00:00Z' } } },
+    ]);
+    expect(gateway.live.etag).toBe(LIVE_ETAG);
+  });
+
+  it('reports when a selected rule is absent from the opened revision', async () => {
+    const gateway = fakeGateway();
+    renderStudio(gateway, '/policy/studio?rule_id=absent');
+    await openDraft();
+    expect(await screen.findByText('Rule could not be selected')).toBeTruthy();
+    expect(gateway.requests('PATCH', `/v1/admin/policy/drafts/${DRAFT_ID}`)).toHaveLength(0);
+  });
+
+  it('clears an uncommitted CIDR when opening another draft with the same rule', async () => {
+    const gateway = fakeGateway();
+    const first = gateway.drafts.get(DRAFT_ID)!;
+    const secondId = `pd_${'b'.repeat(32)}`;
+    first.policy.rules = [{
+      ...draftPolicy().rules[0], conditions: { source_network: { cidrs: ['192.0.2.0/24'] } },
+    }];
+    gateway.drafts.set(secondId, { ...first, policy: structuredClone(first.policy) });
+    renderStudio(gateway, '/policy/studio?rule_id=allow-billing');
+    await openDraft();
+    const input = screen.getByLabelText('Source networks') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '198.51.100.0/24' } });
+    fireEvent.click(screen.getByRole('button', { name: `Open draft ${secondId}` }));
+    await waitFor(() => expect((screen.getByLabelText('Source networks') as HTMLInputElement).value).toBe(''));
+    expect(gateway.requests('PATCH', `/v1/admin/policy/drafts/${secondId}`)).toHaveLength(0);
+  });
+
   it('saves under the draft ETag and offers explicit choices when the draft changed elsewhere', async () => {
     const gateway = fakeGateway();
     renderStudio(gateway);
@@ -831,10 +877,10 @@ function jsonResponse(
   });
 }
 
-function renderStudio(gateway: ReturnType<typeof fakeGateway>) {
+function renderStudio(gateway: ReturnType<typeof fakeGateway>, entry = '/policy/studio') {
   vi.stubGlobal('fetch', gateway.fetch);
   render(
-    <MemoryRouter initialEntries={['/policy/studio']}>
+    <MemoryRouter initialEntries={[entry]}>
       <Routes>
         <Route path="/policy/studio" element={<PolicyStudioView />} />
         <Route path="/rules" element={<p>Rulebase page</p>} />

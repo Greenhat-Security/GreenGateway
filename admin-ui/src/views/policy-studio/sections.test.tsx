@@ -157,6 +157,32 @@ describe('policy studio section editors', () => {
     });
   });
 
+  it('retains an empty network matcher until the operator explicitly removes the condition', () => {
+    const rule = { id: 'office', path: '/reports', action: 'deny' };
+    const latest = renderSection(RulesSection, { schema_version: '1.0.0', rules: [rule] });
+    fireEvent.click(screen.getByRole('button', { name: 'Add source network condition' }));
+    const input = screen.getByLabelText('Source networks');
+    fireEvent.change(input, { target: { value: '192.0.2.0/24' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(latest().rules).toEqual([
+      { ...rule, conditions: { source_network: { cidrs: ['192.0.2.0/24'] } } },
+    ]);
+    fireEvent.click(screen.getByRole('button', { name: 'Remove 192.0.2.0/24 from Source networks' }));
+    expect(latest().rules).toEqual([{ ...rule, conditions: { source_network: { cidrs: [] } } }]);
+    fireEvent.click(screen.getByRole('button', { name: 'Remove policy condition' }));
+    expect(latest().rules).toEqual([rule]);
+  });
+
+  it('exposes nested condition source without replacing the tree when another field changes', () => {
+    const conditions = { not: { any: [{ claim: { issuer: 'example', name: 'team', in: [true, 'true'] } }] } };
+    const rule = { id: 'nested', path: '/a', action: 'deny', conditions };
+    const latest = renderSection(RulesSection, { schema_version: '1.0.0', rules: [rule] });
+    expect(screen.getByText('View condition source')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Remove policy condition' })).toBeNull();
+    fireEvent.change(screen.getByLabelText('Path pattern'), { target: { value: '/b' } });
+    expect(latest().rules).toEqual([{ ...rule, path: '/b' }]);
+  });
+
   it('edits numbers as text, keeps text that is not a number for the gateway to judge, and drops an empty optional value', () => {
     const latest = renderSection(ToolsSection, {
       tools: { 'reports.export': { enabled: true, allowed_roles: [], timeout_ms: 1000 } },
@@ -191,7 +217,7 @@ describe('policy studio section editors', () => {
   it('shows the gateway diagnostics beside the field they point at', () => {
     renderSection(
       RulesSection,
-      { rules: [{ id: 'r', path: 'nope', methods: [], action: 'allow' }] },
+      { schema_version: '0.1.0', rules: [{ id: 'r', path: 'nope', methods: [], action: 'allow', conditions: {} }] },
       [
         {
           code: 'rule_path_invalid',
@@ -205,7 +231,7 @@ describe('policy studio section editors', () => {
         {
           code: 'rule_unknown_member',
           severity: 'warning',
-          pointer: '/rules/0/extra',
+          pointer: '/rules/0/conditions',
           message: 'Unknown member.',
           remediation: 'Remove it.',
           blocks: { simulation: false, tests: false, publication: false, evidence: true },

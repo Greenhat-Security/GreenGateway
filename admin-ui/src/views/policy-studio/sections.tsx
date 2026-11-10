@@ -539,6 +539,7 @@ export function RulesSection({
               'path',
               'tool_name',
               'principal',
+              ...(isPolicyV1(document) ? ['conditions'] : []),
               'action',
             ].map((member) => pointerTo('rules', index, member))}
             tools={
@@ -662,6 +663,17 @@ export function RulesSection({
               register={register}
               onChange={(next) => update({ ...rule, principal: next })}
             />
+            {isPolicyV1(document) ? (
+              <RuleConditionFields
+                key={ruleId || pointer}
+                value={rule.conditions}
+                pointer={pointerTo('rules', index, 'conditions')}
+                disabled={disabled}
+                diagnostics={diagnostics}
+                register={register}
+                onChange={(next) => update(withMember(rule, 'conditions', next))}
+              />
+            ) : null}
             <ChoiceField
               legend="Action"
               pointer={pointerTo('rules', index, 'action')}
@@ -695,6 +707,100 @@ export function RulesSection({
         </button>
       </div>
     </div>
+  );
+}
+
+function RuleConditionFields({
+  value, pointer, disabled, diagnostics, register, onChange,
+}: {
+  value: unknown;
+  pointer: string;
+  disabled: boolean;
+  diagnostics: readonly PolicyDiagnostic[];
+  register: FieldRegistrar;
+  onChange: (next: JsonObject | undefined) => void;
+}) {
+  const id = useId();
+  const root = isJsonObject(value) && Object.keys(value).length === 1 ? value : {};
+  const network = isJsonObject(root.source_network) ? root.source_network : null;
+  const timeWindow = isJsonObject(root.time_window) ? root.time_window : null;
+  const sourceNetworks =
+    network !== null && Array.isArray(network.cidrs) &&
+    network.cidrs.every((cidr): cidr is string => typeof cidr === 'string')
+      ? network.cidrs
+      : null;
+  const editableWindow = timeWindow !== null && [timeWindow.from, timeWindow.until]
+    .every((bound) => bound == null || typeof bound === 'string');
+  const networkPointer = `${pointer}/source_network/cidrs`;
+  const covered = sourceNetworks !== null ? [networkPointer]
+    : editableWindow ? [`${pointer}/time_window/from`, `${pointer}/time_window/until`] : [];
+  const problems = diagnosticsWithin(diagnostics, pointer).filter((diagnostic) =>
+    !covered.some((field) => diagnostic.pointer === field || diagnostic.pointer.startsWith(`${field}/`)),
+  );
+  function replaceCondition(button: HTMLButtonElement, next: JsonObject | undefined) {
+    // The activating button disappears. Keep focus at this rule's condition.
+    button.closest('fieldset')?.focus();
+    onChange(next);
+  }
+  return (
+    <fieldset className="rule-fieldset" ref={register(pointer)} tabIndex={-1}>
+      <legend>Additional policy condition</legend>
+      {value == null ? (
+        <>
+          <p className="rule-hint">This rule has no additional condition.</p>
+          <div className="form-actions">
+            <button type="button" className="secondary-button" disabled={disabled}
+              onClick={(event) => replaceCondition(event.currentTarget, { source_network: { cidrs: [] } })}>
+              Add source network condition
+            </button>
+            <button type="button" className="secondary-button" disabled={disabled}
+              onClick={(event) => replaceCondition(event.currentTarget, { time_window: {} })}>
+              Add time window condition
+            </button>
+          </div>
+        </>
+      ) : sourceNetworks !== null ? (
+        <TokenListField
+          label="Source networks"
+          pointer={networkPointer}
+          values={sourceNetworks}
+          placeholder="192.0.2.0/24"
+          emptyText="At least one CIDR is required"
+          disabled={disabled}
+          diagnostics={diagnostics}
+          register={register}
+          onChange={(cidrs) => onChange({ source_network: { ...network, cidrs } })}
+        />
+      ) : editableWindow ? (
+        <>
+          <p className="rule-hint">Set at least one UTC bound in RFC 3339 format.</p>
+          {(['from', 'until'] as const).map((bound) => (
+            <TextField
+              key={bound}
+              label={bound === 'from' ? 'From (inclusive)' : 'Until (exclusive)'}
+              pointer={`${pointer}/time_window/${bound}`}
+              value={typeof timeWindow[bound] === 'string' ? timeWindow[bound] : ''}
+              placeholder="2026-01-01T00:00:00Z"
+              disabled={disabled}
+              diagnostics={diagnostics}
+              register={register}
+              onChange={(text) => onChange({ time_window: withMember(timeWindow, bound, text || undefined) })}
+            />
+          ))}
+        </>
+      ) : (
+        <details className="rule-expression-box">
+          <summary>View condition source</summary>
+          <pre>{JSON.stringify(value, null, 2)}</pre>
+          <p className="rule-hint">Edit this condition in the Source tab at <code>{pointer}</code>.</p>
+        </details>
+      )}
+      {sourceNetworks !== null || editableWindow ? (
+        <button type="button" className="rule-danger-button" disabled={disabled}
+          onClick={(event) => replaceCondition(event.currentTarget, undefined)}>Remove policy condition</button>
+      ) : null}
+      <FieldProblems id={id} diagnostics={problems} />
+    </fieldset>
   );
 }
 

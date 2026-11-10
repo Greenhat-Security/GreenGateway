@@ -457,6 +457,7 @@ export function RuleTable() {
                     <td data-label="Condition">
                       <span className="rule-condition-summary">
                         {ruleCondition(row.rule)}
+                        {row.rule.conditions != null ? ' · Additional policy condition' : ''}
                       </span>
                     </td>
                     <td data-label="Action">
