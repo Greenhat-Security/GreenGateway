@@ -1754,6 +1754,11 @@ impl ToolExecutor {
                     tool_name: tool.name.clone(),
                 });
             }
+            if !self.authorize_mutation_target_path(&tool, &request, &target, context) {
+                return Err(ToolExecutorError::HttpRuleDenied {
+                    tool_name: tool.name.clone(),
+                });
+            }
             let caller =
                 context
                     .caller
@@ -1909,6 +1914,33 @@ impl ToolExecutor {
                 Err(error)
             }
         }
+    }
+
+    /// An approval also binds the upstream path after the Connection's base
+    /// path is applied. Either policy snapshot may refuse that destination.
+    fn authorize_mutation_target_path(
+        &self,
+        tool: &ToolDefinition,
+        request: &ToolUpstreamRequest,
+        target: &ConnectionHttpTarget,
+        context: &ToolInvocationContext,
+    ) -> bool {
+        let Ok(url) = url::Url::parse(target.url()) else {
+            return false;
+        };
+        let path = url.path();
+        path == request.path
+            || (self.runtime.authorize_http_operation(
+                &tool.name,
+                request.method.as_str(),
+                path,
+                context,
+            ) && self.runtime.authorize_http_operation_live(
+                &tool.name,
+                request.method.as_str(),
+                path,
+                context,
+            ))
     }
 
     fn apply_http_response_transform(
@@ -3204,6 +3236,7 @@ impl ToolExecutor {
                             &request.path,
                             context,
                         )
+                        && self.authorize_mutation_target_path(tool, &request, &target, context)
                         && (checked.recheck)().is_some()
                 };
                 if !check_current() {

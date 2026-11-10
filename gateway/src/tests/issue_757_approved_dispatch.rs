@@ -91,7 +91,7 @@ async fn mutation_approval_dispatch_sends_one_signed_https_request() {
     let db = TempDb::new("issue-757-dispatch");
     let token_db = TempDb::new("issue-757-dispatch-tokens");
     let tools = TempToolsFile::new(&empty_tools_document());
-    let policy = TempPolicyFile::new(&json!({
+    let mut policy_document = json!({
         "schema_version": "0.1.0", "id":"dispatch-policy", "default_action":"allow",
         "enforcement_mode":"enforce", "routes": [],
         "roles": {
@@ -100,7 +100,8 @@ async fn mutation_approval_dispatch_sends_one_signed_https_request() {
             "reviewer": {"permissions":[connections::permissions::ADMIN_MUTATION_APPROVAL_REVIEW]}
         },
         "tools": {"updateWidget":{"allowed_roles":["requester"],"timeout_ms":5000,"max_concurrent":2}}
-    }).to_string());
+    });
+    let policy = TempPolicyFile::new(&policy_document.to_string());
     let capture = audit::sink::tests::CaptureSink::new();
     let router = phase8_router(
         &Phase8Parts {
@@ -337,6 +338,77 @@ async fn mutation_approval_dispatch_sends_one_signed_https_request() {
             })
             .count()
             == 1
+    });
+    // The same reviewed action is still available when a new denial applies
+    // only to the Connection-prefixed destination, not the operation template.
+    let held = invocation.prepare().await;
+    invocation.approve(&held).await;
+    policy_document["rules"] = json!([{
+        "id":"deny-final-widget-path", "methods":["PUT"], "path":format!("{ATTESTED_BASE_PATH}/widgets/**"), "action":"deny"
+    }]);
+    let (headers, _) = call(
+        &router,
+        Method::GET,
+        POLICY_ADMIN_ROUTE,
+        &operator,
+        None,
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    let policy_etag = header_text(&headers, header::ETAG.as_str());
+    call(
+        &router,
+        Method::PUT,
+        POLICY_ADMIN_ROUTE,
+        &operator,
+        Some(&policy_etag),
+        Some(policy_document),
+        StatusCode::OK,
+    )
+    .await;
+    let (_, current_etag) = prepare_route(&router, &invocation.requester, "updateWidget").await;
+    call(
+        &router,
+        Method::POST,
+        &invocation.prepare,
+        &invocation.requester,
+        Some(&current_etag),
+        Some(invocation.body.clone()),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    invocation
+        .dispatch(
+            &held,
+            &invocation.requester,
+            &current_etag,
+            invocation.body.clone(),
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+    let (_, record) = call(
+        &router,
+        Method::GET,
+        &format!("/v1/admin/mutation-approvals/{held}"),
+        &invocation.requester,
+        None,
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(record["status"], "approved");
+    assert_eq!(stub.requests().len(), 1);
+    assert_eventually(std::time::Duration::from_secs(5), || {
+        capture
+            .events()
+            .iter()
+            .filter(|event| {
+                event.event_type == "authz.denied"
+                    && event.payload["matched_rule_id"] == "deny-final-widget-path"
+            })
+            .count()
+            >= 2
     });
     let audit = serde_json::to_string(&capture.events()).unwrap();
     for sensitive in [
