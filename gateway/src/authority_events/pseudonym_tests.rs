@@ -141,6 +141,11 @@ fn derivation_matches_the_documented_construction() {
             "resource.credential_binding",
             vec!["billing-api", "authentication"],
         ),
+        (
+            ReferenceDomain::MutationApproval,
+            "resource.mutation_approval",
+            vec!["00000000-0000-4000-8000-000000000001"],
+        ),
     ] {
         assert_eq!(
             keyring
