@@ -709,6 +709,52 @@ fn bundle_diff(base: &BundleView<'_>, candidate: &BundleView<'_>) -> SemanticDif
 }
 
 #[test]
+fn deployment_controls_use_the_compiler_risks_and_defaults_in_both_directions() {
+    let base = bundle(ResourceView::Undeclared);
+    let settings = json!({
+        "profile": "production", "authentication":{"enabled": false, "mode":"observe"},
+        "csrf":{"enabled":false}, "egress":{"deny_private_addresses":false},
+        "audit":{"durability":"best_effort"}
+    });
+    let document = serde_json::to_vec(
+        &json!({"apiVersion":API_VERSION_V1ALPHA1,"kind":"GatewayDeployment","spec":settings}),
+    )
+    .unwrap();
+    let candidate = BundleView {
+        deployment_canonical_json: &document,
+        ..base
+    };
+    assert_eq!(
+        risks(&bundle_diff(&base, &candidate)),
+        [
+            "risk.auth_disabled",
+            "risk.auth_observe_only",
+            "risk.cookie_or_csrf_weakened",
+            "risk.evidence_not_required",
+            "risk.private_egress_allowed"
+        ]
+    );
+    let reverse = bundle_diff(&candidate, &base);
+    assert_eq!(reverse.changes().len(), 5);
+    assert!(reverse
+        .changes()
+        .iter()
+        .all(|change| change.effect() == Effect::Tightened));
+
+    let mut mixed = settings;
+    mixed["authentication"]["unclassified"] = json!("withheld");
+    let document = serde_json::to_vec(
+        &json!({"apiVersion":API_VERSION_V1ALPHA1,"kind":"GatewayDeployment","spec":mixed}),
+    )
+    .unwrap();
+    let mixed = BundleView {
+        deployment_canonical_json: &document,
+        ..base
+    };
+    assert!(risks(&bundle_diff(&base, &mixed)).contains(&"risk.unknown_impact"));
+}
+
+#[test]
 fn bundle_settings_and_resource_sources_are_compared() {
     let policy = base_policy();
     let pinned = |sha256, document| ResourceView::Bundle { sha256, document };

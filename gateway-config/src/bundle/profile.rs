@@ -1,14 +1,17 @@
-//! The policy invariants a deployment profile enforces (ADR-0008,
+//! The invariants a deployment profile enforces (ADR-0008,
 //! "Initialization profiles").
 //!
 //! `production` requires a deny-by-default policy that enforces its
-//! decisions, with no role granting the `*` wildcard permission. `migration`
+//! decisions, with no role granting the `*` wildcard permission. It also
+//! requires enforced authentication, private address blocking, CSRF
+//! protection and durable audit delivery. `migration`
 //! permits each of those compatibility behaviors only when the deployment
 //! document lists its [`Compatibility`] code under
 //! `spec.compatibility.acknowledged`; an acknowledged behavior is then
 //! reported as a warning instead of an error, so every report still shows
 //! it. No other profile may acknowledge one (the deployment reader refuses
-//! the list there), and `development` adds no policy invariant.
+//! the list there). Development listeners are checked for loopback binds by
+//! the listener compiler.
 //!
 //! They apply to a policy the bundle supplies, once it has passed its
 //! published schema, so every member read here has its schema type. A policy
@@ -19,6 +22,7 @@
 use super::{
     diagnostic::{BundleDiagnostic, Code, Pointer},
     document::Profile,
+    settings::{at_setting, SettingValue, Settings},
     source::FileName,
     syntax::{Node, Value},
 };
@@ -32,6 +36,11 @@ pub(crate) enum Compatibility {
     PolicyDefaultAllow,
     PolicyShadowMode,
     WildcardRole,
+    AuthDisabled,
+    AuthObserveOnly,
+    PrivateEgressAllowed,
+    CsrfDisabled,
+    AuditBestEffort,
 }
 
 impl Compatibility {
@@ -40,6 +49,11 @@ impl Compatibility {
         Self::PolicyDefaultAllow,
         Self::PolicyShadowMode,
         Self::WildcardRole,
+        Self::AuthDisabled,
+        Self::AuthObserveOnly,
+        Self::PrivateEgressAllowed,
+        Self::CsrfDisabled,
+        Self::AuditBestEffort,
     ];
 
     /// Its code in `spec.compatibility.acknowledged`: the reason segment of
@@ -49,6 +63,11 @@ impl Compatibility {
             Self::PolicyDefaultAllow => "policy_default_allow",
             Self::PolicyShadowMode => "policy_shadow_mode",
             Self::WildcardRole => "wildcard_role",
+            Self::AuthDisabled => "auth_disabled",
+            Self::AuthObserveOnly => "auth_observe_only",
+            Self::PrivateEgressAllowed => "private_egress_allowed",
+            Self::CsrfDisabled => "csrf_disabled",
+            Self::AuditBestEffort => "audit_best_effort",
         }
     }
 
@@ -58,6 +77,11 @@ impl Compatibility {
             Self::PolicyDefaultAllow => Code::PolicyDefaultAllow,
             Self::PolicyShadowMode => Code::PolicyShadowMode,
             Self::WildcardRole => Code::PolicyWildcardRole,
+            Self::AuthDisabled => Code::AuthDisabled,
+            Self::AuthObserveOnly => Code::AuthObserveOnly,
+            Self::PrivateEgressAllowed => Code::PrivateEgressAllowed,
+            Self::CsrfDisabled => Code::CsrfDisabled,
+            Self::AuditBestEffort => Code::AuditBestEffort,
         }
     }
 }
@@ -70,14 +94,48 @@ pub(crate) struct ProfileRules {
 }
 
 impl ProfileRules {
-    /// Whether a breach reported as `code` is acknowledged: only a
-    /// `migration` document can acknowledge one.
-    fn acknowledges(&self, code: Code) -> bool {
-        self.profile == Profile::Migration
+    /// A migration acknowledgment downgrades only its own profile diagnostic.
+    fn diagnostic(&self, diagnostic: BundleDiagnostic) -> BundleDiagnostic {
+        if self.profile == Profile::Migration
             && self
                 .acknowledged
                 .iter()
-                .any(|behavior| behavior.code() == code)
+                .any(|behavior| behavior.code() == diagnostic.code)
+        {
+            diagnostic.warning()
+        } else {
+            diagnostic
+        }
+    }
+}
+
+/// Apply the profile to explicit deployment settings. Absent values take the
+/// catalog defaults, which enforce these controls. A development profile
+/// can relax these controls only on its loopback listeners.
+pub(crate) fn deployment(
+    rules: &ProfileRules,
+    settings: &Settings,
+    node: &Node,
+    file: &FileName,
+    diagnostics: &mut Vec<BundleDiagnostic>,
+) {
+    if rules.profile == Profile::Development {
+        return;
+    }
+    for setting in &settings.values {
+        use crate::compiler::{
+            AUDIT_DURABILITY, AUTH_ENABLED, AUTH_MODE, CSRF_ENABLED, EGRESS_DENY_PRIVATE_IPS,
+        };
+        let code = match (setting.field.environment, &setting.value) {
+            (AUTH_ENABLED, SettingValue::Boolean(false)) => Code::AuthDisabled,
+            (AUTH_MODE, SettingValue::Word("observe")) => Code::AuthObserveOnly,
+            (EGRESS_DENY_PRIVATE_IPS, SettingValue::Boolean(false)) => Code::PrivateEgressAllowed,
+            (CSRF_ENABLED, SettingValue::Boolean(false)) => Code::CsrfDisabled,
+            (AUDIT_DURABILITY, SettingValue::Word("best_effort")) => Code::AuditBestEffort,
+            _ => continue,
+        };
+        let path = setting.field.document_path().unwrap_or("/spec");
+        diagnostics.push(rules.diagnostic(at_setting(code, file, node, path.split('/').skip(1))));
     }
 }
 
@@ -94,11 +152,7 @@ pub(crate) fn policy(
     }
     let report = |diagnostics: &mut Vec<BundleDiagnostic>, code, pointer, node: &Node| {
         let diagnostic = BundleDiagnostic::at(code, file, pointer, Some(node.position));
-        diagnostics.push(if rules.acknowledges(code) {
-            diagnostic.warning()
-        } else {
-            diagnostic
-        });
+        diagnostics.push(rules.diagnostic(diagnostic));
     };
     let root = Pointer::root();
     for member in node.as_object().unwrap_or_default() {

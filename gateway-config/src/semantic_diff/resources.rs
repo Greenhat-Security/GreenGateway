@@ -329,9 +329,8 @@ pub fn compare_bundles(
         Some(base.deployment_sha256),
         Some(candidate.deployment_sha256),
     );
-    // The deployment document holds only the profile in this alpha. A
-    // member the field catalog adds later is still compared: until a
-    // detector exists for it, its change is `unknown`.
+    // Settings with a detector contribute their own risks. Unclassified
+    // members still contribute unknown impact when their contents change.
     let rest = |canonical: &[u8]| -> Option<Value> {
         let mut document: Value = serde_json::from_slice(canonical).ok()?;
         document.get_mut("spec")?.as_object_mut()?.remove("profile");
@@ -341,7 +340,14 @@ pub fn compare_bundles(
         rest(base.deployment_canonical_json),
         rest(candidate.deployment_canonical_json),
     ) {
-        (Some(base), Some(candidate)) => base != candidate,
+        (Some(mut base), Some(mut candidate)) => {
+            crate::compiler::semantic_diff::compare_profile_settings(
+                comparison,
+                &mut base,
+                &mut candidate,
+            );
+            base != candidate
+        }
         _ => base.deployment_canonical_json != candidate.deployment_canonical_json,
     };
     if rest_differs {

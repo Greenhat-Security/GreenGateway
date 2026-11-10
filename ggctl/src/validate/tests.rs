@@ -402,6 +402,82 @@ fn validate_and_doctor_run_the_egress_compiler_on_a_bundle() {
 }
 
 #[test]
+fn validate_and_doctor_enforce_each_deployment_profile_control() {
+    let fixture = Fixture::valid();
+    let controls = [
+        ("auth_disabled", "/spec/authentication/enabled"),
+        ("auth_observe_only", "/spec/authentication/mode"),
+        (
+            "private_egress_allowed",
+            "/spec/egress/deny_private_addresses",
+        ),
+        ("csrf_disabled", "/spec/csrf/enabled"),
+        ("audit_best_effort", "/spec/audit/durability"),
+    ];
+    let all: Vec<_> = controls.iter().map(|(code, _)| *code).collect();
+    for (profile, acknowledged) in [
+        ("production", &[][..]),
+        ("migration", &[][..]),
+        ("migration", &all[..1]),
+        ("migration", all.as_slice()),
+        ("development", &[][..]),
+    ] {
+        let mut spec = json!({
+            "profile": profile,
+            "authentication": {"enabled": false, "mode": "observe"},
+            "egress": {"deny_private_addresses": false},
+            "csrf": {"enabled": false},
+            "audit": {"durability": "best_effort"}
+        });
+        if !acknowledged.is_empty() {
+            spec["compatibility"] = json!({"acknowledged": acknowledged});
+        }
+        fixture.write(
+            "deployment.yaml",
+            &json!({
+                "apiVersion": "greengateway.dev/v1alpha1", "kind": "GatewayDeployment", "spec":spec
+            })
+            .to_string(),
+        );
+        fixture.pin_policy_version("0.1.0");
+        for command in ["validate", "doctor"] {
+            let (exit, captured) = run(&[command, fixture.path(), "--format", "json"]);
+            let expected_exit = if profile == "development" || acknowledged.len() == all.len() {
+                Exit::Success
+            } else {
+                Exit::Invalid
+            };
+            assert_eq!(
+                exit,
+                expected_exit,
+                "{command} {profile}: {}",
+                captured.stdout()
+            );
+            let result = report(&captured);
+            let diagnostics = result["diagnostics"].as_array().expect("diagnostics");
+            for (name, path) in controls {
+                let code = format!("profile.{name}");
+                let found = diagnostics.iter().find(|item| item["code"] == code);
+                if profile == "development" {
+                    assert!(found.is_none(), "{code}");
+                } else {
+                    let finding = found.unwrap_or_else(|| panic!("missing {code}: {result}"));
+                    assert_eq!(finding["location"]["pointer"], path, "{finding}");
+                    assert_eq!(
+                        finding["severity"],
+                        if acknowledged.contains(&name) {
+                            "warning"
+                        } else {
+                            "error"
+                        }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn validate_and_doctor_check_listener_bindings_and_tls_intent_offline() {
     let fixture = Fixture::valid();
     let write = |profile: &str, listeners: Value| {

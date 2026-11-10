@@ -167,7 +167,12 @@ impl Stage {
             | Code::SourceUnsupported
             | Code::Unresolved => Self::References,
             Code::ResourceUnknownMember | Code::ResourceInvalid => Self::Resources,
-            Code::DevelopmentListenerNotLoopback
+            Code::AuthDisabled
+            | Code::AuthObserveOnly
+            | Code::PrivateEgressAllowed
+            | Code::CsrfDisabled
+            | Code::AuditBestEffort
+            | Code::DevelopmentListenerNotLoopback
             | Code::PolicyDefaultAllow
             | Code::PolicyShadowMode
             | Code::PolicyWildcardRole => Self::Profile,

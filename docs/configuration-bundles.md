@@ -224,9 +224,9 @@ without repeating the value:
   keeps them beside the provider's name rather than in a provider. The client
   secret takes a secret reference.
 - **`compatibility.acknowledged`** names the compatibility behaviors a
-  `migration` document keeps, each once: `policy_default_allow`,
-  `policy_shadow_mode` and `wildcard_role` (`schema.invalid_value` for another
-  word or a repeat), canonicalized into that order. Any other profile that
+  `migration` document keeps. The [generated field reference](#speccompatibility)
+  lists the accepted words in canonical order. Unknown or repeated words
+  produce `schema.invalid_value`. Any other profile that
   acknowledges one is refused (`schema.not_applicable`); see
   [deployment profiles](#deployment-profiles).
 - **`state.stores`** names the standalone stores a deployment keeps beneath its
@@ -622,7 +622,7 @@ The compatibility behaviors a migration document acknowledges.
 
 | Member | Value | Default | Environment mode |
 | --- | --- | --- | --- |
-| `compatibility.acknowledged` | array of distinct `policy_default_allow`, `policy_shadow_mode` and `wildcard_role` | unset | none: environment mode has no profile |
+| `compatibility.acknowledged` | array of distinct `policy_default_allow`, `policy_shadow_mode`, `wildcard_role`, `auth_disabled`, `auth_observe_only`, `private_egress_allowed`, `csrf_disabled` and `audit_best_effort` | unset | none: environment mode has no profile |
 
 #### Authentication provider
 
@@ -858,7 +858,7 @@ once it has passed its schema:
 | Profile | Policy invariants |
 | --- | --- |
 | `production` | Deny by default (`profile.policy_default_allow` for `default_action: allow`), enforce mode (`profile.policy_shadow_mode` for `enforcement_mode: shadow` at the top level or on any route), and no role granting the `*` wildcard permission (`profile.wildcard_role`). |
-| `migration` | The production invariants, except that each behavior the deployment document lists under `compatibility.acknowledged` (`policy_default_allow`, `policy_shadow_mode`, `wildcard_role`) is reported as a warning with the same code instead of an error, so the bundle is read and every report still shows it. A behavior it does not acknowledge is an error, as in `production`. |
+| `migration` | Every production invariant applies. An exact entry in `compatibility.acknowledged` changes its own diagnostic to a warning. |
 | `development` | None. |
 
 An absent `default_action` is `deny` and an absent `enforcement_mode` is
@@ -867,10 +867,16 @@ role is reported at `/roles` and the line of its `*`, never by name. A policy le
 to the server's store (`source: server`) is not checked by the reader. The
 development profile also requires every enabled listener to bind a loopback
 IP address. Its public listener defaults to `127.0.0.1:8080`, including for
-older bundles with no explicit public address. The profiles' other invariants
-(authentication, private egress, CSRF and audit durability) concern deployment settings. Enforcing those profile
-requirements is a later #242 slice. A `production` document that turns
-authentication off still passes this reader, and gateway bundle startup is pending.
+older bundles with no explicit public address.
+
+Production also requires enabled authentication in `required` mode, private
+address blocking for egress, CSRF protection, and required audit durability.
+The catalog defaults satisfy each requirement. Each explicit relaxation has
+its own diagnostic and migration acknowledgment. For example,
+acknowledging `auth_observe_only` leaves `auth_disabled` an error. Bundle
+diffs and revision plans use the same risk codes as the environment compiler
+for these five settings. Host credential checks and gateway bundle startup
+are still tracked in #242.
 
 ## Generated bundles
 
@@ -1306,3 +1312,8 @@ can appear in one. A published code never changes meaning.
 | `profile.policy_default_allow` | The profile requires a deny-by-default policy. |
 | `profile.policy_shadow_mode` | The profile requires the policy to enforce its decisions, not shadow them. |
 | `profile.wildcard_role` | The profile forbids a role that grants every permission. |
+| `profile.auth_disabled` | The profile requires authentication to be enabled. |
+| `profile.auth_observe_only` | The profile requires authentication to reject failed credentials. |
+| `profile.private_egress_allowed` | The profile requires private address blocking for egress. |
+| `profile.csrf_disabled` | The profile requires CSRF protection. |
+| `profile.audit_best_effort` | The profile requires durable audit delivery. |
