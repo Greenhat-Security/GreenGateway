@@ -5263,9 +5263,9 @@ mod tests {
                 error,
                 PostgresFoundationError::SchemaNotReady {
                     applied: 24,
-                    missing: 9,
+                    missing: actual_missing,
                     auto_migrate: false
-                }
+                } if actual_missing == missing
             ),
             "{error}"
         );
