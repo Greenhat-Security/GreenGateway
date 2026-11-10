@@ -117,7 +117,6 @@ fn sign_as(key: &AssertionSigningKey, subject: &str) -> String {
         "req-issue-463",
         1_757_000_000,
         None,
-        None,
     )
     .expect("signs")
 }

@@ -53,7 +53,7 @@
 //! no private parameter can reach it whatever the key carried.
 //!
 //! This module signs and refuses. It does not decide who may call an operation or whether a mutation
-//! was approved; policy and the approval store run before anything here is asked for a token.
+//! was approved. Approval-bound requests are refused until a trusted decision authority exists.
 
 use std::{
     collections::{btree_map::Entry, BTreeMap},
@@ -576,7 +576,7 @@ pub struct CallerAssertionConfig<'a> {
     pub claims: &'a [PrincipalClaim],
     /// Include the method, path and a digest of the body actually sent.
     pub bind_request: bool,
-    /// Require, and include, the approval that authorised a mutation.
+    /// Require a verified mutation approval. The signer currently refuses this setting.
     pub bind_approval: bool,
 }
 
@@ -701,7 +701,7 @@ fn caller_issuer_is_scopeable(issuer: &str) -> bool {
 
 /// The request being attested, when `bind_request` is on.
 pub struct RequestBinding<'a> {
-    pub method: &'a str,
+    pub method: &'a http::Method,
     pub path: &'a str,
     /// The exact bytes being sent upstream.
     pub body: &'a [u8],
@@ -738,7 +738,6 @@ struct AssertionClaims<'a> {
 ///
 /// `request_id` becomes `jti`, so it must be the identifier this call is already known by elsewhere:
 /// that is what lets an upstream deduplicate a retry and lets an operator join the two audit trails.
-#[allow(clippy::too_many_arguments)]
 pub fn sign_caller_assertion(
     key: &AssertionSigningKey,
     config: &CallerAssertionConfig<'_>,
@@ -746,8 +745,12 @@ pub fn sign_caller_assertion(
     request_id: &str,
     issued_at: u64,
     binding: Option<&RequestBinding<'_>>,
-    approval_id: Option<&str>,
 ) -> Result<String, CallerAssertionError> {
+    // An approval ID is only a lookup key. A future authority must verify and consume
+    // the decision for this action before the signer can attest it.
+    if config.bind_approval {
+        return Err(CallerAssertionError::ApprovalRequired);
+    }
     // A Connection configured to attest its caller must never fall back to acting anonymously: that
     // would silently hand the upstream a request it cannot attribute, which is the failure this
     // whole mechanism exists to prevent.
@@ -822,31 +825,18 @@ pub fn sign_caller_assertion(
 
     if config.bind_request {
         let binding = binding.ok_or(CallerAssertionError::InvalidClaim("request_binding"))?;
-        if !is_printable_claim(binding.method, 16) {
+        let method = binding.method.as_str();
+        if method.len() > 16 {
             return Err(CallerAssertionError::InvalidClaim("method"));
         }
         if !is_printable_claim(binding.path, 2048) {
             return Err(CallerAssertionError::InvalidClaim("path"));
         }
-        extra.insert(
-            "method".to_owned(),
-            Value::String(binding.method.to_ascii_uppercase()),
-        );
+        extra.insert("method".to_owned(), Value::String(method.to_owned()));
         extra.insert("path".to_owned(), Value::String(binding.path.to_owned()));
         extra.insert(
             "request_sha256".to_owned(),
             Value::String(body_digest(binding.body)),
-        );
-    }
-
-    if config.bind_approval {
-        let approval_id = approval_id.ok_or(CallerAssertionError::ApprovalRequired)?;
-        if !is_printable_claim(approval_id, 128) {
-            return Err(CallerAssertionError::InvalidClaim("approval_id"));
-        }
-        extra.insert(
-            "approval_id".to_owned(),
-            Value::String(approval_id.to_owned()),
         );
     }
 

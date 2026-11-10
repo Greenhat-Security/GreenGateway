@@ -124,6 +124,7 @@ struct CallerAssertionBinding {
     lifetime_seconds: u64,
     claims: Vec<PrincipalClaim>,
     bind_request: bool,
+    bind_approval: bool,
     /// Whether the assertion goes upstream as `header_name`. A
     /// `delegated_issuer_token` Connection sends it only to its issuer, as the
     /// subject token: the upstream there is a third party that receives the
@@ -155,6 +156,7 @@ impl CallerAssertionBinding {
             lifetime_seconds: u64::from(settings.lifetime_seconds),
             claims: settings.claims.iter().copied().map(Into::into).collect(),
             bind_request: settings.bind_request,
+            bind_approval: settings.bind_approval,
             signs_upstream: true,
             configuration,
         })
@@ -256,11 +258,7 @@ fn sign_bound_request(
     method: &Method,
     body: &[u8],
 ) -> Result<SignedCallerAssertion, CallerAssertionError> {
-    let request_binding = request_target.map(|path| RequestBinding {
-        method: method.as_str(),
-        path,
-        body,
-    });
+    let request_binding = request_target.map(|path| RequestBinding { method, path, body });
     let config = CallerAssertionConfig {
         issuer: &binding.issuer,
         audience: &binding.audience,
@@ -268,9 +266,7 @@ fn sign_bound_request(
         lifetime_seconds: binding.lifetime_seconds,
         claims: &binding.claims,
         bind_request: binding.bind_request,
-        // Validation refuses `bind_approval` on every Connection this
-        // target can be built for.
-        bind_approval: false,
+        bind_approval: binding.bind_approval,
     };
     let token = sign_caller_assertion(
         key,
@@ -279,7 +275,6 @@ fn sign_bound_request(
         jti,
         unix_now()?,
         request_binding.as_ref(),
-        None,
     )?;
     let mut value =
         HeaderValue::from_str(&token).map_err(|_| CallerAssertionError::SignatureFailed)?;
