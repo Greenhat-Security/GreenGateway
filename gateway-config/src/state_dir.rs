@@ -187,6 +187,8 @@ pub enum StateDirError {
     /// `3`: the lock file is a link, a reparse point or not a regular file,
     /// or on Unix is writable by group or other.
     UnsafeLockFile,
+    /// `3`: the chosen state directory is inside the read-only bundle.
+    InsideBundle,
     /// `5`: another handle, in this process or another, holds the lock.
     Locked,
     /// `3`: the platform or filesystem cannot take the lock, so exclusive
@@ -206,6 +208,7 @@ impl StateDirError {
             Self::Link => "state_dir.link",
             Self::UnsafePermissions => "state_dir.unsafe_permissions",
             Self::UnsafeLockFile => "state_dir.unsafe_lock_file",
+            Self::InsideBundle => "state_dir.inside_bundle",
             Self::Locked => "state_dir.locked",
             Self::LockUnsupported => "state_dir.lock_unsupported",
             Self::Unavailable { .. } => "state_dir.unavailable",
@@ -230,6 +233,7 @@ impl fmt::Display for StateDirError {
             Self::Locked => formatter.write_str(
                 "another process, or another handle in this one, holds the state directory's lock",
             ),
+            Self::InsideBundle => formatter.write_str("the state directory must be outside the selected bundle"),
             Self::LockUnsupported => formatter.write_str(
                 "the state directory's filesystem cannot take an exclusive lock",
             ),
@@ -255,7 +259,8 @@ pub struct StateDirectory {
 
 /// The lock and the directory it was taken on.
 struct Held {
-    /// The directory, absolute, as the caller named it.
+    /// The directory, absolute. Native bundle preflight records the
+    /// canonical location for its fixed store files.
     path: PathBuf,
     /// The open, locked lock file. Closing it releases the lock.
     lock: fs::File,
@@ -283,9 +288,43 @@ impl StateDirectory {
     /// the lock file if it does not exist. Never waits: a lock someone else
     /// holds is [`StateDirError::Locked`].
     pub fn acquire(path: &Path) -> Result<Self, StateDirError> {
+        Self::acquire_with_bundle(path, None)
+    }
+
+    /// Acquire the native gateway's standalone directory, checking the
+    /// read-only bundle boundary before creating a lock file.
+    pub fn acquire_for_bundle(path: &Path, bundle: &Path) -> Result<Self, StateDirError> {
+        Self::acquire_with_bundle(path, Some(bundle))
+    }
+
+    fn acquire_with_bundle(path: &Path, bundle: Option<&Path>) -> Result<Self, StateDirError> {
         let path = std::path::absolute(path).map_err(|_| StateDirError::Missing)?;
         check_directory(&path)?;
-        let directory = open_directory(&path)?;
+        let (directory, canonical) = open_directory(&path)?;
+        let path = if let Some(bundle) = bundle {
+            let unavailable = |_| StateDirError::Unavailable {
+                operation: "bundle boundary check",
+            };
+            let bundle = fs::canonicalize(bundle).map_err(unavailable)?;
+            if canonical.starts_with(&bundle) {
+                return Err(StateDirError::InsideBundle);
+            }
+            // A mount alias can give the very same directory a different
+            // path. Compare the directory handles before the first write.
+            let mounted = Dir::open_ambient_dir(bundle, ambient_authority())
+                .and_then(|dir| dir.dir_metadata())
+                .map_err(unavailable)?;
+            let selected = directory.dir_metadata().map_err(unavailable)?;
+            use cap_fs_ext::MetadataExt;
+            if (mounted.dev(), mounted.ino()) == (selected.dev(), selected.ino()) {
+                return Err(StateDirError::InsideBundle);
+            }
+            // Fixed store locators must not resolve through an alias in an
+            // ancestor a second time after this directory has been admitted.
+            canonical
+        } else {
+            path
+        };
         let lock = open_lock_file(&directory)?;
         match lock.try_lock() {
             Ok(()) => {}
@@ -350,7 +389,7 @@ fn admit_directory(metadata: &fs::Metadata) -> Result<(), StateDirError> {
 /// Opens the admitted directory without following a link at its last
 /// component, and checks the open handle again: an entry swapped in since
 /// the check by path is refused rather than locked.
-fn open_directory(path: &Path) -> Result<Dir, StateDirError> {
+fn open_directory(path: &Path) -> Result<(Dir, PathBuf), StateDirError> {
     let unavailable = || StateDirError::Unavailable {
         operation: "directory open",
     };
@@ -369,7 +408,7 @@ fn open_directory(path: &Path) -> Result<Dir, StateDirError> {
         .and_then(|directory| directory.into_std_file().metadata())
         .map_err(|_| unavailable())?;
     admit_directory(&metadata)?;
-    Ok(directory)
+    Ok((directory, canonical))
 }
 
 /// Opens or creates the lock file beneath `directory`, without following a

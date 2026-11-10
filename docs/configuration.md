@@ -22,7 +22,7 @@ Default: unset.
 
 ### GATEWAY_STATE_DIR
 
-Standalone state directory. Ledger mode requires it. Native bundle startup requires it when the deployment enables standalone stores and refuses it otherwise. Environment mode refuses any assignment. A supplied path must be non-empty.
+Standalone state directory. Ledger mode requires it. Native bundle startup requires an existing directory when the deployment enables standalone stores and refuses the locator otherwise. Preflight locks the directory while binding the fixed store filenames. Environment mode refuses any assignment. A supplied path must be non-empty.
 
 Default: unset.
 

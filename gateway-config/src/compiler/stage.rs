@@ -102,6 +102,8 @@ pub enum Source {
     Bundle,
     /// The selected bundle profile supplied its default.
     Profile,
+    /// A validated host bootstrap locator supplied this setting.
+    Bootstrap,
 }
 
 /// The provenance of one setting: its name and its source, never its value.

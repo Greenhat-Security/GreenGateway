@@ -570,6 +570,7 @@ pub(crate) fn state_dir_code(error: &StateDirError) -> Code {
         StateDirError::Link => Code::StateDirLink,
         StateDirError::UnsafePermissions => Code::StateDirUnsafePermissions,
         StateDirError::UnsafeLockFile => Code::StateDirUnsafeLockFile,
+        StateDirError::InsideBundle => Code::StateDirInsideBundle,
         StateDirError::Locked => Code::StateDirLocked,
         StateDirError::LockUnsupported => Code::StateDirLockUnsupported,
         StateDirError::Unavailable { .. } => Code::StateDirUnavailable,

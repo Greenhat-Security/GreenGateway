@@ -374,6 +374,112 @@ impl Contender {
 }
 
 #[test]
+fn a_bundle_state_lock_cannot_write_inside_the_selected_bundle() {
+    let mount = TempDir::new("mounted");
+    let child = mount.path().join("generation");
+    fs::create_dir(&child).unwrap();
+    #[cfg(unix)]
+    set_mode(&child, 0o700);
+    for path in [mount.path(), &child] {
+        assert_eq!(
+            refusal(StateDirectory::acquire_for_bundle(path, mount.path())),
+            StateDirError::InsideBundle
+        );
+        assert!(!path.join(LOCK_FILE_NAME).exists());
+    }
+    let state = TempDir::new("separate");
+    let held = StateDirectory::acquire_for_bundle(state.path(), mount.path()).unwrap();
+    assert_eq!(held.path(), fs::canonicalize(state.path()).unwrap());
+}
+
+#[test]
+fn compiled_bundle_store_paths_hold_the_lock_until_the_plan_is_dropped() {
+    use crate::bundle::{
+        read_bundle_files, sha256_pin, FileName, ProductionValidators, ReadOptions,
+    };
+    use crate::compiler::stage::Source;
+
+    let state = TempDir::new("bundle-store-plan");
+    let bundle = |extra: &str| {
+        let deployment = format!(
+            "apiVersion: greengateway.dev/v1alpha1\nkind: GatewayDeployment\nspec:\n  profile: development\n  state:\n    stores: [audit, discovery, principals, connections, service_tokens]\n{extra}"
+        );
+        let manifest = format!(
+            "apiVersion: greengateway.dev/v1alpha1\nkind: GatewayBundle\nmetadata:\n  name: stores\nspec:\n  deployment:\n    path: deployment.yaml\n    sha256: \"{}\"\n",
+            sha256_pin(deployment.as_bytes())
+        );
+        let files = [
+            (FileName::manifest(), manifest.into_bytes()),
+            (FileName::fixed("deployment.yaml"), deployment.into_bytes()),
+        ]
+        .into_iter()
+        .collect();
+        read_bundle_files(files, ReadOptions::default(), &ProductionValidators)
+            .bundle
+            .unwrap()
+    };
+    let valid = bundle("");
+    assert!(valid.deployment.offline_plan().is_none());
+    let bound = valid
+        .bind_standalone_stores(acquire(state.path()).unwrap())
+        .unwrap()
+        .unwrap();
+    let plan = bound.plan();
+    assert!(!format!("{bound:?}").contains(CANARY));
+    for (file, path) in [
+        (StateFile::Audit, &plan.storage.audit_sqlite_path),
+        (StateFile::Discovery, &plan.storage.discovery_sqlite_path),
+        (StateFile::Principals, &plan.storage.principal_sqlite_path),
+        (
+            StateFile::Connections,
+            &plan.connections.connections_sqlite_path,
+        ),
+        (
+            StateFile::ServiceTokens,
+            &plan.identity.service_token_sqlite_path,
+        ),
+    ] {
+        assert_eq!(
+            path.as_deref().map(Path::new),
+            Some(bound.directory().file(file).as_path())
+        );
+        assert!(!bound.directory().file(file).exists());
+    }
+    let bootstrap: BTreeSet<_> = plan
+        .provenance()
+        .into_iter()
+        .filter(|field| field.source == Source::Bootstrap)
+        .map(|field| field.setting)
+        .collect();
+    let expected: BTreeSet<_> = crate::bundle::STANDALONE_STORES
+        .iter()
+        .map(|store| store.environment().unwrap())
+        .collect();
+    assert_eq!(bootstrap, expected);
+    let mut other = Contender::start(state.path(), false);
+    assert_eq!(other.verdict(), "state_dir.locked");
+    other.finish();
+    drop(bound);
+
+    let refused = bundle("  trusted_proxies:\n    trust_headers: true\n");
+    let Err(issues) = refused.bind_standalone_stores(acquire(state.path()).unwrap()) else {
+        panic!("missing trusted proxy networks must refuse the bound plan");
+    };
+    assert!(issues
+        .iter()
+        .any(|issue| issue.pointer.to_string() == "/spec/trusted_proxies/cidrs"));
+    assert!(!format!("{issues:?}").contains(CANARY));
+    let pending = bundle("  upstream:\n    url: {\"secret\":\"pending\"}\n");
+    assert!(pending
+        .bind_standalone_stores(acquire(state.path()).unwrap())
+        .unwrap()
+        .is_none());
+    let mut other = Contender::start(state.path(), false);
+    assert_eq!(other.verdict(), "acquired");
+    other.finish();
+}
+
+#[test]
 fn another_process_is_refused_while_this_one_holds_the_lock() {
     let state = TempDir::new("two-processes");
     let held = acquire(state.path()).expect("this process wins");
@@ -573,13 +679,14 @@ fn windows_symbolic_links_are_refused() {
 
 // --- errors ---------------------------------------------------------------------
 
-fn all_errors() -> [StateDirError; 8] {
+fn all_errors() -> [StateDirError; 9] {
     [
         StateDirError::Missing,
         StateDirError::NotDirectory,
         StateDirError::Link,
         StateDirError::UnsafePermissions,
         StateDirError::UnsafeLockFile,
+        StateDirError::InsideBundle,
         StateDirError::Locked,
         StateDirError::LockUnsupported,
         StateDirError::Unavailable {
@@ -599,6 +706,7 @@ fn errors_are_value_free_and_stable() {
             "state_dir.link",
             "state_dir.unsafe_permissions",
             "state_dir.unsafe_lock_file",
+            "state_dir.inside_bundle",
             "state_dir.locked",
             "state_dir.lock_unsupported",
             "state_dir.unavailable",

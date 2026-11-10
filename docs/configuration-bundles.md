@@ -11,9 +11,11 @@ Gateway startup currently uses [environment configuration](configuration.md).
 When native startup selects bundle mode, it checks for competing environment
 settings before reading the mount. It verifies the bundle's pins and documents
 with the same reader as `ggctl validate`. It then requires `GATEWAY_STATE_DIR`
-exactly when the deployment enables standalone stores. Serving from a bundle
-or ledger remains unavailable. A valid bundle reaches `source.mode_unavailable`
-before any state directory, store or listener opens.
+exactly when the deployment enables standalone stores. With those stores
+enabled, it locks the existing state directory and compiles their fixed
+filenames. This may create its empty lock file. Bundle and ledger activation
+remain unavailable, so native startup releases the lock before exiting and
+opens no database or listener.
 
 The design this follows is
 [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md) (setup, operator
@@ -1161,18 +1163,14 @@ this limit before it builds the typed settings.
 
 ## The state directory
 
-**Not yet selectable.** In bundle mode with standalone stores, and in ledger
-mode, a standalone deployment will keep every local store beneath one
-directory, `GATEWAY_STATE_DIR`, under the fixed names below
-([ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md#bundle-mode)). Those
-modes replace each store's environment variable with its fixed name, so they
-will refuse the variable. Environment mode rejects `GATEWAY_STATE_DIR` and
-uses each store's configured path. The layout, the
-admission rules and the lock are the shared `gateway-config` library's
-`state_dir` module, which the gateway and `ggctl` both use. Today the revision
-ledger, the `ggctl ledger` commands over it, and `ggctl backup create` and
-`ggctl backup restore` ([standalone backups](standalone-backup.md)) are the only
-things that open through it.
+In native bundle preflight the operator supplies an existing
+`GATEWAY_STATE_DIR` for the declared standalone stores. The gateway takes its
+exclusive lock and compiles the fixed filenames below using the verified
+deployment bytes. The compiled plan owns the lock. Any refusal or outstanding
+host binding releases it. Offline bundle validation has no state-directory
+input and opens no lock. Environment mode uses each store's configured path.
+The revision ledger and the [standalone backup commands](standalone-backup.md)
+use the same admission and locking rules.
 
 | File | Store | Environment-mode variable |
 | --- | --- | --- |
@@ -1240,6 +1238,7 @@ of a local disk:
 | `state_dir.link` | The path is a symbolic link, junction or reparse point. | 3 |
 | `state_dir.unsafe_permissions` | On Unix, the directory is writable by group or other. | 3 |
 | `state_dir.unsafe_lock_file` | `state.lock` is a link, not a regular file, or on Unix writable by group or other. | 3 |
+| `state_dir.inside_bundle` | The standalone state directory is the selected bundle directory or lies beneath it. | 3 |
 | `state_dir.locked` | Another process, or another handle in this one, holds the lock. | 5 |
 | `state_dir.lock_unsupported` | The filesystem cannot take the lock, so exclusive use cannot be promised. | 3 |
 | `state_dir.unavailable` | The directory or the lock file could not be inspected, opened or locked. | 1 |

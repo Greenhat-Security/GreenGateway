@@ -846,6 +846,7 @@ The [state directory](configuration-bundles.md#the-state-directory)'s own codes,
 | `state_dir.link` | 3 | `--state-dir` names a symbolic link, junction or reparse point. Name the directory itself. |
 | `state_dir.unsafe_permissions` | 3 | The state directory is writable by group or other (Unix), who could replace a store. |
 | `state_dir.unsafe_lock_file` | 3 | `state.lock` is a link, not a regular file, or writable by group or other (Unix). |
+| `state_dir.inside_bundle` | 3 | Native bundle startup requires a state directory outside its read-only bundle. |
 | `state_dir.locked` | 5 | A gateway or another `ggctl` holds the state directory's lock. Stop the gateway first; `ggctl` never waits. |
 | `state_dir.lock_unsupported` | 3 | The filesystem cannot take an exclusive lock, so exclusive use cannot be promised. Network filesystems are unsupported. |
 | `state_dir.unavailable` | 1 | The state directory or its lock file could not be inspected, opened or locked. |

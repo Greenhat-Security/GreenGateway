@@ -6857,9 +6857,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::run#1",
-      "sha256": "456f7296a30f1ae15eec1510878f43bacebc8f16a810c106b685353c2d6884f7",
+      "sha256": "05d6a8ea38b7acb71094fa93e1b00a2cb63c49adf81b83f6aed1aa2a00783d06",
       "owner": "GreenGateway maintainers",
-      "purpose": "The native entry point reports value-free environment or mounted bundle diagnostics and exits before activation. It opens no listener or client."
+      "purpose": "The native entry point reports value-free configuration, bundle and state-directory failures to the operator and exits before activation. It opens no listener or client."
     },
     {
       "file": "gateway/src/bootstrap/commands.rs",
@@ -9723,6 +9723,16 @@
       "sha256": "195f6c89077f4e307f3177b3c7d3c177e0e7b8004353c1e9b857d2d1b820e3aa",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed for #242 (standalone state directory): opens the canonicalized state directory's parent as a cap-std directory and the lock file beneath the directory handle, so the lock is taken on the directory that was admitted. Local filesystem access only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/state_dir.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::state_dir::impl  StateDirectory::acquire_with_bundle#1",
+      "sha256": "4f4da185a8b6cfb37213a45b55d725e5dbab7099c46cc22ced1a06c39e46fbb9",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Check the selected state directory and the read-only bundle by canonical location and open directory identity before taking the existing exclusive lock."
     },
     {
       "file": "gateway-config/src/state_dir/filesystem.rs",
