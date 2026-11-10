@@ -1231,6 +1231,7 @@ mod tests {
             only.capabilities,
             vec![
                 "delegated_token_purges",
+                "managed_http_mutation_v1",
                 "openapi_discovery_catalogs",
                 "openapi_repeated_query",
                 "openapi_swagger2_catalogs",
