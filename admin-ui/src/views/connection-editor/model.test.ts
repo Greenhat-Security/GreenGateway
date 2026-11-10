@@ -79,7 +79,7 @@ describe('connection editor load and save', () => {
       contractFields('SafeConfiguration'),
     );
     expect(Object.keys(stored.configuration.caller_assertion).sort()).toEqual(
-      contractFields('SafeCallerAssertion'),
+      contractFields('SafeCallerAssertion').filter((field) => field !== 'approval_mode'),
     );
 
     const detail = await loadThroughClient(stored);
@@ -165,7 +165,7 @@ describe('connection editor load and save', () => {
     // those: the safe read's `key_problem` is never sent back.
     expect(Object.keys(write.caller_assertion!).sort()).toEqual(
       contractFields('MutationCallerAssertion').filter(
-        (field) => field !== 'signing_key_id',
+        (field) => field !== 'signing_key_id' && field !== 'approval_mode',
       ),
     );
     expect(
@@ -765,6 +765,35 @@ describe('connection editor load and save', () => {
     );
 
     expect(validateForm(form)).toEqual({});
+  });
+
+  it('preserves managed mutation enrollment when rotating a caller assertion', async () => {
+    const stored = storedConnection();
+    const enrolled = {
+      ...stored,
+      configuration: {
+        ...stored.configuration,
+        additional_headers: [],
+        discovery: { type: 'managed_openapi', use_connection_authentication: false },
+        caller_assertion: {
+          ...stored.configuration.caller_assertion,
+          approval_mode: 'managed_http_mutation_v1',
+          bind_approval: true,
+          bind_request: true,
+        },
+      },
+    };
+    const form = formFromDetail(await loadThroughClient(enrolled));
+    expect(validateForm(form)).toEqual({});
+    expect(writeFromForm(form).caller_assertion).toBeUndefined();
+    const edit = { ...form, callerAssertionMode: 'edit' as const,
+      callerAssertionDraft: { ...callerAssertionDraftFromStored(form.callerAssertion!), bindRequest: false },
+    };
+    expect(writeFromForm(edit).caller_assertion).toMatchObject({
+      approval_mode: 'managed_http_mutation_v1', bind_request: true, bind_approval: true,
+    });
+    expect(validateForm({ ...form, authenticationType: 'google_domain_wide_delegation' }).form)
+      .toMatch(/Approval binding requires/);
   });
 
   it('explains why a block with legacy approval binding cannot be saved', async () => {

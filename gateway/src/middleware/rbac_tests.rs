@@ -191,6 +191,32 @@ async fn a_pinned_request_snapshot_answers_permission_and_eligibility_while_the_
     );
 }
 
+#[tokio::test]
+async fn mutation_approval_dispatch_guard_refuses_an_install_even_if_execute_permission_survives() {
+    const EXECUTE: &str = "admin:tools:execute";
+    let caller = test_principal(&["operator"]);
+    let policy = test_policy(DefaultAction::Allow, &[("operator", &[EXECUTE])], &[]);
+    let (state, _) = test_state(policy, &[]);
+    state
+        .with_request_policy_snapshot(async {
+            let guard = state.mutation_dispatch_guard(caller.clone(), EXECUTE);
+            assert_eq!(guard(), Some(0));
+            state.replace_policy(test_policy(
+                DefaultAction::Deny,
+                &[("operator", &[EXECUTE])],
+                &[],
+            ));
+            assert!(state.principal_has_permission(&caller, EXECUTE));
+            assert_eq!(guard(), None);
+            assert_eq!(
+                state.mutation_dispatch_guard(caller.clone(), EXECUTE)(),
+                None
+            );
+        })
+        .await;
+    assert_eq!(state.mutation_dispatch_guard(caller, EXECUTE)(), Some(0));
+}
+
 /// Inventory takes one eligibility snapshot per listing, so a listing cannot
 /// straddle an install between two of its tools: a snapshot taken before an
 /// install answers every tool from the policy it was taken from.

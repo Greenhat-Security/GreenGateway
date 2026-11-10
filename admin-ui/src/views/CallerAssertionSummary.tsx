@@ -68,7 +68,7 @@ export function CallerAssertionSummary({
             test target of a connection that carries it.
           </p>
         )}
-        {assertion.bind_approval ? (
+        {assertion.bind_approval && !assertion.approval_mode ? (
           <p>
             This block asks for approval binding, which the gateway no longer
             accepts on a save. Edit the block, which turns approval binding
@@ -111,7 +111,7 @@ export function CallerAssertionSummary({
         <Row
           label="Approval binding"
           value={
-            assertion.bind_approval ? 'Requested, not supported' : 'Not bound'
+            assertion.approval_mode ? 'Required for managed HTTP mutations' : assertion.bind_approval ? 'Requested, not supported' : 'Not bound'
           }
         />
         {(assertion.published_keys ?? []).map((key) => (

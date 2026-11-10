@@ -19,6 +19,12 @@
         "header_name",
         "lifetime_seconds"
       ],
+      "allOf": [
+        {
+          "if": { "anyOf": [{ "required": ["approval_mode"] }, { "required": ["bind_approval"], "properties": { "bind_approval": { "const": true } } }] },
+          "then": { "required": ["approval_mode", "bind_approval", "bind_request"], "properties": { "bind_request": { "const": true }, "bind_approval": { "const": true } } }
+        }
+      ],
       "properties": {
         "signing_key_id": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Secret alias holding the private key as exactly one PKCS#8 PEM block (BEGIN PRIVATE KEY): a P-256 key for es256, an RSA key of at least 2048 bits for rs256. Resolved with the assertion_signing_key purpose, so it comes from an operator alias or an external secret provider, never the encrypted local store; a key of the other algorithm is refused as algorithm_mismatch." },
         "kid": { "type": "string", "minLength": 1, "maxLength": 128, "description": "JOSE kid, published in the gateway's JWKS so an upstream can select the right key and keys can rotate without a flag day. Name one key only: never put new key material behind a kid that is already published." },
@@ -30,7 +36,8 @@
         "lifetime_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "An assertion is a bearer credential for as long as it is valid, so this is a replay window rather than a convenience setting." },
         "claims": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["email", "roles"] }, "description": "Principal fields to attest beyond sub, which is always present. A closed set rather than free-form templating, so a configuration mistake cannot attest something a caller supplied." },
         "bind_request": { "type": "boolean", "description": "Include the method, path and a SHA-256 of the body actually sent, so an assertion cannot be lifted onto different arguments. The digest covers the transmitted bytes, not a canonical form, so an upstream verifies it with its standard library." },
-        "bind_approval": { "type": "boolean", "const": false, "description": "Reserved: would require, and include, the approval that authorised a mutation. No approval subsystem exists yet, so only false is accepted." },
+        "bind_approval": { "type": "boolean", "description": "Require a consumed approval for this exact managed OpenAPI mutation." },
+        "approval_mode": { "const": "managed_http_mutation_v1" },
         "published_keys": {
           "type": "array",
           "maxItems": 4,
@@ -62,6 +69,12 @@
         "header_name",
         "lifetime_seconds"
       ],
+      "allOf": [
+        {
+          "if": { "anyOf": [{ "required": ["approval_mode"] }, { "required": ["bind_approval"], "properties": { "bind_approval": { "const": true } } }] },
+          "then": { "required": ["approval_mode", "bind_approval", "bind_request"], "properties": { "bind_request": { "const": true }, "bind_approval": { "const": true } } }
+        }
+      ],
       "properties": {
         "signing_key_id": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Secret alias holding the signing key, as in CallerAssertion." },
         "signing_key_configured": { "const": true, "description": "PUT-only redaction marker: keeps the alias of the stored key, the signing key or a published one, with the same kid and algorithm, so a rotation can move a key between signing_key_id and published_keys without naming its alias. A marker that matches no stored key, false, and a marker beside signing_key_id are refused with 400." },
@@ -74,7 +87,8 @@
         "lifetime_seconds": { "type": "integer", "minimum": 1, "maximum": 300 },
         "claims": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["email", "roles"] } },
         "bind_request": { "type": "boolean" },
-        "bind_approval": { "type": "boolean", "const": false },
+        "bind_approval": { "type": "boolean", "description": "Require a consumed approval for this exact managed OpenAPI mutation." },
+        "approval_mode": { "const": "managed_http_mutation_v1" },
         "published_keys": {
           "type": "array",
           "maxItems": 4,
@@ -126,7 +140,8 @@
         "lifetime_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "An assertion is a bearer credential for as long as it is valid, so this is a replay window rather than a convenience setting." },
         "claims": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["email", "roles"] }, "description": "Principal fields to attest beyond sub, which is always present. A closed set rather than free-form templating, so a configuration mistake cannot attest something a caller supplied." },
         "bind_request": { "type": "boolean", "description": "Include the method, path and a SHA-256 of the body actually sent, so an assertion cannot be lifted onto different arguments. The digest covers the transmitted bytes, not a canonical form, so an upstream verifies it with its standard library." },
-        "bind_approval": { "type": "boolean", "description": "Reserved: would require, and include, the approval that authorised a mutation. New writes accept only false; a Connection persisted earlier may still report true, and such a block is refused on every lane with caller_assertion_not_enforced." },
+        "bind_approval": { "type": "boolean", "description": "When true without approval_mode, a legacy record is quarantined." },
+        "approval_mode": { "const": "managed_http_mutation_v1" },
         "published_keys": {
           "type": "array",
           "maxItems": 4,
@@ -766,6 +781,19 @@
       },
       "allOf": [
         {
+          "if": { "required": ["caller_assertion"], "properties": { "caller_assertion": { "type": "object", "required": ["approval_mode"] } } },
+          "then": {
+            "required": ["discovery"],
+            "properties": {
+              "kind": { "const": "http_api" },
+              "endpoint": { "properties": { "base_url": { "pattern": "^https://" } } },
+              "authentication": { "properties": { "type": { "enum": ["none", "static_bearer", "header_api_key"] } } },
+              "discovery": { "type": "object", "properties": { "type": { "const": "managed_openapi" } } },
+              "additional_headers": { "maxItems": 0 }
+            }
+          }
+        },
+        {
           "if": {
             "required": [
               "authentication"
@@ -964,6 +992,19 @@
         }
       },
       "allOf": [
+        {
+          "if": { "required": ["caller_assertion"], "properties": { "caller_assertion": { "type": "object", "required": ["approval_mode"] } } },
+          "then": {
+            "required": ["discovery"],
+            "properties": {
+              "kind": { "const": "http_api" },
+              "endpoint": { "properties": { "base_url": { "pattern": "^https://" } } },
+              "authentication": { "properties": { "type": { "enum": ["none", "static_bearer", "header_api_key"] } } },
+              "discovery": { "type": "object", "properties": { "type": { "const": "managed_openapi" } } },
+              "additional_headers": { "maxItems": 0 }
+            }
+          }
+        },
         {
           "if": {
             "required": [
@@ -5127,6 +5168,208 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 8192
+        }
+      }
+    },
+    "MutationReview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision"
+      ],
+      "properties": {
+        "decision": {
+          "enum": [
+            "approve",
+            "reject"
+          ]
+        }
+      }
+    },
+    "MutationApprovalPrincipal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issuer",
+        "subject"
+      ],
+      "properties": {
+        "issuer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "MutationApprovalAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "caller",
+        "connection_id",
+        "connection_etag",
+        "catalog_revision",
+        "tool_name",
+        "operation",
+        "definition_sha256",
+        "method",
+        "target_sha256",
+        "body_sha256"
+      ],
+      "properties": {
+        "caller": {
+          "$ref": "#/$defs/MutationApprovalPrincipal"
+        },
+        "connection_id": {
+          "$ref": "#/$defs/StableId"
+        },
+        "connection_etag": {
+          "$ref": "#/$defs/Etag"
+        },
+        "catalog_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "tool_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "operation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Named OpenAPI operation ID in the served definition."
+        },
+        "definition_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Digest of the registered tool definition."
+        },
+        "method": {
+          "enum": [
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE"
+          ]
+        },
+        "target_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Digest of the resolved absolute destination URL, including path and query."
+        },
+        "body_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Digest of the rendered HTTP request body bytes."
+        }
+      }
+    },
+    "MutationApproval": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One occurrence of a server-prepared mutation. Only digests of the target URL and rendered body are retained.",
+      "required": [
+        "id",
+        "action",
+        "status",
+        "created_at",
+        "expires_at",
+        "reviewer",
+        "reviewed_at",
+        "revoked_by",
+        "revoked_at",
+        "consumed_at"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "action": {
+          "$ref": "#/$defs/MutationApprovalAction"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "approved",
+            "rejected",
+            "revoked",
+            "consumed",
+            "expired"
+          ]
+        },
+        "created_at": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Whole seconds since the Unix epoch on the approval authority."
+        },
+        "expires_at": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The approval deadline, 900 seconds after creation."
+        },
+        "reviewer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MutationApprovalPrincipal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reviewed_at": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Whole seconds since the Unix epoch on the approval authority."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revoked_by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MutationApprovalPrincipal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revoked_at": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Whole seconds since the Unix epoch on the approval authority."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "consumed_at": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Whole seconds since the Unix epoch on the approval authority."
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },

@@ -532,7 +532,7 @@ export function writeFromForm(form: ConnectionFormState): ConnectionWrite {
   const mode = effectiveCallerAssertionMode(form);
   const callerAssertion =
     mode === 'edit'
-      ? { caller_assertion: callerAssertionWrite(form.callerAssertionDraft) }
+      ? { caller_assertion: callerAssertionWrite(form.callerAssertionDraft, form.callerAssertion?.approval_mode) }
       : mode === 'remove' && form.callerAssertion !== null
         ? { caller_assertion: null }
         : {};
@@ -771,10 +771,17 @@ export function validateForm(
   }
   if (
     callerAssertionMode === 'keep' &&
-    form.callerAssertion?.bind_approval === true
+    form.callerAssertion?.bind_approval === true &&
+    form.callerAssertion.approval_mode === undefined
   ) {
     errors.form =
       'This connection was saved with a caller assertion that asks for approval binding, which the gateway no longer accepts. Edit the caller assertion, which turns approval binding off, or remove it before saving this connection.';
+  }
+  if (form.callerAssertion?.approval_mode && form.callerAssertionMode !== 'remove' &&
+    (form.kind !== 'http_api' || form.discoveryType !== 'managed_openapi' ||
+      !form.baseUrl.startsWith('https://') || form.additionalHeaders.length > 0 ||
+      !['none', 'static_bearer', 'header_api_key'].includes(form.authenticationType))) {
+    errors.form = 'Approval binding requires a managed OpenAPI HTTPS connection with static or no authentication and no additional headers.';
   }
   if (callerAssertionMode === 'edit') {
     validateCallerAssertion(form, secrets, errors);
@@ -1288,6 +1295,7 @@ export function callerAssertionDraftWithPromotedKey(
 
 export function callerAssertionWrite(
   draft: CallerAssertionDraft,
+  approvalMode?: SafeCallerAssertion['approval_mode'],
 ): CallerAssertionWrite {
   return {
     ...assertionKeyBindingPayload(draft.signingKey.binding),
@@ -1299,8 +1307,9 @@ export function callerAssertionWrite(
     header_name: draft.headerName.trim(),
     lifetime_seconds: Number(draft.lifetimeSeconds),
     ...(draft.claims.length > 0 ? { claims: [...draft.claims] } : {}),
-    bind_request: draft.bindRequest,
-    bind_approval: false,
+    bind_request: approvalMode ? true : draft.bindRequest,
+    bind_approval: approvalMode !== undefined,
+    ...(approvalMode ? { approval_mode: approvalMode } : {}),
     ...(draft.publishedKeys.length > 0
       ? {
         published_keys: draft.publishedKeys.map((key) => ({

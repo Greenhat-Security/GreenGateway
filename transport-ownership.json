@@ -7017,9 +7017,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "b37be21406f38b9c7d14260eecebe4ac624310914d6b22189e9e8cc5740a849e",
+      "sha256": "f8d0e62f30c4f1ecfba8df51e050e3908c61a4e80d4072748bb07de049be5f71",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+      "purpose": "Registers authenticated mutation approval and keyed revocation routes and the owner-scoped replay registry used by policy analyses."
     },
     {
       "file": "gateway/src/routing.rs",
@@ -7027,7 +7027,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::routing::register_metrics#1",
-      "sha256": "c1eeb7bfaa806a6504af052a457dc827686a0660bf8b03ebdbfe729c9a2cbe6b",
+      "sha256": "dddf232e0233cdc1838442b006ae7b4c921da6cb57aead70aaf0f4e058566fc2",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -7202,6 +7202,16 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/admin_mutation_approvals.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_mutation_approvals::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "The approval endpoints import the existing admin router, authentication, RBAC, audit and Connection authority from the application root."
+    },
+    {
       "file": "gateway/src/admin_tools.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -7210,6 +7220,16 @@
       "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_mutation_approvals :: *#1",
+      "sha256": "f664235a29365f23a3c6aedde19a5ed3b5a11f135b2fef4ff7ab1b1476aec7f8",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Expose authenticated approval route handlers to the existing administrative router. They use only the configured Connection store."
     },
     {
       "file": "gateway/src/main.rs",
@@ -7450,6 +7470,26 @@
       "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/admin_policy_simulations.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::admin_policy_simulations::policy_simulations_endpoint#1",
+      "sha256": "7ba58531a47630e53592c12d9c74c29dcd574052c59a49fcf529e7069abaa60d",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Record the authorized admin response count using a bounded status class and the duration in fixed buckets."
+    },
+    {
+      "file": "gateway/src/admin_policy_simulations.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::admin_policy_simulations::simulate_authorized#1",
+      "sha256": "37f0cbac656b0f3c035a8fdb5a2d35099abc6fa3783e3987f07c84430b188606",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Count returned reports at the stage trace cap. The counter takes no labels and the evaluator emits no metric."
     },
     {
       "file": "gateway/src/admin_policy_replays.rs",
@@ -8947,6 +8987,16 @@
       "reasons": [
         "network-or-process-reference"
       ],
+      "scope": "gateway::connections::pg_store::require_approval_enrollment_fence#1",
+      "sha256": "c2665d9d5f50f0c78d778a8721d84d427a63ab38eb9ca2239ae96ff29ca23846",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Checks the managed-mutation reader fence within the existing PostgreSQL Connection transaction before persisting enrollment."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
       "scope": "gateway::connections::pg_store::PostgresConnectionStore#1",
       "sha256": "4a92741f6ff2b732a09994aaebdb137b30569c77624714e06172fb8ac9c1f604",
       "owner": "GreenGateway maintainers",
@@ -9259,9 +9309,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::load_record_for_update#1",
-      "sha256": "bd929ce57b33934f894ae46a4af7fd71973b32de7087f8369db9fc5268a1eaf6",
+      "sha256": "51e942f8118b27cc7f4f61958ba7cb593e37fdf8ca198e53f7922dc2898bad70",
       "owner": "GreenGateway maintainers",
-      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority. Read and lock the current managed Connection row on the configured PostgreSQL authority before accepting a reviewed action."
     },
     {
       "file": "gateway/src/connections/pg_store.rs",
@@ -9359,9 +9409,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::lock_connection_state#1",
-      "sha256": "d3bd26064a5d04c99632823c2f62b15377b2ec821fa8db8be2bf993cb6cbc9ad",
+      "sha256": "4f9817cbe175125ff1f01548abf49d9cb85c01dd5b6791a47d8f046dbb8a8d54",
       "owner": "GreenGateway maintainers",
-      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority. Serialize approval transitions, capacity checks, Connection deletion and catalog changes under the existing Connection writer lock."
     },
     {
       "file": "gateway/src/connections/pg_store.rs",
@@ -9409,7 +9459,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::import_connections_in#1",
-      "sha256": "2ffe7654f35541ce14c32a84eb48aeecc411af5ff02c02391ecbcffe7356134d",
+      "sha256": "c7f4829150cceff3a7b74c4431fb3cb1731ea204c6aef35e348774fb0f0cab73",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -9462,6 +9512,66 @@
       "sha256": "78f8639a515bf2d29f1c1782e93d775ee3e48ce33a5e23df0944aa516c3b2c9c",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_mutation_approvals.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::mutation_approvals::begin#1",
+      "sha256": "f1b4fc137f756d452d329aca3df8bfc278addd17ac454fda1666800b6635c601",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Begin a transaction on the configured Connection store pool and take its existing writer lock for a mutation approval operation."
+    },
+    {
+      "file": "gateway/src/connections/pg_mutation_approvals.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::mutation_approvals::now#1",
+      "sha256": "78133f1ea1ba97f2480eb3d40a0a130ae8d9306d494cd56c69c69e5eeea28cd1",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Sample PostgreSQL authority time for a review deadline inside a Connection approval operation."
+    },
+    {
+      "file": "gateway/src/connections/pg_mutation_approvals.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::mutation_approvals::check_policy#1",
+      "sha256": "dafa6ccf403a34f54a81bd10beecaa8cee052523b89eef8aacff38aef66fdc0f",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Take a shared lock on the active RBAC policy row to verify the revision that granted the reviewer permission."
+    },
+    {
+      "file": "gateway/src/connections/pg_mutation_approvals.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::mutation_approvals::check_current#1",
+      "sha256": "196542753a1537c18aad20c252bcdd699271599b5210d072c0952ce2d08395b7",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Validate the stored Connection, catalog revision, named operation and registered definition in the same PostgreSQL transaction as the approval."
+    },
+    {
+      "file": "gateway/src/connections/pg_mutation_approvals.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::mutation_approvals::field#1",
+      "sha256": "e0d2816c359cd3f243bcaacb5eac6cc3240114a60ae591a39df403f34fe6b55a",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Decode named typed fields from an already obtained PostgreSQL approval row and classify a decoding failure without logging row values."
+    },
+    {
+      "file": "gateway/src/connections/pg_mutation_approvals.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::mutation_approvals::read#1",
+      "sha256": "6c46afbe97141ccabc567488ba08d2d3ade98ca051fc32e4def92ec4d2b8d576",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Read one immutable occurrence by identifier from the configured Connection authority, decode the row and verify its stored state."
     },
     {
       "file": "gateway/src/connections/secret.rs",
@@ -10454,9 +10564,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::egress::base_client_builder_for_profile#1",
-      "sha256": "25e74e873cf305687f7b16d1b6bf546761de990f6776cba89770b8d617dd20b7",
+      "sha256": "904728bda095ad12ea54eece83690304eb88209a9f1392a5757ad2d7f68c6737",
       "owner": "GreenGateway maintainers",
-      "purpose": "Checked egress transport, DNS, TLS or protocol implementation; retain destination pinning and fail-closed transport behavior."
+      "purpose": "Builds the pinned HTTP client with the configured TLS and timeout policy. The approved mutation profile disables retries and pooled socket reuse for a single attempt."
     },
     {
       "file": "gateway/src/egress.rs",
@@ -10594,7 +10704,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::import::preflight::live_members_admit#1",
-      "sha256": "d59eafb65cfd249ac81f7e20ee24fcd615efab9ecc287154cad591629c795cf1",
+      "sha256": "da6f09484952a843dda051a916cc60d7e2a5a3f748a223ea1a89e28f2ee72cc1",
       "owner": "GreenGateway maintainers",
       "purpose": "Read-only cluster roster and contract-fence reads through the import's existing PostgreSQL pool, for the operation gate; no caller-selected HTTP authority and no new connection."
     },
@@ -10617,6 +10727,26 @@
       "sha256": "5ad02da962fcb575734a84f12095893588b94885042f61c1157572d30d593e6a",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/import/preflight.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::import::preflight::managed_mutation_enrollment#1",
+      "sha256": "61d73fabc412948825e0ff4473028b346c6427c357c2e3cb2b6cf2fd4945f590",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Examines the bounded standalone Connection inventory and evaluates explicit approval enrollment for the PostgreSQL cutover."
+    },
+    {
+      "file": "gateway/src/import/preflight.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::import::preflight::admit_import_write#1",
+      "sha256": "2f7d9bb652bb184234ed31786e178c87ed329f98a7945a2285cf05c1bed3e18e",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Admits a validated imported Connection through the existing cluster roster and durable compatibility fence."
     },
     {
       "file": "gateway/src/import/preflight.rs",

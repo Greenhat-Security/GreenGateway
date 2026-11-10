@@ -47,11 +47,11 @@ as an allow:
 
 A simulation changes nothing. It does not write, activate or rewrite a policy
 (a candidate is validated, compiled for the run and discarded), emits no
-data-plane authorization event, records no metric of its own, reads or
+data-plane authorization event or metric, reads or
 charges no rate bucket, acquires no tool permit, resolves no name and contacts
 no upstream. The simulation request itself is admitted like any admin `POST`:
 it is counted, passes the generic write limiter and gets the access record
-every HTTP request gets. Beyond that, the only record it leaves is one
+every HTTP request gets. A completed run emits one
 `policy.simulation_run` audit event. A test drives cases that, live, would
 charge a one-request rate bucket, record a would-deny, admit a tool, resolve
 the upstream's name and dispatch to a reachable upstream -- isolated sequences
@@ -59,6 +59,23 @@ that exhaust their synthetic copy of that bucket and egress cases for the
 upstream's own address among them -- proves none of that happened, and checks
 the audit, resolver, bucket and upstream against the live path afterwards
 (`admin_policy_simulations_tests`).
+
+### Control-plane metrics
+
+After both permission checks, the gateway counts each simulation response in
+`greengateway_policy_simulations_total`. Its only label, `outcome`, is
+`completed` for a returned report, `busy` for a concurrency refusal,
+`conflict` for HTTP 409 or 412, `refused` for other client errors, and
+`failed` for server errors. A completed report can contain indeterminate
+decisions. Requests dropped before the handler produces a response do not
+contribute a sample.
+
+`greengateway_policy_simulation_duration_seconds` measures time from
+authorization until the response is ready, including reading the request,
+loading the candidate and rendering the result. Its histogram has finite
+buckets from 10 ms to 5 s. `greengateway_policy_simulation_traces_truncated_total`
+counts returned reports that reached the stage-trace bound. Both metrics
+use no application labels. Individual synthetic cases produce no series.
 
 ## The request
 

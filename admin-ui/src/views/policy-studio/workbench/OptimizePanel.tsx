@@ -52,6 +52,7 @@ export function OptimizePanel({
   draftValidation,
   canEditDraft,
   canAnalyze,
+  canReplay,
   canWritePolicy,
   onShowInEditor,
 }: {
@@ -64,6 +65,7 @@ export function OptimizePanel({
   canEditDraft: boolean;
   // admin:policy:read and admin:policy:analyze, as the server reports them.
   canAnalyze: boolean;
+  canReplay: boolean;
   // admin:policy:write: creating and expiring suppressions.
   canWritePolicy: boolean;
   onShowInEditor: (diagnostic: PolicyDiagnostic) => void;
@@ -181,6 +183,7 @@ export function OptimizePanel({
           <AnalyzerFindings
             candidate={candidate}
             canAnalyze={canAnalyze}
+            canReplay={canReplay}
             canWritePolicy={canWritePolicy}
           />
         </>

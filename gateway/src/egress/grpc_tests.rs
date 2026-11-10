@@ -332,6 +332,7 @@ async fn the_grpc_profile_has_no_reqwest_transport() {
     // the gRPC profile and not about the builder being broken.
     for profile in [
         ProtocolProfile::Http1AndHttp2,
+        ProtocolProfile::ApprovedMutation,
         ProtocolProfile::Sse,
         ProtocolProfile::UpgradeHttp1,
     ] {

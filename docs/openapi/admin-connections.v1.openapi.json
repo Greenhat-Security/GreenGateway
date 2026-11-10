@@ -1045,6 +1045,209 @@
         }
       }
     },
+    "/v1/admin/tools/{id}/mutation-approvals": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpaqueCapabilityId"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "prepareToolMutationApproval",
+        "tags": [
+          "Capabilities"
+        ],
+        "summary": "Request review of one tool mutation",
+        "description": "Requires admin:tools:execute, permission to invoke the tool and its rendered HTTP operation, and the exact strong capability ETag. Applies to direct HTTPS managed OpenAPI tools with a named POST, PUT, PATCH or DELETE operation. The gateway validates arguments, binds the rendered request to the current Connection and catalog, and creates a pending review. Each preparation creates a distinct occurrence and sends zero upstream requests. The requester must be a validated provider principal.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/PlaygroundRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Pending mutation approval. Its lifetime is 15 minutes from preparation.",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/MutationApproval"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/ToolPlaygroundValidationError"
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/admin/mutation-approvals/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/MutationApprovalId"
+        }
+      ],
+      "get": {
+        "operationId": "getMutationApproval",
+        "tags": [
+          "Capabilities"
+        ],
+        "summary": "Read one mutation approval",
+        "description": "Requires admin:tools:approvals:review or admin:tools:execute plus an exact match to the original requester's issuer and subject. An executor requesting another principal's record receives 404. Pending and approved records show expired at the deadline. Expired records can be pruned when another request is prepared.",
+        "responses": {
+          "200": {
+            "description": "Approval state, authenticated actor identities, timestamps and digests. Raw URLs, body bytes and credentials are withheld.",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/MutationApproval"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        }
+      }
+    },
+    "/v1/admin/mutation-approvals/{id}/review": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/MutationApprovalId"
+        }
+      ],
+      "post": {
+        "operationId": "reviewMutationApproval",
+        "tags": [
+          "Capabilities"
+        ],
+        "summary": "Approve or reject a pending mutation",
+        "description": "Requires admin:tools:approvals:review and an authenticated reviewer whose issuer and subject together identify a different principal from the requester. A decision is final for that review. The gateway checks the current Connection and catalog before approval.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/MutationReview"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Recorded reviewer, decision and time. Reviewing sends zero upstream requests.",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/MutationApproval"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/admin/mutation-approvals/{id}/revoke": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/MutationApprovalId"
+        }
+      ],
+      "post": {
+        "operationId": "revokeMutationApproval",
+        "tags": [
+          "Capabilities"
+        ],
+        "summary": "Revoke a pending or approved mutation",
+        "description": "Requires admin:tools:approvals:review and an authenticated reviewer whose issuer and subject together identify a different principal from the requester. Send an empty body. Revoking an approved record preserves its original review.",
+        "responses": {
+          "200": {
+            "description": "Revoked approval with the revoking principal and time.",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/MutationApproval"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      }
+    },
     "/v1/admin/tools/{id}/execute": {
       "parameters": [
         {
@@ -1063,6 +1266,86 @@
         ],
         "summary": "Execute a constrained registered tool",
         "description": "Requires admin:tools:execute and the exact strong capability ETag. The body can contain arguments only; URL/header/credential/TLS/timeout/Connection overrides are not accepted. HTTP response headers and non-success bodies are withheld.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/PlaygroundRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bounded projected HTTP or MCP result.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/PlaygroundResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/ToolPlaygroundValidationError"
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/admin/tools/{id}/mutation-approvals/{approval_id}/execute": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpaqueCapabilityId"
+          }
+        },
+        {
+          "name": "approval_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "executeApprovedToolMutation",
+        "tags": [
+          "Capabilities"
+        ],
+        "summary": "Execute one independently approved mutation",
+        "description": "Requires the original authenticated issuer and subject, admin:tools:execute, current capability ETag, matching registered operation and rendered request, explicit managed_http_mutation_v1 Connection enrollment, and an approved unexpired occurrence. Consumption is permanent before the signed upstream request is attempted.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IfMatch"
@@ -1144,6 +1427,15 @@
       }
     },
     "parameters": {
+      "MutationApprovalId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
       "StableId": {
         "name": "id",
         "in": "path",

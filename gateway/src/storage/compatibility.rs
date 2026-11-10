@@ -86,13 +86,8 @@
 //! document, so the write also waits until every live member advertises
 //! [`Capability::PolicyToolArgumentConditions`]. Storing Discovery tools
 //! with repeated query mappings also needs [`OPENAPI_REPEATED_QUERY`].
-//! No operation changes the schema: migration 25, the one step that rolls,
-//! adds columns nothing writes yet, and the approved-extension list in
-//! `migrations.rs` is empty. Every other operation this binary performs
-//! belongs to the schema-25 contract, which every member serving schema 25
-//! shares, its prepared release included. No shipped operation declares a
-//! durable fence or a backfill, so in this release nothing raises the fence
-//! and the backfill ledger is empty; both are checked everywhere they apply.
+//! Enrolling a managed HTTP mutation raises a durable fence. A returning
+//! replica must support the approval requirement before it may serve traffic.
 
 use std::collections::BTreeSet;
 
@@ -122,6 +117,8 @@ pub(crate) enum Capability {
     /// member without it ignores the record and keeps serving the purged
     /// principal's cached tokens, so [`DELEGATED_TOKEN_PURGES`] waits for it.
     DelegatedTokenPurges,
+    /// Verifies and atomically consumes approvals before dispatching enrolled managed tools.
+    ManagedHttpMutationV1,
     /// The member generates, refreshes and replays a managed OpenAPI
     /// catalog whose specification is a Google Discovery document (issue
     /// #443). A member without it cannot generate from one, so
@@ -167,8 +164,9 @@ pub(crate) enum Capability {
 
 impl Capability {
     /// Every capability, in name order.
-    pub(crate) const KNOWN: [Self; 9] = [
+    pub(crate) const KNOWN: [Self; 10] = [
         Self::DelegatedTokenPurges,
+        Self::ManagedHttpMutationV1,
         Self::OpenApiDiscoveryCatalogs,
         Self::OpenApiRepeatedQuery,
         Self::OpenApiSwagger2Catalogs,
@@ -182,6 +180,7 @@ impl Capability {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::DelegatedTokenPurges => "delegated_token_purges",
+            Self::ManagedHttpMutationV1 => "managed_http_mutation_v1",
             Self::OpenApiDiscoveryCatalogs => "openapi_discovery_catalogs",
             Self::OpenApiRepeatedQuery => "openapi_repeated_query",
             Self::OpenApiSwagger2Catalogs => "openapi_swagger2_catalogs",
@@ -203,6 +202,7 @@ impl Capability {
 /// What this binary advertises: every capability it implements.
 pub(crate) const BINARY_CAPABILITIES: &[Capability] = &[
     Capability::DelegatedTokenPurges,
+    Capability::ManagedHttpMutationV1,
     Capability::OpenApiDiscoveryCatalogs,
     Capability::OpenApiRepeatedQuery,
     Capability::OpenApiSwagger2Catalogs,
@@ -289,9 +289,9 @@ pub(crate) use gate::{
     evaluate, evaluate_without_own_row, fence_target, Activation, Backfill, BackfillState,
     BinaryContract, ContractFence, FenceExclusion, FenceTarget, MemberAdvertisement,
     OperationAdmission, OperationRefusal, OperationRequirement, DELEGATED_TOKEN_PURGES,
-    OPENAPI_DISCOVERY_CATALOGS, OPENAPI_REPEATED_QUERY, OPENAPI_SWAGGER2_CATALOGS,
-    OPERATION_REQUIREMENTS, POLICY_DOCUMENT_V1, POLICY_ROLE_DESCRIPTIONS, POLICY_RULE_CONDITIONS,
-    POLICY_TOOL_ARGUMENT_CONDITIONS,
+    MANAGED_HTTP_MUTATION_V1, OPENAPI_DISCOVERY_CATALOGS, OPENAPI_REPEATED_QUERY,
+    OPENAPI_SWAGGER2_CATALOGS, OPERATION_REQUIREMENTS, POLICY_DOCUMENT_V1,
+    POLICY_ROLE_DESCRIPTIONS, POLICY_RULE_CONDITIONS, POLICY_TOOL_ARGUMENT_CONDITIONS,
 };
 
 #[cfg(feature = "postgres")]
@@ -316,7 +316,6 @@ mod gate {
     /// What keeps a member that lacks the capability from serving the
     /// operation's data later.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    #[allow(dead_code)] // `DurableFence` is constructed only by tests: no shipped operation needs one.
     pub(crate) enum Activation {
         /// Live-roster agreement is enough: a lacking member that returns
         /// after the operation wrote refuses the data (fails closed)
@@ -543,6 +542,18 @@ mod gate {
         activation: Activation::LiveMembers,
     };
 
+    /// Opting into per-mutation approval changes what may send on a Connection.
+    /// Returning replicas must understand that requirement even after every
+    /// enrolled Connection has since been removed.
+    pub(crate) const MANAGED_HTTP_MUTATION_V1: OperationRequirement = OperationRequirement {
+        operation: "connections.managed_http_mutation_v1",
+        minimum_schema: 34,
+        document_format: None,
+        capability: Capability::ManagedHttpMutationV1,
+        backfill: Backfill::NotRequired,
+        activation: Activation::DurableFence,
+    };
+
     /// Every operation this binary gates. An operation added later
     /// registers here, advertises a new capability, and calls the gate
     /// before its write.
@@ -555,6 +566,7 @@ mod gate {
         POLICY_DOCUMENT_V1,
         POLICY_RULE_CONDITIONS,
         POLICY_TOOL_ARGUMENT_CONDITIONS,
+        MANAGED_HTTP_MUTATION_V1,
     ];
 
     /// What this binary serves and advertises: the left-hand side of every

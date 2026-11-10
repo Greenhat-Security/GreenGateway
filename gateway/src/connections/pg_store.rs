@@ -230,6 +230,26 @@ where
         .map_err(|error| pg_error(operation, error))
 }
 
+/// Every PostgreSQL write path, including cutover import, must observe the
+/// forward-only enrollment fence established by the compatibility authority.
+async fn require_approval_enrollment_fence(
+    client: &deadpool_postgres::Object,
+    write: &ConnectionWrite,
+    operation: &'static str,
+) -> Result<(), ConnectionStoreError> {
+    if write.uses_managed_mutation_approval() {
+        let requirement = &crate::storage::compatibility::MANAGED_HTTP_MUTATION_V1;
+        let row = client.query_one(
+            "SELECT EXISTS(SELECT 1 FROM greengateway.contract_fence WHERE singleton AND minimum_schema >= $1 AND $2 = ANY(string_to_array(capabilities, ',')))",
+            &[&requirement.minimum_schema, &requirement.capability.as_str()],
+        ).await.map_err(|error| pg_error(operation, error))?;
+        if !scalar::<bool>(&row, 0, operation)? {
+            return Err(pg_unavailable("mutation approval enrollment fence"));
+        }
+    }
+    Ok(())
+}
+
 /// The PostgreSQL managed-connection record store. Cheap to construct;
 /// borrows the foundation's pool.
 pub struct PostgresConnectionStore {
@@ -399,6 +419,7 @@ impl PostgresConnectionStore {
                     return Err(ConnectionStoreError::CollectionConflict { current });
                 }
             }
+            require_approval_enrollment_fence(&client, &candidate, OPERATION_CREATE).await?;
             let count = count_records(&client).await?;
             if count >= self.maximum_connections {
                 return Err(ConnectionStoreError::LimitExceeded {
@@ -530,6 +551,7 @@ impl PostgresConnectionStore {
                 .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?;
             validate_bindings(&client, &current).await?;
             ensure_etag(id, expected, &current)?;
+            require_approval_enrollment_fence(&client, &candidate, OPERATION_REPLACE).await?;
             if current.write == candidate {
                 return Ok(current);
             }
@@ -4683,7 +4705,7 @@ async fn load_record(
 }
 
 async fn load_record_for_update(
-    client: &deadpool_postgres::Object,
+    client: &impl deadpool_postgres::GenericClient,
     id: &ConnectionId,
     operation: &'static str,
 ) -> Result<Option<StoredConnection>, ConnectionStoreError> {
@@ -5344,7 +5366,7 @@ async fn begin_mutation(
 /// because deleting a row cannot exceed a bound; the SQLite store
 /// likewise runs `remove_dependency` outside a transaction.
 async fn lock_connection_state(
-    client: &deadpool_postgres::Object,
+    client: &impl deadpool_postgres::GenericClient,
     operation: &'static str,
 ) -> Result<(), ConnectionStoreError> {
     let locked = client
@@ -5544,6 +5566,7 @@ pub(crate) async fn import_connections_in(
 
     for connection in connections {
         let record = &connection.record;
+        require_approval_enrollment_fence(client, &record.write, OPERATION).await?;
         let id = &record.id;
         match (
             connection.openapi_catalog.as_ref(),
@@ -6213,6 +6236,9 @@ async fn import_enum_source_values(
 // Referenced types kept for the future snapshot reconciler.
 #[allow(dead_code)]
 type ConnectionSnapshot = BTreeMap<ConnectionId, StoredConnection>;
+
+#[path = "pg_mutation_approvals.rs"]
+mod mutation_approvals;
 
 #[cfg(test)]
 #[path = "pg_store_tests.rs"]

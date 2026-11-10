@@ -214,12 +214,12 @@ without repeating the value:
   state whether a listener terminates TLS, and
   **`listeners.public.client_certificate_crl` and
   `listeners.admin.client_certificate_crl`** whether it checks client
-  certificates against a revocation list. The certificate, key and list are
-  host locators that stay in the environment, so the document states the intent
-  only; holding the intent and the locators to each other, in both directions,
-  arrives with the mapping onto the compiler. Whether a listener asks for client
-  certificates at all (`client_certificates`), and so needs a CA bundle, was
-  already a setting.
+  certificates against a revocation list. Offline validation parses every bind
+  address, checks address collisions, and requires a separate address for
+  admin TLS. A listener requesting client certificates needs TLS and a shared
+  certificate identity source. A CRL requires client authentication on that
+  listener. Checking actual certificate/key pairs, the CA bundle and CRL
+  against those declarations requires the host locators at activation.
 - **`admin_login.client_id`, `admin_login.client_secret` and
   `admin_login.redirect_uri`** are the OAuth client admin sign-in uses, which in
   environment mode are members of the `AUTH_PROVIDERS` entry
@@ -876,8 +876,10 @@ An absent `default_action` is `deny` and an absent `enforcement_mode` is
 `enforce`, as in environment mode. Role names are policy values, so a wildcard
 role is reported at `/roles` and the line of its `*`, never by name. A policy left
 to the server's store (`source: server`) is not checked by the reader. The
-profiles' other invariants (authentication, private egress, CSRF, audit
-durability and listeners) concern deployment settings. Enforcing those profile
+development profile also requires every enabled listener to bind a loopback
+IP address. Its public listener defaults to `127.0.0.1:8080`, including for
+older bundles with no explicit public address. The profiles' other invariants
+(authentication, private egress, CSRF and audit durability) concern deployment settings. Enforcing those profile
 requirements is a later #242 slice. A `production` document that turns
 authentication off still passes this reader, and gateway bundle startup is pending.
 
@@ -888,16 +890,13 @@ accepts strictly with the production policy and tools validators, which `init`
 reads it back with, and `gateway-config`'s tests hold every one it can write to
 them and to the policy enforcement it configures. The output is deterministic:
 the same profile and answers always give the same bytes, and so the same
-digests. `init` writes only the profile into the deployment document. Every
-setting it leaves out keeps its default, which is already what the production
-profile asks for (authentication required, private-address egress denied, CSRF
-on, required audit durability), so what `init` writes is the same safe starting
-point for every profile:
+digests. `init` writes the profile into the deployment document and spells out
+the loopback public address for development. Other settings keep their defaults.
 
 | File | Standalone topology (default) | Cluster topology |
 | --- | --- | --- |
 | `bundle.yaml` | Pins every file below; `connections` from the server | Policy, tools and Connections all from the server, which is their writer in cluster mode (the PostgreSQL control planes) |
-| `deployment.yaml` | `spec.profile`, with a comment marking `development` and `migration` as not for production | The same |
+| `deployment.yaml` | `spec.profile`, the development public bind when applicable, and a comment on development and migration bundles | The same |
 | `policy.json` | `default_action: deny`, `enforcement_mode: enforce`, no route, and no role unless the answers bind an operator | Not written |
 | `tools.json` | No tools | Not written |
 | `.gitattributes` | `* text eol=lf`, so a Windows checkout cannot change a pinned file's bytes; the reader ignores it | The same |
@@ -1256,6 +1255,8 @@ can appear in one. A published code never changes meaning.
 | `bundle.not_utf8` | A file is not valid UTF-8. |
 | `bundle.digest_mismatch` | A file's SHA-256 differs from its pin. |
 | `bundle.invalid_egress_setting` | The gateway's egress compiler refused the setting at the reported deployment pointer. |
+| `bundle.invalid_listener_setting` | The listener compiler refused the address, TLS or client-certificate settings at the reported pointer. |
+| `profile.listener_not_loopback` | A development listener's bind address is outside the loopback range. |
 | `bundle.invalid_runtime_setting` | The gateway's runtime compiler refused the setting at the reported deployment pointer. |
 | `bundle.invalid_deployment_setting` | The shared compiler refused a deployment setting or a combination of settings. |
 | `bundle.invalid_auth_provider` | The gateway's authentication compiler refused the provider list. |

@@ -448,9 +448,11 @@ pub(super) fn add_admin_api_routes(
                     routes.admin.policy_analyses_route.as_str(),
                     // Its own limiter, so analyses never take a simulation's,
                     // test run's or replay's slots.
-                    post(policy_analyses_endpoint).layer(Extension(Arc::new(
-                        PolicyEvaluationLimiter::new(MAX_CONCURRENT_POLICY_ANALYSES),
-                    ))),
+                    post(policy_analyses_endpoint)
+                        .layer::<_, Infallible>(Extension(Arc::new(PolicyEvaluationLimiter::new(
+                            MAX_CONCURRENT_POLICY_ANALYSES,
+                        ))))
+                        .layer(Extension(Arc::clone(&replay_jobs))),
                 )
                 .route(
                     routes.admin.policy_analysis_suppressions_route.as_str(),
@@ -563,6 +565,26 @@ pub(super) fn add_admin_api_routes(
                 .route(
                     routes.admin.tool_execute_route.as_str(),
                     post(tool_playground_execute_endpoint),
+                )
+                .route(
+                    routes.admin.tool_mutation_approval_create_route.as_str(),
+                    post(tool_mutation_approval_create_endpoint),
+                )
+                .route(
+                    routes.admin.tool_mutation_approval_execute_route.as_str(),
+                    post(tool_mutation_approval_execute_endpoint),
+                )
+                .route(
+                    routes.admin.mutation_approval_route.as_str(),
+                    get(tool_mutation_approval_get_endpoint),
+                )
+                .route(
+                    routes.admin.mutation_approval_review_route.as_str(),
+                    post(tool_mutation_approval_review_endpoint),
+                )
+                .route(
+                    routes.admin.mutation_approval_revoke_route.as_str(),
+                    post(tool_mutation_approval_revoke_endpoint),
                 )
                 .route(
                     routes.admin.tools_openapi_preview_route.as_str(),
@@ -937,13 +959,33 @@ pub(super) fn install_metrics_recorder(
 /// The exporter configuration [`install_metrics_recorder`] installs, so a
 /// test can render a fresh registry exactly as `/metrics` would.
 pub(super) fn metrics_recorder_builder() -> PrometheusBuilder {
-    PrometheusBuilder::new().with_recommended_naming(true)
+    PrometheusBuilder::new()
+        .with_recommended_naming(true)
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(
+                metrics::POLICY_SIMULATION_DURATION_SECONDS.to_owned(),
+            ),
+            &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0],
+        )
+        .expect("static policy simulation duration buckets are valid")
 }
 
 /// Everything [`install_metrics_recorder`] does to the registry once the
 /// recorder is in place.
 pub(super) fn register_metrics(cluster: bool) {
     ::metrics::describe_counter!(REQUEST_COUNTER, "HTTP requests served by GreenGateway");
+    ::metrics::describe_counter!(
+        metrics::POLICY_SIMULATIONS_TOTAL,
+        "Authorized policy simulation responses by outcome"
+    );
+    ::metrics::describe_histogram!(
+        metrics::POLICY_SIMULATION_DURATION_SECONDS,
+        "Seconds from authorization to a policy simulation response"
+    );
+    ::metrics::describe_counter!(
+        metrics::POLICY_SIMULATION_TRACES_TRUNCATED_TOTAL,
+        "Policy simulation responses with truncated stage traces"
+    );
     ::metrics::describe_counter!(
         audit::AUDIT_EVENTS_DROPPED_TOTAL,
         "Audit events dropped by the bounded asynchronous audit channel"

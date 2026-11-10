@@ -505,6 +505,9 @@ NAT64 prefix and overlap checks, and credentialed CORS restrictions. Decimal
 runtime bounds and rates use their canonical spelling. The reader also runs the shared
 authentication-provider and admin-login validation. It passes the presence of
 the login client's typed secret reference to that rule without resolving it.
+The listener adapter runs the compiler's address and client-authentication
+rules over public bind addresses and declared TLS intent. Development binds
+must be loopback. Files referenced by a host still need activation checks.
 When a deployment supplies all inputs offline, the reader runs the shared
 `ConfigPlan` compiler on the complete projection. Document and profile
 values have their own provenance. A mounted policy satisfies the host-route

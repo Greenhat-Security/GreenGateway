@@ -14,6 +14,9 @@ use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
+#[path = "store_mutation_approvals.rs"]
+mod mutation_approvals;
+
 use crate::{auth::change_actor::ChangeActor, tools::definitions::ToolDefinition};
 
 use super::{
@@ -1068,6 +1071,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 14,
         sql: MIGRATION_14_SQL,
+    },
+    Migration {
+        version: 15,
+        sql: mutation_approvals::MIGRATION_SQL,
     },
 ];
 
@@ -4368,6 +4375,7 @@ fn validate_schema(connection: &Connection, path: &Path) -> Result<(), Connectio
         "SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode, action, connection_id, prior_version, new_version, overlay_revision, committed_at FROM catalog_change_evidence LIMIT 0",
         "SELECT singleton, authority_id, created_at FROM authority_event_state LIMIT 0",
         "SELECT source, position, delivered_events, advanced_at FROM authority_event_cursors LIMIT 0",
+        mutation_approvals::SCHEMA_QUERY,
     ] {
         connection
             .prepare(query)

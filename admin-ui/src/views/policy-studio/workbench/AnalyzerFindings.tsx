@@ -17,6 +17,7 @@ import {
   runPolicyAnalysisReport,
   type AnalysisFinding,
   type AnalysisReport,
+  type ObservedReplay,
   type AnalysisSuppressionRecord,
 } from '../../../lib/policyAnalyses';
 import type { PolicyRunRefusal } from '../../../lib/policyRuns';
@@ -37,6 +38,7 @@ const DEFAULT_SUPPRESSION_DAYS = 30;
 
 type Analysis = Readonly<{
   key: string;
+  replayJobId: string;
   label: string;
   live: boolean;
   liveEtag: string;
@@ -137,6 +139,44 @@ function stateText(finding: AnalysisFinding): string | null {
   }
 }
 
+function ReplayObservations({ replay }: { replay: ObservedReplay }) {
+  const heading = useId();
+  const projectionName = (name: string) => name === 'as_authored' ? 'As authored' : 'Enforce all shadow';
+  return (
+    <section className="workbench-findings" aria-labelledby={heading}>
+      <h5 id={heading}>Observed replay expansions</h5>
+      <p>
+        From <time>{replay.from}</time> up to <time>{replay.to}</time>. The replay selected {replay.selected} records,
+        scanned {replay.scanned} and found {replay.replayable} replayable. Its record limit was {replay.maxRecords}
+        {' '}and its high-water cutoff was {replay.highWater}.
+      </p>
+      {!replay.complete && <p role="status">Incomplete replay. {replay.limitations.join(', ')}.</p>}
+      {replay.findings.length === 0 ? (
+        <p>{replay.coverage.some((lane) => lane.compared > 0)
+          ? 'No access expansions were observed among the decisions compared.'
+          : 'No decisions could be compared in this replay.'}</p>
+      ) : (
+        <ul>{replay.findings.map((finding) => (
+          <li key={`${finding.projection}-${finding.lane}-${finding.code}`}>
+            {projectionName(finding.projection)}, {finding.lane === 'http' ? 'HTTP' : 'tool'} — {finding.count}{' '}
+            {finding.code === 'newly_allowed' ? 'changed from logical deny to allow' : 'changed from blocked to forwarded'}.
+          </li>
+        ))}</ul>
+      )}
+      <table>
+        <caption>Replay coverage</caption>
+        <thead><tr><th>Projection</th><th>Lane</th><th>Records</th><th>Compared</th><th>Indeterminate</th><th>Unsupported</th></tr></thead>
+        <tbody>{replay.coverage.map((row) => (
+          <tr key={`${row.projection}-${row.lane}`}><td>{projectionName(row.projection)}</td><td>{row.lane}</td>
+            <td>{row.records}</td><td>{row.compared}</td><td>{row.indeterminate}</td><td>{row.unsupported}</td></tr>
+        ))}</tbody>
+      </table>
+      <p className="rule-hint">Outside replay coverage: {replay.notReplayed.join(', ')}.</p>
+      <p>Replay result digest <code>{replay.resultDigest}</code></p>
+    </section>
+  );
+}
+
 // The analyzer's findings about the candidate, each with its suppression
 // state, and the suppressions a policy writer may create or expire. Nothing
 // here changes the policy; a suppression changes only how a finding is
@@ -144,15 +184,19 @@ function stateText(finding: AnalysisFinding): string | null {
 export function AnalyzerFindings({
   candidate,
   canAnalyze,
+  canReplay,
   canWritePolicy,
 }: {
   candidate: WorkbenchCandidate | null;
   canAnalyze: boolean;
+  canReplay: boolean;
   canWritePolicy: boolean;
 }) {
   const headingId = useId();
   const [run, setRun] = useState<RunState>({ kind: 'idle' });
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
+  const [replayInput, setReplayInput] = useState('');
+  const replayJobId = canReplay ? replayInput.trim() : '';
   const [records, setRecords] = useState<ReadonlyMap<string, AnalysisSuppressionRecord>>(
     new Map(),
   );
@@ -172,6 +216,7 @@ export function AnalyzerFindings({
     try {
       const answer = await runPolicyAnalysisReport({
         baseEtag: candidate.liveEtag,
+        ...(replayJobId ? { replayJobId } : {}),
         candidate:
           candidate.kind === 'live'
             ? { kind: 'active' }
@@ -195,6 +240,7 @@ export function AnalyzerFindings({
       setRecords(listed);
       setAnalysis({
         key,
+        replayJobId,
         label: candidateLabel(candidate),
         live: candidate.kind === 'live',
         liveEtag: candidate.liveEtag,
@@ -209,7 +255,7 @@ export function AnalyzerFindings({
         alert: runAlert(error, 'Analysis unavailable', 'admin:policy:read and admin:policy:analyze'),
       });
     }
-  }, [candidate]);
+  }, [candidate, replayJobId]);
 
   const write = useCallback(
     async (action: () => Promise<unknown>, title: string) => {
@@ -239,7 +285,8 @@ export function AnalyzerFindings({
     );
   }
 
-  const stale = analysis !== null && candidate !== null && analysis.key !== candidateKey(candidate);
+  const stale = analysis !== null && candidate !== null &&
+    (analysis.key !== candidateKey(candidate) || analysis.replayJobId !== replayJobId);
   const report = analysis?.report ?? null;
   const canSuppress =
     canWritePolicy &&
@@ -259,6 +306,12 @@ export function AnalyzerFindings({
         still listed. An empty list means the analyzer proved none of these problems, not that
         the policy has none.
       </p>
+      {canReplay && (
+        <label>
+          Completed replay ID (optional)
+          <input value={replayInput} maxLength={64} onChange={(event) => setReplayInput(event.target.value)} />
+        </label>
+      )}
       <button
         type="button"
         className="secondary-button"
@@ -284,10 +337,11 @@ export function AnalyzerFindings({
           <p className="rule-hint">Analyzed: {analysis.label}.</p>
           {stale ? (
             <StaleNotice>
-              The candidate or the live revision changed after this analysis. Run it again before
+              The candidate, live revision or replay selection changed after this analysis. Run it again before
               acting on it.
             </StaleNotice>
           ) : null}
+          {canReplay && report.observedReplay !== null && <ReplayObservations replay={report.observedReplay} />}
           {!report.complete ? (
             <p className="rule-hint">
               The analysis stopped at a bound ({report.limitations.join(', ')}). It says nothing

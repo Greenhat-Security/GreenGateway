@@ -22,6 +22,7 @@ pub mod local_secret;
 pub mod managed_store;
 pub mod mcp;
 pub mod model;
+pub mod mutation_approval;
 pub mod oauth;
 pub mod openapi;
 pub mod permissions;

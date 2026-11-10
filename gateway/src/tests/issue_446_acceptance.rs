@@ -20,6 +20,9 @@
 
 use super::*;
 
+#[path = "issue_757_approved_dispatch.rs"]
+mod issue_757_approved_dispatch;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use jsonwebtoken::{
     decode, decode_header,

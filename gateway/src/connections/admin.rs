@@ -325,6 +325,8 @@ pub struct SafeCallerAssertion {
     pub claims: Vec<CallerAssertionClaim>,
     pub bind_request: bool,
     pub bind_approval: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<super::model::ApprovalMode>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub published_keys: Vec<SafePublishedAssertionKey>,
     /// Present when this replica leaves the block's keys out of the published
@@ -369,6 +371,7 @@ impl SafeConnectionConfiguration {
                     claims: assertion.claims.clone(),
                     bind_request: assertion.bind_request,
                     bind_approval: assertion.bind_approval,
+                    approval_mode: assertion.approval_mode,
                     published_keys: assertion
                         .published_keys
                         .iter()

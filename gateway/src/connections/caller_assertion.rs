@@ -53,7 +53,7 @@
 //! no private parameter can reach it whatever the key carried.
 //!
 //! This module signs and refuses. It does not decide who may call an operation or whether a mutation
-//! was approved. Approval-bound requests are refused until a trusted decision authority exists.
+//! was approved. Only a consumed decision for the rendered request can produce an approval claim.
 
 use std::{
     collections::{btree_map::Entry, BTreeMap},
@@ -576,7 +576,7 @@ pub struct CallerAssertionConfig<'a> {
     pub claims: &'a [PrincipalClaim],
     /// Include the method, path and a digest of the body actually sent.
     pub bind_request: bool,
-    /// Require a verified mutation approval. The signer currently refuses this setting.
+    /// Require the consumed decision for the exact mutation being signed.
     pub bind_approval: bool,
 }
 
@@ -734,6 +734,71 @@ struct AssertionClaims<'a> {
     extra: Map<String, Value>,
 }
 
+/// The key resolver binds this target to the signer. The assertion derives all
+/// caller and request claims from these same values before signing.
+pub(super) struct ApprovedCallerRequest<'a> {
+    pub(super) receipt: super::mutation_approval::ConsumedMutationApproval,
+    pub(super) target: &'a super::http::ConnectionHttpTarget,
+    pub(super) tool: &'a crate::tools::definitions::ToolDefinition,
+    pub(super) caller: &'a AttestedCaller,
+    pub(super) method: &'a http::Method,
+    pub(super) body: &'a [u8],
+}
+
+struct ApprovalClaims {
+    id: uuid::Uuid,
+    target_sha256: String,
+    expires_at: u64,
+}
+
+pub(super) fn sign_approved_caller_assertion(
+    key: &AssertionSigningKey,
+    config: &CallerAssertionConfig<'_>,
+    request_id: &str,
+    issued_at: u64,
+    request: ApprovedCallerRequest<'_>,
+) -> Result<String, CallerAssertionError> {
+    if !config.bind_approval || !config.bind_request {
+        return Err(CallerAssertionError::ApprovalRequired);
+    }
+    let action = super::mutation_approval::MutationAction::for_http_tool(
+        request.caller,
+        request.target,
+        request.tool,
+        request.method,
+        request.body,
+    )
+    .map_err(|_| CallerAssertionError::ApprovalRequired)?;
+    let expires_at = request
+        .receipt
+        .verify_for_signing(&action, issued_at)
+        .map_err(|error| {
+            if matches!(error, super::mutation_approval::ApprovalError::Mismatch) {
+                CallerAssertionError::ApprovalRequired
+            } else {
+                CallerAssertionError::InvalidLifetime
+            }
+        })?;
+    let path = super::http::origin_form_request_target(request.target.url())?;
+    sign_assertion(
+        key,
+        config,
+        Some(&request.caller.identity()),
+        request_id,
+        issued_at,
+        Some(&RequestBinding {
+            method: request.method,
+            path: &path,
+            body: request.body,
+        }),
+        Some(ApprovalClaims {
+            id: request.receipt.id(),
+            target_sha256: action.target_sha256,
+            expires_at,
+        }),
+    )
+}
+
 /// Signs one caller assertion, or refuses.
 ///
 /// `request_id` becomes `jti`, so it must be the identifier this call is already known by elsewhere:
@@ -746,9 +811,19 @@ pub fn sign_caller_assertion(
     issued_at: u64,
     binding: Option<&RequestBinding<'_>>,
 ) -> Result<String, CallerAssertionError> {
-    // An approval ID is only a lookup key. A future authority must verify and consume
-    // the decision for this action before the signer can attest it.
-    if config.bind_approval {
+    sign_assertion(key, config, caller, request_id, issued_at, binding, None)
+}
+
+fn sign_assertion(
+    key: &AssertionSigningKey,
+    config: &CallerAssertionConfig<'_>,
+    caller: Option<&CallerIdentity<'_>>,
+    request_id: &str,
+    issued_at: u64,
+    binding: Option<&RequestBinding<'_>>,
+    approval: Option<ApprovalClaims>,
+) -> Result<String, CallerAssertionError> {
+    if config.bind_approval != approval.is_some() {
         return Err(CallerAssertionError::ApprovalRequired);
     }
     // A Connection configured to attest its caller must never fall back to acting anonymously: that
@@ -782,6 +857,19 @@ pub fn sign_caller_assertion(
         .ok_or(CallerAssertionError::InvalidLifetime)?;
 
     let mut extra = Map::new();
+    let expires_at = if let Some(approval) = approval {
+        extra.insert(
+            "approval_id".to_owned(),
+            Value::String(approval.id.to_string()),
+        );
+        extra.insert(
+            "target_sha256".to_owned(),
+            Value::String(approval.target_sha256),
+        );
+        expires_at.min(approval.expires_at)
+    } else {
+        expires_at
+    };
 
     // The two halves of the identity, unscoped, so an upstream matching its own records never has to
     // take the composite `sub` apart. Always present: an upstream that reads these instead of `sub`

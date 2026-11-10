@@ -456,6 +456,36 @@ pub(super) fn tool_playground_runtime_error_response(
                 "invalid_params",
                 details,
             ),
+            Some("mutation_approval_not_found") => tool_playground_error_response(
+                StatusCode::NOT_FOUND,
+                "mutation approval request failed",
+                "mutation_approval_not_found",
+            ),
+            Some("mutation_approval_expired") => tool_playground_error_response(
+                StatusCode::GONE,
+                "mutation approval request failed",
+                "mutation_approval_expired",
+            ),
+            Some("mutation_approval_mismatch") => tool_playground_error_response(
+                StatusCode::CONFLICT,
+                "mutation approval request failed",
+                "mutation_approval_mismatch",
+            ),
+            Some("mutation_approval_state_conflict") => tool_playground_error_response(
+                StatusCode::CONFLICT,
+                "mutation approval request failed",
+                "mutation_approval_state_conflict",
+            ),
+            Some("mutation_approval_unavailable") => tool_playground_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "mutation approval request failed",
+                "mutation_approval_unavailable",
+            ),
+            Some("mutation_approval_unsupported") => tool_playground_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "mutation approval requires a direct managed HTTPS OpenAPI mutation",
+                "mutation_approval_unsupported",
+            ),
             Some("unknown_tool") => tool_playground_error_response(
                 StatusCode::NOT_FOUND,
                 "tool was not found",

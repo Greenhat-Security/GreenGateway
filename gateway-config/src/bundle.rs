@@ -637,6 +637,7 @@ fn read_deployment(
             diagnostics.push(issue);
             Vec::new()
         });
+    diagnostics.extend(settings.listener_diagnostics(profile, &node, &reference.file));
     diagnostics.extend(settings.public_diagnostics(&node, &reference.file));
     diagnostics.extend(settings.provider_diagnostics(&node, &reference.file));
     let plan = match settings.offline_plan(profile, bundled_policy, &node, &reference.file) {

@@ -92,6 +92,7 @@ struct CoreTlsResponse {
     status: &'static str,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    wait_before_write: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl CoreTlsResponse {
@@ -100,6 +101,7 @@ impl CoreTlsResponse {
             status,
             headers: Vec::new(),
             body: Vec::new(),
+            wait_before_write: None,
         }
     }
 
@@ -108,11 +110,17 @@ impl CoreTlsResponse {
             status,
             headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
             body: body.to_string().into_bytes(),
+            wait_before_write: None,
         }
     }
 
     fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    fn after(mut self, signal: &Arc<tokio::sync::Notify>) -> Self {
+        self.wait_before_write = Some(Arc::clone(signal));
         self
     }
 }
@@ -177,6 +185,14 @@ async fn spawn_core_tls_upstream(
                     return;
                 };
                 let response = handler(request);
+                if let Some(signal) = response.wait_before_write {
+                    if tokio::time::timeout(Duration::from_secs(3), signal.notified())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
                 let mut head = format!(
                     "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n",
                     response.status,
@@ -1324,6 +1340,9 @@ async fn e2e_04_authenticated_mcp_stream_refresh_lkg_and_delete_workflow() {
     const MANAGED_MCP_BEARER: &str = "issue-240-e2e04-managed-mcp-bearer";
     let managed_requests = Arc::new(Mutex::new(Vec::<CoreTlsRequest>::new()));
     let captured_requests = Arc::clone(&managed_requests);
+    // rmcp opens the session GET in a background task. Hold discovery
+    // open until it reaches this server, even if tools/list arrives first.
+    let stream_opened = Arc::new(tokio::sync::Notify::new());
     let upstream = spawn_core_tls_upstream(Arc::new(move |request| {
         let authorized = request
             .headers
@@ -1338,7 +1357,10 @@ async fn e2e_04_authenticated_mcp_stream_refresh_lkg_and_delete_workflow() {
             return CoreTlsResponse::empty("401 Unauthorized");
         }
         match request.method {
-            Method::GET => CoreTlsResponse::empty("405 Method Not Allowed"),
+            Method::GET => {
+                stream_opened.notify_one();
+                CoreTlsResponse::empty("405 Method Not Allowed")
+            }
             Method::DELETE => CoreTlsResponse::empty("200 OK"),
             Method::POST => {
                 let body: Value = serde_json::from_slice(&request.body)
@@ -1379,7 +1401,8 @@ async fn e2e_04_authenticated_mcp_stream_refresh_lkg_and_delete_workflow() {
                                 }]
                             }
                         }),
-                    ),
+                    )
+                    .after(&stream_opened),
                     "tools/call" => CoreTlsResponse::json(
                         "200 OK",
                         json!({

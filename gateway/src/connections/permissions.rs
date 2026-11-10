@@ -8,6 +8,7 @@ pub const ADMIN_CONNECTIONS_REFRESH: &str = "admin:connections:refresh";
 pub const ADMIN_TOOLS_READ: &str = "admin:tools:read";
 pub const ADMIN_TOOLS_WRITE: &str = "admin:tools:write";
 pub const ADMIN_TOOLS_EXECUTE: &str = "admin:tools:execute";
+pub const ADMIN_MUTATION_APPROVAL_REVIEW: &str = "admin:tools:approvals:review";
 
 /// The cluster status API (issue #241, PR 14): `GET
 /// /v1{ADMIN_PREFIX}/cluster` and `/cluster/replicas`.
@@ -39,6 +40,7 @@ mod tests {
             ADMIN_TOOLS_READ,
             ADMIN_TOOLS_WRITE,
             ADMIN_TOOLS_EXECUTE,
+            ADMIN_MUTATION_APPROVAL_REVIEW,
             ADMIN_CLUSTER_READ,
         ];
 

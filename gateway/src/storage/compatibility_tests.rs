@@ -39,7 +39,7 @@ fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
     let rendered = advertisement(BINARY_CAPABILITIES).expect("the shipped set fits the column");
     assert_eq!(
         rendered,
-        "delegated_token_purges,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
+        "delegated_token_purges,managed_http_mutation_v1,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
          operation_requirements,policy_document_v1,policy_role_descriptions,\
          policy_rule_conditions,policy_tool_argument_conditions"
     );
@@ -52,6 +52,7 @@ fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
         recognized.names(),
         vec![
             "delegated_token_purges",
+            "managed_http_mutation_v1",
             "openapi_discovery_catalogs",
             "openapi_repeated_query",
             "openapi_swagger2_catalogs",
@@ -320,7 +321,8 @@ mod gate_tests {
                 DELEGATED_TOKEN_PURGES,
                 POLICY_DOCUMENT_V1,
                 POLICY_RULE_CONDITIONS,
-                POLICY_TOOL_ARGUMENT_CONDITIONS
+                POLICY_TOOL_ARGUMENT_CONDITIONS,
+                MANAGED_HTTP_MUTATION_V1
             ],
             "registering an operation is a protocol change: review its requirement, its new \
              capability and the docs in ha-state-model.md section 7 before updating this test"
@@ -1047,6 +1049,39 @@ mod gate_tests {
             gate(&requirement(), &contract(), OWN, &[]),
             Err(OperationRefusal::RosterMissingThisReplica)
         );
+    }
+
+    #[test]
+    fn managed_mutation_enrollment_waits_for_live_peers_and_fences_out_late_joiners() {
+        let requirement = &MANAGED_HTTP_MUTATION_V1;
+        assert_eq!(requirement.activation, Activation::DurableFence);
+        let binary = BinaryContract::shipped();
+        let own = MemberAdvertisement {
+            schema_version: binary.schema,
+            document_version: binary.document,
+            ..member(OWN, true, requirement.capability.as_str())
+        };
+        let mut old = MemberAdvertisement {
+            schema_version: binary.schema,
+            document_version: binary.document,
+            ..member(PEER, true, "operation_requirements")
+        };
+        assert!(matches!(
+            gate(requirement, &binary, OWN, &[own.clone(), old.clone()]),
+            Err(OperationRefusal::MembersLackRequirement { .. })
+        ));
+        old.live = false;
+        assert!(gate(requirement, &binary, OWN, &[own, old]).is_ok());
+        let target = fence_target(&ContractFence::open(), requirement)
+            .unwrap()
+            .expect("enrollment raises the open fence");
+        let fence = fence(1, target.minimum_schema, &target.capabilities);
+        assert!(binary.fenced_by(&fence).is_none());
+        let old_binary = BinaryContract {
+            capabilities: &[Capability::OperationRequirements],
+            ..binary
+        };
+        assert!(old_binary.fenced_by(&fence).is_some());
     }
 
     /// The pure gate judges a durable-fence operation exactly as it judges
