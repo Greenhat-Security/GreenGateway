@@ -157,7 +157,7 @@ describe('PolicyStudioView', () => {
     expect(screen.queryByText('Stale answer.')).toBeNull();
   });
 
-  it('opens the selected rule, edits its time window and saves only the draft revision', async () => {
+  it('opens the selected rule, wraps its time window and saves only the draft revision', async () => {
     const gateway = fakeGateway();
     renderStudio(gateway, '/policy/studio?rule_id=allow-billing');
     await openDraft();
@@ -165,15 +165,17 @@ describe('PolicyStudioView', () => {
     expect(document.activeElement).toBe(condition);
     expect(gateway.requests('POST', '/v1/admin/policy/drafts')).toHaveLength(0);
     fireEvent.click(within(condition).getByRole('button', { name: 'Add time window condition' }));
-    fireEvent.change(within(condition).getByLabelText('Until (exclusive)'), {
+    fireEvent.change(screen.getByLabelText('Until (exclusive)'), {
       target: { value: '2027-01-01T00:00:00Z' },
     });
+    fireEvent.click(screen.getByText('Change condition structure'));
+    fireEvent.click(screen.getByRole('button', { name: 'Wrap in Not' }));
     fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
     await screen.findByText('Revision 2 saved. The live policy is unchanged.', undefined, WAIT);
     const patch = gateway.requests('PATCH', `/v1/admin/policy/drafts/${DRAFT_ID}`)[0];
     expect(patch.headers.get('If-Match')).toBe(draftEtag(DRAFT_ID, 1));
     expect(JSON.parse(patch.body ?? '{}').policy.rules).toEqual([
-      { ...draftPolicy().rules[0], conditions: { time_window: { until: '2027-01-01T00:00:00Z' } } },
+      { ...draftPolicy().rules[0], conditions: { not: { time_window: { until: '2027-01-01T00:00:00Z' } } } },
     ]);
     expect(gateway.live.etag).toBe(LIVE_ETAG);
   });
@@ -184,6 +186,43 @@ describe('PolicyStudioView', () => {
     await openDraft();
     expect(await screen.findByText('Rule could not be selected')).toBeTruthy();
     expect(gateway.requests('PATCH', `/v1/admin/policy/drafts/${DRAFT_ID}`)).toHaveLength(0);
+  });
+
+  it('keeps duplicate members in raw Source instead of rewriting the parsed condition', async () => {
+    const gateway = fakeGateway();
+    const duplicate = diagnostic({
+      code: 'duplicate_member', pointer: '/rules/0/conditions',
+      message: 'A policy member occurs twice.', remediation: 'Keep a single condition.',
+    });
+    gateway.validate = () => jsonResponse(400, { valid: false, diagnostics: [duplicate] });
+    renderStudio(gateway);
+    await openDraft();
+    fireEvent.click(screen.getByRole('tab', { name: /^Source/ }));
+    const raw = '{"schema_version":"1.0.0","rules":[{"id":"a","path":"/a","action":"deny","conditions":{"time_window":{}},"conditions":{"source_network":{"cidrs":[]}}}]}';
+    fireEvent.change(screen.getByLabelText('Policy document (JSON)'), { target: { value: raw } });
+    fireEvent.click(screen.getByRole('tab', { name: /HTTP and MCP rules/ }));
+    expect(screen.queryByText('Change condition structure')).toBeNull();
+    await screen.findByText('Invalid: 1 error.', undefined, WAIT);
+    expect(screen.getByText('Validate the edits in Source before changing this condition here.')).toBeTruthy();
+    fireEvent.click(screen.getByRole('tab', { name: /^Source/ }));
+    expect((screen.getByLabelText('Policy document (JSON)') as HTMLTextAreaElement).value).toBe(raw);
+  });
+
+  it('moves focus from a gateway diagnostic to the nested condition field', async () => {
+    const gateway = fakeGateway();
+    const record = gateway.drafts.get(DRAFT_ID)!;
+    record.policy.rules = [{
+      ...draftPolicy().rules[0],
+      conditions: { all: [{ source_network: { cidrs: ['192.0.2.0/24'] } }, { time_window: { until: 'later' } }] },
+    }];
+    const pointer = '/rules/0/conditions/all/1/time_window/until';
+    gateway.validate = () => jsonResponse(400, { valid: false, diagnostics: [
+      diagnostic({ pointer, message: 'The time bound is invalid.', remediation: 'Use a UTC timestamp.' }),
+    ] });
+    renderStudio(gateway);
+    await openDraft();
+    fireEvent.click(await screen.findByRole('button', { name: `Show in editor: ${pointer}` }, WAIT));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText('Until (exclusive)')));
   });
 
   it('clears an uncommitted CIDR when opening another draft with the same rule', async () => {
