@@ -260,16 +260,34 @@ impl SqliteConnectionStore {
         })
     }
 
+    pub fn check_mutation_approval(
+        &self,
+        id: Uuid,
+        action: &MutationAction,
+    ) -> Result<(), ApprovalError> {
+        action.validate()?;
+        let mut connection = self.connection_guard();
+        let tx = connection.transaction()?;
+        let record = load_approval(&tx, id)?;
+        record.check_consumption(action, authority_now(&tx)?)?;
+        self.check_approval_generation(&tx, action)?;
+        record.ensure_live(authority_now(&tx)?)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn consume_mutation_approval(
         &self,
         id: Uuid,
         action: &MutationAction,
+        check_permission: impl FnOnce() -> Result<i64, ApprovalError>,
     ) -> Result<ConsumedMutationApproval, ApprovalError> {
         action.validate()?;
         self.approval_transaction(|tx| {
             let record = load_approval(tx, id)?;
             record.check_consumption(action, authority_now(tx)?)?;
             self.check_approval_generation(tx, action)?;
+            check_permission()?;
             let now = authority_now(tx)?;
             record.ensure_live(now)?;
             let changed = tx.execute(
@@ -280,7 +298,7 @@ impl SqliteConnectionStore {
             if changed != 1 {
                 return Err(ApprovalError::Conflict);
             }
-            Ok(ConsumedMutationApproval::new(id))
+            Ok(ConsumedMutationApproval::new(record, now))
         })
     }
 }

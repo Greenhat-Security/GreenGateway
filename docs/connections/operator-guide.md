@@ -237,7 +237,13 @@ For a restore rehearsal:
 3. Configure the exact backed-up key IDs and roles.
 4. Start an isolated gateway with outbound egress blocked.
 5. Confirm startup succeeds and only safe secret metadata is visible.
-6. Permit only controlled recovery-validation destinations, Test representative
+6. Before restoring production traffic, invalidate restored pending and approved
+   mutation occurrences in isolation, or wait a full 15 minutes with gateway
+   and authority clocks verified and new preparations disabled. Confirm no
+   pending or approved row is still within its lifetime. Restore the
+   upstream replay ledger together with its business state. An older snapshot
+   can contain an approved row that was subsequently consumed or revoked.
+7. Permit only controlled recovery-validation destinations, test representative
    disabled Connections, and keep ordinary production egress blocked until the
    rehearsal is complete.
 
@@ -728,9 +734,10 @@ itself in `X-Request-Id`, so it is not guaranteed unique per call, and two
 callers can send the same one. Keyed on both, a repeat can only be the same
 caller's, and a client that reuses an ID sees its own second call rejected.
 Compare `path` with the request target before any proxy in front of the
-upstream rewrote it. `exp` is `iat` plus `lifetime_seconds` on the gateway's
-clock; if the two clocks can drift apart, allow a few seconds of leeway
-(`leeway=` in PyJWT) rather than lengthening the lifetime.
+upstream rewrote it. Ordinary assertions expire at `iat` plus
+`lifetime_seconds`. Approval-bound assertions can expire sooner. Synchronize
+the gateway, storage authority and verifier clocks and enforce their `exp`
+with zero expiry leeway.
 
 #### The block in the admin UI
 
@@ -745,9 +752,10 @@ or **Remove caller assertion**:
   a disable or a credential rotation cannot change it or put the Connection
   back into service unattested. The gateway still revalidates the kept block
   on every save, so the editor refuses a primary or additional header name
-  that matches the assertion header before it writes, and a block stored with
-  `bind_approval: true` must be edited, which turns approval binding off, or
-  removed before the Connection can be saved again.
+  that matches the assertion header before it writes. A legacy block with
+  `bind_approval: true` and no `approval_mode` needs an explicit enrollment,
+  an edit that turns off approval binding, or removal. Editing an enrolled
+  block preserves its approval mode and requires request binding.
 - Editing sends the whole block. Each key's alias is picked from the aliases
   whose compatible purposes include `assertion_signing_key`: operator aliases
   and external providers, never the encrypted local store. A key the editor
@@ -777,10 +785,9 @@ marker. Naming any key alias in a `PUT`, even the stored one, needs the
 secrets-write permission, so a principal without it cannot test guesses
 against a hidden alias.
 
-New and replacement writes reject `bind_approval: true` until dispatch can
-consume a reviewed mutation and sign its verified identifier. Writes also
-reject a caller-assertion header that matches an additional header name
-regardless of case, and a plain HTTP endpoint.
+A write with `bind_approval: true` requires the enrollment described below.
+Writes reject a caller-assertion header that matches an additional header
+name regardless of case, and reject a plain HTTP endpoint.
 
 A caller assertion binds private keys, so it is credential authority: creating
 a Connection that carries one, deleting it, and any change to the block,
@@ -792,54 +799,94 @@ rename, does not.
 
 #### Preparing and reviewing a mutation
 
-An operator can record a decision on one proposed call to a direct, managed
-OpenAPI tool. Preparation supports named HTTPS POST, PUT, PATCH and DELETE
-operations. It renders the request under the caller’s normal tool and HTTP
-policy, including request transforms. It performs no credential resolution or
-upstream request. Preparing the same input twice creates two independent
-review IDs.
+Each approval covers one proposed HTTPS POST, PUT, PATCH or DELETE on a named
+operation of a direct managed OpenAPI tool. To enable dispatch, set these
+fields together in the Connection's signed caller assertion via the admin API.
 
-1. Fetch the tool detail and its execution ETag. As the requesting principal
-   with `admin:tools:execute`, send `POST /v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals`
-   with the exact ETag in `If-Match` and the usual `{"arguments":{…}}` body.
-   A successful response is `201` and includes the new approval ID and expiry.
-2. The requesting principal can read their record at
-   `GET /v1{ADMIN_PREFIX}/mutation-approvals/{id}`. A reviewer with
-   `admin:tools:approvals:review` can also read it. The record names the
-   authenticated caller's issuer and subject, Connection and revision, catalog
-   revision, tool, operation and case-sensitive HTTP method. It includes the
-   SHA-256 digests of the registered definition, the absolute URL with query,
-   and the exact body bytes after rendering. A reviewer can compare the URL
-   and body digests with independently expected values. The store retains
-   neither the URL nor the body.
-3. A different authenticated principal with the reviewer permission sends
-   `POST /v1{ADMIN_PREFIX}/mutation-approvals/{id}/review` with
-   `{"decision":"approve"}` or `{"decision":"reject"}`. A reviewer can revoke
-   a pending or approved decision with an empty
-   `POST /v1{ADMIN_PREFIX}/mutation-approvals/{id}/revoke`. The authority
-   compares issuer and subject together to enforce separation of duties.
-   Assign reviewer access to independently controlled identities. Service
-   tokens cannot request or review mutations.
+```json
+{
+  "approval_mode": "managed_http_mutation_v1",
+  "bind_approval": true,
+  "bind_request": true
+}
+```
 
-With `AUTHORITY_EVIDENCE_DURABILITY=required`, both storage modes return `409 authority_evidence_unsupported` for preparation, review and revocation. The decision row expires and there is no append-only transition history. Authorized reads remain available.
+Keep the signing key, issuer, audience and header configured as for an ordinary
+assertion. Use an HTTPS `http_api` Connection with `managed_openapi`
+discovery, with no additional Connection headers. Supported primary
+authentication types are `none`, `header_api_key` and `static_bearer`.
+Registration can use an operator-supplied API specification. Publish the tool
+against the enrolled Connection's current ETag. Ordinary tool execution, proxy
+routes, composites, managed MCP, discovery fetches and stored tests cannot
+dispatch on that Connection. Cluster enrollment requires schema 34 and every
+live replica to advertise `managed_http_mutation_v1`. Enrollment raises the
+durable contract fence, which remains in force after removing the enrollment.
 
-The approval window is 15 minutes from preparation. Review and revocation
-timestamps come from the storage authority. It rechecks the Connection and
-registered operation when approving, and deleting the Connection removes its
-records. A caller can retain at most 32 unexpired records and the deployment
-at most 1,024. A new preparation clears expired records and returns `429`
-while either limit is full. Standalone deployments use the Connection SQLite
-database. Replicas share the same records and conditional transitions in
-PostgreSQL. Cleanup removes terminal decisions on the same schedule. The
-approval store provides short-lived workflow state. An operator who needs
-longer review history must retain the corresponding audit events.
+1. **Prepare as the requester.** Fetch the tool detail and its execution ETag.
+   With `admin:tools:execute`, send
+   `POST /v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals` with that ETag in
+   `If-Match` and the usual `{"arguments":{…}}` body. The gateway applies tool
+   policy and request transforms and returns `201` with the new ID and expiry.
+   Preparation reads no credential and sends no upstream request. Two
+   preparations of identical arguments produce independent occurrences.
+2. **Inspect the exact action.** The requester and a principal with
+   `admin:tools:approvals:review` can read
+   `GET /v1{ADMIN_PREFIX}/mutation-approvals/{id}`. Compare the requester’s
+   issuer and subject, Connection ETag, catalog revision, tool, operation
+   and method with the expected mutation. Compare the SHA-256 digests of the
+   registered definition, effective absolute URL including the query, and
+   exact rendered body bytes against independently expected values. The store
+   retains the digests and omits the raw URL and body.
+3. **Decide under an independent identity.** An authorized reviewer posts
+   `{"decision":"approve"}` or `{"decision":"reject"}` to
+   `/v1{ADMIN_PREFIX}/mutation-approvals/{id}/review`. A reviewer can revoke a
+   pending or approved occurrence with an empty
+   `POST /v1{ADMIN_PREFIX}/mutation-approvals/{id}/revoke`. The requester's
+   issuer and subject together must differ from the reviewer's. Assign the
+   two identities to independently controlled accounts. Service tokens cannot
+   request, review or execute an approval.
+4. **Execute as the original requester.** Send
+   `POST /v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals/{approval_id}/execute`
+   with the execution ETag in `If-Match` and the original arguments. The gateway
+   checks current execution permission, renders the request again and compares
+   it with the approved action. It atomically consumes the occurrence before
+   signing and attempting the request. Only one concurrent caller can consume
+   it, including across replicas. A timeout, transport failure or lost response
+   after consumption leaves the occurrence spent. The gateway makes no automatic
+   resend. Check the upstream outcome before preparing a new occurrence.
 
-Successful reads and review transitions record `connection.mutation_approval` events with the
-actor, operation and outcome. Successful writes identify the approval and
-Connection. Review responses are private to the requester and authorized
-reviewers. The gateway continues to refuse approval-bound dispatch on every
-lane. A review ID grants no permission to call an upstream and no caller
-assertion carries it in this release.
+**Verify at the upstream.** Verify the signature with the gateway's JWKS and
+the configured algorithm, key, issuer, audience and token type. Require a valid
+`approval_id`, a live `exp`, the expected caller, `method`, `path`,
+`request_sha256` and `target_sha256`. The path includes the original query.
+Hash the received body bytes, including an empty body, and hash the UTF-8
+serialization of the effective absolute HTTPS URL, including its origin,
+escaped path and query. Reconstruct it from the trusted public origin and
+original request target before an intermediary rewrites either. Preserve
+percent encoding, query order and repeated parameters. The gateway caps
+`exp` at the review deadline. Atomically record the pair `(iss, approval_id)`
+in shared replay storage before applying the mutation. Retain it for at
+least the full 15-minute review lifetime from first acceptance, including
+when this JWT expires sooner. Where possible, commit the unique replay record and the
+business mutation in one transaction across all upstream replicas. A
+per-request `jti` identifies the signed call. The approval ID identifies the
+reviewed occurrence if a caller repeats a request or a database restore
+brings back an older decision.
+
+**Retention and audit.** The authority sets the deadline 15 minutes from
+preparation. Standalone uses the Connection SQLite database. Cluster replicas
+share PostgreSQL. A new preparation prunes expired records, including terminal
+records, and returns `429` when 32 unexpired records for one requester or
+1,024 deployment-wide already occupy the store. Deleting the Connection
+cascades to its approvals. The gateway emits `connection.mutation_approval`
+with the actor, operation and outcome. It records successful consumption
+before attempting transport. It excludes token material, request and response
+bodies, raw URLs and signing keys from approval events. A consumption event
+does not establish that the upstream applied the mutation. With
+`AUTHORITY_EVIDENCE_DURABILITY=required`, preparation, review, revocation and
+consumption return `409 authority_evidence_unsupported` because these bounded
+records have no append-only transition history. Authorized reads remain
+available.
 
 #### Signing keys
 

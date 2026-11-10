@@ -52,6 +52,7 @@
         "connection.replace",
         "credential.binding_change",
         "jwt.revoke",
+        "mutation_approval.consume",
         "mutation_approval.prepare",
         "mutation_approval.review",
         "mutation_approval.revoke",

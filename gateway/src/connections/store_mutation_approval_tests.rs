@@ -64,7 +64,9 @@ fn mutation_approval_survives_restart_and_only_one_database_handle_can_consume_i
     let second_occurrence = first.create_mutation_approval(&action).unwrap().id;
     assert_ne!(id, second_occurrence);
     assert_eq!(
-        first.consume_mutation_approval(id, &action).unwrap_err(),
+        first
+            .consume_mutation_approval(id, &action, || Ok(0))
+            .unwrap_err(),
         ApprovalError::Conflict
     );
     assert_eq!(
@@ -88,7 +90,7 @@ fn mutation_approval_survives_restart_and_only_one_database_handle_can_consume_i
             let action = &action;
             scope.spawn(move || {
                 barrier.wait();
-                store.consume_mutation_approval(id, action)
+                store.consume_mutation_approval(id, action, || Ok(0))
             })
         });
         let results = handles.map(|handle| handle.join().unwrap());
@@ -126,6 +128,19 @@ fn mutation_approval_checks_each_action_field_and_rejects_stale_catalogs() {
     store
         .decide_mutation_approval(id, &reviewer, ApprovalDecision::Approve, || Ok(0))
         .unwrap();
+    store
+        .check_mutation_approval(id, &action)
+        .expect("early admission");
+    assert_eq!(
+        store
+            .consume_mutation_approval(id, &action, || Err(ApprovalError::Conflict))
+            .unwrap_err(),
+        ApprovalError::Conflict
+    );
+    assert_eq!(
+        store.mutation_approval(id).unwrap().status,
+        ApprovalStatus::Approved
+    );
     let mut changed = action.clone();
     changed.caller.subject.push('2');
     let mut issuer = action.clone();
@@ -148,13 +163,32 @@ fn mutation_approval_checks_each_action_field_and_rejects_stale_catalogs() {
     version.connection_etag.push('2');
     let mut connection = action.clone();
     connection.connection_id = ConnectionId::new_managed();
+    for different_caller in [changed, issuer] {
+        assert_eq!(
+            store
+                .check_mutation_approval(id, &different_caller)
+                .unwrap_err(),
+            ApprovalError::NotFound
+        );
+        assert_eq!(
+            store
+                .consume_mutation_approval(id, &different_caller, || Ok(0))
+                .unwrap_err(),
+            ApprovalError::NotFound
+        );
+    }
     for incompatible in [
-        changed, issuer, operation, tool, method, body, target, revision, definition, version,
-        connection,
+        operation, tool, method, body, target, revision, definition, version, connection,
     ] {
         assert_eq!(
             store
-                .consume_mutation_approval(id, &incompatible)
+                .check_mutation_approval(id, &incompatible)
+                .unwrap_err(),
+            ApprovalError::Mismatch
+        );
+        assert_eq!(
+            store
+                .consume_mutation_approval(id, &incompatible, || Ok(0))
                 .unwrap_err(),
             ApprovalError::Mismatch
         );
@@ -167,7 +201,9 @@ fn mutation_approval_checks_each_action_field_and_rejects_stale_catalogs() {
         )
         .unwrap();
     assert_eq!(
-        store.consume_mutation_approval(id, &action).unwrap_err(),
+        store
+            .consume_mutation_approval(id, &action, || Ok(0))
+            .unwrap_err(),
         ApprovalError::Mismatch
     );
     assert_eq!(
@@ -180,7 +216,9 @@ fn mutation_approval_checks_each_action_field_and_rejects_stale_catalogs() {
     assert_eq!(revoked.status, ApprovalStatus::Revoked);
     assert!(revoked.reviewer == revoked.revoked_by);
     assert_eq!(
-        store.consume_mutation_approval(id, &action).unwrap_err(),
+        store
+            .consume_mutation_approval(id, &action, || Ok(0))
+            .unwrap_err(),
         ApprovalError::Conflict
     );
 }
@@ -202,7 +240,9 @@ fn mutation_approval_holds_rejections_revocations_expiry_and_connection_deletion
         ApprovalError::Conflict
     );
     assert_eq!(
-        store.consume_mutation_approval(id, &action).unwrap_err(),
+        store
+            .consume_mutation_approval(id, &action, || Ok(0))
+            .unwrap_err(),
         ApprovalError::Conflict
     );
     let pending = store.create_mutation_approval(&action).unwrap();
@@ -228,9 +268,23 @@ fn mutation_approval_holds_rejections_revocations_expiry_and_connection_deletion
     );
     assert_eq!(
         store
-            .consume_mutation_approval(expiring.id, &action)
+            .consume_mutation_approval(expiring.id, &action, || Ok(0))
             .unwrap_err(),
         ApprovalError::Expired
+    );
+    let mut foreign_action = action.clone();
+    foreign_action.caller = reviewer.clone();
+    assert_eq!(
+        store
+            .check_mutation_approval(expiring.id, &foreign_action)
+            .unwrap_err(),
+        ApprovalError::NotFound
+    );
+    assert_eq!(
+        store
+            .consume_mutation_approval(expiring.id, &foreign_action, || Ok(0))
+            .unwrap_err(),
+        ApprovalError::NotFound
     );
     let fresh = store.create_mutation_approval(&action).unwrap().id;
     assert_eq!(

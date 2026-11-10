@@ -8,7 +8,7 @@
     "write": [34, 34],
     "approved_extensions": [],
     "document_format": [0, 1],
-    "capabilities": ["delegated_token_purges", "openapi_discovery_catalogs", "openapi_repeated_query", "openapi_swagger2_catalogs", "operation_requirements", "policy_document_v1", "policy_role_descriptions", "policy_rule_conditions", "policy_tool_argument_conditions"],
+    "capabilities": ["delegated_token_purges", "managed_http_mutation_v1", "openapi_discovery_catalogs", "openapi_repeated_query", "openapi_swagger2_catalogs", "operation_requirements", "policy_document_v1", "policy_role_descriptions", "policy_rule_conditions", "policy_tool_argument_conditions"],
     "operations": [
       {
         "operation": "policy.role_descriptions",
@@ -73,6 +73,14 @@
         "document_format": 1,
         "backfill": null,
         "activation": "live_members"
+      },
+      {
+        "operation": "connections.managed_http_mutation_v1",
+        "capability": "managed_http_mutation_v1",
+        "minimum_schema": 34,
+        "document_format": null,
+        "backfill": null,
+        "activation": "durable_fence"
       }
     ],
     "contractions": []

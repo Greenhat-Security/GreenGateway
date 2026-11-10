@@ -6465,6 +6465,7 @@ impl TemporaryStaticAuthRuntime {
     /// `assertion-signing-key`.
     fn caller_assertion_settings() -> CallerAssertionSettings {
         CallerAssertionSettings {
+            approval_mode: None,
             signing_key_id: "assertion-signing-key".to_owned(),
             kid: "gw-test-1".to_owned(),
             algorithm: CallerAssertionAlgorithm::Es256,

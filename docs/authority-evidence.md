@@ -1022,7 +1022,7 @@ outside the gateway:
 | `required_mode` | Rows | What required mode does |
 | --- | --- | --- |
 | `admitted` | Cluster policy, tools, Connection create, replace and delete, catalogs, token issue and change, JWT revocation, admin sessions and import, and standalone Connection create, replace and delete, local-secret create, rotate, delete and re-encryption, catalog publication and overlays, and token issue and rotate/revoke | Runs it. Its evidence is the row's `record` |
-| `refused` | Mutation approval preparation, review and revocation in both modes. Standalone policy mutations, policy file reloads, and tools publication (admin API and file reloads) | Refuses it when asked, before anything is written |
+| `refused` | Mutation approval preparation, review, revocation and consumption in both modes. Standalone policy mutations, policy file reloads, and tools publication (admin API and file reloads) | Refuses it when asked, before anything is written |
 | `refused_at_startup` | Standalone admin sessions (`ADMIN_SESSION_MODE=standalone_memory`) | Refuses to start |
 | `unavailable` | Cluster policy file reload and local secrets, standalone JWT revocation and import, configuration export | Nothing to refuse: the mode or the build has no such operation. A gate that is asked anyway refuses it |
 | `outside_gateway` | External secret-provider rotation | Not covered: the provider owns the write and the gateway cannot refuse it |

@@ -21,6 +21,7 @@ export const OPERATIONS = [
   "connection.replace",
   "credential.binding_change",
   "jwt.revoke",
+  "mutation_approval.consume",
   "mutation_approval.prepare",
   "mutation_approval.review",
   "mutation_approval.revoke",
@@ -46,7 +47,7 @@ export const OPERATIONS = [
 const MODES = ["postgres", "standalone"];
 const REVISION_OPERATIONS = {
   create: ["mutation_approval.prepare", "admin_session.grant", "connection.create", "secret.create", "service_token.issue"],
-  advance: ["mutation_approval.review", "mutation_approval.revoke", "connection.replace", "credential.binding_change", "catalog.overlay.delete", "catalog.overlay.replace",
+  advance: ["mutation_approval.consume", "mutation_approval.review", "mutation_approval.revoke", "connection.replace", "credential.binding_change", "catalog.overlay.delete", "catalog.overlay.replace",
     "policy.rollback", "policy.rule.create", "policy.rule.delete", "policy.rule.reorder", "policy.rule.update", "policy.suggestion.accept",
     "secret.rotate", "secret.external_rotate", "service_token.rotate", "service_token.revoke"],
   publish: ["catalog.mcp.publish", "catalog.openapi.publish", "configuration.activate", "configuration.import",
@@ -244,6 +245,7 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
     const path = `gateway/src/${file}`;
     for (const match of source(path).matchAll(/pub\(super\) async fn ([a-z0-9_]+_endpoint)\(/g)) {
       if (/(?:create|put|post|patch|delete|rollback|register|rotate|revoke|refresh|accept)_endpoint$/.test(match[1])
+          || /_mutation_approval_execute_endpoint$/.test(match[1])
           || file === "admin_mutation_approvals.rs" && /_review_endpoint$/.test(match[1])) {
         check(coveredEntries.has(`${path}::${match[1]}`), `unreviewed mutation entrypoint ${path}::${match[1]}`);
       }

@@ -1471,6 +1471,86 @@ mod database {
         );
     }
 
+    #[tokio::test]
+    async fn managed_mutation_enrollment_import_requires_and_establishes_the_durable_fence() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let deployment = "deploy-import-approval";
+        let (config, _dsn_file) = target_config(&database.dsn, deployment);
+        let pool = migrate(&config).await;
+        let fixture = build_fixture("approval-enrollment", 1, 0);
+        let actor = crate::auth::change_actor::ChangeActor::for_test("fixture");
+        let mut enrolled = openapi_connection();
+        enrolled.display_name = "Enrolled".to_owned();
+        enrolled.caller_assertion = Some(serde_json::from_value(json!({
+            "signing_key_id":"fixture", "kid":"fixture", "issuer":"fixture", "audience":"fixture",
+            "algorithm":"es256", "token_type":"fixture", "header_name":"x-caller-assertion",
+            "lifetime_seconds":30, "bind_request":true, "bind_approval":true,
+            "approval_mode":"managed_http_mutation_v1"
+        })).unwrap());
+        let source = SqliteConnectionStore::open(fixture.connections_file()).unwrap();
+        let stored = source.create(enrolled.clone(), &actor).unwrap();
+        drop(source);
+        // A direct store client cannot introduce an enrolled row ahead of a fence.
+        let target = PostgresConnectionStore::new(pool.clone(), MAX_CONNECTIONS).unwrap();
+        assert!(target.create(enrolled, &actor, None).await.is_err());
+        let (lo, hi) = migrations::schema_version_range();
+        let old = uuid::Uuid::new_v4();
+        pool.get().await.unwrap().execute(
+            "INSERT INTO greengateway.cluster_members
+              (deployment_id, instance_id, boot_id, binary_version, schema_version_min, schema_version_max,
+               document_version_min, document_version_max, fingerprint, capabilities)
+             VALUES ($1,$2::text::uuid,$3::text::uuid,'older',$4,$5,0,1,repeat('a',64),'operation_requirements')",
+            &[&deployment, &old.to_string(), &uuid::Uuid::new_v4().to_string(), &lo, &hi],
+        ).await.unwrap();
+        const ENROLLED_FENCES: &str = "SELECT count(*) FROM greengateway.contract_fence WHERE singleton AND minimum_schema >= 34 AND 'managed_http_mutation_v1' = ANY(string_to_array(capabilities, ','))";
+        for mode in [ImportMode::DryRun, ImportMode::Apply] {
+            let Err(error) = run(&request(&fixture, mode), &config).await else {
+                panic!("mixed roster admitted enrollment")
+            };
+            assert!(
+                error.to_string().contains("capability_not_advertised"),
+                "{error}"
+            );
+            assert_eq!(count_of(&pool, ENROLLED_FENCES).await, 0);
+            assert_eq!(
+                count_of(
+                    &pool,
+                    "SELECT count(*) FROM greengateway.connection_records"
+                )
+                .await,
+                0
+            );
+        }
+        pool.get()
+            .await
+            .unwrap()
+            .execute(
+                "DELETE FROM greengateway.cluster_members WHERE instance_id = $1::text::uuid",
+                &[&old.to_string()],
+            )
+            .await
+            .unwrap();
+        run(&request(&fixture, ImportMode::DryRun), &config)
+            .await
+            .unwrap();
+        assert_eq!(count_of(&pool, ENROLLED_FENCES).await, 0);
+        run(&request(&fixture, ImportMode::Apply), &config)
+            .await
+            .unwrap();
+        assert_eq!(count_of(&pool, ENROLLED_FENCES).await, 1);
+        assert!(target
+            .get(&stored.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .write
+            .uses_managed_mutation_approval());
+    }
+
     /// Issue #243: a standalone deployment on policy v1 imports into
     /// cluster mode, and only while no live replica of the target is a
     /// build that cannot read format 1. Such a replica -- one that

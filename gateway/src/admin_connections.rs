@@ -765,6 +765,11 @@ pub(super) async fn connection_create_endpoint(
     // dispatch owns keeping that work off the request executor: standalone
     // mode runs its SQLite transaction on the blocking pool, cluster mode
     // awaits the PostgreSQL authority.
+    if let Err(response) =
+        admit_mutation_approval_enrollment(&state, &parts, &principal, &candidate).await
+    {
+        return *response;
+    }
     let created = match state
         .control_plane
         .create_managed(
@@ -910,6 +915,11 @@ pub(super) async fn connection_put_endpoint(
         .await
     {
         return connection_mutation_error_response(error);
+    }
+    if let Err(response) =
+        admit_mutation_approval_enrollment(&state, &parts, &principal, &candidate).await
+    {
+        return *response;
     }
     let updated = match state
         .control_plane
@@ -1757,6 +1767,53 @@ where
 pub(super) struct ConvertedCatalogRefusal {
     pub(super) reason: &'static str,
     pub(super) response: Box<Response>,
+}
+
+/// An enrolled Connection is durable. Fence older replicas out before the
+/// first PostgreSQL write so they cannot join later and serve the profile.
+async fn admit_mutation_approval_enrollment(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    candidate: &connections::model::ConnectionWrite,
+) -> ResponseResult<()> {
+    if !candidate.uses_managed_mutation_approval() {
+        return Ok(());
+    }
+    #[cfg(feature = "postgres")]
+    {
+        let refusal = storage::compatibility::OperationRefusal::RosterUnavailable;
+        let store = state
+            .control_plane
+            .managed_store()
+            .map_err(|_| Box::new(operation_refused(&refusal)))?;
+        if store.sqlite().is_none() {
+            let membership = state
+                .membership
+                .as_ref()
+                .ok_or_else(|| Box::new(operation_refused(&refusal)))?;
+            let request = cluster_membership::GatedWriteRequest {
+                request_id: client_ip::request_id(&parts.headers, &parts.extensions),
+                source_ip: client_ip::canonical_client_ip(
+                    &parts.headers,
+                    &parts.extensions,
+                    &state.client_ip_policy,
+                ),
+                actor: Some(auth::actor_from_principal(principal)),
+            };
+            membership
+                .admit_operation(
+                    &storage::compatibility::MANAGED_HTTP_MUTATION_V1,
+                    &state.audit,
+                    &request,
+                )
+                .await
+                .map_err(|error| Box::new(operation_refused(&error)))?;
+        }
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = (state, parts, principal);
+    Ok(())
 }
 
 /// Ask the cluster's operation gate before storing a managed OpenAPI catalog

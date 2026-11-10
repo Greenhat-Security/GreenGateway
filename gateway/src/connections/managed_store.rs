@@ -176,20 +176,44 @@ impl ManagedConnectionStore {
         }
     }
 
-    pub async fn consume_mutation_approval(
+    pub async fn check_mutation_approval(
         &self,
         id: Uuid,
         action: MutationAction,
-    ) -> Result<ConsumedMutationApproval, ApprovalError> {
+    ) -> Result<(), ApprovalError> {
         match self {
             Self::Sqlite(store) => {
                 let store = store.clone();
-                tokio::task::spawn_blocking(move || store.consume_mutation_approval(id, &action))
+                tokio::task::spawn_blocking(move || store.check_mutation_approval(id, &action))
                     .await
                     .map_err(|_| ApprovalError::Unavailable)?
             }
             #[cfg(feature = "postgres")]
-            Self::Postgres { store, .. } => store.consume_mutation_approval(id, &action).await,
+            Self::Postgres { store, .. } => store.check_mutation_approval(id, &action).await,
+        }
+    }
+
+    pub async fn consume_mutation_approval(
+        &self,
+        id: Uuid,
+        action: MutationAction,
+        check_permission: impl FnOnce() -> Result<i64, ApprovalError> + Send + 'static,
+    ) -> Result<ConsumedMutationApproval, ApprovalError> {
+        match self {
+            Self::Sqlite(store) => {
+                let store = store.clone();
+                tokio::task::spawn_blocking(move || {
+                    store.consume_mutation_approval(id, &action, check_permission)
+                })
+                .await
+                .map_err(|_| ApprovalError::Unavailable)?
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres { store, .. } => {
+                store
+                    .consume_mutation_approval(id, &action, check_permission()?)
+                    .await
+            }
         }
     }
 

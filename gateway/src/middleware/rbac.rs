@@ -972,6 +972,25 @@ impl RbacState {
             .then_some(policy.security_revision)
     }
 
+    /// Recheck the complete policy snapshot under which the tool and rendered HTTP
+    /// request were admitted. Standalone reloads have no numeric revision.
+    pub(crate) fn mutation_dispatch_guard(
+        &self,
+        principal: auth::Principal,
+        permission: &'static str,
+    ) -> impl Fn() -> Option<i64> + Send + Sync + 'static {
+        let admitted = self.effective_policy();
+        let state = self.clone();
+        move || {
+            let live = state.policy.load();
+            (Arc::ptr_eq(&admitted, &live)
+                && admitted
+                    .compiled
+                    .principal_has_permission(&principal, permission))
+            .then_some(admitted.security_revision)
+        }
+    }
+
     /// [`RbacState::principal_has_permission`] judged by the request's policy
     /// snapshot rather than the live lane, for a check that must agree with
     /// the tool-lane decisions made beside it. The management lane itself keeps

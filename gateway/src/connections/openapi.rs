@@ -3046,7 +3046,9 @@ fn managed_openapi_catalog_withdrawal_reason(
     if !record.write.enabled {
         return Some(OpenApiCatalogError::ConnectionDisabled);
     }
-    if !caller_assertion_servable_on(&record.write, AttestingLane::OpenApiTool) {
+    if !record.write.uses_managed_mutation_approval()
+        && !caller_assertion_servable_on(&record.write, AttestingLane::OpenApiTool)
+    {
         return Some(OpenApiCatalogError::CallerAssertionNotEnforced);
     }
     if !credential_servable_on(&record.write, AttestingLane::OpenApiTool) {

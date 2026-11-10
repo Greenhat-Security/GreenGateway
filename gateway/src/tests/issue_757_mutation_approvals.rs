@@ -84,7 +84,12 @@ pub(super) async fn prepare_route(router: &Router, token: &str, name: &str) -> (
     )
 }
 
-pub(super) async fn register_widgets(router: &Router, operator: &str, connection_id: &str, connection_etag: &str) -> Value {
+pub(super) async fn register_widgets(
+    router: &Router,
+    operator: &str,
+    connection_id: &str,
+    connection_etag: &str,
+) -> Value {
     let catalog = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi");
     let (_, preview) = call(
         router,
@@ -323,6 +328,7 @@ async fn mutation_approval_binds_rendered_request_and_enforces_independent_revie
     )
     .unwrap();
     let revoke = format!("{record}/revoke");
+    let execute = format!("{prepare}/{}/execute", pending["id"].as_str().unwrap());
     for (path, token, tag, payload, operation) in [
         (
             &prepare,
@@ -339,6 +345,13 @@ async fn mutation_approval_binds_rendered_request_and_enforces_independent_revie
             "mutation_approval.review",
         ),
         (&revoke, &reviewer, None, None, "mutation_approval.revoke"),
+        (
+            &execute,
+            &requester,
+            etag,
+            body.clone(),
+            "mutation_approval.consume",
+        ),
     ] {
         let (_, refused) = call(
             &required,

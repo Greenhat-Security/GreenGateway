@@ -342,12 +342,22 @@ pub struct CallerAssertionSettings {
     /// Require, and include, the approval that authorised a mutation.
     #[serde(default)]
     pub bind_approval: bool,
+    /// Explicit enrollment. Earlier releases persisted a bare approval flag,
+    /// which must remain quarantined even after an upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<ApprovalMode>,
     /// Keys published in the JWKS beside the signing key that never sign:
     /// the next key, published before the switch so every verifier already
     /// holds it, and the previous one, kept until every assertion it signed
     /// has expired. This is what lets a key rotate without a flag day.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub published_keys: Vec<CallerAssertionPublishedKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ApprovalMode {
+    #[serde(rename = "managed_http_mutation_v1")]
+    ManagedHttpMutationV1,
 }
 
 /// A key published in the JWKS that this Connection does not sign with.
@@ -615,6 +625,18 @@ impl ConnectionWrite {
             allow_legacy_options,
             &mut errors,
         );
+        if self
+            .caller_assertion
+            .as_ref()
+            .is_some_and(|assertion| assertion.approval_mode.is_some())
+            && !self.uses_managed_mutation_approval()
+        {
+            errors.push(ConnectionValidationError::new(
+                "caller_assertion.approval_mode",
+                "unsupported_binding",
+                "managed_http_mutation_v1 requires both bindings, a managed HTTPS OpenAPI HTTP Connection, static or no authentication, and no additional headers",
+            ));
+        }
         validate_delegated_issuer_token(
             self.kind,
             &self.authentication,
@@ -694,6 +716,33 @@ impl ConnectionWrite {
         let Some(assertion) = self.caller_assertion.as_ref() else {
             return false;
         };
+        !assertion.bind_approval
+            && assertion.approval_mode.is_none()
+            && self.caller_assertion_transport_enforceable(assertion)
+    }
+
+    /// Whether this record was explicitly enrolled and the dispatch lane can
+    /// enforce its complete configuration. Legacy approval-bound records
+    /// never pass this check, including on restart or import.
+    pub fn uses_managed_mutation_approval(&self) -> bool {
+        self.caller_assertion.as_ref().is_some_and(|assertion| {
+            assertion.approval_mode == Some(ApprovalMode::ManagedHttpMutationV1)
+                && assertion.bind_approval
+                && assertion.bind_request
+                && self.kind == ConnectionKind::HttpApi
+                && matches!(self.discovery, Some(DiscoveryConfig::ManagedOpenapi { .. }))
+                && matches!(
+                    self.authentication,
+                    ConnectionAuthentication::None
+                        | ConnectionAuthentication::HeaderApiKey { .. }
+                        | ConnectionAuthentication::StaticBearer { .. }
+                )
+                && self.additional_headers.is_empty()
+                && self.caller_assertion_transport_enforceable(assertion)
+        })
+    }
+
+    fn caller_assertion_transport_enforceable(&self, assertion: &CallerAssertionSettings) -> bool {
         let header_collides = self.additional_headers.iter().any(|header| {
             header
                 .header_name
@@ -703,9 +752,7 @@ impl ConnectionWrite {
             ConnectionAuthentication::HeaderApiKey { header_name, .. }
                 if header_name.eq_ignore_ascii_case(&assertion.header_name)
         ) || is_reserved_credential_header(&assertion.header_name);
-        !assertion.bind_approval
-            && !header_collides
-            && self.endpoint.base_url.starts_with("https://")
+        !header_collides && self.endpoint.base_url.starts_with("https://")
     }
 
     /// Whether this Connection binds secret material of any kind. A caller
@@ -1012,13 +1059,12 @@ fn validate_caller_assertion(
         }
     }
 
-    // Reviews can be recorded, but dispatch cannot yet consume their decisions
-    // and sign the verified occurrence. Keep this write closed until it can.
-    if settings.bind_approval && !allow_legacy {
+    // Legacy rows with the bare flag remain readable and cannot opt into dispatch.
+    if settings.bind_approval && settings.approval_mode.is_none() && !allow_legacy {
         errors.push(ConnectionValidationError::new(
             "caller_assertion.bind_approval",
             "unsupported_binding",
-            "approval binding is not supported yet and must be false",
+            "approval binding requires explicit managed_http_mutation_v1 enrollment",
         ));
     }
 
@@ -2115,9 +2161,47 @@ newline"
     }
 
     #[test]
-    fn approval_binding_is_refused_until_an_approval_subsystem_exists() {
-        // Nothing can supply the approval id this would require, so accepting
-        // it would persist a guarantee the gateway cannot keep.
+    fn managed_mutation_approval_requires_explicit_compatible_enrollment() {
+        let mut document = with_caller_assertion(json!({
+            "bind_approval": true, "bind_request": true, "approval_mode": "managed_http_mutation_v1"
+        }));
+        document["authentication"] = json!({"type":"none"});
+        let validator = connection_schema_validator();
+        validator.validate(&document).expect("explicit enrollment");
+        let candidate: ConnectionWrite = serde_json::from_value(document.clone()).unwrap();
+        let candidate = candidate.validated().unwrap();
+        assert!(candidate.uses_managed_mutation_approval());
+        assert!(!candidate.caller_assertion_enforceable());
+
+        for (path, value) in [
+            ("/caller_assertion/bind_request", json!(false)),
+            ("/caller_assertion/bind_approval", json!(false)),
+            ("/caller_assertion/approval_mode", json!("future")),
+            ("/endpoint/base_url", json!("http://billing.example.test")),
+            ("/authentication", example()["authentication"].clone()),
+            ("/kind", json!("mcp_streamable_http")),
+            (
+                "/discovery",
+                json!({"type":"managed_mcp","use_connection_authentication":false}),
+            ),
+        ] {
+            let mut invalid = document.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            assert!(validator.validate(&invalid).is_err(), "{path}");
+            if let Ok(candidate) = serde_json::from_value::<ConnectionWrite>(invalid) {
+                assert!(candidate.clone().validated().is_err(), "{path}");
+                assert!(candidate.validated_persisted_v0().is_err(), "{path}");
+            }
+        }
+        document["additional_headers"] = json!([{"header_name":"x-extra", "secret_id":"fixture"}]);
+        assert!(validator.validate(&document).is_err());
+        let candidate: ConnectionWrite = serde_json::from_value(document).unwrap();
+        assert!(candidate.validated().is_err());
+    }
+
+    #[test]
+    fn bare_approval_binding_remains_quarantined() {
+        // A record predating explicit enrollment cannot acquire a sending lane.
         let document = with_caller_assertion(json!({ "bind_approval": true }));
         assert!(
             connection_schema_validator().validate(&document).is_err(),
@@ -2137,7 +2221,7 @@ newline"
             .validated_persisted_v0()
             .expect("an already-persisted approval binding must remain readable");
 
-        // Explicitly false is the only accepted value.
+        // Ordinary Connections can explicitly opt out.
         let document = with_caller_assertion(json!({ "bind_approval": false }));
         connection_schema_validator()
             .validate(&document)

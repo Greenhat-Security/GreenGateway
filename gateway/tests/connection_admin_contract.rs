@@ -170,6 +170,14 @@ const EXPECTED_OPERATIONS: &[ExpectedOperation] = &[
         response_definition: "PlaygroundResult",
     },
     ExpectedOperation {
+        path: "/v1/admin/tools/{id}/mutation-approvals/{approval_id}/execute",
+        method: "post",
+        operation_id: "executeApprovedToolMutation",
+        request_definition: Some("PlaygroundRequest"),
+        success_status: "200",
+        response_definition: "PlaygroundResult",
+    },
+    ExpectedOperation {
         path: "/v1/admin/tools/{id}/mutation-approvals",
         method: "post",
         operation_id: "prepareToolMutationApproval",

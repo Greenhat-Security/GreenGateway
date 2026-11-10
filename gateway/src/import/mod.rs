@@ -720,6 +720,20 @@ pub(crate) async fn run(
     let discovery = sections::DiscoverySection::plan(&source)?;
     let principals = sections::PrincipalsSection::plan(&source);
 
+    if source
+        .connections
+        .iter()
+        .any(|entry| entry.record.write.uses_managed_mutation_approval())
+    {
+        preflight::managed_mutation_enrollment(
+            &pool,
+            &deployment_id,
+            target.cluster_member_stale_window(),
+            request.mode.writes(),
+        )
+        .await?;
+    }
+
     let mut reports = Vec::new();
     if request.mode.writes() {
         reports.push(policy.apply(&pool).await?);

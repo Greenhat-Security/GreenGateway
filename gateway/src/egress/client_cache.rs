@@ -71,6 +71,8 @@ impl fmt::Debug for PinnedClientCacheKey {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum ProtocolProfile {
     Http1AndHttp2,
+    /// Buffered, one-use approval. The client is cached, but every request gets a fresh socket.
+    ApprovedMutation,
     Sse,
     /// HTTP/1.1-only transport used to originate a protocol upgrade.
     ///

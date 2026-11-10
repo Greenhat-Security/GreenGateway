@@ -1532,6 +1532,38 @@ impl EgressClient {
         .await
     }
 
+    /// Sends a single buffered mutation over the already admitted HTTPS destination.
+    /// An ambiguous transport error is final for this approval occurrence.
+    pub(crate) async fn stream_approved_mutation_at_checked_destination(
+        &self,
+        destination: &CheckedEgressDestination,
+        method: Method,
+        url: &str,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+    ) -> Result<EgressStreamResponse, EgressError> {
+        if destination.scheme != "https" {
+            return Err(EgressError::SchemeNotAllowed(destination.scheme.clone()));
+        }
+        if !matches!(
+            method,
+            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+        ) {
+            return Err(EgressError::InvalidPolicy(
+                "approval requires a mutation method".to_owned(),
+            ));
+        }
+        let body = body.map_or(EgressRequestBody::Empty, EgressRequestBody::Buffered);
+        body.enforce_known_size(self.config.max_request_body_bytes)?;
+        let (parsed, client) = self.client_for_checked_destination(
+            destination,
+            url,
+            client_cache::ProtocolProfile::ApprovedMutation,
+        )?;
+        self.send_stream_with_client(client, method, parsed, headers, body, None)
+            .await
+    }
+
     pub(crate) async fn stream_request_with_body_for_sse_at_checked_destination(
         &self,
         destination: &CheckedEgressDestination,
@@ -2020,8 +2052,20 @@ fn base_client_builder_for_profile(
         .redirect(reqwest::redirect::Policy::none());
     // A total request timeout would cut a long-lived stream or an upgraded
     // connection; both bound their lifetime at the caller instead.
-    if matches!(profile, client_cache::ProtocolProfile::Http1AndHttp2) {
+    if matches!(
+        profile,
+        client_cache::ProtocolProfile::Http1AndHttp2
+            | client_cache::ProtocolProfile::ApprovedMutation
+    ) {
         builder = builder.timeout(config.timeout);
+    }
+    if profile == client_cache::ProtocolProfile::ApprovedMutation {
+        // reqwest 0.13's retry layer and hyper-util 0.1's canceled pooled
+        // request retry are independent. A zero idle limit disables hyper's
+        // entire connection pool, including canceled checkout retries.
+        builder = builder
+            .retry(reqwest::retry::never())
+            .pool_max_idle_per_host(0);
     }
     // Every profile pins HTTP/1.1 explicitly, and the reason differs by profile.
     //
