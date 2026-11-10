@@ -245,6 +245,13 @@ are hostnames without ports and that NAT64 prefixes meet the gateway's IPv6
 prefix and overlap rules. A refusal points to the affected setting and omits
 the supplied value. This check runs offline.
 
+The reader also applies the gateway's authentication-provider rules, including
+type-specific requirements, unique provider names, and unique effective issuers.
+Admin login must select a JWT provider with an issuer and supply its client ID,
+client secret reference and redirect URI. Offline validation checks the form
+and presence of the reference. The secret value and alias availability are
+checked only when a resolver is used.
+
 The remaining domains still need compiler integration for checks such as
 session lifetime bounds, client-certificate requirements and cookie-name
 syntax. Profile requirements on the deployment settings are also pending (see
@@ -1234,6 +1241,8 @@ can appear in one. A published code never changes meaning.
 | `bundle.not_utf8` | A file is not valid UTF-8. |
 | `bundle.digest_mismatch` | A file's SHA-256 differs from its pin. |
 | `bundle.invalid_egress_setting` | The gateway's egress compiler refused the setting at the reported deployment pointer. |
+| `bundle.invalid_auth_provider` | The gateway's authentication compiler refused the provider list. |
+| `bundle.invalid_admin_login` | The selected login provider is unusable, or a required client setting is missing. |
 | `syntax.empty_document` | The document is empty. |
 | `syntax.too_deep` | Too many nested collections. |
 | `syntax.too_many_members` | An object has too many members. |

@@ -2218,37 +2218,95 @@ fn validate_admin_login_provider(
         return;
     };
 
+    for refusal in admin_login_refusals(provider_name, providers, None) {
+        let message = match refusal {
+            AdminLoginRefusal::Unknown => {
+                format!("{ADMIN_LOGIN_PROVIDER} references unknown auth provider '{provider_name}'")
+            }
+            AdminLoginRefusal::Type => format!(
+                "{ADMIN_LOGIN_PROVIDER} references provider '{provider_name}' which must be type 'jwt'"
+            ),
+            AdminLoginRefusal::Issuer => format!(
+                "{ADMIN_LOGIN_PROVIDER} provider '{provider_name}' must set issuer for OIDC discovery"
+            ),
+            AdminLoginRefusal::Client(field) => format!(
+                "{ADMIN_LOGIN_PROVIDER} provider '{provider_name}' must set {field}"
+            ),
+        };
+        problems.push(message);
+    }
+}
+
+/// The bundle can prove a client secret reference was supplied without
+/// asking a provider for its value. These are the only facts this rule uses.
+pub(crate) struct AdminClientPresence {
+    pub(crate) client_id: bool,
+    pub(crate) client_secret: bool,
+    pub(crate) redirect_uri: bool,
+}
+
+pub(crate) enum AdminLoginRefusal {
+    Unknown,
+    Type,
+    Issuer,
+    Client(&'static str),
+}
+
+fn admin_login_refusals(
+    provider_name: &str,
+    providers: &[AuthProviderConfig],
+    document_client: Option<AdminClientPresence>,
+) -> Vec<AdminLoginRefusal> {
     let Some(provider) = providers
         .iter()
         .find(|provider| provider.name == provider_name)
     else {
-        problems.push(format!(
-            "{ADMIN_LOGIN_PROVIDER} references unknown auth provider '{provider_name}'"
-        ));
-        return;
+        return vec![AdminLoginRefusal::Unknown];
     };
 
+    let mut refused = Vec::new();
     if provider.provider_type != AuthProviderType::Jwt {
-        problems.push(format!(
-            "{ADMIN_LOGIN_PROVIDER} references provider '{provider_name}' which must be type 'jwt'"
-        ));
+        refused.push(AdminLoginRefusal::Type);
     }
-    for (field_name, value) in [
-        ("client_id", &provider.client_id),
-        ("client_secret", &provider.client_secret),
-        ("redirect_uri", &provider.redirect_uri),
+    let present = |value: &Option<String>| value.as_deref().is_some_and(|value| !value.is_empty());
+    let client = document_client.unwrap_or_else(|| AdminClientPresence {
+        client_id: present(&provider.client_id),
+        client_secret: present(&provider.client_secret),
+        redirect_uri: present(&provider.redirect_uri),
+    });
+    for (field, supplied) in [
+        ("client_id", client.client_id),
+        ("client_secret", client.client_secret),
+        ("redirect_uri", client.redirect_uri),
     ] {
-        if value.as_deref().is_none_or(str::is_empty) {
-            problems.push(format!(
-                "{ADMIN_LOGIN_PROVIDER} provider '{provider_name}' must set {field_name}"
-            ));
+        if !supplied {
+            refused.push(AdminLoginRefusal::Client(field));
         }
     }
-    if provider.issuer.as_deref().is_none_or(str::is_empty) {
-        problems.push(format!(
-            "{ADMIN_LOGIN_PROVIDER} provider '{provider_name}' must set issuer for OIDC discovery"
-        ));
+    if !present(&provider.issuer) {
+        refused.push(AdminLoginRefusal::Issuer);
     }
+    refused
+}
+
+/// Run the environment compiler's provider and admin login rules on typed
+/// bundle input. Its legacy messages can quote input, so only fixed outcomes
+/// cross the bundle boundary.
+pub(crate) fn check_document_providers(
+    providers: Vec<RawAuthProviderConfig>,
+    login: Option<&str>,
+    client: AdminClientPresence,
+) -> (bool, Vec<AdminLoginRefusal>) {
+    let mut problems = Vec::new();
+    let providers = validate_auth_providers(AUTH_PROVIDERS, providers, &mut problems);
+    let refused = match login {
+        Some(name) => admin_login_refusals(name, &providers, Some(client)),
+        None if client.client_id || client.client_secret || client.redirect_uri => {
+            vec![AdminLoginRefusal::Unknown]
+        }
+        None => Vec::new(),
+    };
+    (problems.is_empty(), refused)
 }
 
 fn normalize_optional_config_string(value: Option<String>) -> Option<String> {

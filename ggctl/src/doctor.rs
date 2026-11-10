@@ -150,6 +150,8 @@ impl Stage {
             | Code::NotApplicable
             | Code::NotRepresentable
             | Code::InvalidEgressSetting
+            | Code::InvalidAuthProvider
+            | Code::InvalidAdminLogin
             | Code::InlineSecretValue
             | Code::InvalidSecretReference
             | Code::TooManySecretReferences => Self::Structure,
