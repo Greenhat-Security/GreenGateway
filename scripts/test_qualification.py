@@ -624,6 +624,35 @@ class ReconcileTests(unittest.TestCase):
         past = q.reconcile(self.observation, self.lines(range(1, 25)), cutoff=cutoff, rpo_target=1)
         self.assertEqual((past["restored_past_target"], past["verdict"]), (4, "failed"))
 
+    def test_pitr_judges_the_surviving_marker_gap_against_the_target(self):
+        cutoff = self.start + q.timedelta(seconds=20, milliseconds=500)
+        observation = dict(self.observation, drill="pitr-markers", fault_at=None)
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            observed, recorded = folder / "observation.json", folder / "recorded.txt"
+            observed.write_text(json.dumps(observation), encoding="utf-8")
+            recorded.write_text("\n".join(self.lines(range(1, 21))), encoding="utf-8")
+            command = ["reconcile", "--observation", str(observed), "--recorded", str(recorded),
+                       "--cutoff", q.iso(cutoff), "--rpo-target-seconds"]
+            self.assertEqual(quietly(q.main, command + ["0.4"]), 1)
+            result = json.loads((folder / "reconcile-pitr-markers.json").read_text(encoding="utf-8"))
+            self.assertEqual((result["rpo_seconds"], result["recovery_point_gap_seconds"]), (0.0, 0.5))
+            self.assertEqual(result["verdict"], "failed")
+            self.assertEqual(quietly(q.main, command + ["0.5"]), 0)
+        none_survived = q.reconcile(observation, [], cutoff=cutoff, rpo_target=60)
+        self.assertIsNone(none_survived["recovery_point_gap_seconds"])
+        self.assertEqual(none_survived["verdict"], "failed")
+
+    def test_pitr_requires_successful_source_probes_on_both_sides_of_the_cutoff(self):
+        cutoff = self.start + q.timedelta(seconds=20)
+        for first, last, target_second in [(20, 22, 20), (18, 20, 20), (29, 39, 30)]:
+            markers = self.observation["markers"][first - 1:last]
+            target = self.start + q.timedelta(seconds=target_second)
+            with self.subTest(first=first, last=last), self.assertRaisesRegex(q.InputError, "PITR --cutoff"):
+                q.reconcile(dict(self.observation, markers=markers), [], cutoff=target, rpo_target=5)
+        at_target = q.reconcile(self.observation, self.lines(range(1, 21)), cutoff=cutoff, rpo_target=1)
+        self.assertEqual((at_target["restored_past_target"], at_target["verdict"]), (0, "passed"))
+
     def test_foreign_or_unsent_markers_are_refused(self):
         for lines in (["ggq-other-run-000001"], [f"{self.run_id}-000999"], ["DROP TABLE"]):
             with self.subTest(lines=lines):

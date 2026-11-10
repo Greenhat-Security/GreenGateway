@@ -1458,7 +1458,17 @@ def reconcile(observation, recorded_lines, *, cutoff=None, rpo_target=None):
     gap = None
     if durable:
         gap = (cutoff - max(parse_iso(m["acknowledged_at"], "a marker") for m in durable)).total_seconds()
-    after = [m for m in markers if parse_iso(m["sent_at"], "a marker") >= cutoff]
+
+    def sent_after_cutoff(marker):
+        sent = parse_iso(marker["sent_at"], "a marker")
+        # A PITR target may include a write at that instant. A fault's outage
+        # window starts at the instant the fault was injected.
+        return sent > cutoff if explicit else sent >= cutoff
+
+    after = [m for m in markers if sent_after_cutoff(m)]
+    if explicit and (not acknowledged or not any(m["ok"] for m in after)):
+        raise InputError("choose a PITR --cutoff between a probe acknowledged before it "
+                         "and a successful probe sent after it")
     recovered_at = observation.get("recovered_at")
     recovered = parse_iso(recovered_at, "recovered_at") if recovered_at else None
     outage = [m for m in after if recovered is None or parse_iso(m["sent_at"], "a marker") < recovered]
@@ -1483,7 +1493,9 @@ def reconcile(observation, recorded_lines, *, cutoff=None, rpo_target=None):
     if rpo_target is None:
         result["verdict"] = "measured"
     else:
-        within = lost_window <= rpo_target and not result.get("restored_past_target")
+        within = lost_window <= rpo_target
+        if explicit:
+            within = within and gap is not None and gap <= rpo_target and not result["restored_past_target"]
         result["verdict"] = "passed" if within else "failed"
     return result
 
@@ -1501,6 +1513,9 @@ def command_reconcile(args):
     print(f"reconcile {result['verdict']}: rpo_seconds={result['rpo_seconds']}, "
           f"missing_acknowledged={result['missing_acknowledged']}, "
           f"during_outage_missing={result['during_outage']['missing']}")
+    if cutoff is not None:
+        print(f"recovery_point_gap_seconds={result['recovery_point_gap_seconds']}, "
+              f"restored_past_target={result['restored_past_target']}")
     return 0 if result["verdict"] in ("passed", "measured") else 1
 
 
