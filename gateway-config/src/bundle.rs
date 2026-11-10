@@ -330,6 +330,8 @@ pub struct DeploymentDocument {
     /// spelling and the store list and acknowledged behaviors in canonical
     /// order.
     pub canonical_json: Vec<u8>,
+    /// The standalone stores enabled by the validated deployment.
+    pub standalone_stores: Vec<StandaloneStore>,
     plan: Option<Box<crate::compiler::ConfigPlan>>,
 }
 
@@ -629,6 +631,12 @@ fn read_deployment(
         profile, settings, ..
     } = document::deployment(&node, &reference.file, diagnostics)?;
     let initial = diagnostics.len();
+    let standalone_stores = settings
+        .standalone_stores(&node, &reference.file)
+        .unwrap_or_else(|issue| {
+            diagnostics.push(issue);
+            Vec::new()
+        });
     diagnostics.extend(settings.public_diagnostics(&node, &reference.file));
     diagnostics.extend(settings.provider_diagnostics(&node, &reference.file));
     let plan = match settings.offline_plan(profile, bundled_policy, &node, &reference.file) {
@@ -674,6 +682,7 @@ fn read_deployment(
             sha256: reference.sha256.clone(),
             profile,
             canonical_json,
+            standalone_stores,
             plan,
         },
         rules,

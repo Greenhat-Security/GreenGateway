@@ -6857,9 +6857,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::run#1",
-      "sha256": "6fb57058490dbaa64873a9184f761d3305a6a950525c1336ee56979641408509",
+      "sha256": "456f7296a30f1ae15eec1510878f43bacebc8f16a810c106b685353c2d6884f7",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+      "purpose": "The native entry point reports value-free environment or mounted bundle diagnostics and exits before activation. It opens no listener or client."
     },
     {
       "file": "gateway/src/bootstrap/commands.rs",

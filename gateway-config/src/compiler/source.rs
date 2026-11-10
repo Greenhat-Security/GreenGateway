@@ -66,12 +66,59 @@ enum Mode {
     Ledger,
 }
 
-/// Compiles the selected authority. With no selectors this calls the
-/// existing environment compiler. Source refusals contain setting names and
-/// fixed reasons only, including in the gateway's operator-facing errors.
+/// The authority selected for a native serving boot. Ledger activation is
+/// unavailable. Locators have no Debug representation.
+pub enum SelectedSource {
+    Environment,
+    Bundle(MountedBundle),
+}
+
+pub struct MountedBundle {
+    pub directory: std::path::PathBuf,
+    state_directory: Option<std::path::PathBuf>,
+}
+
+impl MountedBundle {
+    /// Match the bootstrap locator to the store declaration in the pinned
+    /// deployment. This never opens or creates the state directory.
+    pub fn state_directory(
+        &self,
+        needs_stores: bool,
+    ) -> Result<Option<&std::path::Path>, ConfigError> {
+        match (self.state_directory.as_deref(), needs_stores) {
+            (Some(_), false) => Err(source_error(&[(
+                GATEWAY_STATE_DIR,
+                SourceRefusal::SelectorWithoutMode,
+            )])),
+            (None, true) => Err(source_error(&[(
+                GATEWAY_STATE_DIR,
+                SourceRefusal::MissingSelector,
+            )])),
+            (path, _) => Ok(path),
+        }
+    }
+}
+
+pub fn mode_unavailable() -> ConfigError {
+    source_error(&[(GATEWAY_CONFIG_SOURCE, SourceRefusal::ModeUnavailable)])
+}
+
+/// The environment-only caller never opens files, including when the process
+/// environment selects a different authority.
 pub fn compile_selected(
     mut get_var: impl FnMut(&str) -> Result<String, VarError>,
 ) -> Result<ConfigPlan, ConfigError> {
+    match select(&mut get_var)? {
+        SelectedSource::Environment => compile(get_var),
+        SelectedSource::Bundle(_) => Err(mode_unavailable()),
+    }
+}
+
+/// Checks selectors and overlapping environment before a native serving
+/// boot can read any mounted material.
+pub fn select(
+    mut get_var: impl FnMut(&str) -> Result<String, VarError>,
+) -> Result<SelectedSource, ConfigError> {
     let mode = match get_var(GATEWAY_CONFIG_SOURCE).as_deref() {
         Err(VarError::NotPresent) | Ok("environment") => Mode::Environment,
         Ok("bundle") => Mode::Bundle,
@@ -84,32 +131,30 @@ pub fn compile_selected(
         }
     };
     let mut refused = Vec::new();
-    for (name, value, allowed, required) in [
-        (
-            GATEWAY_CONFIG_BUNDLE,
-            get_var(GATEWAY_CONFIG_BUNDLE),
-            mode == Mode::Bundle,
-            mode == Mode::Bundle,
-        ),
-        (
-            GATEWAY_STATE_DIR,
-            get_var(GATEWAY_STATE_DIR),
-            mode != Mode::Environment,
-            mode == Mode::Ledger,
-        ),
-    ] {
-        let reason = match value {
+    let mut locator = |name: &'static str, allowed: bool, required: bool| {
+        let reason = match get_var(name) {
             Err(VarError::NotPresent) if required => SourceRefusal::MissingSelector,
-            Err(VarError::NotPresent) => continue,
+            Err(VarError::NotPresent) => return None,
             _ if !allowed => SourceRefusal::SelectorWithoutMode,
-            Ok(value) if !value.trim().is_empty() => continue,
+            Ok(value) if !value.trim().is_empty() => return Some(std::path::PathBuf::from(value)),
             _ => SourceRefusal::InvalidSelector,
         };
         refused.push((name, reason));
-    }
+        None
+    };
+    let directory = locator(
+        GATEWAY_CONFIG_BUNDLE,
+        mode == Mode::Bundle,
+        mode == Mode::Bundle,
+    );
+    let state_directory = locator(
+        GATEWAY_STATE_DIR,
+        mode != Mode::Environment,
+        mode == Mode::Ledger,
+    );
     if mode == Mode::Environment {
         return if refused.is_empty() {
-            compile(get_var)
+            Ok(SelectedSource::Environment)
         } else {
             Err(source_error(&refused))
         };
@@ -122,10 +167,17 @@ pub fn compile_selected(
             refused.push((field.environment, SourceRefusal::ConflictingEnvironment));
         }
     }
-    if refused.is_empty() {
-        refused.push((GATEWAY_CONFIG_SOURCE, SourceRefusal::ModeUnavailable));
+    if !refused.is_empty() {
+        return Err(source_error(&refused));
     }
-    Err(source_error(&refused))
+    if let Some(directory) = directory {
+        Ok(SelectedSource::Bundle(MountedBundle {
+            directory,
+            state_directory,
+        }))
+    } else {
+        Err(mode_unavailable())
+    }
 }
 
 fn source_error(refused: &[(&'static str, SourceRefusal)]) -> ConfigError {

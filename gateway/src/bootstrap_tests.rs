@@ -269,6 +269,93 @@ fn source_conflicts_stop_startup_before_preflight_or_activation() {
 }
 
 #[test]
+fn mounted_bundles_are_checked_before_any_startup_stage() {
+    use gateway_config::bundle::{init, sha256_pin, FileRole, Profile};
+
+    let root = std::env::temp_dir().join(format!("gg-bundle-boot-{}", uuid::Uuid::new_v4()));
+    let unused_state = root.with_extension("state-canary");
+    std::fs::create_dir(&root).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let files = init::scaffold(Profile::Development, &init::Answers::default());
+    for file in &files {
+        std::fs::write(root.join(file.name.as_str()), &file.bytes).unwrap();
+    }
+    let boot = |with_state| {
+        let mut settings = vec![
+            ("GATEWAY_CONFIG_SOURCE", "bundle"),
+            ("GATEWAY_CONFIG_BUNDLE", root.to_str().unwrap()),
+        ];
+        if with_state {
+            settings.push(("GATEWAY_STATE_DIR", unused_state.to_str().unwrap()));
+        }
+        let (result, stages) = start(&settings, None, nothing_to_check());
+        assert!(stage_calls(&stages).is_empty());
+        assert!(!unused_state.exists());
+        let error = result.unwrap_err();
+        assert!(!format!("{error:?}").contains("state-canary"));
+        error
+    };
+    let source_reason = |with_state, expected: &str| {
+        let StartupFailure::Configuration(error) = boot(with_state) else {
+            panic!("expected the source selector to be refused");
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+    };
+    let deployment = files
+        .iter()
+        .find(|file| file.role == FileRole::Deployment)
+        .unwrap();
+    let manifest = files
+        .iter()
+        .find(|file| file.role == FileRole::Manifest)
+        .unwrap();
+    let write = |extra: &str, update_pin: bool| {
+        let mut document = b"apiVersion: greengateway.dev/v1alpha1\nkind: GatewayDeployment\nspec:\n  profile: development\n".to_vec();
+        document.extend_from_slice(extra.as_bytes());
+        std::fs::write(root.join(deployment.name.as_str()), &document).unwrap();
+        if update_pin {
+            let manifest_text = std::str::from_utf8(&manifest.bytes)
+                .unwrap()
+                .replace(&sha256_pin(&deployment.bytes), &sha256_pin(&document));
+            std::fs::write(root.join(manifest.name.as_str()), manifest_text).unwrap();
+        }
+    };
+    write("", true);
+    source_reason(false, "source.mode_unavailable");
+    source_reason(true, "GATEWAY_STATE_DIR: source.selector_without_mode");
+    write("  state:\n    stores: [\"audit\"]\n", true);
+    source_reason(false, "GATEWAY_STATE_DIR: source.missing_selector");
+    source_reason(true, "source.mode_unavailable");
+
+    write("  state:\n    backend: postgres\n", true);
+    source_reason(true, "GATEWAY_STATE_DIR: source.selector_without_mode");
+    write(
+        "  state:\n    backend: postgres\n    stores: [\"audit\"]\n",
+        true,
+    );
+    let StartupFailure::Bundle(issues) = boot(false) else {
+        panic!("a cluster deployment cannot select a standalone store");
+    };
+    assert!(issues
+        .iter()
+        .any(|issue| issue.pointer.to_string() == "/spec/state/stores"));
+
+    write("  profile: document-canary\n", false);
+    let StartupFailure::Bundle(issues) = boot(false) else {
+        panic!("tampering must be refused before the document is parsed");
+    };
+    assert!(issues
+        .iter()
+        .any(|issue| issue.code.as_str() == "bundle.digest_mismatch"));
+    assert!(!format!("{issues:?}").contains("document-canary"));
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
 fn a_preflight_failure_activates_nothing() {
     let (result, stages) = start(STANDALONE, Some(Stage::Preflight), nothing_to_check());
     assert_eq!(stage_error(result), "the database did not answer");

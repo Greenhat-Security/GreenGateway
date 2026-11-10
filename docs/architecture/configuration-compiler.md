@@ -487,9 +487,12 @@ holding the string a reader returned, and `Source` has two variants,
   `bootstrap`, and `store`) instead of reporting bundle values as
   `Environment`;
 - use the ADR's source-selection checks before the stages, because the stages
-  assume one coherent source. `compiler::source::compile_selected` performs those
+  assume one coherent source. `compiler::source::select` performs those
   checks for gateway startup, one-shot configuration and offline environment
-  files. Bundle and ledger activation are still unavailable.
+  files. Native serving startup reads the selected mount and checks its
+  standalone state-directory requirement. One-shot configuration and offline
+  environment-file checks perform no mounted reads. Bundle and ledger
+  activation are still unavailable.
 
 The bundle reader in `gateway-config` (`bundle::read_bundle`) validates a
 bundle's files, digests, documents, and profile today. Its deployment document

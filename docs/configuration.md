@@ -4,13 +4,13 @@ GreenGateway reads configuration from environment variables. Each variable is do
 
 After reading the three source selectors, the gateway uses the [field catalog](configuration-catalog.json) to identify settings that conflict with bundle or ledger mode. In environment mode it reads the cataloged settings in order. The catalog documents each setting's type, bounds, default, blank-value behavior, sensitivity, applicable state backends, bundle mapping and Cloudflare support. Tests check the catalog against the compiler and the defaults and ranges in this reference.
 
-The gateway compiles all of these settings once, before it opens a file, store, or connection. Every problem is reported in one pass, in the order the settings are read, and a configuration with any problem starts nothing: the gateway prints the problems and exits with status 1. A path or host name is not checked while compiling, so a missing file or an unreachable issuer fails startup later, when the gateway opens or contacts it. Unset and empty are different inputs: for most settings an empty or whitespace-only value is the same as unset, for some it is refused, and for `AUTH_EXEMPT_PATHS`, `RBAC_EXEMPT_PATHS`, `CSRF_EXEMPT_PATHS`, and `VALIDATION_ALLOWED_CONTENT_TYPES` it is an empty list that replaces the default. The [configuration compiler contract](architecture/configuration-compiler.md) describes what is read, what is validated, how secret material is carried, and what compiling never does.
+In environment mode the gateway compiles these settings once, before it opens a file, store, or connection. Every problem is reported in one pass, in the order the settings are read, and a configuration with any problem starts nothing: the gateway prints the problems and exits with status 1. A path or host name is not checked while compiling, so a missing file or an unreachable issuer fails startup later, when the gateway opens or contacts it. Unset and empty are different inputs: for most settings an empty or whitespace-only value is the same as unset, for some it is refused, and for `AUTH_EXEMPT_PATHS`, `RBAC_EXEMPT_PATHS`, `CSRF_EXEMPT_PATHS`, and `VALIDATION_ALLOWED_CONTENT_TYPES` it is an empty list that replaces the default. The [configuration compiler contract](architecture/configuration-compiler.md) describes what is read, what is validated, how secret material is carried, and what compiling never does.
 
 ## Source selection
 
 ### GATEWAY_CONFIG_SOURCE
 
-Selects `environment`, `bundle` or `ledger`. Bundle and ledger startup remain unavailable. The gateway checks source conflicts before initializing stores or opening listeners. See [source diagnostics](ggctl.md#source-diagnostics).
+Selects `environment`, `bundle` or `ledger`. The native gateway checks source conflicts before reading a mounted bundle, verifies its pinned documents and checks its state-directory declaration. Bundle and ledger serving remain unavailable. See [source diagnostics](ggctl.md#source-diagnostics).
 
 Default: `environment` when unset. An empty value is invalid.
 
@@ -22,7 +22,7 @@ Default: unset.
 
 ### GATEWAY_STATE_DIR
 
-Standalone state directory. Required in ledger mode and optional in bundle mode. Environment mode refuses any assignment. A supplied path must be non-empty.
+Standalone state directory. Ledger mode requires it. Native bundle startup requires it when the deployment enables standalone stores and refuses it otherwise. Environment mode refuses any assignment. A supplied path must be non-empty.
 
 Default: unset.
 
