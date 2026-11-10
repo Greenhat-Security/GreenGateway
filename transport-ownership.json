@@ -15866,6 +15866,16 @@
       "purpose": "Opens the operator-configured AUTHORITY_EVENT_FILE for appending with std::fs; a local file only, no network, socket or process capability."
     },
     {
+      "file": "gateway/src/authority_events/sink.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::authority_events::sink::sync_file_directories#1",
+      "sha256": "2b27683ad9b09cada5821a07b546f8fd194f4eafb5d8d8af873c905c8d488c23",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Sync the configured local event file directories on Unix and check the opened file identity before acknowledging an opted-in batch."
+    },
+    {
       "file": "gateway/src/authority_events/standalone.rs",
       "reasons": [
         "unexpanded-attribute"
