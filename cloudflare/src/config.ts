@@ -130,6 +130,23 @@ export function buildGreenGatewayContainerEnv(
   const containerEnv: Record<string, string> = {};
   const bindings = env as Record<string, unknown>;
 
+  // The Worker has no bundle mount or durable ledger. Check selectors before
+  // the forwarding filter drops blank values and bindings outside its list.
+  if ("GATEWAY_CONFIG_SOURCE" in bindings) {
+    const source = bindings.GATEWAY_CONFIG_SOURCE;
+    if (source === "bundle" || source === "ledger") {
+      throw new Error("source.mode_unavailable: GATEWAY_CONFIG_SOURCE");
+    }
+    if (source !== "environment") {
+      throw new Error("source.invalid_selector: GATEWAY_CONFIG_SOURCE");
+    }
+  }
+  for (const locator of ["GATEWAY_CONFIG_BUNDLE", "GATEWAY_STATE_DIR"]) {
+    if (locator in bindings) {
+      throw new Error(`source.selector_without_mode: ${locator}`);
+    }
+  }
+
   for (const key of GREEN_GATEWAY_ENV_KEYS) {
     const value = bindings[key];
     if (typeof value === "string" && value.trim().length > 0) {

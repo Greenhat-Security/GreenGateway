@@ -291,6 +291,7 @@ holds this table to `diagnostic::ConfigRule`.
 | `AuthorityPseudonymKeysDistinct` | The current and previous pseudonym key aliases naming the same alias. |
 | `AuthorityEvidenceDeliveryRequired` | `AUTHORITY_EVIDENCE_DURABILITY=required` with `AUTHORITY_EVENT_SINK=none`, in either mode: a cluster replica would journal evidence that is never delivered, and a standalone gateway's stores would record evidence that is never delivered. |
 | `AuthorityEvidenceUnsupportedConfiguration` | `AUTHORITY_EVIDENCE_DURABILITY=required` with a setting that enables an authority change the evidence inventory marks unsupported in this mode: `ADMIN_SESSION_MODE=standalone_memory`. |
+| `SourceSelection` | The selected source is unavailable, its selectors are invalid or missing, or an ordinary environment setting would create a competing authority. |
 
 Codes and rules are Rust enums. `ConfigRule::as_str` gives every rule
 (`ConfigRule::ALL`) a stable name, its variant name in snake case
@@ -483,9 +484,10 @@ holding the string a reader returned, and `Source` has two variants,
 - record its own `Source` variant (the ADR names `bundle`, `ledger`,
   `bootstrap`, and `store`) instead of reporting bundle values as
   `Environment`;
-- apply the ADR's source rules (overlapping environment variables refused,
-  a documented bootstrap set allowed to coexist) before the stages, because
-  the stages assume one coherent source.
+- use the ADR's source-selection checks before the stages, because the stages
+  assume one coherent source. `compiler::source::compile_selected` performs those
+  checks for gateway startup, one-shot configuration and offline environment
+  files. Bundle and ledger activation are still unavailable.
 
 The bundle reader in `gateway-config` (`bundle::read_bundle`) validates a
 bundle's files, digests, documents, and profile today. Its deployment document

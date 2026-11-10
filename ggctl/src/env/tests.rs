@@ -751,6 +751,59 @@ fn the_shipped_example_environment_is_valid() {
     assert_eq!(found["result"]["environment"]["otherVariables"], 0);
 }
 
+#[test]
+fn every_environment_cli_input_honors_the_same_source_selection() {
+    let valid = EnvFixture::new("GATEWAY_CONFIG_SOURCE=environment\n");
+    assert_eq!(run(&["validate", "--env", valid.path()]).0, Exit::Success);
+    let file = EnvFixture::new(&format!(
+        "GATEWAY_CONFIG_SOURCE=bundle\nGATEWAY_CONFIG_BUNDLE={CANARY}\nTLS_KEY_FILE={CANARY}\nAUTH_ENABLED=\n"
+    ));
+    for words in [
+        vec!["validate", "--env", file.path(), "--format", "json"],
+        vec!["doctor", "--env", file.path(), "--format", "json"],
+        vec![
+            "diff",
+            "--env",
+            file.path(),
+            "--against-env",
+            valid.path(),
+            "--format",
+            "json",
+        ],
+        vec![
+            "diff",
+            "--env",
+            valid.path(),
+            "--against-env",
+            file.path(),
+            "--format",
+            "json",
+        ],
+    ] {
+        let (exit, captured) = run(&words);
+        assert_eq!(exit, Exit::Invalid);
+        let found = report(&captured);
+        let diagnostics = found["diagnostics"].as_array().unwrap();
+        let conflict = diagnostics
+            .iter()
+            .find(|item| item["code"] == "source.conflicting_environment")
+            .unwrap();
+        assert_eq!(conflict["location"]["line"], 4);
+        assert_eq!(conflict["field"], "AUTH_ENABLED");
+        assert_no_canary(&captured);
+        file.assert_not_echoed(&captured);
+        if words[0] == "doctor" {
+            let check = &found["result"]["checks"][2];
+            assert_eq!(check["id"], "env.compiler");
+            assert_eq!(check["status"], "fail");
+            assert_eq!(check["reason"], "source.conflicting_environment");
+        }
+        if words[0] == "validate" {
+            assert_eq!(found["result"]["environment"]["otherVariables"], 0);
+        }
+    }
+}
+
 /// Every compiler rule is published by its stable name, in declaration
 /// order, in the reference and in the report schema, so a report can carry
 /// no rule a reader cannot look up.

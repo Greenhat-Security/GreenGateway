@@ -6,13 +6,11 @@ versioned configuration bundle format and the reader that validates it (issue
 [`ggctl validate` and `ggctl doctor`](ggctl.md#validate) run the same code, and
 `ggctl` checks a bundle offline today. [`ggctl init`](ggctl.md#init) creates a
 new bundle for a deployment profile ([generated bundles](#generated-bundles)) and
-[`ggctl convert`](ggctl.md#convert) converts one between document versions. Nothing in a released gateway reads a
-bundle yet: there is no startup mode, environment variable, or admin route that
-selects one. Bundle mode, which maps a deployment document onto the
-configuration compiler, is a later #242 slice. Until it lands, environment
-configuration ([configuration.md](configuration.md)) is the only way to
-configure a gateway, and the format below may still change before it is
-released.
+[`ggctl convert`](ggctl.md#convert) converts one between document versions.
+Gateway startup currently uses [environment configuration](configuration.md).
+The gateway checks the ADR-0008 source selectors before startup. A request to
+activate a bundle or ledger fails with a [source diagnostic](ggctl.md#source-diagnostics)
+before it can open a file, store, or listener.
 
 The design this follows is
 [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md) (setup, operator
@@ -1111,8 +1109,8 @@ mode, a standalone deployment will keep every local store beneath one
 directory, `GATEWAY_STATE_DIR`, under the fixed names below
 ([ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md#bundle-mode)). Those
 modes replace each store's environment variable with its fixed name, so they
-will refuse the variable. No gateway reads `GATEWAY_STATE_DIR` yet, and in
-environment mode every store stays where its variable puts it. The layout, the
+will refuse the variable. Environment mode rejects `GATEWAY_STATE_DIR` and
+uses each store's configured path. The layout, the
 admission rules and the lock are the shared `gateway-config` library's
 `state_dir` module, which the gateway and `ggctl` both use. Today the revision
 ledger, the `ggctl ledger` commands over it, and `ggctl backup create` and
