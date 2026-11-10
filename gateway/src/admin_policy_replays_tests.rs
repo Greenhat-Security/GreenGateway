@@ -872,7 +872,7 @@ impl Drop for ReplayTestDirectory {
 /// the real worker is waiting for its completion audit receipt.
 #[tokio::test]
 async fn standalone_replay_crash_child() {
-    let Some(dir) = std::env::var_os("GG_TEST_REPLAY_CRASH_DIR") else {
+    let Some(dir) = std::env::var_os("GATEWAY_TEST_STANDALONE_REPLAY_CRASH_DIR") else {
         return;
     };
     let dir = std::path::PathBuf::from(dir);
@@ -936,7 +936,7 @@ async fn startup_interrupts_a_crashed_job_and_keeps_owner_and_retry_binding() {
             "--exact",
             "tests::admin_policy_replays_tests::standalone_replay_crash_child",
         ])
-        .env("GG_TEST_REPLAY_CRASH_DIR", path)
+        .env("GATEWAY_TEST_STANDALONE_REPLAY_CRASH_DIR", path)
         .spawn()
         .unwrap();
     let mut child = Child(child);
