@@ -46,7 +46,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::config::{
-    AuthProviderType, AuthorityEvidenceDurability, Config, StateBackend, UpstreamRouteConfig,
+    AuthProviderType, AuthorityEventFormat, AuthorityEvidenceDurability, Config, StateBackend,
+    UpstreamRouteConfig,
 };
 
 /// Domain separation for the fingerprint input, with a format version. Bumping
@@ -360,6 +361,14 @@ fn insert_authority_event_settings(input: &mut BTreeMap<String, String>, config:
         input.insert(
             "authority_evidence_durability".into(),
             settings.durability.as_str().to_owned(),
+        );
+    }
+    // A new dispatcher must keep the same output schema after lease handoff.
+    // Preserve the pre-negotiation fingerprint for delivery_v1.
+    if settings.format != AuthorityEventFormat::DeliveryV1 {
+        input.insert(
+            "authority_event_format".into(),
+            settings.format.as_str().into(),
         );
     }
 }
@@ -1532,11 +1541,20 @@ mod tests {
             static_config_fingerprint(&config)
         };
         let unchanged = fingerprint(&|_| {});
+        let mut projection = BTreeMap::new();
+        insert_authority_event_settings(&mut projection, &base);
+        assert!(!projection.contains_key("authority_event_format"));
         type ConfigChange = Box<dyn Fn(&mut Config)>;
         let changes: Vec<(&str, ConfigChange)> = vec![
             (
                 "the sink kind",
                 Box::new(|config| config.authority_events.sink = AuthorityEventSinkSetting::Log),
+            ),
+            (
+                "the qualified record format",
+                Box::new(|config| {
+                    config.authority_events.format = AuthorityEventFormat::QualifiedV1
+                }),
             ),
             (
                 "the current key alias",

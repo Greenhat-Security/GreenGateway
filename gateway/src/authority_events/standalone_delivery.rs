@@ -281,6 +281,7 @@ pub(crate) fn project_standalone(
     )?;
 
     Ok(DeliveryRecord {
+        qualified_actor: None,
         schema_version: DELIVERY_SCHEMA_VERSION.to_owned(),
         authority_id: keyring.authority_id().to_string(),
         event_id,

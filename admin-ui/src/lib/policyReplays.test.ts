@@ -13,12 +13,62 @@ import {
 const LIVE_ETAG = '"sha256:live-1"';
 const JOB_ID = `rpl_${'a'.repeat(32)}`;
 
+function comparisonLane(records: number, allowed = 0, enforcement = 0) {
+  return {
+    records,
+    compared: records,
+    transitions: {
+      newly_allowed: allowed, newly_denied: 0, enforcement_only_change: enforcement,
+      attribution_only_change: 0, unchanged_allow: records - allowed - enforcement, unchanged_deny: 0,
+      indeterminate: 0, unsupported_context: 0,
+    },
+    forwarding: { newly_forwarded: allowed + enforcement, newly_blocked: 0 },
+  };
+}
+
+function withComparison(complete: boolean, asAuthored: unknown) {
+  const limits = complete ? [] : ['scan_truncated'];
+  return {
+    ...replayJob(complete ? 'completed' : 'completed_incomplete', limits),
+    result: { ...replayResult(complete, limits), impact: { projections: { as_authored: asAuthored } } },
+  };
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
   clearMemoryToken();
 });
 
 describe('policy replay client', () => {
+  it('projects observed logical and forwarding changes without copying raw record content', () => {
+    const authored = {
+      http: { ...comparisonLane(7, 1, 2), matrix: [{ private_path: '/private-replay-example' }] },
+      tool: comparisonLane(1),
+      statement: { code: 'newly_allowed_observed', newly_allowed: 1, newly_forwarded: 3, replayable_events: 8 },
+    };
+    const comparison = projectReplayJob(withComparison(false, authored))?.result?.comparison;
+    expect(comparison?.http).toMatchObject({ newly_allowed: 1, newly_forwarded: 3, compared: 7 });
+    expect(comparison?.tool.compared).toBe(1);
+    expect(JSON.stringify(comparison)).not.toContain('private-replay');
+    expect(projectReplayJob(replayJob('completed'))?.result?.comparison).toBeNull();
+  });
+
+  it('requires complete, consistent positive coverage before accepting an absence claim', () => {
+    const authored = {
+      http: comparisonLane(7), tool: comparisonLane(1),
+      statement: { code: 'no_newly_allowed_observed', replayable_events: 8 },
+    };
+    expect(projectReplayJob(withComparison(true, authored))?.result?.comparison?.statement)
+      .toBe('no_newly_allowed_observed');
+    expect(projectReplayJob(withComparison(false, authored))).toBeNull();
+    expect(projectReplayJob(withComparison(true, { ...authored, http: comparisonLane(7, 1) }))).toBeNull();
+    expect(projectReplayJob(withComparison(true, { ...authored, http: comparisonLane(3) }))).toBeNull();
+    expect(projectReplayJob(withComparison(true, { ...authored, tool: { ...authored.tool, compared: 0 } }))).toBeNull();
+    expect(projectReplayJob(withComparison(true, { ...authored, tool: { ...authored.tool, forwarding: {} } }))).toBeNull();
+    const unfinished = { ...authored, statement: { code: 'not_established', reason: 'incomplete' } };
+    expect(projectReplayJob(withComparison(false, unfinished))?.result?.comparison?.statement).toBe('not_established');
+  });
+
   it('starts a job with the exact candidate text, its window, bound and key', async () => {
     const fetch = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
       Promise.resolve(jsonResponse(202, replayJob('queued'))),

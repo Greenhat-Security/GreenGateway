@@ -8147,7 +8147,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::authority_events::delivery::file_attributes#1",
-      "sha256": "67e21686f9e810201859562c3a9c3ef978cb300b6049f5e810176f8207924dea",
+      "sha256": "31ac4ee704e0ea74cd4cc1ed1843fee089d5a0e8081bc39f81f19b5ac899bb9a",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
     },
@@ -8481,6 +8481,26 @@
       "sha256": "6784b1ca2fbb5aecac05d65ef310aab6aba6d2d3ba0ab9018e45d7b9bf497fc1",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway-config/src/compiler.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::compiler::validate_admin_login_provider#1",
+      "sha256": "c0574d589c8569908da1688f33e5956c3100af92583da834a11e175ecb534eb6",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242: formats typed provider refusals, including missing client fields, into the existing environment diagnostics using only the supplied input."
+    },
+    {
+      "file": "gateway-config/src/compiler.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::compiler::admin_login_refusals#1",
+      "sha256": "8f18c0eff83cfb64d370a00b84a102b52aed3bc1670841c6bb666eb5d9c11811",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242: records a missing admin client field as the Client variant of the validation result. The function checks presence, provider type and issuer using the supplied configuration."
     },
     {
       "file": "gateway/src/config.rs",
@@ -15806,6 +15826,16 @@
       "purpose": "Reviewed for #242 PR 15 (standalone backup create): imports PermissionsExt to read the Unix mode bits of the written archive, not followed, and refuse to publish one the filesystem left readable by group or other. Read-only metadata; it adds no network or process capability."
     },
     {
+      "file": "gateway-config/src/bundle/settings.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::bundle::settings::impl  Settings::provider_diagnostics#1",
+      "sha256": "2ac99155787002aeadc0b049af51e41db06d42564fa9820e4f87ca1e713941ae",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242: maps typed deployment fields to provider rules and maps their client-field refusals back to schema pointers. A secret reference supplies a presence flag. This code performs in-memory validation."
+    },
+    {
       "file": "gateway/src/authority_events/dispatcher.rs",
       "reasons": [
         "unexpanded-attribute"
@@ -15864,6 +15894,16 @@
       "sha256": "b4e92296c095b89cd0834a5a6d41b106c92283970200b9a495a28ec65b168b67",
       "owner": "GreenGateway maintainers",
       "purpose": "Opens the operator-configured AUTHORITY_EVENT_FILE for appending with std::fs; a local file only, no network, socket or process capability."
+    },
+    {
+      "file": "gateway/src/authority_events/sink.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::authority_events::sink::sync_file_directories#1",
+      "sha256": "2b27683ad9b09cada5821a07b546f8fd194f4eafb5d8d8af873c905c8d488c23",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Sync the configured local event file directories on Unix and check the opened file identity before acknowledging an opted-in batch."
     },
     {
       "file": "gateway/src/authority_events/standalone.rs",
@@ -15934,6 +15974,16 @@
       "sha256": "c74d0805c061ae897fa27c1a39da30ad9da3070ee5a7dc9e5b2a7e9684e217a3",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway-config/src/compiler/authority_events.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway_config::compiler::authority_events::AuthorityEventFormat#1",
+      "sha256": "ebe623b6f7c8ad97bb4813b9ececd856a2e2f65280cc8aead019dcdcb58b8d10",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Closed wire-format vocabulary parsed from configuration. Changes to the generated enum inputs require review."
     },
     {
       "file": "gateway-config/src/compiler/authority_events.rs",

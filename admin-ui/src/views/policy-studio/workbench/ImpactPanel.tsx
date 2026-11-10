@@ -14,6 +14,8 @@ import {
   newReplayIdempotencyKey,
   startPolicyReplay,
   type PolicyReplayCodeCount,
+  type PolicyReplayComparison,
+  type PolicyReplayComparisonLane,
   type PolicyReplayJob,
   type PolicyReplayLane,
   type PolicyReplayResult,
@@ -342,11 +344,9 @@ export function ImpactPanel({
       <div className="error-panel alert info" role="note">
         <h3>What a replay can and cannot show</h3>
         <p>
-          A replay counts the candidate’s decisions for retained records. This view does not
-          yet show the job’s comparison with what the gateway recorded or with the live
-          policy, so it shows neither newly allowed nor newly denied traffic. Retained
-          records cover only what the audit log kept, and no replay result says a policy is
-          safe.
+          The gateway evaluates retained records under the pinned base and candidate. A shadow
+          deny can forward a request, so compare both policy decisions and forwarding changes.
+          These counts cover only records the audit log retained for this window.
         </p>
       </div>
 
@@ -571,8 +571,8 @@ function JobView({
       </div>
       {entry.gone ? (
         <StaleNotice>
-          The gateway no longer holds this job: it expired, was discarded elsewhere, or the
-          gateway restarted, which forgets every job. What is shown is the last state read.
+          The gateway no longer holds this job. It may have expired, been discarded, or been
+          lost during a standalone restart. This is the last state read.
         </StaleNotice>
       ) : null}
       {job.base.current === false ? (
@@ -713,6 +713,8 @@ function ReplayResultView({
         </div>
       )}
 
+      <ComparisonView comparison={result.comparison} />
+
       <h4>Records read</h4>
       <CountList
         label="Records by classification"
@@ -769,6 +771,61 @@ function ReplayResultView({
           </>
         ) : null}
       </p>
+    </section>
+  );
+}
+
+const COMPARISON_ROWS: ReadonlyArray<readonly [keyof PolicyReplayComparisonLane, string]> = [
+  ['compared', 'Compared'],
+  ['newly_allowed', 'Newly allowed'],
+  ['newly_denied', 'Newly denied'],
+  ['newly_forwarded', 'Newly forwarded'],
+  ['newly_blocked', 'Newly blocked'],
+  ['enforcement_only_change', 'Only enforcement changed'],
+  ['attribution_only_change', 'Only attribution changed'],
+  ['unchanged_allow', 'Unchanged allow'],
+  ['unchanged_deny', 'Unchanged deny'],
+  ['indeterminate', 'Indeterminate'],
+  ['unsupported_context', 'Unsupported context'],
+];
+
+function ComparisonView({ comparison }: { comparison: PolicyReplayComparison | null }) {
+  const compared = comparison ? comparison.http.compared + comparison.tool.compared : 0;
+  return (
+    <section aria-label="Pinned policy comparison">
+      <h4>Pinned policy comparison</h4>
+      {comparison === null ? (
+        <p>This result has no as-authored comparison.</p>
+      ) : (
+        <>
+          {comparison.statement === 'no_newly_allowed_observed' ? (
+            <p>No newly allowed decisions were observed among {compared} replayable events.</p>
+          ) : comparison.statement === 'not_established' ? (
+            <p>This replay does not establish whether any requests would be newly allowed.</p>
+          ) : null}
+          <div className="table-scroll">
+            <table className="logs-table workbench-table">
+              <caption>Changes from the pinned base to the candidate</caption>
+              <thead><tr>
+                <th scope="col">Measure</th><th scope="col">HTTP</th><th scope="col">Tools</th>
+              </tr></thead>
+              <tbody>
+                {COMPARISON_ROWS.map(([key, label]) => (
+                  <tr key={key}>
+                    <th scope="row">{label}</th>
+                    {[comparison.http, comparison.tool].map((lane, index) => (
+                      <td key={index}>
+                        {lane.compared === 0 && key !== 'compared' && key !== 'indeterminate' &&
+                          key !== 'unsupported_context' ? 'No comparison' : lane[key]}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
     </section>
   );
 }

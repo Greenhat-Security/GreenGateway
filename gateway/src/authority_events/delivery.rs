@@ -7,7 +7,8 @@
 //! `docs/schemas/authority_event_delivery.v1.schema.json`, which the tests
 //! below validate every projection against.
 //!
-//! It is deliberately **not** the proposed `authority_event.v1` event. That
+//! The default envelope retains its original format. An opted-in sink can
+//! receive an `authority_event.v1` for a caller-bound PostgreSQL token revoke. That
 //! contract names every actor by an issuer-scoped subject reference, an issuer
 //! reference, a kind and an authentication mode. Since migration 24 the
 //! evidence rows record the actor's kind, auth mode and, for a principal that
@@ -96,6 +97,7 @@ use super::pseudonym::{PseudonymError, PseudonymKeyring, ReferenceDomain};
 use crate::auth::change_actor::{auth_mode_agrees, ActorKind};
 #[cfg(feature = "postgres")]
 use crate::auth::principal::{canonical_issuer, AuthMethod};
+use crate::config::AuthorityEventFormat;
 #[cfg(feature = "postgres")]
 use crate::storage::postgres_authority_events::{JournalSource, JournaledEvidence};
 
@@ -177,6 +179,10 @@ const MAX_COMMITTED_AT_CHARS: usize = 30;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DeliveryRecord {
+    // Only negotiated PostgreSQL projection can create this actor. It never
+    // enters the closed delivery_v1 wire representation.
+    #[serde(skip)]
+    pub(super) qualified_actor: Option<QualifiedActor>,
     pub(crate) schema_version: String,
     /// The persisted evidence-authority ID every reference is derived under.
     /// Consumers deduplicate on `(authority_id, event_id)`.
@@ -194,6 +200,51 @@ pub(crate) struct DeliveryRecord {
     pub(crate) actor: DeliveryActor,
     pub(crate) resource: DeliveryResource,
     pub(crate) revision: DeliveryRevision,
+}
+
+/// The closed actor shape used only by a qualified committed event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(super) struct QualifiedActor {
+    kind: &'static str,
+    subject_ref: String,
+    issuer_ref: String,
+    auth_mode: String,
+}
+
+/// Wire fields of authority_event.v1. A durable cursor position belongs to
+/// the delivery envelope. The qualified event carries its revision instead.
+#[derive(Serialize)]
+struct QualifiedEvent<'a> {
+    schema_version: &'static str,
+    event_id: &'a str,
+    operation_id: &'a str,
+    authority_id: &'a str,
+    operation: &'a str,
+    result: &'a str,
+    committed_at: &'a str,
+    actor: &'a QualifiedActor,
+    resource: &'a DeliveryResource,
+    revision: &'a DeliveryRevision,
+}
+
+impl DeliveryRecord {
+    pub(super) fn wire_json(&self, format: AuthorityEventFormat) -> serde_json::Result<String> {
+        if let (AuthorityEventFormat::QualifiedV1, Some(actor)) = (format, &self.qualified_actor) {
+            return serde_json::to_string(&QualifiedEvent {
+                schema_version: "authority_event.v1",
+                event_id: &self.event_id,
+                operation_id: &self.operation_id,
+                authority_id: &self.authority_id,
+                operation: &self.operation,
+                result: &self.result,
+                committed_at: &self.committed_at,
+                actor,
+                resource: &self.resource,
+                revision: &self.revision,
+            });
+        }
+        serde_json::to_string(self)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,6 +503,7 @@ fn document_shape(action: &str, resource_type: &str) -> Result<ActionShape, Proj
 pub(crate) fn project(
     evidence: &JournaledEvidence,
     keyring: &PseudonymKeyring,
+    format: AuthorityEventFormat,
 ) -> Result<DeliveryRecord, ProjectionError> {
     let operation_id = required(evidence.operation_id.as_deref())?;
     let actor = required(evidence.actor_user_id.as_deref())?;
@@ -555,8 +607,13 @@ pub(crate) fn project(
     }
     .map_err(ProjectionError::Reference)?;
     let actor = journal_actor(evidence, actor, keyring)?;
+    let qualified_actor = match format {
+        AuthorityEventFormat::DeliveryV1 => None,
+        AuthorityEventFormat::QualifiedV1 => qualified_revoke_actor(evidence, &actor, keyring)?,
+    };
 
     Ok(DeliveryRecord {
+        qualified_actor,
         schema_version: DELIVERY_SCHEMA_VERSION.to_owned(),
         authority_id: keyring.authority_id().to_string(),
         event_id,
@@ -577,6 +634,50 @@ pub(crate) fn project(
             security: security_revision.map(|value| value.to_string()),
         },
     })
+}
+
+/// V7 is reserved for caller-bound service-token operations. Historical and
+/// unkeyed v4 revokes retain their legacy representation, as do authenticated
+/// gateway service tokens, which have no provider issuer. An impossible v7
+/// writer shape blocks the batch so corruption cannot pass as a fallback.
+#[cfg(feature = "postgres")]
+fn qualified_revoke_actor(
+    evidence: &JournaledEvidence,
+    actor: &DeliveryActor,
+    keyring: &PseudonymKeyring,
+) -> Result<Option<QualifiedActor>, ProjectionError> {
+    if evidence.source != JournalSource::ServiceTokenChange
+        || evidence.action.as_deref() != Some(ACTION_SERVICE_TOKEN_REVOKE)
+    {
+        return Ok(None);
+    }
+    let id = Uuid::parse_str(required(evidence.operation_id.as_deref())?)
+        .map_err(|_| ProjectionError::InvalidEvidence)?;
+    if !crate::auth::tokens::valid_revoke_operation_id(id) {
+        return Ok(None);
+    }
+    let prior = positive(evidence.prior_version)?;
+    if prior.checked_add(1) != evidence.new_version {
+        return Err(ProjectionError::InvalidEvidence);
+    }
+    match (actor.kind.as_deref(), evidence.actor_issuer.as_deref()) {
+        (Some("service_token"), None) => Ok(None),
+        (Some("principal"), Some(issuer))
+            if canonical_issuer(issuer).as_deref() == Some(issuer) =>
+        {
+            let subject = required(evidence.actor_user_id.as_deref())?;
+            let reference = keyring
+                .derive(ReferenceDomain::ActorSubject, &[issuer, subject])
+                .map_err(ProjectionError::Reference)?;
+            Ok(Some(QualifiedActor {
+                kind: "principal",
+                subject_ref: reference.as_str().to_owned(),
+                issuer_ref: required(actor.issuer_ref.as_deref())?.to_owned(),
+                auth_mode: required(actor.auth_mode.as_deref())?.to_owned(),
+            }))
+        }
+        _ => Err(ProjectionError::InvalidEvidence),
+    }
 }
 
 /// A journaled row's actor. A document row is first read in migration 24's

@@ -252,13 +252,12 @@ export function changedMembers(
   const known = new Set(POLICY_MEMBERS.map((entry) => entry.member));
   const changed = POLICY_MEMBERS.filter(
     ({ member, absent }) =>
-      canonicalJson(live[member] ?? absent) !==
-      canonicalJson(candidate[member] ?? absent),
+      !sameJson(live[member] ?? absent, candidate[member] ?? absent),
   ).map((entry) => entry.label);
   const unknown = [...new Set([...Object.keys(live), ...Object.keys(candidate)])]
     .filter((member) => !known.has(member))
     .filter(
-      (member) => canonicalJson(live[member]) !== canonicalJson(candidate[member]),
+      (member) => !sameJson(live[member], candidate[member]),
     )
     .sort();
   return [...changed, ...unknown];
@@ -268,20 +267,30 @@ export function egressChanged(
   live: PolicyDocument | JsonObject,
   candidate: JsonObject,
 ): boolean {
-  return canonicalJson(live.egress ?? {}) !== canonicalJson(candidate.egress ?? {});
+  return !sameJson(live.egress ?? {}, candidate.egress ?? {});
 }
 
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) {
-    return `[${value.map(canonicalJson).join(',')}]`;
+// Source is editable before the gateway enforces the condition depth limit.
+// Keep comparison stack-safe and retain array order and object-key semantics.
+function sameJson(left: unknown, right: unknown): boolean {
+  const pending: Array<[unknown, unknown]> = [[left, right]];
+  while (pending.length > 0) {
+    const [a, b] = pending.pop()!;
+    if (a === b) continue;
+    if (Array.isArray(a) && Array.isArray(b) && a.length === b.length) {
+      for (let index = 0; index < a.length; index += 1) pending.push([a[index], b[index]]);
+    } else if (isJsonObject(a) && isJsonObject(b)) {
+      const keys = Object.keys(a);
+      if (keys.length !== Object.keys(b).length) return false;
+      for (const key of keys) {
+        if (!Object.hasOwn(b, key)) return false;
+        pending.push([a[key], b[key]]);
+      }
+    } else {
+      return false;
+    }
   }
-  if (isJsonObject(value)) {
-    return `{${Object.keys(value)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
-      .join(',')}}`;
-  }
-  return value === undefined ? 'undefined' : JSON.stringify(value);
+  return true;
 }
 
 // The gateway requires stable ids to be unique across all four sections.

@@ -294,9 +294,11 @@ impl DispatcherTerm {
         let mut projected = Vec::with_capacity(rows.len());
         for row in &rows {
             projected.push(
-                project(row, &self.keyring).map_err(|error| StepError::Projection {
-                    position: row.position,
-                    error,
+                project(row, &self.keyring, self.sink.format()).map_err(|error| {
+                    StepError::Projection {
+                        position: row.position,
+                        error,
+                    }
                 })?,
             );
         }

@@ -243,6 +243,18 @@ are hostnames without ports and that NAT64 prefixes meet the gateway's IPv6
 prefix and overlap rules. A refusal points to the affected setting and omits
 the supplied value. This check runs offline.
 
+The same offline pass compiles the public runtime settings for request bounds,
+rate limits, CORS, shutdown, audit durability, payload capture, discovery
+signals and tool execution. For example, a wildcard in `cors.allowed_origins`
+is rejected because the gateway supports credentialed requests.
+
+The reader also applies the gateway's authentication-provider rules, including
+type-specific requirements, unique provider names, and unique effective issuers.
+Admin login must select a JWT provider with an issuer and supply its client ID,
+client secret reference and redirect URI. Offline validation checks the form
+and presence of the reference. The secret value and alias availability are
+checked only when a resolver is used.
+
 The remaining domains still need compiler integration for checks such as
 session lifetime bounds, client-certificate requirements and cookie-name
 syntax. Profile requirements on the deployment settings are also pending (see
@@ -598,6 +610,7 @@ Authority evidence and its event delivery.
 | --- | --- | --- | --- |
 | `authority_evidence.durability` | `required` or `best_effort` | `"best_effort"` | [`AUTHORITY_EVIDENCE_DURABILITY`](configuration.md#authority_evidence_durability) |
 | `authority_evidence.event_sink` | `none`, `log` or `file` | `"none"` | [`AUTHORITY_EVENT_SINK`](configuration.md#authority_event_sink) |
+| `authority_evidence.event_format` | `delivery_v1` or `qualified_v1` | `"delivery_v1"` | [`AUTHORITY_EVENT_FORMAT`](configuration.md#authority_event_format) |
 | `authority_evidence.pseudonym_key_alias` | string | unset | [`AUTHORITY_PSEUDONYM_KEY_ALIAS`](configuration.md#authority_pseudonym_key_alias) |
 | `authority_evidence.previous_pseudonym_key_alias` | string | unset | [`AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS`](configuration.md#authority_pseudonym_previous_key_alias) |
 | `authority_evidence.event_journal_capacity` | integer, 1 to 1000000000 | `1000000` | [`AUTHORITY_EVENT_JOURNAL_CAPACITY`](configuration.md#authority_event_journal_capacity) |
@@ -1232,6 +1245,9 @@ can appear in one. A published code never changes meaning.
 | `bundle.not_utf8` | A file is not valid UTF-8. |
 | `bundle.digest_mismatch` | A file's SHA-256 differs from its pin. |
 | `bundle.invalid_egress_setting` | The gateway's egress compiler refused the setting at the reported deployment pointer. |
+| `bundle.invalid_runtime_setting` | The gateway's runtime compiler refused the setting at the reported deployment pointer. |
+| `bundle.invalid_auth_provider` | The gateway's authentication compiler refused the provider list. |
+| `bundle.invalid_admin_login` | The selected login provider is unusable, or a required client setting is missing. |
 | `syntax.empty_document` | The document is empty. |
 | `syntax.too_deep` | Too many nested collections. |
 | `syntax.too_many_members` | An object has too many members. |

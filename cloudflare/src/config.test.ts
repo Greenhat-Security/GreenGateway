@@ -134,6 +134,7 @@ describe("buildGreenGatewayContainerEnv", () => {
     const env = buildGreenGatewayContainerEnv({
       AUTHORITY_EVIDENCE_DURABILITY: "required",
       AUTHORITY_EVENT_SINK: "file",
+      AUTHORITY_EVENT_FORMAT: "qualified_v1",
       AUTHORITY_EVENT_FILE: "/tmp/greengateway-authority-events.jsonl",
       AUTHORITY_PSEUDONYM_KEY_ALIAS: "pseudonym-current",
       AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS: "pseudonym-previous",
@@ -142,6 +143,7 @@ describe("buildGreenGatewayContainerEnv", () => {
     expect(env).toMatchObject({
       AUTHORITY_EVIDENCE_DURABILITY: "required",
       AUTHORITY_EVENT_SINK: "file",
+      AUTHORITY_EVENT_FORMAT: "qualified_v1",
       AUTHORITY_EVENT_FILE: "/tmp/greengateway-authority-events.jsonl",
       AUTHORITY_PSEUDONYM_KEY_ALIAS: "pseudonym-current",
       AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS: "pseudonym-previous",

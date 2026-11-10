@@ -496,9 +496,13 @@ bundle's files, digests, documents, and profile today. Its deployment document
 carries the profile and every catalog field with a document path, in the
 closed sections those paths imply (`bundle::settings`), each held to its
 catalog type and its own bounds; the parity tests below hold those bounds to
-this compiler. The bundle reader maps `spec.egress` into the existing egress
-stage and uses its findings in offline validation. This covers the hostname
-grammar and NAT64 prefix and overlap checks. Other domains and profile
+this compiler. The bundle reader maps public egress and runtime fields into
+their existing stages for offline validation, including hostname grammar,
+NAT64 prefix and overlap checks, and credentialed CORS restrictions. Decimal
+runtime bounds and rates use their canonical spelling. The reader also runs the shared
+authentication-provider and admin-login validation. It passes the presence of
+the login client's typed secret reference to that rule without resolving it.
+Other domains and profile
 invariants on deployment settings still need compiler integration. A front end
 gives a decimal setting the `f64` its text parses to, which is the value the
 same text gives in the environment.

@@ -114,11 +114,27 @@ fn a_configuration_has_no_change_against_itself_or_a_respelling() {
             base(),
             &[
                 ("AUTHORITY_EVIDENCE_DURABILITY", Some("best_effort")),
+                ("AUTHORITY_EVENT_FORMAT", Some("delivery_v1")),
                 ("AUDIT_DURABILITY", Some("required")),
             ],
         ),
     );
     assert!(defaults.is_empty(), "{:?}", fields(&defaults));
+}
+
+#[test]
+fn authority_event_format_diff_shows_the_consumer_contract_change() {
+    let negotiated = with(base(), &[("AUTHORITY_EVENT_FORMAT", Some("qualified_v1"))]);
+    let change = diff(&base(), &negotiated);
+    assert_eq!(fields(&change), ["AUTHORITY_EVENT_FORMAT"]);
+    assert_eq!(change.changes()[0].effect(), Effect::Neutral);
+    assert_eq!(
+        change.changes()[0].display(),
+        Display::Shown {
+            before: Shown::Word("delivery_v1"),
+            after: Shown::Word("qualified_v1"),
+        }
+    );
 }
 
 /// Settings to set (`Some`) or unset (`None`).

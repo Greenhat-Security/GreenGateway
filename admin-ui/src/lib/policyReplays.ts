@@ -86,9 +86,26 @@ export type PolicyReplayRecords = Readonly<{
   by_code: readonly PolicyReplayCodeCount[];
 }>;
 
-// What the candidate decided for one window of retained records. It holds
-// counts and stable codes only, and it does not compare them with what was
-// recorded or with the live policy.
+const TRANSITIONS = [
+  'newly_allowed', 'newly_denied', 'enforcement_only_change', 'attribution_only_change',
+  'unchanged_allow', 'unchanged_deny', 'indeterminate', 'unsupported_context',
+] as const;
+
+type Transition = (typeof TRANSITIONS)[number];
+export type PolicyReplayComparisonLane = Readonly<Record<Transition, number> & {
+  compared: number;
+  newly_forwarded: number;
+  newly_blocked: number;
+}>;
+
+type ComparisonStatement = 'newly_allowed_observed' | 'no_newly_allowed_observed' | 'not_established';
+export type PolicyReplayComparison = Readonly<{
+  http: PolicyReplayComparisonLane;
+  tool: PolicyReplayComparisonLane;
+  statement: ComparisonStatement;
+}>;
+
+// Only counts from the pinned policies and stable codes are retained.
 export type PolicyReplayResult = Readonly<{
   complete: boolean;
   limitations: readonly string[];
@@ -96,6 +113,7 @@ export type PolicyReplayResult = Readonly<{
   high_water: number;
   max_records: number;
   records: PolicyReplayRecords;
+  comparison: PolicyReplayComparison | null;
   replayed: Readonly<{
     total: number;
     http: PolicyReplayLane;
@@ -360,6 +378,8 @@ function projectReplayResult(value: unknown): PolicyReplayResult | null {
   ) {
     return null;
   }
+  const comparison = projectComparison(value.impact, value.complete, http, tool);
+  if (comparison === false) return null;
   return {
     complete: value.complete,
     limitations,
@@ -370,9 +390,72 @@ function projectReplayResult(value: unknown): PolicyReplayResult | null {
     high_water: value.source.high_water,
     max_records: value.source.max_records,
     records,
+    comparison,
     replayed: { total: value.replayed.total, http, rate, tool },
     not_replayed: notReplayed,
   };
+}
+
+// Older jobs and jobs with only a hypothetical projection have no as-authored
+// comparison. A malformed supplied comparison invalidates the result.
+function projectComparison(
+  value: unknown,
+  complete: boolean,
+  httpReplay: PolicyReplayLane,
+  toolReplay: PolicyReplayLane,
+): PolicyReplayComparison | null | false {
+  if (value === undefined) return null;
+  if (!isJsonObject(value) || !isJsonObject(value.projections)) return false;
+  const authored = value.projections.as_authored;
+  if (authored === undefined) {
+    return isJsonObject(value.projections.enforce_all_shadow) ? null : false;
+  }
+  if (!isJsonObject(authored) || !isJsonObject(authored.statement)) return false;
+  const http = projectComparisonLane(authored.http, httpReplay);
+  const tool = projectComparisonLane(authored.tool, toolReplay);
+  if (http === null || tool === null) return false;
+  const compared = http.compared + tool.compared;
+  const allowed = http.newly_allowed + tool.newly_allowed;
+  const forwarded = http.newly_forwarded + tool.newly_forwarded;
+  const statement = authored.statement;
+  switch (statement.code) {
+    case 'newly_allowed_observed':
+      if (allowed + forwarded === 0 || statement.replayable_events !== compared ||
+          statement.newly_allowed !== allowed || statement.newly_forwarded !== forwarded) return false;
+      break;
+    case 'no_newly_allowed_observed':
+      if (!complete || compared === 0 || allowed + forwarded !== 0 ||
+          statement.replayable_events !== compared) return false;
+      break;
+    case 'not_established':
+      if (allowed + forwarded !== 0 || (complete && compared > 0) ||
+          statement.reason !== (complete ? 'nothing_compared' : 'incomplete')) return false;
+      break;
+    default:
+      return false;
+  }
+  return { http, tool, statement: statement.code };
+}
+
+function projectComparisonLane(value: unknown, replay: PolicyReplayLane): PolicyReplayComparisonLane | null {
+  if (!isJsonObject(value) || !isCount(value.records) || value.records > POLICY_REPLAY_MAX_RECORDS ||
+      value.records !== replay.replayable || !isCount(value.compared) || value.compared > replay.decided ||
+      !isJsonObject(value.transitions) ||
+      !isJsonObject(value.forwarding)) return null;
+  const transitions = {} as Record<Transition, number>;
+  let total = 0;
+  for (const code of TRANSITIONS) {
+    const count = value.transitions[code];
+    if (!isCount(count) || count > value.records) return null;
+    transitions[code] = count;
+    total += count;
+  }
+  const { newly_forwarded, newly_blocked } = value.forwarding;
+  if (total !== value.records ||
+      value.compared !== total - transitions.indeterminate - transitions.unsupported_context ||
+      !isCount(newly_forwarded) || !isCount(newly_blocked) ||
+      newly_forwarded + newly_blocked > value.compared) return null;
+  return { ...transitions, compared: value.compared, newly_forwarded, newly_blocked };
 }
 
 function projectRecords(value: Record<string, unknown>): PolicyReplayRecords | null {
