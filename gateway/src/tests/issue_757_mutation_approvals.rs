@@ -122,6 +122,8 @@ async fn mutation_approval_binds_rendered_request_and_enforces_independent_revie
     config.rate_limit_write_burst = 1000;
     let capture = audit::sink::tests::CaptureSink::new();
     let log = audit::AuditLog::new(Arc::new(capture.clone()));
+    let mut required_config = config.clone();
+    required_config.authority_events.durability = config::AuthorityEvidenceDurability::Required;
     let router = app(
         config,
         PrometheusBuilder::new().build_recorder().handle(),
@@ -308,6 +310,55 @@ async fn mutation_approval_binds_rendered_request_and_enforces_independent_revie
     );
     let review = format!("{record}/review");
     let approve = Some(json!({"decision":"approve"}));
+    let required = app(
+        required_config,
+        PrometheusBuilder::new().build_recorder().handle(),
+        log.clone(),
+        test_audit_event_sender(),
+    )
+    .unwrap();
+    let revoke = format!("{record}/revoke");
+    for (path, token, tag, payload, operation) in [
+        (
+            &prepare,
+            &requester,
+            etag,
+            body.clone(),
+            "mutation_approval.prepare",
+        ),
+        (
+            &review,
+            &reviewer,
+            None,
+            approve.clone(),
+            "mutation_approval.review",
+        ),
+        (&revoke, &reviewer, None, None, "mutation_approval.revoke"),
+    ] {
+        let (_, refused) = call(
+            &required,
+            Method::POST,
+            path,
+            token,
+            tag,
+            payload,
+            StatusCode::CONFLICT,
+        )
+        .await;
+        assert_eq!(refused["reason"], "authority_evidence_unsupported");
+        assert_eq!(refused["operation"], operation);
+    }
+    let (_, still_pending) = call(
+        &required,
+        Method::GET,
+        &record,
+        &reviewer,
+        None,
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(still_pending["status"], "pending");
     call(
         &router,
         Method::POST,

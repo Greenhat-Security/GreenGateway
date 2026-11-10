@@ -52,6 +52,9 @@
         "connection.replace",
         "credential.binding_change",
         "jwt.revoke",
+        "mutation_approval.prepare",
+        "mutation_approval.review",
+        "mutation_approval.revoke",
         "policy.file_reload",
         "policy.publish",
         "policy.rollback",
@@ -138,7 +141,8 @@
             "service_token",
             "jwt_revocation",
             "configuration",
-            "admin_session"
+            "admin_session",
+            "mutation_approval"
           ]
         },
         "ref": {
@@ -171,7 +175,8 @@
             "configuration",
             "maintenance",
             "session",
-            "policy_tests"
+            "policy_tests",
+            "mutation_approval"
           ]
         },
         "before": {

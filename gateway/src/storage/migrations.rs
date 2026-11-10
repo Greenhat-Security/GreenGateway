@@ -2673,6 +2673,7 @@ mod tests {
                  DROP TABLE greengateway.policy_replay_jobs; \
                  DROP SEQUENCE greengateway.policy_replay_job_fence; \
                  DROP TABLE greengateway.policy_analysis_suppressions; \
+                 DROP TABLE greengateway.connection_mutation_approvals; \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await
