@@ -2519,7 +2519,8 @@
       "operations": [
         "mutation_approval.prepare",
         "mutation_approval.review",
-        "mutation_approval.revoke"
+        "mutation_approval.revoke",
+        "mutation_approval.consume"
       ],
       "modes": [
         "postgres",
@@ -2537,9 +2538,13 @@
         {
           "path": "gateway/src/admin_mutation_approvals.rs",
           "anchor": "async fn tool_mutation_approval_revoke_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_tools.rs",
+          "anchor": "async fn tool_mutation_approval_execute_endpoint("
         }
       ],
-      "boundary": "The Connection store creates each occurrence and serializes review and revocation against its current state. Both backends refuse these operations when required evidence is configured.",
+      "boundary": "The Connection store creates each occurrence and serializes review, revocation and one-shot consumption against its current state. Both backends refuse these operations when required evidence is configured.",
       "record": "The mutable decision row expires and cascades with its Connection. Audit notifications are emitted after the transaction.",
       "actor": "The request and review use the authenticated issuer and subject. The reviewer identity in the latest decision row does not preserve each transition.",
       "identity": "The occurrence UUID identifies a decision. Its Connection and catalog revisions describe the requested target, not a durable sequence of approval events.",

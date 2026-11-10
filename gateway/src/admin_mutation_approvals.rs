@@ -194,7 +194,7 @@ pub(super) fn mutation_approval_denied(
     forbidden()
 }
 
-fn audit_mutation_approval(
+pub(super) fn audit_mutation_approval(
     state: &ToolAdminState,
     parts: &http::request::Parts,
     principal: &auth::Principal,

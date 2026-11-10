@@ -96,13 +96,7 @@ pub(super) async fn tool_playground_execute_endpoint(
     request: AxumRequest,
 ) -> Response {
     record_request(TOOL_EXECUTE_ADMIN_ROUTE);
-    tool_invocation(
-        state,
-        raw_id,
-        request,
-        tools::executor::ToolRequestPurpose::Execute,
-    )
-    .await
+    tool_invocation(state, raw_id, request, ToolInvocationOperation::Execute).await
 }
 
 pub(super) async fn tool_mutation_approval_create_endpoint(
@@ -115,16 +109,37 @@ pub(super) async fn tool_mutation_approval_create_endpoint(
         state,
         raw_id,
         request,
-        tools::executor::ToolRequestPurpose::PrepareMutation,
+        ToolInvocationOperation::PrepareMutation,
     )
     .await
+}
+
+pub(super) async fn tool_mutation_approval_execute_endpoint(
+    State(state): State<ToolAdminState>,
+    Path((raw_id, approval_id)): Path<(String, String)>,
+    request: AxumRequest,
+) -> Response {
+    record_request(TOOL_MUTATION_APPROVAL_EXECUTE_ROUTE);
+    tool_invocation(
+        state,
+        raw_id,
+        request,
+        ToolInvocationOperation::Approved(approval_id),
+    )
+    .await
+}
+
+enum ToolInvocationOperation {
+    Execute,
+    PrepareMutation,
+    Approved(String),
 }
 
 async fn tool_invocation(
     state: ToolAdminState,
     raw_id: String,
     request: AxumRequest,
-    purpose: tools::executor::ToolRequestPurpose,
+    purpose: ToolInvocationOperation,
 ) -> Response {
     let (parts, body) = request.into_parts();
     let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
@@ -134,8 +149,11 @@ async fn tool_invocation(
         match authorized_tool_rbac_state(&state, &principal, ADMIN_TOOLS_EXECUTE_PERMISSION) {
             Ok(rbac_state) => rbac_state.clone(),
             Err(ToolAdminAuthzError::Forbidden(_)) => {
-                if purpose == tools::executor::ToolRequestPurpose::PrepareMutation {
+                if matches!(purpose, ToolInvocationOperation::PrepareMutation) {
                     return mutation_approval_denied(&state, &parts, &principal, "prepare");
+                }
+                if matches!(purpose, ToolInvocationOperation::Approved(_)) {
+                    return mutation_approval_denied(&state, &parts, &principal, "execute");
                 }
                 return tool_playground_permission_forbidden(&state, &parts, &principal);
             }
@@ -253,7 +271,7 @@ async fn tool_invocation(
         .then(|| context.request_id.clone());
 
     let args = Value::Object(request.arguments);
-    if purpose == tools::executor::ToolRequestPurpose::PrepareMutation {
+    if matches!(purpose, ToolInvocationOperation::PrepareMutation) {
         if context.caller.is_none() {
             return mutation_approval_denied(&state, &parts, &principal, "prepare");
         }
@@ -289,17 +307,99 @@ async fn tool_invocation(
             StatusCode::CREATED,
         );
     }
-    let result = match state
-        .executor
-        .execute_with_precondition(
-            &definition.name,
-            args,
-            context,
-            tokio_util::sync::CancellationToken::new(),
-            precondition,
-        )
-        .await
-    {
+    let execution = if let ToolInvocationOperation::Approved(raw_approval_id) = purpose {
+        if context.caller.is_none() {
+            return mutation_approval_denied(&state, &parts, &principal, "execute");
+        }
+        if let Err(response) = admit_authority_change(
+            &state.authority_evidence,
+            authority_events::required::AuthorityOperation::MutationApprovalConsume,
+            &state.audit,
+            &parts,
+            &principal,
+            &state.client_ip_policy,
+        ) {
+            return *response;
+        }
+        let Ok(id) = uuid::Uuid::parse_str(&raw_approval_id) else {
+            return mutation_approval_result(
+                &state,
+                &parts,
+                &principal,
+                "execute",
+                None,
+                Err(connections::mutation_approval::ApprovalError::NotFound),
+                StatusCode::OK,
+            );
+        };
+        let Ok(store) = state.connections.managed_store() else {
+            return mutation_approval_result(
+                &state,
+                &parts,
+                &principal,
+                "execute",
+                Some(id),
+                Err(connections::mutation_approval::ApprovalError::Unavailable),
+                StatusCode::OK,
+            );
+        };
+        let result = state
+            .executor
+            .execute_approved_mutation(
+                &definition.name,
+                args,
+                context,
+                precondition,
+                tools::executor::ApprovedMutationDispatch {
+                    id,
+                    store: store.clone(),
+                    rbac: rbac_state,
+                    principal: principal.clone(),
+                },
+            )
+            .await;
+        if let Err(error) = &result {
+            let reason = match error {
+                tools::runtime::ToolRuntimeError::WorkFailed {
+                    reason: Some(reason),
+                    ..
+                } if matches!(
+                    reason.as_str(),
+                    "mutation_approval_not_found"
+                        | "mutation_approval_mismatch"
+                        | "mutation_approval_state_conflict"
+                        | "mutation_approval_expired"
+                        | "mutation_approval_unavailable"
+                        | "mutation_approval_unsupported"
+                ) =>
+                {
+                    reason.as_str()
+                }
+                _ => "execution_failed",
+            };
+            audit_mutation_approval(
+                &state,
+                &parts,
+                &principal,
+                json!({
+                    "operation": "execute", "outcome": "failure", "approval_id": id.to_string(), "reason": reason,
+                }),
+            );
+        }
+        result
+    } else {
+        state
+            .executor
+            .execute_with_precondition(
+                &definition.name,
+                args,
+                context,
+                tokio_util::sync::CancellationToken::new(),
+                precondition,
+            )
+            .await
+    };
+    let result = match execution {
         Ok(result) => result,
         Err(error) => {
             return tool_playground_runtime_error_response(error, composite_request_id.as_deref())

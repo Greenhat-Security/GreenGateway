@@ -324,6 +324,7 @@ export type SafeCallerAssertion = {
   claims?: CallerAssertionClaim[];
   bind_request: boolean;
   bind_approval: boolean;
+  approval_mode?: 'managed_http_mutation_v1';
   published_keys?: SafePublishedAssertionKey[];
   /** Present only when the gateway leaves this block's keys out of its JWKS. */
   key_problem?: CallerAssertionKeyProblem;
@@ -363,8 +364,8 @@ export type CallerAssertionWrite = CallerAssertionKeyBinding & {
   lifetime_seconds: number;
   claims?: CallerAssertionClaim[];
   bind_request?: boolean;
-  /** The gateway refuses `true` on every write: nothing can satisfy it yet. */
-  bind_approval?: false;
+  bind_approval?: boolean;
+  approval_mode?: 'managed_http_mutation_v1';
   published_keys?: PublishedAssertionKeyWrite[];
 };
 
@@ -1111,6 +1112,7 @@ function projectSafeCallerAssertion(value: unknown): SafeCallerAssertion {
       !isCallerAssertionClaimList(source.claims)) ||
     typeof source.bind_request !== 'boolean' ||
     typeof source.bind_approval !== 'boolean' ||
+    (source.approval_mode !== undefined && (source.approval_mode !== 'managed_http_mutation_v1' || !source.bind_request || !source.bind_approval)) ||
     (source.published_keys !== undefined &&
       !isSafePublishedAssertionKeyList(source.published_keys)) ||
     (source.key_problem !== undefined &&
@@ -1133,6 +1135,7 @@ function projectSafeCallerAssertion(value: unknown): SafeCallerAssertion {
     ...(source.claims === undefined ? {} : { claims: [...source.claims] }),
     bind_request: source.bind_request,
     bind_approval: source.bind_approval,
+    ...(source.approval_mode === undefined ? {} : { approval_mode: source.approval_mode }),
     ...(source.published_keys === undefined
       ? {}
       : {

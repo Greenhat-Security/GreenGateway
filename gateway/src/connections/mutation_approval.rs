@@ -428,6 +428,9 @@ impl MutationApproval {
         action: &MutationAction,
         now: i64,
     ) -> Result<(), ApprovalError> {
+        if self.action.caller != action.caller {
+            return Err(ApprovalError::NotFound);
+        }
         self.ensure_live(now)?;
         if &self.action != action {
             return Err(ApprovalError::Mismatch);
@@ -442,14 +445,46 @@ impl MutationApproval {
 
 /// Issued only after the authority commits the one-shot transition to consumed.
 #[derive(Debug)]
-pub struct ConsumedMutationApproval(Uuid);
+pub struct ConsumedMutationApproval {
+    id: Uuid,
+    action: MutationAction,
+    consumed_at: i64,
+    expires_at: i64,
+}
 
 impl ConsumedMutationApproval {
-    pub(super) fn new(id: Uuid) -> Self {
-        Self(id)
+    pub(super) fn new(record: MutationApproval, consumed_at: i64) -> Self {
+        Self {
+            id: record.id,
+            action: record.action,
+            consumed_at,
+            expires_at: record.expires_at,
+        }
     }
 
     pub fn id(&self) -> Uuid {
-        self.0
+        self.id
+    }
+
+    /// Rebind the committed decision to the actual outbound call. A clock behind
+    /// the authority's consumption time cannot safely attest its lifetime.
+    pub(super) fn verify_for_signing(
+        &self,
+        action: &MutationAction,
+        issued_at: u64,
+    ) -> Result<u64, ApprovalError> {
+        if &self.action != action {
+            return Err(ApprovalError::Mismatch);
+        }
+        let consumed_at =
+            u64::try_from(self.consumed_at).map_err(|_| ApprovalError::Unavailable)?;
+        let expires_at = u64::try_from(self.expires_at).map_err(|_| ApprovalError::Unavailable)?;
+        if issued_at < consumed_at {
+            return Err(ApprovalError::Unavailable);
+        }
+        if issued_at >= expires_at {
+            return Err(ApprovalError::Expired);
+        }
+        Ok(expires_at)
     }
 }

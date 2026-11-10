@@ -377,6 +377,108 @@ fn egress_config(host: &str, ca_pem: Option<&str>, identity_pem: Option<&str>) -
     config
 }
 
+#[tokio::test]
+async fn approved_mutation_egress_uses_a_fresh_socket_and_never_retries_an_ambiguous_send() {
+    use futures_util::StreamExt;
+    use http::HeaderMap;
+    use hyper_util::rt::TokioIo;
+    const HOST: &str = "mutations.example.test";
+    install_test_provider();
+    let ca = certificate_authority("GreenGateway Mutation Test CA");
+    let leaf = leaf(&ca, HOST, rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+    let tls = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(leaf.certificate_der)],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf.private_key_der)),
+        )
+        .unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let sockets = Arc::new(AtomicUsize::new(0));
+    let mutations = Arc::new(AtomicUsize::new(0));
+    let accepted = sockets.clone();
+    let received = mutations.clone();
+    let server = tokio::spawn(async move {
+        let acceptor = TlsAcceptor::from(Arc::new(tls));
+        while let Ok((socket, _)) = listener.accept().await {
+            accepted.fetch_add(1, Ordering::SeqCst);
+            let acceptor = acceptor.clone();
+            let received = received.clone();
+            tokio::spawn(async move {
+                let stream = acceptor.accept(socket).await.unwrap();
+                let service = hyper::service::service_fn(
+                    move |request: http::Request<hyper::body::Incoming>| {
+                        let received = received.clone();
+                        async move {
+                            let (parts, body) = request.into_parts();
+                            if parts.method == Method::POST {
+                                let bytes = axum::body::to_bytes(axum::body::Body::new(body), 16)
+                                    .await
+                                    .unwrap();
+                                assert_eq!(bytes.as_ref(), b"body");
+                                received.fetch_add(1, Ordering::SeqCst);
+                                if parts.uri.path() == "/ambiguous" {
+                                    return Err(std::io::Error::other("close after receipt"));
+                                }
+                            }
+                            Ok(http::Response::new(axum::body::Body::empty()))
+                        }
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    let client = EgressClient::new_with_resolver(
+        egress_config(HOST, Some(&ca.pem()), None),
+        Arc::new(StaticResolver { address }),
+    )
+    .unwrap();
+    let url = format!("https://{HOST}:{}/mutation", address.port());
+    let destination = client.checked_destination(&url).await.unwrap();
+    // The server supports persistent connections. Ordinary traffic demonstrably reuses them.
+    for _ in 0..6 {
+        client.request(Method::GET, &url).await.unwrap();
+    }
+    let ordinary_sockets = sockets.load(Ordering::SeqCst);
+    assert!(ordinary_sockets < 6);
+    for occurrence in 1..=2 {
+        let mut response = client
+            .stream_approved_mutation_at_checked_destination(
+                &destination,
+                Method::POST,
+                &url,
+                HeaderMap::new(),
+                Some(b"body".to_vec()),
+            )
+            .await
+            .unwrap();
+        assert!(response.body.next().await.is_none());
+        assert_eq!(mutations.load(Ordering::SeqCst), occurrence);
+        assert_eq!(
+            sockets.load(Ordering::SeqCst),
+            ordinary_sockets + occurrence
+        );
+    }
+    let ambiguous = format!("https://{HOST}:{}/ambiguous", address.port());
+    assert!(client
+        .stream_approved_mutation_at_checked_destination(
+            &destination,
+            Method::POST,
+            &ambiguous,
+            HeaderMap::new(),
+            Some(b"body".to_vec())
+        )
+        .await
+        .is_err());
+    assert_eq!(mutations.load(Ordering::SeqCst), 3);
+    assert_eq!(sockets.load(Ordering::SeqCst), ordinary_sockets + 3);
+    server.abort();
+}
+
 /// Drives the whole production path -- allowlist, DNS pinning, the pinned client
 /// cache, and the shared TLS config -- and reports only the trust verdict.
 async fn production_verdict(

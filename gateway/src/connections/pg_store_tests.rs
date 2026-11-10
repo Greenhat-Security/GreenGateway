@@ -157,7 +157,7 @@ async fn mutation_approvals_are_one_shot_across_postgres_replicas() {
     );
     assert_eq!(
         first
-            .consume_mutation_approval(occurrence.id, &action)
+            .consume_mutation_approval(occurrence.id, &action, revision)
             .await
             .unwrap_err(),
         ApprovalError::Conflict
@@ -172,18 +172,60 @@ async fn mutation_approvals_are_one_shot_across_postgres_replicas() {
         .await
         .expect("independent review");
     assert_eq!(approved.status, ApprovalStatus::Approved);
+    second
+        .check_mutation_approval(occurrence.id, &action)
+        .await
+        .expect("early admission");
+    assert_eq!(
+        first
+            .consume_mutation_approval(occurrence.id, &action, initial_policy.security_revision)
+            .await
+            .unwrap_err(),
+        ApprovalError::Conflict
+    );
+    assert_eq!(
+        second
+            .mutation_approval(occurrence.id)
+            .await
+            .unwrap()
+            .status,
+        ApprovalStatus::Approved
+    );
+    let mut another_caller = action.clone();
+    another_caller.caller = reviewer.clone();
+    assert_eq!(
+        second
+            .check_mutation_approval(occurrence.id, &another_caller)
+            .await
+            .unwrap_err(),
+        ApprovalError::NotFound
+    );
+    assert_eq!(
+        first
+            .consume_mutation_approval(occurrence.id, &another_caller, revision)
+            .await
+            .unwrap_err(),
+        ApprovalError::NotFound
+    );
     let mut changed = action.clone();
     changed.body_sha256 = "c".repeat(64);
     assert_eq!(
         second
-            .consume_mutation_approval(occurrence.id, &changed)
+            .check_mutation_approval(occurrence.id, &changed)
+            .await
+            .unwrap_err(),
+        ApprovalError::Mismatch
+    );
+    assert_eq!(
+        second
+            .consume_mutation_approval(occurrence.id, &changed, revision)
             .await
             .unwrap_err(),
         ApprovalError::Mismatch
     );
     let (left, right) = tokio::join!(
-        first.consume_mutation_approval(occurrence.id, &action),
-        second.consume_mutation_approval(occurrence.id, &action),
+        first.consume_mutation_approval(occurrence.id, &action, revision),
+        second.consume_mutation_approval(occurrence.id, &action, revision),
     );
     let receipt = match (left, right) {
         (Ok(receipt), Err(ApprovalError::Conflict))
@@ -201,7 +243,7 @@ async fn mutation_approvals_are_one_shot_across_postgres_replicas() {
         .expect("revoke");
     assert_eq!(
         first
-            .consume_mutation_approval(other.id, &action)
+            .consume_mutation_approval(other.id, &action, revision)
             .await
             .unwrap_err(),
         ApprovalError::Conflict
@@ -253,7 +295,7 @@ async fn mutation_approvals_are_one_shot_across_postgres_replicas() {
         .expect("withdraw operation");
     assert_eq!(
         second
-            .consume_mutation_approval(stale.id, &action)
+            .consume_mutation_approval(stale.id, &action, revision)
             .await
             .unwrap_err(),
         ApprovalError::Mismatch

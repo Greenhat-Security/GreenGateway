@@ -12087,7 +12087,7 @@ pub(crate) mod postgres_audit_tests {
         let members = store.members(window).await.expect("members");
         assert_eq!(
             members[0].capabilities,
-            "delegated_token_purges,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
+            "delegated_token_purges,managed_http_mutation_v1,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
              operation_requirements,policy_document_v1,policy_role_descriptions,\
              policy_rule_conditions,policy_tool_argument_conditions"
         );
@@ -12140,7 +12140,7 @@ pub(crate) mod postgres_audit_tests {
             .expect("refresh");
         assert_eq!(
             store.members(window).await.expect("members")[0].capabilities,
-            "delegated_token_purges,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
+            "delegated_token_purges,managed_http_mutation_v1,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
              operation_requirements,policy_document_v1,policy_role_descriptions,\
              policy_rule_conditions,policy_tool_argument_conditions"
         );

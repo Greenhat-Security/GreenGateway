@@ -74,6 +74,7 @@ pub(crate) enum AuthorityOperation {
     /// The stored policy test suite replaced or first stored (issue #243).
     PolicyTestsPublish,
     MutationApprovalPrepare,
+    MutationApprovalConsume,
     MutationApprovalReview,
     MutationApprovalRevoke,
 }
@@ -136,6 +137,7 @@ impl AuthorityOperation {
             Self::ToolsPublish => "tools.publish",
             Self::ConfigurationImport => "configuration.import",
             Self::PolicyTestsPublish => "policy_tests.publish",
+            Self::MutationApprovalConsume => "mutation_approval.consume",
             Self::MutationApprovalPrepare => "mutation_approval.prepare",
             Self::MutationApprovalReview => "mutation_approval.review",
             Self::MutationApprovalRevoke => "mutation_approval.revoke",
@@ -156,7 +158,8 @@ impl AuthorityOperation {
         match backend {
             StateBackend::Postgres => match self {
                 Self::PolicyFileReload => RequiredMode::Unavailable,
-                Self::MutationApprovalPrepare
+                Self::MutationApprovalConsume
+                | Self::MutationApprovalPrepare
                 | Self::MutationApprovalReview
                 | Self::MutationApprovalRevoke => RequiredMode::Refused,
                 Self::PolicyPublish

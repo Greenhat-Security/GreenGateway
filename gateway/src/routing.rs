@@ -569,6 +569,10 @@ pub(super) fn add_admin_api_routes(
                     post(tool_mutation_approval_create_endpoint),
                 )
                 .route(
+                    routes.admin.tool_mutation_approval_execute_route.as_str(),
+                    post(tool_mutation_approval_execute_endpoint),
+                )
+                .route(
                     routes.admin.mutation_approval_route.as_str(),
                     get(tool_mutation_approval_get_endpoint),
                 )

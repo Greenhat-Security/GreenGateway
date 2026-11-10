@@ -300,11 +300,11 @@ impl PostgresConnectionStore {
         Ok(result)
     }
 
-    pub(crate) async fn consume_mutation_approval(
+    pub(crate) async fn check_mutation_approval(
         &self,
         id: Uuid,
         action: &MutationAction,
-    ) -> Result<ConsumedMutationApproval, ApprovalError> {
+    ) -> Result<(), ApprovalError> {
         action.validate()?;
         let mut client = self
             .pool
@@ -315,13 +315,37 @@ impl PostgresConnectionStore {
         let (record, sampled_at) = read(&tx, id).await?;
         record.check_consumption(action, sampled_at)?;
         check_current(&tx, action).await?;
+        record.ensure_live(now(&tx).await?)?;
+        tx.commit().await.map_err(|_| ApprovalError::Unavailable)
+    }
+
+    pub(crate) async fn consume_mutation_approval(
+        &self,
+        id: Uuid,
+        action: &MutationAction,
+        authorized_policy_revision: i64,
+    ) -> Result<ConsumedMutationApproval, ApprovalError> {
+        action.validate()?;
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| ApprovalError::Unavailable)?;
+        let tx = begin(&mut client).await?;
+        check_policy(&tx, authorized_policy_revision).await?;
+        let (record, sampled_at) = read(&tx, id).await?;
+        record.check_consumption(action, sampled_at)?;
+        check_current(&tx, action).await?;
         let consumed_at = now(&tx).await?;
         record.ensure_live(consumed_at)?;
-        tx.execute(
-            "UPDATE greengateway.connection_mutation_approvals SET status='consumed', consumed_at=$2 WHERE id=$1::text::uuid",
+        let changed = tx.execute(
+            "UPDATE greengateway.connection_mutation_approvals SET status='consumed', consumed_at=$2 WHERE id=$1::text::uuid AND status='approved'",
             &[&id.to_string(), &consumed_at],
         ).await.map_err(|_| ApprovalError::Unavailable)?;
+        if changed != 1 {
+            return Err(ApprovalError::Conflict);
+        }
         tx.commit().await.map_err(|_| ApprovalError::Unavailable)?;
-        Ok(ConsumedMutationApproval::new(id))
+        Ok(ConsumedMutationApproval::new(record, consumed_at))
     }
 }

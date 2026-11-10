@@ -7017,7 +7017,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "0d182cd6f58424267f4835cafca702d60d33232274b531e2b0c3879b5b3959b9",
+      "sha256": "054794847c63324030cd39f932f21c7f002080af0a83140748e96827dc4ac195",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed the composed admin router with the keyed service-token revoke route and the authenticated mutation approval routes."
     },
@@ -8967,6 +8967,16 @@
       "reasons": [
         "network-or-process-reference"
       ],
+      "scope": "gateway::connections::pg_store::require_approval_enrollment_fence#1",
+      "sha256": "c2665d9d5f50f0c78d778a8721d84d427a63ab38eb9ca2239ae96ff29ca23846",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Checks the managed-mutation reader fence within the existing PostgreSQL Connection transaction before persisting enrollment."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
       "scope": "gateway::connections::pg_store::PostgresConnectionStore#1",
       "sha256": "4a92741f6ff2b732a09994aaebdb137b30569c77624714e06172fb8ac9c1f604",
       "owner": "GreenGateway maintainers",
@@ -9429,7 +9439,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::import_connections_in#1",
-      "sha256": "2ffe7654f35541ce14c32a84eb48aeecc411af5ff02c02391ecbcffe7356134d",
+      "sha256": "c7f4829150cceff3a7b74c4431fb3cb1731ea204c6aef35e348774fb0f0cab73",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10534,9 +10544,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::egress::base_client_builder_for_profile#1",
-      "sha256": "25e74e873cf305687f7b16d1b6bf546761de990f6776cba89770b8d617dd20b7",
+      "sha256": "904728bda095ad12ea54eece83690304eb88209a9f1392a5757ad2d7f68c6737",
       "owner": "GreenGateway maintainers",
-      "purpose": "Checked egress transport, DNS, TLS or protocol implementation; retain destination pinning and fail-closed transport behavior."
+      "purpose": "Builds the pinned HTTP client with the configured TLS and timeout policy. The approved mutation profile disables retries and pooled socket reuse for a single attempt."
     },
     {
       "file": "gateway/src/egress.rs",
@@ -10674,7 +10684,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::import::preflight::live_members_admit#1",
-      "sha256": "d59eafb65cfd249ac81f7e20ee24fcd615efab9ecc287154cad591629c795cf1",
+      "sha256": "da6f09484952a843dda051a916cc60d7e2a5a3f748a223ea1a89e28f2ee72cc1",
       "owner": "GreenGateway maintainers",
       "purpose": "Read-only cluster roster and contract-fence reads through the import's existing PostgreSQL pool, for the operation gate; no caller-selected HTTP authority and no new connection."
     },
@@ -10697,6 +10707,26 @@
       "sha256": "5ad02da962fcb575734a84f12095893588b94885042f61c1157572d30d593e6a",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/import/preflight.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::import::preflight::managed_mutation_enrollment#1",
+      "sha256": "61d73fabc412948825e0ff4473028b346c6427c357c2e3cb2b6cf2fd4945f590",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Examines the bounded standalone Connection inventory and evaluates explicit approval enrollment for the PostgreSQL cutover."
+    },
+    {
+      "file": "gateway/src/import/preflight.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::import::preflight::admit_import_write#1",
+      "sha256": "2f7d9bb652bb184234ed31786e178c87ed329f98a7945a2285cf05c1bed3e18e",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Admits a validated imported Connection through the existing cluster roster and durable compatibility fence."
     },
     {
       "file": "gateway/src/import/preflight.rs",

@@ -1318,6 +1318,86 @@
           }
         ]
       }
+    },
+    "/v1/admin/tools/{id}/mutation-approvals/{approval_id}/execute": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpaqueCapabilityId"
+          }
+        },
+        {
+          "name": "approval_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "executeApprovedToolMutation",
+        "tags": [
+          "Capabilities"
+        ],
+        "summary": "Execute one independently approved mutation",
+        "description": "Requires the original authenticated issuer and subject, admin:tools:execute, current capability ETag, matching registered operation and rendered request, explicit managed_http_mutation_v1 Connection enrollment, and an approved unexpired occurrence. Consumption is permanent before the signed upstream request is attempted.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/PlaygroundRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bounded projected HTTP or MCP result.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/PlaygroundResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/ToolPlaygroundValidationError"
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      }
     }
   },
   "components": {

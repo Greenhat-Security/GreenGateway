@@ -61,6 +61,19 @@
   },
   "allOf": [
     {
+      "if": { "required": ["caller_assertion"], "properties": { "caller_assertion": { "type": "object", "required": ["approval_mode"] } } },
+      "then": {
+        "required": ["discovery"],
+        "properties": {
+          "kind": { "const": "http_api" },
+          "endpoint": { "properties": { "base_url": { "pattern": "^https://" } } },
+          "authentication": { "properties": { "type": { "enum": ["none", "static_bearer", "header_api_key"] } } },
+          "discovery": { "type": "object", "properties": { "type": { "const": "managed_openapi" } } },
+          "additional_headers": { "maxItems": 0 }
+        }
+      }
+    },
+    {
       "if": {
         "properties": {
           "authentication": {
@@ -239,6 +252,12 @@
         "header_name",
         "lifetime_seconds"
       ],
+      "allOf": [
+        {
+          "if": { "anyOf": [{ "required": ["approval_mode"] }, { "required": ["bind_approval"], "properties": { "bind_approval": { "const": true } } }] },
+          "then": { "required": ["approval_mode", "bind_approval", "bind_request"], "properties": { "bind_request": { "const": true }, "bind_approval": { "const": true } } }
+        }
+      ],
       "properties": {
         "signing_key_id": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Secret alias holding the private key as exactly one PKCS#8 PEM block (BEGIN PRIVATE KEY): a P-256 key for es256, an RSA key of at least 2048 bits for rs256. Resolved with the assertion_signing_key purpose, so it comes from an operator alias or an external secret provider, never the encrypted local store; a key of the other algorithm is refused as algorithm_mismatch." },
         "kid": { "type": "string", "minLength": 1, "maxLength": 128, "description": "JOSE kid, published in the gateway's JWKS so an upstream can select the right key and keys can rotate without a flag day. Name one key only: never put new key material behind a kid that is already published." },
@@ -250,7 +269,8 @@
         "lifetime_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "An assertion is a bearer credential for as long as it is valid, so this is a replay window rather than a convenience setting." },
         "claims": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["email", "roles"] }, "description": "Principal fields to attest beyond sub, which is always present. A closed set rather than free-form templating, so a configuration mistake cannot attest something a caller supplied." },
         "bind_request": { "type": "boolean", "description": "Include the method, path and a SHA-256 of the body actually sent, so an assertion cannot be lifted onto different arguments. The digest covers the transmitted bytes, not a canonical form, so an upstream verifies it with its standard library." },
-        "bind_approval": { "type": "boolean", "const": false, "description": "Reserved: would require, and include, the approval that authorised a mutation. The gateway can record a mutation review. Dispatch does not yet consume its decision, so writes accept only false." },
+        "bind_approval": { "type": "boolean", "description": "Require a consumed approval for this exact managed OpenAPI mutation." },
+        "approval_mode": { "const": "managed_http_mutation_v1" },
         "published_keys": {
           "type": "array",
           "maxItems": 4,

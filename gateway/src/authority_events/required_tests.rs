@@ -8,7 +8,7 @@ use serde_json::Value;
 use super::*;
 use crate::audit::sink::tests::CaptureSink;
 
-const EVERY_OPERATION: [AuthorityOperation; 14] = [
+const EVERY_OPERATION: [AuthorityOperation; 15] = [
     AuthorityOperation::PolicyPublish,
     AuthorityOperation::PolicyRollback,
     AuthorityOperation::PolicyRuleCreate,
@@ -21,6 +21,7 @@ const EVERY_OPERATION: [AuthorityOperation; 14] = [
     AuthorityOperation::ConfigurationImport,
     AuthorityOperation::PolicyTestsPublish,
     AuthorityOperation::MutationApprovalPrepare,
+    AuthorityOperation::MutationApprovalConsume,
     AuthorityOperation::MutationApprovalReview,
     AuthorityOperation::MutationApprovalRevoke,
 ];
@@ -121,6 +122,7 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
         [
             AuthorityOperation::PolicyFileReload,
             AuthorityOperation::MutationApprovalPrepare,
+            AuthorityOperation::MutationApprovalConsume,
             AuthorityOperation::MutationApprovalReview,
             AuthorityOperation::MutationApprovalRevoke
         ],

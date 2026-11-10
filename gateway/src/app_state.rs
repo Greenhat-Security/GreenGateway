@@ -107,6 +107,8 @@ pub(super) const TOOL_ADMIN_ROUTE: &str = "/v1/admin/tools/{id}";
 pub(super) const TOOL_EXECUTE_ADMIN_ROUTE: &str = "/v1/admin/tools/{id}/execute";
 pub(super) const TOOL_MUTATION_APPROVAL_CREATE_ROUTE: &str =
     "/v1/admin/tools/{id}/mutation-approvals";
+pub(super) const TOOL_MUTATION_APPROVAL_EXECUTE_ROUTE: &str =
+    "/v1/admin/tools/{id}/mutation-approvals/{approval_id}/execute";
 pub(super) const MUTATION_APPROVAL_ROUTE: &str = "/v1/admin/mutation-approvals/{id}";
 pub(super) const MUTATION_APPROVAL_REVIEW_ROUTE: &str = "/v1/admin/mutation-approvals/{id}/review";
 pub(super) const MUTATION_APPROVAL_REVOKE_ROUTE: &str = "/v1/admin/mutation-approvals/{id}/revoke";
@@ -320,6 +322,7 @@ pub(super) struct AdminRoutes {
     pub(super) tool_route: String,
     pub(super) tool_execute_route: String,
     pub(super) tool_mutation_approval_create_route: String,
+    pub(super) tool_mutation_approval_execute_route: String,
     pub(super) mutation_approval_route: String,
     pub(super) mutation_approval_review_route: String,
     pub(super) mutation_approval_revoke_route: String,
@@ -453,6 +456,9 @@ impl AdminRoutes {
             tool_execute_route: format!("{api_prefix}/tools/{{id}}/execute"),
             tool_mutation_approval_create_route: format!(
                 "{api_prefix}/tools/{{id}}/mutation-approvals"
+            ),
+            tool_mutation_approval_execute_route: format!(
+                "{api_prefix}/tools/{{id}}/mutation-approvals/{{approval_id}}/execute"
             ),
             mutation_approval_route: format!("{api_prefix}/mutation-approvals/{{id}}"),
             mutation_approval_review_route: format!(
