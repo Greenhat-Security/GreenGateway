@@ -84,7 +84,9 @@ const FAILURE_TEXT: Record<string, string> = {
   pins_unreadable:
     'The replica that took the job over could not rebuild its pinned policies under this build.',
   engine_version_changed:
-    'The job was started under another evaluator version, so no replica of this build continues it.',
+    'The job used a different evaluator version. Start a new replay to evaluate this window.',
+  standalone_restart: 'The gateway restarted before it could store a confirmed result.',
+  store_unavailable: 'The gateway could not commit the replay result to its job store.',
   checkpoint_unreadable: 'The replica that took the job over could not read its checkpoint.',
   takeover_limit: 'The job was taken over too many times.',
   audit_unavailable: 'The audit log did not accept the record of this job completing.',
@@ -95,8 +97,8 @@ type JobEntry = { job: PolicyReplayJob; subject: string; gone: boolean };
 
 // The Impact view: bounded historical replay of retained audit records
 // under the live policy or the candidate. Jobs are read-only on the policy
-// and the log; the gateway keeps them (in memory standalone, in the shared
-// job table in cluster mode), and this page lists only the ones started here.
+// and the log. The gateway retains them in its job store, and this page
+// lists only the ones started here.
 export function ImpactPanel({
   candidate,
   candidateProblem,
@@ -571,8 +573,8 @@ function JobView({
       </div>
       {entry.gone ? (
         <StaleNotice>
-          The gateway no longer holds this job. It may have expired, been discarded, or been
-          lost during a standalone restart. This is the last state read.
+          The gateway no longer holds this job. It may have expired or been discarded.
+          This is the last state read.
         </StaleNotice>
       ) : null}
       {job.base.current === false ? (
