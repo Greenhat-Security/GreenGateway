@@ -134,14 +134,17 @@ pub trait ResourceValidators {
 
     fn policy(&self, document: Value) -> Option<Self::Policy>;
 
+    /// Validate the document with access to the exact pinned source bytes.
+    fn policy_source(&self, _source: &[u8], document: Value) -> Option<Self::Policy> {
+        self.policy(document)
+    }
+
     fn tools(&self, document: Value) -> Option<Self::Tools>;
 }
 
-/// The production policy and tools validators: the validating parses
-/// environment mode loads the same documents with
-/// ([`Policy::validate_json_value`] and [`definitions_from_json_value`]), so
-/// a bundle these accept is one the gateway's policy and tools loaders
-/// accept. The gateway and `ggctl` both read bundles with these.
+/// The gateway and `ggctl` use the environment-mode policy and tools
+/// validators for bundled resources. Policy v1 validation also checks the
+/// exact bytes pinned by the manifest.
 ///
 /// A validator's error can quote document values, so it is dropped here and
 /// the reader reports `resource.invalid` by code alone.
@@ -154,6 +157,16 @@ impl ResourceValidators for ProductionValidators {
 
     fn policy(&self, document: Value) -> Option<Policy> {
         Policy::validate_json_value(document).ok()
+    }
+
+    fn policy_source(&self, source: &[u8], document: Value) -> Option<Policy> {
+        use crate::rbac::policy_document::{parse_v1_source, PolicySchema};
+
+        if PolicySchema::of_document(&document) == Some(PolicySchema::V1) {
+            parse_v1_source(source, &document).ok()
+        } else {
+            self.policy(document)
+        }
     }
 
     fn tools(&self, document: Value) -> Option<Vec<ToolDefinition>> {
@@ -468,8 +481,13 @@ fn read<S: FileSource, V: ResourceValidators>(
             (FileRole::Policy, &mut files, &mut *pins),
             diagnostics,
             |text, version, file, found| {
-                resource::policy(text, version, rules.as_ref(), file, found)
-                    .and_then(|document| refused_unless(validators.policy(document), file, found))
+                resource::policy(text, version, rules.as_ref(), file, found).and_then(|document| {
+                    refused_unless(
+                        validators.policy_source(text.as_bytes(), document),
+                        file,
+                        found,
+                    )
+                })
             },
         )
     });

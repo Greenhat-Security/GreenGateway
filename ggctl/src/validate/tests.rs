@@ -59,10 +59,14 @@ impl Fixture {
         );
         fixture.write("policy.json", policy);
         fixture.write("tools.json", TOOLS);
-        fixture.pin(
-            "      source: bundle\n      path: policy.json\n      schema_version: \"0.1.0\"\n      sha256: \"POLICY\"\n",
-        );
+        fixture.pin_policy_version("0.1.0");
         fixture
+    }
+
+    fn pin_policy_version(&self, version: &str) {
+        self.pin(&format!(
+            "      source: bundle\n      path: policy.json\n      schema_version: \"{version}\"\n      sha256: \"POLICY\"\n"
+        ));
     }
 
     pub(crate) fn valid() -> Self {
@@ -266,6 +270,58 @@ fn a_document_only_the_production_validator_refuses_is_refused_by_code_alone() {
 }
 
 #[test]
+fn validate_and_diff_pinned_v1_policies() {
+    let mapping = json!({"id": "operators", "issuer": "https://issuer.example", "subjects": [CANARY], "grant_roles": ["reader"]});
+    let mut policy =
+        json!({"schema_version": "1.0.0", "roles": {"reader": {"permissions": ["read"]}}});
+    let claimed = Fixture::with("production", &policy.to_string());
+    claimed.pin_policy_version("1.0.0");
+    let mapped = Fixture::valid();
+    for mappings in [json!([]), json!([mapping])] {
+        policy["identity_mappings"] = mappings;
+        mapped.write("policy.json", &policy.to_string());
+        mapped.pin_policy_version("1.0.0");
+        let (exit, captured) = run(&["validate", mapped.path()]);
+        assert_eq!(exit, Exit::Success, "{}", captured.stderr());
+        assert_no_canary(&captured);
+        let (exit, captured) = run(&[
+            "diff",
+            mapped.path(),
+            "--against",
+            claimed.path(),
+            "--format",
+            "json",
+        ]);
+        assert_eq!(exit, Exit::Success);
+        assert_no_canary(&captured);
+        let found = report(&captured);
+        assert_eq!(
+            found["result"]["diff"]["riskCodes"],
+            json!(["risk.unknown_impact"])
+        );
+        assert!(captured.stdout().contains("policy.identity_mappings"));
+    }
+
+    // Unique element IDs are enforced by the gateway beyond the published
+    // schema. Both mappings have a valid shape.
+    policy["identity_mappings"] = json!([mapping, mapping]);
+    mapped.write("policy.json", &policy.to_string());
+    mapped.pin_policy_version("1.0.0");
+    let (exit, captured) = run(&["validate", mapped.path(), "--format", "json"]);
+    assert_eq!(exit, Exit::Invalid);
+    assert_no_canary(&captured);
+    assert_eq!(codes(&report(&captured)), ["resource.invalid"]);
+
+    mapped.pin_policy_version("0.1.0");
+    let (exit, captured) = run(&["validate", mapped.path(), "--format", "json"]);
+    assert_eq!(exit, Exit::Invalid);
+    assert_eq!(
+        codes(&report(&captured)),
+        ["resource.schema_version_mismatch"]
+    );
+}
+
+#[test]
 fn validate_and_doctor_run_the_egress_compiler_on_a_bundle() {
     let fixture = Fixture::valid();
     let set_egress = |hosts: &str, prefixes: &str| {
@@ -357,7 +413,7 @@ fn an_invalid_bundle_exits_3_with_located_value_free_diagnostics() {
         json!({
             "code": "resource.unknown_member",
             "severity": "error",
-            "message": "the resource document has a top-level member its validator would ignore",
+            "message": "the policy schema does not define this top-level member",
             "remediation": "docs/configuration-bundles.md#diagnostics",
             "location": {"file": "policy.json", "pointer": "", "line": 1, "column": 29},
         })

@@ -42,10 +42,13 @@ impl ApiVersion {
 pub(crate) const BUNDLE_KIND: &str = crate::documents::BUNDLE_KIND;
 pub(crate) const DEPLOYMENT_KIND: &str = crate::documents::DEPLOYMENT_KIND;
 
-/// The resource document versions a `v1alpha1` bundle may declare. The
-/// environment-mode validators accept any `0.` version; the bundle boundary
-/// pins the exact versions that exist.
-pub const POLICY_SCHEMA_VERSIONS: &[&str] = &["0.1.0"];
+/// Policy version used by the existing `ggctl init` templates.
+pub(super) const POLICY_V0_VERSION: &str = "0.1.0";
+/// Exact policy versions a `v1alpha1` manifest may declare.
+pub const POLICY_SCHEMA_VERSIONS: &[&str] = &[
+    POLICY_V0_VERSION,
+    crate::rbac::policy_document::POLICY_V1_SCHEMA_VERSION,
+];
 pub const TOOLS_SCHEMA_VERSIONS: &[&str] = &["0.1.0"];
 
 /// A deployment profile. The compiler enforces each profile's invariants;

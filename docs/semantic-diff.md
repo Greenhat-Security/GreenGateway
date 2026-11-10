@@ -39,6 +39,10 @@ whose order is meaning (policy routes, direct rules, rate-limit overrides,
 upstream routes) stay ordered; sets (hosts, CIDRs, ports, origins, exempt
 paths, permissions) are compared as sets, and host names case-insensitively.
 
+For policy v1, `policy.identity_mappings` reports a change with unknown impact
+and withholds the mapping contents. An omitted list uses claimed roles. A
+present, empty list enables mapped roles and grants none through mappings.
+
 `diff(a, a)` is empty for every configuration, and so is the diff of a policy
 against its reordering or its spelled-out defaults: a seeded property test
 holds both for generated policies, and fixed tests for environment

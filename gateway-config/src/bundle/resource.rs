@@ -18,40 +18,31 @@ use serde_json::Value;
 
 use super::{
     diagnostic::{BundleDiagnostic, Code, Pointer},
+    document::POLICY_V0_VERSION,
     json,
     profile::ProfileRules,
     source::FileName,
     syntax::{Node, SyntaxError, RESOURCE_LIMITS},
 };
+use crate::rbac::{policy::V1_TOP_LEVEL_KEYS, policy_document::POLICY_V1_SCHEMA_VERSION};
 
 /// The bound environment mode already applies to each document.
 pub const MAX_RESOURCE_BYTES: usize = 1024 * 1024;
 
-/// The top-level members a policy `0.x` document may have: exactly the ones
-/// the gateway's policy loader reads (`KNOWN_TOP_LEVEL_KEYS` in
-/// `gateway/src/rbac/policy.rs`, which a gateway test holds equal to this
-/// list). The loader warns about any other member and drops it; at the
-/// bundle boundary it is refused instead.
-pub const POLICY_TOP_LEVEL_MEMBERS: &[&str] = &[
-    "schema_version",
-    "id",
-    "default_action",
-    "enforcement_mode",
-    "roles",
-    "routes",
-    "rules",
-    "egress",
-    "rate_limits",
-    "tools",
-];
+/// The policy loader's top-level vocabulary for v0. The bundle reader
+/// refuses unrecognized members at their source position.
+pub const POLICY_TOP_LEVEL_MEMBERS: &[&str] = crate::rbac::policy::KNOWN_TOP_LEVEL_KEYS;
 
-const POLICY_SCHEMA_JSON: &str = include_str!("../../../docs/schemas/policy.v0.schema.json");
+const POLICY_V0_SCHEMA_JSON: &str = include_str!("../../../docs/schemas/policy.v0.schema.json");
+const POLICY_V1_SCHEMA_JSON: &str = include_str!("../../../docs/schemas/policy.v1.schema.json");
 const TOOLS_SCHEMA_JSON: &str = include_str!("../../../docs/schemas/tools.v0.schema.json");
 
 /// The environment-mode policy loader does not apply the published schema;
 /// in a bundle the document must pass it as well as the loader.
-static POLICY_SCHEMA_VALIDATOR: LazyLock<Option<jsonschema::Validator>> =
-    LazyLock::new(|| compile(POLICY_SCHEMA_JSON));
+static POLICY_V0_SCHEMA_VALIDATOR: LazyLock<Option<jsonschema::Validator>> =
+    LazyLock::new(|| compile(POLICY_V0_SCHEMA_JSON));
+static POLICY_V1_SCHEMA_VALIDATOR: LazyLock<Option<jsonschema::Validator>> =
+    LazyLock::new(|| compile(POLICY_V1_SCHEMA_JSON));
 
 /// The production tools validator applies this schema first as well; the
 /// reader applies it so that a caller without that validator still does.
@@ -78,11 +69,19 @@ pub(crate) fn policy(
     diagnostics: &mut Vec<BundleDiagnostic>,
 ) -> Option<Value> {
     let (node, value) = resource_value(text, schema_version, file, diagnostics)?;
+    let (known_members, schema) = match schema_version {
+        POLICY_V0_VERSION => (POLICY_TOP_LEVEL_MEMBERS, &POLICY_V0_SCHEMA_VALIDATOR),
+        POLICY_V1_SCHEMA_VERSION => (V1_TOP_LEVEL_KEYS, &POLICY_V1_SCHEMA_VALIDATOR),
+        _ => {
+            diagnostics.push(BundleDiagnostic::file(Code::UnsupportedSchemaVersion, file));
+            return None;
+        }
+    };
     let unknown: Vec<_> = node
         .as_object()
         .unwrap_or_default()
         .iter()
-        .filter(|member| !POLICY_TOP_LEVEL_MEMBERS.contains(&member.key.as_str()))
+        .filter(|member| !known_members.contains(&member.key.as_str()))
         .map(|member| {
             BundleDiagnostic::at(
                 Code::ResourceUnknownMember,
@@ -96,7 +95,7 @@ pub(crate) fn policy(
         diagnostics.extend(unknown);
         return None;
     }
-    let value = published_schema(&POLICY_SCHEMA_VALIDATOR, value, file, diagnostics)?;
+    let value = published_schema(schema, value, file, diagnostics)?;
     if let Some(rules) = profile {
         super::profile::policy(rules, &node, file, diagnostics);
     }
@@ -192,5 +191,7 @@ fn resource_value(
 
 #[cfg(test)]
 pub(crate) fn published_schemas_compile() -> bool {
-    POLICY_SCHEMA_VALIDATOR.is_some() && TOOLS_SCHEMA_VALIDATOR.is_some()
+    POLICY_V0_SCHEMA_VALIDATOR.is_some()
+        && POLICY_V1_SCHEMA_VALIDATOR.is_some()
+        && TOOLS_SCHEMA_VALIDATOR.is_some()
 }

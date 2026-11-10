@@ -27,7 +27,7 @@ A bundle is a **flat directory**:
 | --- | --- | --- | --- |
 | `bundle.yaml` (fixed name) | `GatewayBundle` manifest | YAML subset | 64 KiB |
 | the deployment document the manifest names | `GatewayDeployment` | YAML subset (`.yaml`) or strict JSON (`.json`) | 1 MiB |
-| the policy document the manifest names, if any | policy `0.1.0` | strict JSON (`.json`) | 1 MiB |
+| the policy document the manifest names, if any | policy `0.1.0` or `1.0.0` | strict JSON (`.json`) | 1 MiB |
 | the tools document the manifest names, if any | tools `0.1.0` | strict JSON (`.json`) | 1 MiB |
 
 The files the manifest references may total at most 4 MiB, and the reader
@@ -79,7 +79,7 @@ the referenced documents.
 | --- | --- | --- | --- |
 | Manifest | `greengateway.dev/v1alpha1` | `GatewayBundle` | alpha |
 | Deployment document | `greengateway.dev/v1alpha1` | `GatewayDeployment` | alpha; the profile and the deployment settings |
-| Policy resource | (its own `schema_version`) | | `0.1.0` only |
+| Policy resource | (its own `schema_version`) | | `0.1.0` and `1.0.0` |
 | Tools resource | (its own `schema_version`) | | `0.1.0` only |
 
 The reader accepts only these exact pairs. There is no prefix match, no "any
@@ -100,10 +100,10 @@ converting once. A target older than the bundle is refused
 today, so the only conversion is the identity: `--output` writes an unchanged
 copy and `--in-place` changes nothing.
 
-Environment-mode policy and tools loading is unchanged: it still accepts any
-`0.` schema version, and the policy loader still warns about unknown top-level
-members and drops them. The exact version and the refusal below apply only at
-the bundle boundary.
+The environment-mode loaders retain their `0.x` compatibility rules. Policy
+also supports the exact version `1.0.0`. In a bundle, every policy or tools
+resource must declare one of the exact versions in the table. `ggctl init`
+generates a `0.1.0` starter policy.
 
 ## The manifest
 
@@ -818,10 +818,11 @@ read as strict JSON (a duplicate member is refused, never overwritten), its
 (`resource.schema_version_mismatch`), and the manifest may declare only a version
 this reader implements (`resource.unsupported_schema_version`). Then:
 
-- a policy document may not have a top-level member the policy loader would warn
-  about and drop (`resource.unknown_member`), and must pass both
-  [`policy.v0.schema.json`](schemas/policy.v0.schema.json) and the production
-  policy validator;
+- a policy must use the top-level members defined by its version. An unknown
+  member produces `resource.unknown_member`. The reader applies the matching
+  published schema and the production validator. For `1.0.0`, validation uses
+  the exact pinned bytes and enforces stable element IDs across the document.
+  [Policy v0 schema](schemas/policy.v0.schema.json) · [Policy v1 schema](schemas/policy.v1.schema.json)
 - a tools document must pass both
   [`tools.v0.schema.json`](schemas/tools.v0.schema.json) and the production tools
   validator, which applies the same schema first.
@@ -1285,7 +1286,7 @@ can appear in one. A published code never changes meaning.
 | `secret.too_many_references` | The deployment exceeds 512 secret references. Repeated uses of an alias count separately across all settings. |
 | `resource.unsupported_schema_version` | The manifest declares a resource version this reader does not implement. |
 | `resource.schema_version_mismatch` | The resource's `schema_version` differs from the declared one. |
-| `resource.unknown_member` | A policy top-level member the loader would drop. |
+| `resource.unknown_member` | The declared policy version does not define this top-level member. |
 | `resource.invalid` | The resource fails its published schema or production validator. |
 | `profile.policy_default_allow` | The profile requires a deny-by-default policy. |
 | `profile.policy_shadow_mode` | The profile requires the policy to enforce its decisions, not shadow them. |

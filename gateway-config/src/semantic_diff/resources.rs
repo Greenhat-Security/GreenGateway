@@ -25,7 +25,7 @@ use super::{
     RiskCode, Rule, Section, SemanticDiff, SetCounts,
 };
 use crate::{
-    bundle::{Bundle, BundledResource, ProductionBundle, POLICY_TOP_LEVEL_MEMBERS},
+    bundle::{Bundle, BundledResource, ProductionBundle},
     rbac::Policy,
     tools::definitions::ToolDefinition,
 };
@@ -453,6 +453,11 @@ static ROLES: Field = policy_field(
     RiskCode::PolicyBroadened,
     Rule::GrowthIsLooser,
 );
+static IDENTITY_MAPPINGS: Field = policy_field(
+    "policy.identity_mappings",
+    RiskCode::UnknownImpact,
+    Rule::Unclassified,
+);
 static ROUTES: Field = policy_field("policy.routes", RiskCode::UnknownImpact, Rule::Unclassified);
 static ROUTE_SHADOW_OVERRIDES: Field = policy_field(
     "policy.routes.shadow_overrides",
@@ -542,6 +547,14 @@ pub fn compare_policy(comparison: &mut Comparison, base: &Value, candidate: &Val
         &roles(candidate),
         role_impacts,
     );
+    // An absent list uses claimed roles. Even an empty list enables mapped
+    // roles, so preserve field presence when comparing the two policies.
+    opaque_member(
+        comparison,
+        &IDENTITY_MAPPINGS,
+        base.get("identity_mappings"),
+        candidate.get("identity_mappings"),
+    );
 
     let routes = |document: &Map<String, Value>| list(document.get("routes"));
     let (base_routes, candidate_routes) = (routes(base), routes(candidate));
@@ -587,7 +600,22 @@ pub fn compare_policy(comparison: &mut Comparison, base: &Value, candidate: &Val
     let other = |document: &Map<String, Value>| -> BTreeMap<String, Value> {
         document
             .iter()
-            .filter(|(name, _)| !POLICY_TOP_LEVEL_MEMBERS.contains(&name.as_str()))
+            .filter(|(name, _)| {
+                !matches!(
+                    name.as_str(),
+                    "schema_version"
+                        | "id"
+                        | "default_action"
+                        | "enforcement_mode"
+                        | "roles"
+                        | "identity_mappings"
+                        | "routes"
+                        | "rules"
+                        | "egress"
+                        | "rate_limits"
+                        | "tools"
+                )
+            })
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect()
     };
