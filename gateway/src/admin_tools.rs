@@ -96,7 +96,36 @@ pub(super) async fn tool_playground_execute_endpoint(
     request: AxumRequest,
 ) -> Response {
     record_request(TOOL_EXECUTE_ADMIN_ROUTE);
+    tool_invocation(
+        state,
+        raw_id,
+        request,
+        tools::executor::ToolRequestPurpose::Execute,
+    )
+    .await
+}
 
+pub(super) async fn tool_mutation_approval_create_endpoint(
+    State(state): State<ToolAdminState>,
+    Path(raw_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(TOOL_MUTATION_APPROVAL_CREATE_ROUTE);
+    tool_invocation(
+        state,
+        raw_id,
+        request,
+        tools::executor::ToolRequestPurpose::PrepareMutation,
+    )
+    .await
+}
+
+async fn tool_invocation(
+    state: ToolAdminState,
+    raw_id: String,
+    request: AxumRequest,
+    purpose: tools::executor::ToolRequestPurpose,
+) -> Response {
     let (parts, body) = request.into_parts();
     let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
         return unauthorized();
@@ -105,6 +134,9 @@ pub(super) async fn tool_playground_execute_endpoint(
         match authorized_tool_rbac_state(&state, &principal, ADMIN_TOOLS_EXECUTE_PERMISSION) {
             Ok(rbac_state) => rbac_state.clone(),
             Err(ToolAdminAuthzError::Forbidden(_)) => {
+                if purpose == tools::executor::ToolRequestPurpose::PrepareMutation {
+                    return mutation_approval_denied(&state, &parts, &principal, "prepare");
+                }
                 return tool_playground_permission_forbidden(&state, &parts, &principal);
             }
             Err(error) => return tool_admin_authz_error_response(error),
@@ -220,11 +252,48 @@ pub(super) async fn tool_playground_execute_endpoint(
         .is_some()
         .then(|| context.request_id.clone());
 
+    let args = Value::Object(request.arguments);
+    if purpose == tools::executor::ToolRequestPurpose::PrepareMutation {
+        if context.caller.is_none() {
+            return mutation_approval_denied(&state, &parts, &principal, "prepare");
+        }
+        if let Err(response) = admit_authority_change(
+            &state.authority_evidence,
+            authority_events::required::AuthorityOperation::MutationApprovalPrepare,
+            &state.audit,
+            &parts,
+            &principal,
+            &state.client_ip_policy,
+        ) {
+            return *response;
+        }
+        let action = match state
+            .executor
+            .prepare_mutation(&definition.name, args, context, precondition)
+            .await
+        {
+            Ok(action) => action,
+            Err(error) => return tool_playground_runtime_error_response(error, None),
+        };
+        let record = match state.connections.managed_store() {
+            Ok(store) => store.create_mutation_approval(action).await,
+            Err(_) => Err(connections::mutation_approval::ApprovalError::Unavailable),
+        };
+        return mutation_approval_result(
+            &state,
+            &parts,
+            &principal,
+            "prepare",
+            None,
+            record,
+            StatusCode::CREATED,
+        );
+    }
     let result = match state
         .executor
         .execute_with_precondition(
             &definition.name,
-            Value::Object(request.arguments),
+            args,
             context,
             tokio_util::sync::CancellationToken::new(),
             precondition,

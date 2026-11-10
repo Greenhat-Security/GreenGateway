@@ -7,6 +7,267 @@ use crate::storage::postgres::{
 };
 use serde_json::json;
 
+/// The same approval is resolved by independent replicas against one authority.
+/// In particular, possession of the occurrence ID cannot approve a different call.
+#[tokio::test]
+async fn mutation_approvals_are_one_shot_across_postgres_replicas() {
+    use crate::connections::mutation_approval::{
+        ApprovalDecision, ApprovalError, ApprovalPrincipal, ApprovalStatus, MutationAction,
+    };
+
+    use crate::storage::{
+        postgres_policy::PostgresPolicyStore, DocumentChange, PolicyCommitPrecondition,
+        PolicyCommitRequest, PolicyControlPlane,
+    };
+
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (first, pool) = migrated_store(&database.dsn, 64).await;
+    let (second, _) = migrated_store(&database.dsn, 64).await;
+    let operator = ChangeActor::for_test("operator");
+    let mut candidate = http_candidate("Reviews");
+    candidate.enabled = true;
+    let api = first
+        .create(candidate, &operator, None)
+        .await
+        .expect("create");
+    let mapping =
+        json!({"method":"POST","path_template":"/invoices","body":{"mode":"whole_args_json"}});
+    let definition = json!({
+        "name":"create_invoice","description":"Creates an invoice","input_json_schema":{"type":"object"},
+        "upstream":mapping,
+        "source":{"type":"open_api","connection_id":api.id.as_str(),"operation_id":"createInvoice","catalog_revision":1},
+        "target":{"type":"http","connection_id":api.id.as_str(),"mapping":mapping}
+    });
+    let typed: crate::tools::definitions::ToolDefinition =
+        serde_json::from_value(definition.clone()).expect("typed definition");
+    let digest = hex::encode(crate::connections::openapi::definition_digest(&typed).unwrap());
+    let entries = [StoredOpenApiCatalogEntry {
+        tool_name: "create_invoice".to_owned(),
+        operation_id: Some("createInvoice".to_owned()),
+        definition,
+        selected_scheme_names: Vec::new(),
+    }];
+    first
+        .replace_openapi_catalog(
+            &api.id,
+            &api.etag(),
+            0,
+            0,
+            RESERVATION_SPEC,
+            &reservation_spec_digest(),
+            &entries,
+            &operator,
+        )
+        .await
+        .expect("publish");
+    let requester = ApprovalPrincipal {
+        issuer: "https://identity.example".into(),
+        subject: "requester".into(),
+    };
+    let reviewer = ApprovalPrincipal {
+        issuer: "https://identity.example".into(),
+        subject: "reviewer".into(),
+    };
+    let action = MutationAction {
+        caller: requester.clone(),
+        connection_id: api.id.clone(),
+        connection_etag: api.etag().to_string(),
+        catalog_revision: 1,
+        tool_name: "create_invoice".into(),
+        operation: "createInvoice".into(),
+        definition_sha256: digest,
+        method: "POST".into(),
+        target_sha256: "a".repeat(64),
+        body_sha256: "b".repeat(64),
+    };
+    let occurrence = first
+        .create_mutation_approval(&action)
+        .await
+        .expect("first occurrence");
+    let other = second
+        .create_mutation_approval(&action)
+        .await
+        .expect("independent identical action");
+    assert_ne!(occurrence.id, other.id);
+    let policies = PostgresPolicyStore::new(pool.clone());
+    let make_policy = |id: &str| {
+        crate::rbac::Policy::validate_json_value(json!({
+            "schema_version": "0.1.0", "id": id, "default_action":"deny",
+            "roles": {"reviewer":{"permissions":["admin:tools:approvals:review"]}}
+        }))
+        .expect("valid review policy")
+    };
+    let initial_policy = policies
+        .commit(PolicyCommitRequest {
+            precondition: PolicyCommitPrecondition::Initialize,
+            candidate: &make_policy("initial"),
+            change: DocumentChange::test_policy("operator"),
+            diff_summary: &json!({}),
+        })
+        .await
+        .expect("initialize review policy");
+    let current_policy = policies
+        .commit(PolicyCommitRequest {
+            precondition: PolicyCommitPrecondition::Expected {
+                etag: initial_policy.etag,
+            },
+            candidate: &make_policy("replacement"),
+            change: DocumentChange::test_policy("operator"),
+            diff_summary: &json!({}),
+        })
+        .await
+        .expect("publish new active policy");
+    let revision = current_policy.security_revision;
+    assert_ne!(revision, initial_policy.security_revision);
+    assert_eq!(
+        first
+            .decide_mutation_approval(
+                occurrence.id,
+                &reviewer,
+                ApprovalDecision::Approve,
+                initial_policy.security_revision
+            )
+            .await
+            .unwrap_err(),
+        ApprovalError::Conflict
+    );
+    assert_eq!(
+        second
+            .revoke_mutation_approval(other.id, &reviewer, initial_policy.security_revision)
+            .await
+            .unwrap_err(),
+        ApprovalError::Conflict
+    );
+
+    assert_eq!(
+        first
+            .decide_mutation_approval(
+                occurrence.id,
+                &requester,
+                ApprovalDecision::Approve,
+                revision
+            )
+            .await
+            .unwrap_err(),
+        ApprovalError::SelfReview
+    );
+    assert_eq!(
+        first
+            .consume_mutation_approval(occurrence.id, &action)
+            .await
+            .unwrap_err(),
+        ApprovalError::Conflict
+    );
+    let approved = second
+        .decide_mutation_approval(
+            occurrence.id,
+            &reviewer,
+            ApprovalDecision::Approve,
+            revision,
+        )
+        .await
+        .expect("independent review");
+    assert_eq!(approved.status, ApprovalStatus::Approved);
+    let mut changed = action.clone();
+    changed.body_sha256 = "c".repeat(64);
+    assert_eq!(
+        second
+            .consume_mutation_approval(occurrence.id, &changed)
+            .await
+            .unwrap_err(),
+        ApprovalError::Mismatch
+    );
+    let (left, right) = tokio::join!(
+        first.consume_mutation_approval(occurrence.id, &action),
+        second.consume_mutation_approval(occurrence.id, &action),
+    );
+    let receipt = match (left, right) {
+        (Ok(receipt), Err(ApprovalError::Conflict))
+        | (Err(ApprovalError::Conflict), Ok(receipt)) => receipt,
+        pair => panic!("expected exactly one consumption: {pair:?}"),
+    };
+    assert_eq!(receipt.id(), occurrence.id);
+    assert_eq!(
+        first.mutation_approval(occurrence.id).await.unwrap().status,
+        ApprovalStatus::Consumed
+    );
+    second
+        .revoke_mutation_approval(other.id, &reviewer, revision)
+        .await
+        .expect("revoke");
+    assert_eq!(
+        first
+            .consume_mutation_approval(other.id, &action)
+            .await
+            .unwrap_err(),
+        ApprovalError::Conflict
+    );
+
+    let expired = first
+        .create_mutation_approval(&action)
+        .await
+        .expect("will expire");
+    pool.get().await.unwrap().execute(
+        "UPDATE greengateway.connection_mutation_approvals SET created_at=1,expires_at=901 WHERE id=$1::text::uuid", &[&expired.id.to_string()],
+    ).await.unwrap();
+    assert_eq!(
+        second.mutation_approval(expired.id).await.unwrap().status,
+        ApprovalStatus::Expired
+    );
+    assert_eq!(
+        first
+            .decide_mutation_approval(expired.id, &reviewer, ApprovalDecision::Approve, revision)
+            .await
+            .unwrap_err(),
+        ApprovalError::Expired
+    );
+
+    let stale = first
+        .create_mutation_approval(&action)
+        .await
+        .expect("fresh occurrence");
+    assert_eq!(
+        second.mutation_approval(expired.id).await.unwrap_err(),
+        ApprovalError::NotFound
+    );
+    first
+        .decide_mutation_approval(stale.id, &reviewer, ApprovalDecision::Approve, revision)
+        .await
+        .unwrap();
+    first
+        .replace_openapi_catalog(
+            &api.id,
+            &api.etag(),
+            1,
+            1,
+            RESERVATION_SPEC,
+            &reservation_spec_digest(),
+            &[],
+            &operator,
+        )
+        .await
+        .expect("withdraw operation");
+    assert_eq!(
+        second
+            .consume_mutation_approval(stale.id, &action)
+            .await
+            .unwrap_err(),
+        ApprovalError::Mismatch
+    );
+    first
+        .delete(&api.id, &api.etag(), &operator)
+        .await
+        .expect("delete owning connection");
+    assert_eq!(
+        second.mutation_approval(stale.id).await.unwrap_err(),
+        ApprovalError::NotFound
+    );
+}
+
 struct DsnFile {
     path: String,
     directory: std::path::PathBuf,

@@ -565,6 +565,22 @@ pub(super) fn add_admin_api_routes(
                     post(tool_playground_execute_endpoint),
                 )
                 .route(
+                    routes.admin.tool_mutation_approval_create_route.as_str(),
+                    post(tool_mutation_approval_create_endpoint),
+                )
+                .route(
+                    routes.admin.mutation_approval_route.as_str(),
+                    get(tool_mutation_approval_get_endpoint),
+                )
+                .route(
+                    routes.admin.mutation_approval_review_route.as_str(),
+                    post(tool_mutation_approval_review_endpoint),
+                )
+                .route(
+                    routes.admin.mutation_approval_revoke_route.as_str(),
+                    post(tool_mutation_approval_revoke_endpoint),
+                )
+                .route(
                     routes.admin.tools_openapi_preview_route.as_str(),
                     post(tools_openapi_preview_endpoint),
                 )

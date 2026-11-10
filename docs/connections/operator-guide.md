@@ -777,10 +777,10 @@ marker. Naming any key alias in a `PUT`, even the stored one, needs the
 secrets-write permission, so a principal without it cannot test guesses
 against a hidden alias.
 
-New and replacement writes reject `bind_approval: true`, because no approval
-subsystem exists for a mutation to be bound to, an assertion `header_name` that
-matches any additional header name regardless of case, and a plain HTTP
-endpoint.
+New and replacement writes reject `bind_approval: true` until dispatch can
+consume a reviewed mutation and sign its verified identifier. Writes also
+reject a caller-assertion header that matches an additional header name
+regardless of case, and a plain HTTP endpoint.
 
 A caller assertion binds private keys, so it is credential authority: creating
 a Connection that carries one, deleting it, and any change to the block,
@@ -789,6 +789,57 @@ well as `admin:connections:write`. So does changing the endpoint or test
 target of a Connection that carries one, as for any Connection with credential
 bindings. A routine save that keeps the block exactly as stored, such as a
 rename, does not.
+
+#### Preparing and reviewing a mutation
+
+An operator can record a decision on one proposed call to a direct, managed
+OpenAPI tool. Preparation supports named HTTPS POST, PUT, PATCH and DELETE
+operations. It renders the request under the caller’s normal tool and HTTP
+policy, including request transforms. It performs no credential resolution or
+upstream request. Preparing the same input twice creates two independent
+review IDs.
+
+1. Fetch the tool detail and its execution ETag. As the requesting principal
+   with `admin:tools:execute`, send `POST /v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals`
+   with the exact ETag in `If-Match` and the usual `{"arguments":{…}}` body.
+   A successful response is `201` and includes the new approval ID and expiry.
+2. The requesting principal can read their record at
+   `GET /v1{ADMIN_PREFIX}/mutation-approvals/{id}`. A reviewer with
+   `admin:tools:approvals:review` can also read it. The record names the
+   authenticated caller's issuer and subject, Connection and revision, catalog
+   revision, tool, operation and case-sensitive HTTP method. It includes the
+   SHA-256 digests of the registered definition, the absolute URL with query,
+   and the exact body bytes after rendering. A reviewer can compare the URL
+   and body digests with independently expected values. The store retains
+   neither the URL nor the body.
+3. A different authenticated principal with the reviewer permission sends
+   `POST /v1{ADMIN_PREFIX}/mutation-approvals/{id}/review` with
+   `{"decision":"approve"}` or `{"decision":"reject"}`. A reviewer can revoke
+   a pending or approved decision with an empty
+   `POST /v1{ADMIN_PREFIX}/mutation-approvals/{id}/revoke`. The authority
+   compares issuer and subject together to enforce separation of duties.
+   Assign reviewer access to independently controlled identities. Service
+   tokens cannot request or review mutations.
+
+With `AUTHORITY_EVIDENCE_DURABILITY=required`, both storage modes return `409 authority_evidence_unsupported` for preparation, review and revocation. The decision row expires and there is no append-only transition history. Authorized reads remain available.
+
+The approval window is 15 minutes from preparation. Review and revocation
+timestamps come from the storage authority. It rechecks the Connection and
+registered operation when approving, and deleting the Connection removes its
+records. A caller can retain at most 32 unexpired records and the deployment
+at most 1,024. A new preparation clears expired records and returns `429`
+while either limit is full. Standalone deployments use the Connection SQLite
+database. Replicas share the same records and conditional transitions in
+PostgreSQL. Cleanup removes terminal decisions on the same schedule. The
+approval store provides short-lived workflow state. An operator who needs
+longer review history must retain the corresponding audit events.
+
+Successful reads and review transitions record `connection.mutation_approval` events with the
+actor, operation and outcome. Successful writes identify the approval and
+Connection. Review responses are private to the requester and authorized
+reviewers. The gateway continues to refuse approval-bound dispatch on every
+lane. A review ID grants no permission to call an upstream and no caller
+assertion carries it in this release.
 
 #### Signing keys
 

@@ -2513,6 +2513,69 @@
       "required_durability_supported": false,
       "required_mode": "unavailable",
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "mutation_approvals",
+      "operations": [
+        "mutation_approval.prepare",
+        "mutation_approval.review",
+        "mutation_approval.revoke"
+      ],
+      "modes": [
+        "postgres",
+        "standalone"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_tools.rs",
+          "anchor": "async fn tool_mutation_approval_create_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_mutation_approvals.rs",
+          "anchor": "async fn tool_mutation_approval_review_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_mutation_approvals.rs",
+          "anchor": "async fn tool_mutation_approval_revoke_endpoint("
+        }
+      ],
+      "boundary": "The Connection store creates each occurrence and serializes review and revocation against its current state. Both backends refuse these operations when required evidence is configured.",
+      "record": "The mutable decision row expires and cascades with its Connection. Audit notifications are emitted after the transaction.",
+      "actor": "The request and review use the authenticated issuer and subject. The reviewer identity in the latest decision row does not preserve each transition.",
+      "identity": "The occurrence UUID identifies a decision. Its Connection and catalog revisions describe the requested target, not a durable sequence of approval events.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_delivery",
+        "missing_metadata"
+      ],
+      "follow_up": "Commit append-only attributed evidence with every approval transition, including a separate delivery identity and cursor, before admitting required mode.",
+      "sources": [
+        {
+          "path": "gateway/src/connections/store_mutation_approvals.rs",
+          "anchor": "pub fn create_mutation_approval("
+        },
+        {
+          "path": "gateway/src/connections/pg_mutation_approvals.rs",
+          "anchor": "pub(crate) async fn create_mutation_approval("
+        },
+        {
+          "path": "gateway/src/authority_events/required.rs",
+          "anchor": "Self::MutationApprovalPrepare"
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/tests/issue_757_mutation_approvals.rs",
+          "anchor": "async fn mutation_approval_binds_rendered_request_and_enforces_independent_review("
+        },
+        {
+          "path": "gateway/src/authority_events/required_tests.rs",
+          "anchor": "fn the_gate_enforces_exactly_what_the_evidence_inventory_says("
+        }
+      ],
+      "required_durability_supported": false,
+      "required_mode": "refused",
+      "test_claim": "Authenticated requests receive a refusal for prepare, review and revoke under required mode. Reading a pending occurrence still succeeds. The inventory parity test checks both storage modes."
     }
   ]
 }

@@ -68,10 +68,16 @@ test("new mutation endpoint in a reviewed admin surface requires inventory revie
       source(path) + (path.endsWith("/admin_policy.rs") ? `\npub(super) async fn ${endpoint}(` : "")
     ), /unreviewed mutation entrypoint/);
   }
+  assert.throws(() => validateInventory(inventory(), (path) =>
+    source(path) + (path.endsWith("/admin_mutation_approvals.rs") ? "\npub(super) async fn bulk_review_endpoint(" : "")
+  ), /unreviewed mutation entrypoint/);
 });
 
 test("resource creation and replacement retain distinct revision histories", () => {
   for (const [operation, kind, axis, creates] of [
+    ["mutation_approval.prepare", "mutation_approval", "mutation_approval", true],
+    ["mutation_approval.review", "mutation_approval", "mutation_approval", false],
+    ["mutation_approval.revoke", "mutation_approval", "mutation_approval", false],
     ["connection.create", "connection", "connection", true],
     ["secret.create", "local_secret", "secret", true],
     ["service_token.issue", "service_token", "token", true],

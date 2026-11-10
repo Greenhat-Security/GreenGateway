@@ -456,6 +456,11 @@ pub(super) fn tool_playground_runtime_error_response(
                 "invalid_params",
                 details,
             ),
+            Some("mutation_approval_unsupported") => tool_playground_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "mutation approval requires a direct managed HTTPS OpenAPI mutation",
+                "mutation_approval_unsupported",
+            ),
             Some("unknown_tool") => tool_playground_error_response(
                 StatusCode::NOT_FOUND,
                 "tool was not found",

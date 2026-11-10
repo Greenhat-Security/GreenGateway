@@ -142,10 +142,11 @@ pub(crate) enum ReferenceDomain {
     JwtRevocation,
     Configuration,
     AdminSession,
+    MutationApproval,
 }
 
 impl ReferenceDomain {
-    pub(crate) const ALL: [Self; 14] = [
+    pub(crate) const ALL: [Self; 15] = [
         Self::ActorSubject,
         Self::ActorIssuer,
         Self::ActorRecorded,
@@ -160,6 +161,7 @@ impl ReferenceDomain {
         Self::JwtRevocation,
         Self::Configuration,
         Self::AdminSession,
+        Self::MutationApproval,
     ];
 
     /// The label framed into every derivation in this domain. Changing one
@@ -180,6 +182,7 @@ impl ReferenceDomain {
             Self::JwtRevocation => "resource.jwt_revocation",
             Self::Configuration => "resource.configuration",
             Self::AdminSession => "resource.admin_session",
+            Self::MutationApproval => "resource.mutation_approval",
         }
     }
 

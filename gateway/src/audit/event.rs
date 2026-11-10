@@ -125,6 +125,7 @@ pub const CONNECTION_GOOGLE_DELEGATION_TOKEN: &str = "connection.google_delegati
 /// actor; the token and the key are never recorded. Tool calls record theirs
 /// on `tool.upstream_request` instead.
 pub const CONNECTION_CALLER_ASSERTION: &str = "connection.caller_assertion";
+pub const CONNECTION_MUTATION_APPROVAL: &str = "connection.mutation_approval";
 /// A purge of one principal's cached delegated tokens (issue #441): what started it, whose tokens
 /// they were, and how many entries left the cache.
 pub const CONNECTION_DELEGATED_TOKEN_PURGE: &str = "connection.delegated_token_purge";

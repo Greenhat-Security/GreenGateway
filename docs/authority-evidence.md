@@ -1042,8 +1042,8 @@ outside the gateway:
 
 | `required_mode` | Rows | What required mode does |
 | --- | --- | --- |
-| `admitted` | Every cluster row the gateway performs (policy, tools, Connection create, replace and delete, catalogs, token issue and change, JWT revocation, admin sessions, the import), and standalone Connection create, replace and delete, local-secret create, rotate, delete and re-encryption, catalog publication and overlays, and token issue and rotate/revoke | Runs it. Its evidence is the row's `record` |
-| `refused` | Standalone policy mutations, policy file reloads, and tools publication (admin API and file reloads) | Refuses it when asked, before anything is written |
+| `admitted` | Cluster policy, tools, Connection create, replace and delete, catalogs, token issue and change, JWT revocation, admin sessions and import, and standalone Connection create, replace and delete, local-secret create, rotate, delete and re-encryption, catalog publication and overlays, and token issue and rotate/revoke | Runs it. Its evidence is the row's `record` |
+| `refused` | Mutation approval preparation, review and revocation in both modes. Standalone policy mutations, policy file reloads, and tools publication (admin API and file reloads) | Refuses it when asked, before anything is written |
 | `refused_at_startup` | Standalone admin sessions (`ADMIN_SESSION_MODE=standalone_memory`) | Refuses to start |
 | `unavailable` | Cluster policy file reload and local secrets, standalone JWT revocation and import, configuration export | Nothing to refuse: the mode or the build has no such operation. A gate that is asked anyway refuses it |
 | `outside_gateway` | External secret-provider rotation | Not covered: the provider owns the write and the gateway cannot refuse it |
@@ -1059,7 +1059,7 @@ Enforcement:
   `ADMIN_SESSION_MODE=standalone_memory` (rule
   `AuthorityEvidenceUnsupportedConfiguration`). Both problems name
   `AUTHORITY_EVIDENCE_DURABILITY`, so the value-free diagnostics attribute them to it.
-- **Admin API.** Each standalone endpoint of a `refused` row asks the gate once the
+- **Admin API.** Each endpoint of a `refused` row asks the gate once the
   caller is authorized. A refusal is `409 {"error":"...","reason":"authority_evidence_unsupported","operation":"<code>"}`,
   naming the inventory operation code and nothing from the request. Every policy
   mutation asks at `commit_policy_mutation`, the commit path they share (so draft

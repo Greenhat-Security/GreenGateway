@@ -2983,7 +2983,9 @@ fn connection_revision_from_etag(
     Ok(connection)
 }
 
-fn definition_digest(definition: &ToolDefinition) -> Result<[u8; 32], ConnectionStoreError> {
+pub(super) fn definition_digest(
+    definition: &ToolDefinition,
+) -> Result<[u8; 32], ConnectionStoreError> {
     let encoded = serde_json::to_vec(definition).map_err(|source| ConnectionStoreError::Json {
         operation: "OpenAPI definition digest",
         source,
