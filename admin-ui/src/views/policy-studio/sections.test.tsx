@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { PolicyDiagnostic } from '../../lib/policyDrafts';
 import type { JsonObject } from './model';
 import {
+  IdentityMappingsSection,
   RateLimitsSection,
   RolesSection,
   RulesSection,
@@ -25,6 +26,74 @@ afterEach(() => {
 });
 
 describe('policy studio section editors', () => {
+  it('keeps mapped-role mode after removing the last mapping until claimed roles are explicitly selected', () => {
+    const initial = {
+      schema_version: '1.0.0',
+      rules: [{ id: 'mapping-1', path: '/billing', action: 'deny' }],
+    };
+    const latest = renderSection(IdentityMappingsSection, initial);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Use identity mappings' }));
+    expect(latest()).toEqual({ ...initial, identity_mappings: [] });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
+    expect(latest().identity_mappings).toEqual([{ id: 'mapping-2', issuer: '', grant_roles: [] }]);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove mapping mapping-2' }));
+    expect(latest()).toEqual({ ...initial, identity_mappings: [] });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Use claimed roles' }));
+    expect(latest()).toEqual(initial);
+  });
+
+  it('edits issuer-bound matchers and granted roles without dropping other draft fields', () => {
+    const mapping = {
+      id: 'mapped-read',
+      issuer: 'https://first.example',
+      subjects: ['reader'],
+      organizations: ['acme'],
+      claimed_roles: ['staff'],
+      auth_methods: ['bearer_token'],
+      scopes: ['read'],
+      grant_roles: ['readers'],
+      future_field: 'retained',
+    };
+    const initial = {
+      schema_version: '1.0.0',
+      roles: { readers: { permissions: [] }, writers: { permissions: [] } },
+      identity_mappings: [mapping],
+    };
+    const latest = renderSection(IdentityMappingsSection, initial);
+    fireEvent.change(screen.getByLabelText('Issuer'), { target: { value: 'https://updated.example' } });
+    for (const [label, value] of [
+      ['Subjects', ' reviewer '],
+      ['Scopes', 'write'],
+      ['Granted roles', 'writers'],
+    ]) {
+      fireEvent.change(screen.getByLabelText(label), { target: { value } });
+      fireEvent.keyDown(screen.getByLabelText(label), { key: 'Enter' });
+    }
+
+    expect(latest()).toEqual({
+      ...initial,
+      identity_mappings: [{
+        ...mapping,
+        issuer: 'https://updated.example',
+        subjects: ['reader', ' reviewer '],
+        scopes: ['read', 'write'],
+        grant_roles: ['readers', 'writers'],
+      }],
+    });
+  });
+
+  it('cannot enable mappings in a v0 draft', () => {
+    const document = { schema_version: '0.1.0' };
+    const latest = renderSection(IdentityMappingsSection, document);
+    const enable = screen.queryByRole<HTMLButtonElement>('button', { name: 'Use identity mappings' });
+    expect(enable === null || enable.disabled).toBe(true);
+    expect(latest()).toEqual(document);
+  });
+
   it('reorders rules and keeps focus with the rule that moved', () => {
     const latest = renderSection(RulesSection, {
       rules: [

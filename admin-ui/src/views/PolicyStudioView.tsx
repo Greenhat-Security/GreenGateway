@@ -79,6 +79,7 @@ import {
 } from './policy-studio/model';
 import {
   EgressSection,
+  IdentityMappingsSection,
   OverviewSection,
   RateLimitsSection,
   RolesSection,
@@ -187,6 +188,7 @@ type PublishReview = Readonly<{
   source: string;
   inspection: PolicyInspection;
   changed: readonly string[];
+  roleSourceChange: string | null;
   risks: readonly PolicyDiagnostic[];
   // The suggestion this publication also accepts, chosen in the
   // confirmation; null publishes without accepting one.
@@ -916,6 +918,7 @@ export function PolicyStudioView() {
       source,
       inspection: currentInspection,
       changed,
+      roleSourceChange: roleSourceChange(live.policy, draft.policy),
       risks: currentInspection.diagnostics.filter(
         (diagnostic) => diagnostic.severity === 'risk',
       ),
@@ -2184,6 +2187,14 @@ export function PolicyStudioView() {
                       register={register}
                       onChange={updateDocument}
                     />
+                  ) : activeSection === 'identity_mappings' ? (
+                    <IdentityMappingsSection
+                      document={parsed.document}
+                      diagnostics={diagnostics}
+                      disabled={!editable}
+                      register={register}
+                      onChange={updateDocument}
+                    />
                   ) : activeSection === 'routes' ? (
                     <RoutesSection
                       document={parsed.document}
@@ -2808,6 +2819,21 @@ function ChangesPanel({
   );
 }
 
+function roleSourceChange(live: PolicyDocument, candidate: PolicyDocument): string | null {
+  const before = live.identity_mappings;
+  const after = candidate.identity_mappings;
+  if (Array.isArray(after) && after.length === 0 && (!Array.isArray(before) || before.length > 0)) {
+    return 'Publishing this empty mapping list gives every principal zero mapped roles.';
+  }
+  if (Array.isArray(after) && !Array.isArray(before)) {
+    return 'After publication, every role grant must come from a matching identity mapping.';
+  }
+  if (!Array.isArray(after) && Array.isArray(before)) {
+    return 'After publication, the gateway will use claimed roles again.';
+  }
+  return null;
+}
+
 // A publish confirmation shows only its review, read when it opened; the
 // others describe the draft as it is now.
 function ConfirmationPanel({
@@ -2896,6 +2922,7 @@ function ConfirmationPanel({
     >
       <h3 id="policy-studio-confirmation-title">{title}</h3>
       <p id="policy-studio-confirmation-message">{message}</p>
+      {kind === 'publish' && review?.roleSourceChange && <p role="note">{review.roleSourceChange}</p>}
       {kind === 'publish' && acceptance !== null && review !== null ? (
         <fieldset className="rule-fieldset policy-studio-acceptance">
           <legend>Suggestion this publication accepts</legend>

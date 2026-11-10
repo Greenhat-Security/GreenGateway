@@ -13,6 +13,7 @@ export type CandidateParse =
 export type StudioSection =
   | 'overview'
   | 'roles'
+  | 'identity_mappings'
   | 'routes'
   | 'rules'
   | 'tools'
@@ -26,6 +27,7 @@ export const STUDIO_SECTIONS: ReadonlyArray<{
 }> = [
   { id: 'overview', label: 'Overview' },
   { id: 'roles', label: 'Roles' },
+  { id: 'identity_mappings', label: 'Identity mappings' },
   { id: 'routes', label: 'Routes' },
   { id: 'rules', label: 'HTTP and MCP rules' },
   { id: 'tools', label: 'Tools' },
@@ -46,6 +48,7 @@ const POLICY_MEMBERS: ReadonlyArray<{
   { member: 'default_action', label: 'default action', absent: 'deny' },
   { member: 'enforcement_mode', label: 'enforcement mode', absent: 'enforce' },
   { member: 'roles', label: 'roles', absent: {} },
+  { member: 'identity_mappings', label: 'identity mappings', absent: undefined },
   { member: 'routes', label: 'routes', absent: [] },
   { member: 'rules', label: 'rules', absent: [] },
   { member: 'egress', label: 'egress', absent: {} },
@@ -143,6 +146,7 @@ export function sectionForPointer(pointer: string): StudioSection {
   }
   if (
     member === 'roles' ||
+    member === 'identity_mappings' ||
     member === 'routes' ||
     member === 'rules' ||
     member === 'tools' ||
@@ -280,11 +284,10 @@ function canonicalJson(value: unknown): string {
   return value === undefined ? 'undefined' : JSON.stringify(value);
 }
 
-// Every id already used by a rule, route or rate override: the gateway
-// requires them unique across all three.
+// The gateway requires stable ids to be unique across all four sections.
 export function usedElementIds(document: JsonObject): Set<string> {
   const ids = new Set<string>();
-  for (const member of ['rules', 'routes', 'rate_limits']) {
+  for (const member of ['rules', 'routes', 'rate_limits', 'identity_mappings']) {
     for (const element of arrayMember(document, member)) {
       if (isJsonObject(element) && typeof element.id === 'string') {
         ids.add(element.id);

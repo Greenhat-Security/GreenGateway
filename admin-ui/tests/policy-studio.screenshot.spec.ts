@@ -163,3 +163,21 @@ test('captures the Policy Studio rule editor with live diagnostics', async ({ pa
     fullPage: true,
   });
 });
+
+test('edits identity mappings by keyboard on a narrow screen', async ({ page }) => {
+  await routeStudio(page);
+  await page.setViewportSize({ width: 390, height: 900 });
+  await page.goto('/admin/policy/studio');
+  await page.getByRole('button', { name: `Open draft ${DRAFT_ID}` }).click();
+  await page.getByRole('tab', { name: 'Roles', exact: true }).focus();
+  await page.keyboard.press('ArrowRight');
+  await expect(page.getByRole('tab', { name: 'Identity mappings' })).toBeFocused();
+  await page.getByRole('button', { name: 'Use identity mappings' }).click();
+  await page.getByRole('button', { name: 'Add mapping' }).click();
+  await page.getByLabel('Issuer', { exact: true }).fill('https://idp.example/');
+  const roles = page.getByLabel('Granted roles', { exact: true });
+  await roles.fill('support');
+  await roles.press('Enter');
+  await expect(page.getByRole('button', { name: 'Remove support from Granted roles' })).toBeVisible();
+  await page.screenshot({ path: path.join(screenshotDir, 'policy-identity-mappings-mobile.png'), fullPage: true });
+});
