@@ -670,13 +670,9 @@ pub(super) fn token_store_error_response(error: storage::RepositoryError) -> Res
     if let Some(parameter) = error.invalid_parameter_name() {
         return bad_request(&format!("invalid query parameter: {parameter}"));
     }
-    // A `Conflict` is not translated here. The only store conflict an
-    // endpoint can reach is the rotate endpoint's revoked-token case, and
-    // that endpoint answers it with its own `409` before falling through to
-    // this shared mapping; any other conflict (a store-level uniqueness
-    // violation, for instance) is a store failure this responder logs and
-    // answers `500`, which is the pre-#340 behavior the async-contract
-    // refactor's blanket translation had broadened to every operation.
+    // The rotate and keyed-revoke endpoints translate their known conflicts
+    // into 409 responses. A storage uniqueness violation or another
+    // unexpected conflict is an internal failure.
     // A store that cannot be reached, or that could not answer inside its
     // contention budget, is a dependency failure: `503`, so a load
     // balancer and an operator see "the authority is unavailable" rather

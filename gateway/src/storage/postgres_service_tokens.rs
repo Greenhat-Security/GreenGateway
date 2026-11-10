@@ -24,7 +24,7 @@
 //!   its outbox row, each writes one `service_token_change_evidence` row
 //!   (migration 18; the issue since migration 27): the actor (its subject,
 //!   and since migration 24 its kind, auth mode and canonical issuer),
-//!   action, generated event and operation IDs, the token's row revision
+//!   action, an event ID and operation ID, the token's row revision
 //!   before and after (none before an issue, and 1 after it), the shared
 //!   revision the change took and the database clock's commit time. It has
 //!   no foreign key, so it outlives the token row, and it holds no token
@@ -340,25 +340,47 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
             .map(|row| row.record))
     }
 
-    async fn revoke(
+    async fn revoke_with_operation(
         &self,
         id: &str,
         actor: &ChangeActor,
+        operation_id: Option<uuid::Uuid>,
     ) -> Result<Option<TokenRecord>, RepositoryError> {
+        if operation_id.is_some_and(|key| !crate::auth::tokens::valid_revoke_operation_id(key)) {
+            return Err(RepositoryError::invalid_parameter(
+                OPERATION_REVOKE,
+                "operation_id",
+            ));
+        }
         validate_change_actor(OPERATION_REVOKE, actor)?;
-        // One logical operation, minted once per call and never
-        // regenerated: its evidence row carries it.
-        let operation_id = uuid::Uuid::new_v4();
+        if operation_id.is_some() && !actor.can_bind_operation() {
+            return Err(invalid_data(OPERATION_REVOKE));
+        }
         let client = checkout(&self.pool, CheckoutClass::ControlPlaneWrite).await?;
         begin_mutation(&client, OPERATION_REVOKE).await?;
         let outcome: Result<Option<TokenRecord>, RepositoryError> = async {
-            let Some(current) = Self::load_by_id(&client, id, OPERATION_REVOKE, true).await? else {
+            let replay = match operation_id {
+                Some(key) => is_revoke_replay(&client, key, id, actor).await?,
+                None => false,
+            };
+            let current = Self::load_by_id(&client, id, OPERATION_REVOKE, true).await?;
+            if replay {
+                let revoked = current
+                    .filter(|row| row.record.revoked_at.is_some())
+                    .ok_or_else(|| invalid_data(OPERATION_REVOKE))?;
+                return Ok(Some(revoked.record));
+            }
+            let Some(current) = current else {
                 return Ok(None);
             };
-            // Idempotent and monotonic: the first revoked_at is the one that
-            // stands, and a repeat neither rewrites it, spends a revision,
-            // nor records evidence of a change that did not happen.
             if current.record.revoked_at.is_some() {
+                // A new key cannot claim another operation's committed change.
+                if operation_id.is_some() {
+                    return Err(RepositoryError::new(
+                        RepositoryErrorKind::Conflict,
+                        crate::auth::tokens::REVOKE_OPERATION_BINDING,
+                    ));
+                }
                 return Ok(Some(current.record));
             }
             let security_revision = reserve_shared_revision(&client, OPERATION_REVOKE).await?;
@@ -388,7 +410,7 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
             record_change_evidence(
                 &client,
                 &ChangeEvidence {
-                    operation_id,
+                    operation_id: operation_id.unwrap_or_else(uuid::Uuid::new_v4),
                     action: crate::auth::tokens::TOKEN_CHANGE_ACTION_REVOKE,
                     token_id: id,
                     prior_version: Some(current.revision),
@@ -569,6 +591,48 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
                 .await?
                 .map(|row| row.record)),
         }
+    }
+}
+
+/// Called under the singleton token-mutation lock. An operation can have
+/// evidence for more than one action; every row with this ID must agree.
+async fn is_revoke_replay(
+    client: &deadpool_postgres::Object,
+    key: uuid::Uuid,
+    id: &str,
+    actor: &ChangeActor,
+) -> Result<bool, RepositoryError> {
+    let row = client
+        .query_one(
+            r#"
+            SELECT bool_and(
+                action = $2 AND token_id = $3 AND actor_user_id = $4
+                AND actor_issuer IS NOT DISTINCT FROM $5
+                AND actor_kind IS NOT DISTINCT FROM $6
+                AND actor_auth_mode IS NOT DISTINCT FROM $7
+            )
+            FROM greengateway.service_token_change_evidence
+            WHERE operation_id = $1::text::uuid
+            "#,
+            &[
+                &key.to_string(),
+                &crate::auth::tokens::TOKEN_CHANGE_ACTION_REVOKE,
+                &id,
+                &actor.subject(),
+                &actor.issuer(),
+                &actor.kind().as_str(),
+                &actor.auth_mode(),
+            ],
+        )
+        .await
+        .map_err(|error| classify_query(error, OPERATION_REVOKE))?;
+    match column::<Option<bool>>(&row, 0, OPERATION_REVOKE)? {
+        None => Ok(false),
+        Some(true) => Ok(true),
+        Some(false) => Err(RepositoryError::new(
+            RepositoryErrorKind::Conflict,
+            crate::auth::tokens::REVOKE_OPERATION_BINDING,
+        )),
     }
 }
 

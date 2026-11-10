@@ -141,9 +141,14 @@ pub(super) async fn token_revoke_endpoint(
     Path(token_id): Path<String>,
     request: AxumRequest,
 ) -> Response {
-    record_request(TOKEN_ADMIN_ROUTE);
+    let keyed = request.method() == Method::POST;
+    record_request(if keyed {
+        TOKEN_KEYED_REVOKE_ADMIN_ROUTE
+    } else {
+        TOKEN_ADMIN_ROUTE
+    });
 
-    let (parts, _body) = request.into_parts();
+    let (parts, body) = request.into_parts();
     let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
         return unauthorized();
     };
@@ -156,15 +161,78 @@ pub(super) async fn token_revoke_endpoint(
     // recorded as the change's evidence in the revoke's own transaction; the
     // audit event below stays post-commit telemetry.
     let actor = auth::change_actor::ChangeActor::from_principal(&principal);
-    match store.revoke(&token_id, &actor).await {
+    let (result, operation_id) = if keyed {
+        if !actor.can_bind_operation() {
+            return forbidden();
+        }
+        let mut keys = parts.headers.get_all("idempotency-key").iter();
+        let key = keys.next().and_then(|value| value.to_str().ok());
+        let Some(operation_id) = key.and_then(|raw| {
+            uuid::Uuid::parse_str(raw).ok().filter(|id| {
+                auth::tokens::valid_revoke_operation_id(*id) && id.hyphenated().to_string() == raw
+            })
+        }) else {
+            return bad_request("Idempotency-Key must be one canonical lowercase UUIDv7");
+        };
+        if keys.next().is_some() {
+            return bad_request("Idempotency-Key must occur exactly once");
+        }
+        if parts.uri.query().is_some()
+            || parts
+                .headers
+                .keys()
+                .any(|name| name.as_str().starts_with("if-"))
+        {
+            return bad_request(
+                "keyed service-token revocation accepts no query or conditional headers",
+            );
+        }
+        match tokio::time::timeout(Duration::from_secs(5), axum::body::to_bytes(body, 0)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {
+                return bad_request("keyed service-token revocation requires an empty body")
+            }
+            Err(_) => {
+                return (
+                    StatusCode::REQUEST_TIMEOUT,
+                    Json(json!({"error": "revocation request timed out"})),
+                )
+                    .into_response()
+            }
+        }
+        (
+            store
+                .revoke_with_operation(&token_id, &actor, Some(operation_id))
+                .await,
+            Some(operation_id),
+        )
+    } else {
+        (store.revoke(&token_id, &actor).await, None)
+    };
+    match result {
         Ok(Some(record)) => {
             if let Some(validator) = state.validator.as_ref() {
                 validator.invalidate_token_id(&token_id);
             }
             emit_service_token_changed(&state, &parts, &principal, "token_revoked", &record);
+            if let Some(operation_id) = operation_id {
+                return Json(json!({
+                    "operation_id": operation_id.to_string(),
+                    "token_id": record.id,
+                    "revoked_at": record.revoked_at
+                }))
+                .into_response();
+            }
             (StatusCode::OK, Json(record)).into_response()
         }
         Ok(None) => not_found("service token was not found"),
+        Err(error)
+            if keyed
+                && error.kind() == storage::RepositoryErrorKind::Conflict
+                && error.operation() == auth::tokens::REVOKE_OPERATION_BINDING =>
+        {
+            conflict("revocation conflicts with an already committed operation")
+        }
         Err(error) => token_store_error_response(error),
     }
 }

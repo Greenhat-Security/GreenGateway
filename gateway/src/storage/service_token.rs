@@ -20,7 +20,7 @@ use super::{
 /// prefix. Verification is authoritative: it consults stored revocation and
 /// expiry state rather than a cache, and updates `last_used_at` only for
 /// tokens it has already re-checked. Revocation is idempotent and monotonic
-/// — a revoked token never becomes valid again, and rotating a revoked token
+/// â€” a revoked token never becomes valid again, and rotating a revoked token
 /// is a conflict.
 ///
 /// Create, rotate and revoke are told who is acting. Each committed change --
@@ -52,6 +52,17 @@ pub trait ServiceTokenStore: Send + Sync {
         &self,
         id: &str,
         actor: &ChangeActor,
+    ) -> Result<Option<TokenRecord>, RepositoryError> {
+        self.revoke_with_operation(id, actor, None).await
+    }
+
+    /// A supplied operation ID binds the committed revoke to its actor and
+    /// token. Only an identical retry may return that operation's result.
+    async fn revoke_with_operation(
+        &self,
+        id: &str,
+        actor: &ChangeActor,
+        operation_id: Option<uuid::Uuid>,
     ) -> Result<Option<TokenRecord>, RepositoryError>;
 
     async fn rotate(
@@ -110,16 +121,17 @@ impl ServiceTokenStore for SqliteTokenStore {
         .await
     }
 
-    async fn revoke(
+    async fn revoke_with_operation(
         &self,
         id: &str,
         actor: &ChangeActor,
+        operation_id: Option<uuid::Uuid>,
     ) -> Result<Option<TokenRecord>, RepositoryError> {
         let store = self.clone();
         let id = id.to_owned();
         let actor = actor.clone();
         run_blocking(move || {
-            TokenStore::revoke(&store, &id, &actor)
+            TokenStore::revoke_with_operation(&store, &id, &actor, operation_id)
                 .map_err(|error| map_token_store_error("service_token_revoke", error))
         })
         .await
@@ -198,13 +210,20 @@ pub(super) fn map_token_store_error(
         TokenStoreError::Random(_) => {
             RepositoryError::new(RepositoryErrorKind::Internal, operation)
         }
+        TokenStoreError::RevokeOperationConflict => RepositoryError::new(
+            RepositoryErrorKind::Conflict,
+            crate::auth::tokens::REVOKE_OPERATION_BINDING,
+        ),
         TokenStoreError::RevokedToken { .. } => {
             RepositoryError::new(RepositoryErrorKind::Conflict, operation)
+        }
+        TokenStoreError::InvalidRevokeOperationId => {
+            RepositoryError::invalid_parameter(operation, "operation_id")
         }
         // Only an authenticated principal reaches a store, so an actor
         // evidence cannot record is the gateway's defect, not the caller's
         // input: refused, and not answered as a parameter error.
-        TokenStoreError::InvalidChangeActor => {
+        TokenStoreError::InvalidChangeActor | TokenStoreError::InconsistentRevokeEvidence => {
             RepositoryError::new(RepositoryErrorKind::InvalidData, operation)
         }
         // The change rolled back with its evidence. Keep an availability
