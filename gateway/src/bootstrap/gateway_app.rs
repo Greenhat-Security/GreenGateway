@@ -283,6 +283,19 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
             .map(rbac::PolicyHistoryStore::open)
             .transpose()?
             .map(|store| Arc::new(store) as Arc<dyn storage::PolicyHistory>);
+    // Replay reads the audit log but commits its bounded journal beside the
+    // other policy resources, independently of audit sink buffering.
+    let replay_path = policy_history_sqlite_path(&config).filter(|_| {
+        config.state_backend == config::StateBackend::Sqlite
+            && config.policy_file.is_some()
+            && config.audit_sqlite_path.is_some()
+    });
+    #[cfg(feature = "postgres")]
+    let replay_path = replay_path.filter(|_| build_overrides.pg_policy.is_none());
+    let replay_jobs = match replay_path {
+        Some(path) => PolicyReplayJobs::open(&path, &audit_log)?,
+        None => PolicyReplayJobs::new(),
+    };
     // Policy drafts (issue #243, slice 9) live beside the history they will
     // join once published: migration 22's table in cluster mode, and a
     // `policy_drafts` table in the same SQLite database as `policy_versions`
@@ -1378,7 +1391,9 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
         client_ip_policy,
         max_body_size: config.max_body_size,
     };
+    replay_jobs.start_retention(&app_state.lifecycle);
     let admin_api_states = AdminApiStates {
+        replay_jobs: Arc::new(replay_jobs),
         audit: audit_admin_state,
         auth: admin_auth_state,
         status: status_state,

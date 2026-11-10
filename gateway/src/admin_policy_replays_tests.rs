@@ -821,6 +821,343 @@ fn registry_etag() -> String {
     .expect("the policy has an ETag")
 }
 
+fn restart_router(
+    dir: &FsPath,
+    audit: audit::AuditLog,
+) -> Result<Router, Box<dyn std::error::Error>> {
+    let mut config = test_config(Vec::new());
+    config.auth_enabled = false;
+    config.policy_file = Some(dir.join("policy.json").to_string_lossy().into_owned());
+    config.policy_history_sqlite_path =
+        Some(dir.join("history.sqlite").to_string_lossy().into_owned());
+    config.audit_sqlite_path = Some(dir.join("audit.sqlite").to_string_lossy().into_owned());
+    config.rbac_exempt_paths.push(POLICY_ADMIN_ROUTE.to_owned());
+    let app = gateway_app_with_process_started_at_and_overrides(
+        config,
+        PrometheusBuilder::new().build_recorder().handle(),
+        audit,
+        test_audit_event_sender(),
+        Instant::now(),
+        GatewayAppBuildOverrides {
+            disable_proxy_health_checks: true,
+            ..Default::default()
+        },
+    )?;
+    match app.http {
+        GatewayApp::Unified(router) => Ok(router),
+        _ => panic!("expected unified test gateway"),
+    }
+}
+
+fn startup_audit() -> audit::AuditLog {
+    audit::AuditLog::new(Arc::new(audit::sink::tests::CaptureSink::new()))
+}
+
+struct ReplayTestDirectory(std::path::PathBuf);
+impl ReplayTestDirectory {
+    fn new() -> Self {
+        let path =
+            std::env::temp_dir().join(format!("gg-replay-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+impl Drop for ReplayTestDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Run by the crash test in a separate process. The parent kills it while
+/// the real worker is waiting for its completion audit receipt.
+#[tokio::test]
+async fn standalone_replay_crash_child() {
+    let Some(dir) = std::env::var_os("GG_TEST_REPLAY_CRASH_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    #[derive(Default)]
+    struct HoldCompletion(std::sync::Mutex<Option<audit::DurableAck>>);
+    impl audit::AuditSink for HoldCompletion {
+        fn emit(&self, _: &audit::AuditEvent) {}
+        fn is_durable(&self) -> bool {
+            true
+        }
+        fn emit_durable(&self, event: &audit::AuditEvent, ack: audit::DurableAck) {
+            if event.event_type == audit::event::POLICY_REPLAY_COMPLETED {
+                *self.0.lock().unwrap() = Some(ack);
+            } else {
+                ack.stored();
+            }
+        }
+    }
+    let sink = Arc::new(HoldCompletion::default());
+    let audit = audit::AuditLog::new_required(sink.clone(), Duration::from_secs(60));
+    let router = restart_router(&dir, audit).expect("child gateway starts");
+    let body = std::fs::read_to_string(dir.join("request.json")).unwrap();
+    let response = start(&router, operator("restart-owner"), body).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let job = json_body(response).await;
+    let id = job["job_id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while sink.0.lock().unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker reached its final audit receipt");
+    std::fs::write(dir.join("ready.tmp"), id).unwrap();
+    std::fs::rename(dir.join("ready.tmp"), dir.join("ready")).unwrap();
+    tokio::time::sleep(Duration::from_secs(45)).await;
+    panic!("parent did not stop the crash child");
+}
+
+#[tokio::test]
+async fn startup_interrupts_a_crashed_job_and_keeps_owner_and_retry_binding() {
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = ReplayTestDirectory::new();
+    let path = dir.0.as_path();
+    std::fs::write(
+        path.join("policy.json"),
+        replays_policy_document().to_string(),
+    )
+    .unwrap();
+    let mut body = replay_body(&registry_etag(), json!({"source":"active"}));
+    body["idempotency_key"] = json!("restart-key-canary");
+    std::fs::write(path.join("request.json"), body.to_string()).unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::admin_policy_replays_tests::standalone_replay_crash_child",
+        ])
+        .env("GG_TEST_REPLAY_CRASH_DIR", path)
+        .spawn()
+        .unwrap();
+    let mut child = Child(child);
+    let id = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(id) = std::fs::read_to_string(path.join("ready")) {
+                break id;
+            }
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "child exited before its worker was ready"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("child admitted a replay");
+    assert!(restart_router(path, startup_audit())
+        .err()
+        .expect("a second live owner is refused")
+        .to_string()
+        .contains("replay journal lock"));
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    drop(child);
+
+    let router = restart_router(path, startup_audit()).expect("restart after process death");
+    let owner = operator("restart-owner");
+    let job = json_body(get_job(&router, owner.clone(), &id).await).await;
+    assert_eq!(job["state"], "interrupted");
+    assert_eq!(job["failure"]["reason"], "standalone_restart");
+    assert!(job.get("result").is_none() && job.get("result_digest").is_none());
+    assert_eq!(
+        get_job(&router, operator("other-owner"), &id)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let retry = start(&router, owner.clone(), body.to_string()).await;
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(json_body(retry).await["job_id"], id);
+    body["max_records"] = json!(5);
+    assert_eq!(
+        start(&router, owner.clone(), body.to_string())
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let db = rusqlite::Connection::open(path.join("history.sqlite")).unwrap();
+    let serialized: Vec<u8> = db
+        .query_row(
+            "SELECT metadata FROM standalone_policy_replays_v1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    for raw in ["restart-key-canary", "restart-owner"] {
+        assert!(!std::str::from_utf8(&serialized).unwrap().contains(raw));
+    }
+    assert_eq!(
+        delete_job(&router, owner, &id).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    drop(router);
+    let router = restart_router(path, startup_audit()).unwrap();
+    assert_eq!(
+        get_job(&router, operator("restart-owner"), &id)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn startup_retains_completed_results_until_their_original_expiry() {
+    let dir = ReplayTestDirectory::new();
+    let path = dir.0.as_path();
+    std::fs::write(
+        path.join("policy.json"),
+        replays_policy_document().to_string(),
+    )
+    .unwrap();
+    let router = restart_router(path, startup_audit()).unwrap();
+    let mut body = replay_body(&registry_etag(), json!({"source":"active"}));
+    body["idempotency_key"] = json!("completed-restart");
+    let admitted = json_body(start(&router, replayer(), body.to_string()).await).await;
+    let id = admitted["job_id"].as_str().expect("admitted job id");
+    let before = finished(&router, replayer(), id).await;
+    assert_eq!(before["state"], "completed_incomplete");
+    let other = operator("second-restart-owner");
+    let theirs = json_body(start(&router, other.clone(), body.to_string()).await).await;
+    let other_id = theirs["job_id"].as_str().unwrap();
+    assert_ne!(other_id, id);
+    finished(&router, other.clone(), other_id).await;
+    drop(router);
+    let router = restart_router(path, startup_audit()).unwrap();
+    assert_eq!(
+        get_job(&router, other.clone(), id).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        json_body(start(&router, other, body.to_string()).await).await["job_id"],
+        other_id
+    );
+    let after = json_body(start(&router, replayer(), body.to_string()).await).await;
+    for key in [
+        "state",
+        "job_id",
+        "result",
+        "result_digest",
+        "cutoff",
+        "base",
+        "candidate",
+        "evaluator",
+    ] {
+        assert_eq!(before[key], after[key], "{key}");
+    }
+    drop(router);
+    let db = rusqlite::Connection::open(path.join("history.sqlite")).unwrap();
+    let original: Vec<u8> = db
+        .query_row(
+            "SELECT result FROM standalone_policy_replays_v1 WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.execute("UPDATE standalone_policy_replays_v1 SET result=(SELECT result FROM standalone_policy_replays_v1 WHERE id=?2) WHERE id=?1",
+        [id, other_id]).unwrap();
+    let error = restart_router(path, startup_audit())
+        .err()
+        .expect("an aggregate is bound to its owner and job");
+    assert!(error
+        .to_string()
+        .contains("invalid standalone policy replay journal"));
+    db.execute(
+        "UPDATE standalone_policy_replays_v1 SET result=?2 WHERE id=?1",
+        rusqlite::params![id, original],
+    )
+    .unwrap();
+    let past_ms = (OffsetDateTime::now_utc() - time::Duration::minutes(16)).unix_timestamp() * 1000;
+    db.execute(
+        "UPDATE standalone_policy_replays_v1 SET finished_ms=?1",
+        [past_ms],
+    )
+    .unwrap();
+    let router = restart_router(path, startup_audit()).unwrap();
+    let expired = json_body(get_job(&router, replayer(), id).await).await;
+    assert_eq!(expired["state"], "expired");
+    assert!(expired.get("result").is_none());
+    let has_result: bool = db
+        .query_row(
+            "SELECT result IS NOT NULL FROM standalone_policy_replays_v1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!has_result);
+    drop(router);
+    db.execute(
+        "UPDATE standalone_policy_replays_v1 SET metadata_hash=zeroblob(32)",
+        [],
+    )
+    .unwrap();
+    let error = restart_router(path, startup_audit())
+        .err()
+        .expect("corrupt bindings refuse startup");
+    assert!(error
+        .to_string()
+        .contains("invalid standalone policy replay journal"));
+}
+
+#[tokio::test]
+async fn a_failed_journal_commit_withholds_the_result_after_audit() {
+    let directory = ReplayTestDirectory::new();
+    let path = directory.0.as_path();
+    std::fs::write(
+        path.join("policy.json"),
+        replays_policy_document().to_string(),
+    )
+    .unwrap();
+    let capture = audit::sink::tests::CaptureSink::new();
+    let router = restart_router(path, audit::AuditLog::new(Arc::new(capture.clone()))).unwrap();
+    let db = rusqlite::Connection::open(path.join("history.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER refuse_test_completion BEFORE UPDATE OF result ON standalone_policy_replays_v1
+                      WHEN NEW.result IS NOT NULL BEGIN SELECT RAISE(FAIL, 'fixture'); END;").unwrap();
+    let body = replay_body(&registry_etag(), json!({"source":"active"}));
+    let admitted = json_body(start(&router, replayer(), body.to_string()).await).await;
+    let id = admitted["job_id"].as_str().unwrap();
+    let job = finished(&router, replayer(), id).await;
+    assert_eq!(job["state"], "failed");
+    assert_eq!(job["failure"]["reason"], "store_unavailable");
+    assert!(job.get("result").is_none() && job.get("result_digest").is_none());
+    assert!(wait_for_lifecycle(&capture, 2)
+        .iter()
+        .any(|event| event.event_type == audit::event::POLICY_REPLAY_COMPLETED));
+    let durable: bool = db
+        .query_row(
+            "SELECT result IS NOT NULL FROM standalone_policy_replays_v1 WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!durable);
+    // A later admission repairs the reservation without restarting the gateway.
+    db.execute_batch("DROP TRIGGER refuse_test_completion")
+        .unwrap();
+    let admitted = json_body(start(&router, replayer(), body.to_string()).await).await;
+    let next_id = admitted["job_id"].as_str().unwrap();
+    assert_ne!(next_id, id);
+    assert_eq!(
+        finished(&router, replayer(), next_id).await["state"],
+        "completed_incomplete"
+    );
+    drop(router);
+    let router = restart_router(path, startup_audit()).unwrap();
+    let repaired = json_body(get_job(&router, replayer(), id).await).await;
+    assert_eq!(repaired["state"], "failed");
+    assert_eq!(repaired["failure"]["reason"], "store_unavailable");
+    assert!(repaired.get("result").is_none());
+}
+
 fn operator(subject: &str) -> Option<auth::Principal> {
     let mut principal = test_principal(&["replayer"]);
     principal.user_id = subject.to_owned();

@@ -90,10 +90,15 @@ impl CandidateSource {
 /// The stored document a `draft` or `revision` candidate was read as, for
 /// results and audit records: identifiers only, never content. A candidate
 /// the request carried itself has none.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
 pub(crate) enum StoredCandidate {
     /// A server-side draft, at the revision the request's draft ETag named.
-    Draft { draft_id: String, revision: i64 },
+    Draft {
+        draft_id: String,
+        #[serde(rename = "draft_revision")]
+        revision: i64,
+    },
     /// A version of the policy history.
     Revision { version: i64 },
 }
