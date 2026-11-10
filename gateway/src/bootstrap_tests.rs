@@ -284,7 +284,7 @@ fn mounted_bundles_are_checked_before_any_startup_stage() {
     for file in &files {
         std::fs::write(root.join(file.name.as_str()), &file.bytes).unwrap();
     }
-    let boot = |with_state| {
+    let boot_with = |with_state, host_inputs: &[(&str, &str)]| {
         let mut settings = vec![
             ("GATEWAY_CONFIG_SOURCE", "bundle"),
             ("GATEWAY_CONFIG_BUNDLE", root.to_str().unwrap()),
@@ -292,12 +292,15 @@ fn mounted_bundles_are_checked_before_any_startup_stage() {
         if with_state {
             settings.push(("GATEWAY_STATE_DIR", unused_state.to_str().unwrap()));
         }
+        settings.extend_from_slice(host_inputs);
         let (result, stages) = start(&settings, None, nothing_to_check());
         assert!(stage_calls(&stages).is_empty());
         let error = result.unwrap_err();
         assert!(!format!("{error:?}").contains("state-canary"));
+        assert!(!format!("{error:?}").contains("tls-path-canary"));
         error
     };
+    let boot = |with_state| boot_with(with_state, &[]);
     let source_reason = |with_state, expected: &str| {
         let StartupFailure::Configuration(error) = boot(with_state) else {
             panic!("expected the source selector to be refused");
@@ -327,6 +330,32 @@ fn mounted_bundles_are_checked_before_any_startup_stage() {
     source_reason(false, "source.mode_unavailable");
     source_reason(true, "GATEWAY_STATE_DIR: source.selector_without_mode");
     assert!(!unused_state.exists());
+
+    let certificate = root.with_extension("tls-path-canary.crt");
+    let private_key = root.with_extension("tls-path-canary.key");
+    let tls_paths = [
+        ("TLS_CERT_FILE", certificate.to_str().unwrap()),
+        ("TLS_KEY_FILE", private_key.to_str().unwrap()),
+    ];
+    let refused_tls = |paths: &[(&str, &str)]| {
+        let StartupFailure::Bundle(issues) = boot_with(false, paths) else {
+            panic!("the unexpected or incomplete host binding must be refused");
+        };
+        assert!(issues
+            .iter()
+            .any(|issue| issue.pointer.to_string() == "/spec/listeners/public/tls"));
+    };
+    write("  listeners:\n    public:\n      tls: \"off\"\n", true);
+    refused_tls(&tls_paths);
+    write("  listeners:\n    public:\n      tls: required\n", true);
+    refused_tls(&[]);
+    refused_tls(&tls_paths[..1]);
+    assert!(!certificate.exists() && !private_key.exists());
+    let StartupFailure::Configuration(error) = boot_with(false, &tls_paths) else {
+        panic!("declared TLS paths must reach the activation gate without opening the files");
+    };
+    assert!(error.to_string().contains("source.mode_unavailable"));
+
     write("  state:\n    stores: [\"audit\"]\n", true);
     source_reason(false, "GATEWAY_STATE_DIR: source.missing_selector");
     assert!(matches!(

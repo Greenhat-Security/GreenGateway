@@ -603,6 +603,44 @@ pub(crate) enum DocumentListenerRefusal {
     DevelopmentBind(&'static str),
 }
 
+/// Validate real mounted listener inputs through the serving stage. Only
+/// catalog names leave this boundary; parser messages may contain host paths.
+pub(crate) fn check_mounted(
+    get_var: impl FnMut(&str) -> Result<String, VarError>,
+) -> BTreeSet<&'static str> {
+    let mut findings = Findings::default();
+    let parsed = parse(&ListenerInputs::read(get_var), &mut findings);
+    // The environment report orders both checks after ADMIN_TLS_KEY_FILE.
+    // The document diagnostic belongs to the particular listener's TLS field.
+    for (cert_setting, certs, key_setting, keys) in [
+        (
+            TLS_CERT_FILE,
+            parsed.tls_cert_files,
+            TLS_KEY_FILE,
+            parsed.tls_key_files,
+        ),
+        (
+            ADMIN_TLS_CERT_FILE,
+            parsed.admin_tls_cert_files,
+            ADMIN_TLS_KEY_FILE,
+            parsed.admin_tls_key_files,
+        ),
+    ] {
+        findings.rule(key_setting, ConfigRule::TlsMaterialUnpaired, |problems| {
+            require_inbound_tls_pair(
+                cert_setting,
+                certs.as_deref(),
+                key_setting,
+                keys.as_deref(),
+                problems,
+            );
+        });
+    }
+    let mut refused = BTreeSet::new();
+    Checked::new((), findings).collect_refusals(&mut refused);
+    refused
+}
+
 /// Check the public document with the production parser and relationship rules.
 /// Certificate/key pairing, CA contents and CRL files require host bootstrap
 /// inputs. The unit value below records a CA requirement without inventing a path.
