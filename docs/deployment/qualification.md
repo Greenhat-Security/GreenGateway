@@ -306,10 +306,16 @@ the production database.
 4. **Reconcile against the target** with the marker query from step 1, run
    against the scratch database:
    `reconcile --observation <pitr-markers record> --recorded recorded.txt --cutoff <target time> --rpo-target-seconds <agreed RPO>`.
-   `recovery_point_gap_seconds` is how far before the target the last surviving
-   acknowledged marker lies, and `restored_past_target` counts markers sent after
-   the target that the restore nevertheless holds; either beyond expectation
-   fails the drill.
+   Choose a target between a successful probe acknowledged before it and a
+   successful probe sent after it. The command refuses a target outside that
+   window. To pass, at least one pre-target acknowledged marker must survive.
+   Its most recent acknowledgement must be within the agreed RPO
+   (`recovery_point_gap_seconds`), and any missing acknowledged markers must
+   also fall within that RPO. The observer records probe times to milliseconds.
+   A restored marker sent in the target's millisecond or later counts toward
+   `restored_past_target` and fails the drill because its write cannot be
+   shown to precede the target. Space the probes closely enough to measure
+   the agreed gap.
 5. **Destroy** the scratch environment and record that you did.
 
 ## 7. Upgrade

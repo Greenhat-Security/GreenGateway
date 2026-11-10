@@ -184,8 +184,8 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 
-def iso(moment):
-    return moment.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+def iso(moment, timespec="milliseconds"):
+    return moment.astimezone(timezone.utc).isoformat(timespec=timespec).replace("+00:00", "Z")
 
 
 def parse_iso(text, what):
@@ -1449,7 +1449,10 @@ def reconcile(observation, recorded_lines, *, cutoff=None, rpo_target=None):
     known = {m["seq"] for m in markers}
     if recorded - known:
         raise InputError("the database holds markers this observation never sent")
-    acknowledged = [m for m in markers if m["ok"] and parse_iso(m["acknowledged_at"], "a marker") < cutoff]
+    # Probe timestamps are rounded down to milliseconds. A probe stamped in
+    # the target's millisecond cannot establish that its write preceded it.
+    boundary = cutoff.replace(microsecond=cutoff.microsecond // 1000 * 1000) if explicit else cutoff
+    acknowledged = [m for m in markers if m["ok"] and parse_iso(m["acknowledged_at"], "a marker") < boundary]
     missing = [m for m in acknowledged if m["seq"] not in recorded]
     durable = [m for m in acknowledged if m["seq"] in recorded]
     lost_window = 0.0
@@ -1458,19 +1461,25 @@ def reconcile(observation, recorded_lines, *, cutoff=None, rpo_target=None):
     gap = None
     if durable:
         gap = (cutoff - max(parse_iso(m["acknowledged_at"], "a marker") for m in durable)).total_seconds()
-    after = [m for m in markers if parse_iso(m["sent_at"], "a marker") >= cutoff]
+
+    after = [m for m in markers if parse_iso(m["sent_at"], "a marker") >= boundary]
+    if explicit and (not acknowledged or not any(m["ok"] and parse_iso(m["sent_at"], "a marker") > cutoff
+                                                 for m in after)):
+        raise InputError("choose a PITR --cutoff between a probe acknowledged before it "
+                         "and a successful probe sent after it")
     recovered_at = observation.get("recovered_at")
     recovered = parse_iso(recovered_at, "recovered_at") if recovered_at else None
     outage = [m for m in after if recovered is None or parse_iso(m["sent_at"], "a marker") < recovered]
     settled = [m for m in after if recovered is not None and parse_iso(m["sent_at"], "a marker") >= recovered]
     result = {
         "schema_version": SCHEMA_VERSION, "kind": "greengateway-qualification-reconcile", "run_id": run_id,
-        "drill": observation.get("drill"), "recorded_at": iso(utc_now()), "cutoff": iso(cutoff),
+        "drill": observation.get("drill"), "recorded_at": iso(utc_now()),
+        "cutoff": iso(cutoff, "milliseconds" if cutoff == boundary else "microseconds"),
         "cutoff_source": "explicit recovery target" if explicit else "fault_at",
         "resolution_seconds": observation.get("resolution_seconds"),
         "acknowledged_before_cutoff": len(acknowledged), "recorded_of_those": len(durable),
-        "missing_acknowledged": len(missing), "rpo_seconds": round(lost_window, 3),
-        "recovery_point_gap_seconds": None if gap is None else round(gap, 3),
+        "missing_acknowledged": len(missing), "rpo_seconds": lost_window,
+        "recovery_point_gap_seconds": gap,
         "after_cutoff": {"sent": len(after), "recorded": sum(m["seq"] in recorded for m in after)},
         "during_outage": {"sent": len(outage), "recorded": sum(m["seq"] in recorded for m in outage),
                           "missing": sum(m["seq"] not in recorded for m in outage)},
@@ -1483,7 +1492,9 @@ def reconcile(observation, recorded_lines, *, cutoff=None, rpo_target=None):
     if rpo_target is None:
         result["verdict"] = "measured"
     else:
-        within = lost_window <= rpo_target and not result.get("restored_past_target")
+        within = lost_window <= rpo_target
+        if explicit:
+            within = within and gap is not None and gap <= rpo_target and not result["restored_past_target"]
         result["verdict"] = "passed" if within else "failed"
     return result
 
@@ -1501,6 +1512,9 @@ def command_reconcile(args):
     print(f"reconcile {result['verdict']}: rpo_seconds={result['rpo_seconds']}, "
           f"missing_acknowledged={result['missing_acknowledged']}, "
           f"during_outage_missing={result['during_outage']['missing']}")
+    if cutoff is not None:
+        print(f"recovery_point_gap_seconds={result['recovery_point_gap_seconds']}, "
+              f"restored_past_target={result['restored_past_target']}")
     return 0 if result["verdict"] in ("passed", "measured") else 1
 
 
