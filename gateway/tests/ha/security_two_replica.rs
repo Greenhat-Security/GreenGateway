@@ -996,6 +996,99 @@ fn marked_policy(marker: &str) -> Value {
     })
 }
 
+/// The same owner can edit a draft on either replica. Both replicas export
+/// evidence for the exact saved revision, even after a process restarts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn draft_evidence_is_owner_and_revision_bound_across_replicas() {
+    let Some(mut cluster) = start_secure_cluster(ClusterOptions::default()).await else {
+        return skipped();
+    };
+    let owner = admin_token(&cluster.oidc, "draft-owner@ha.test");
+    let other = admin_token(&cluster.oidc, "other-admin@ha.test");
+    let (status, headers, _) = send_settled(|| cluster.get("a", POLICY_ROUTE).bearer(&owner)).await;
+    assert_eq!(status, 200);
+    let live_etag = etag(&headers, "initial live policy");
+    let drafts = format!("{POLICY_ROUTE}/drafts");
+    let (status, headers, draft) = send_settled(|| {
+        cluster
+            .post("a", &drafts)
+            .bearer(&owner)
+            .if_match(&live_etag)
+            .json(&json!({}))
+    })
+    .await;
+    assert_eq!(status, 201, "{draft}");
+    let initial_etag = etag(&headers, "new draft");
+    let draft_id = draft["draft_id"].as_str().expect("created draft ID");
+    let path = format!("{drafts}/{draft_id}");
+    let mut candidate = draft["policy"].clone();
+    candidate["schema_version"] = json!("1.0.0");
+    candidate["id"] = json!("ha-draft");
+    let change = json!({"policy": candidate});
+    let (status, headers, updated) = send_settled(|| {
+        cluster
+            .request(reqwest::Method::PATCH, "b", &path)
+            .bearer(&owner)
+            .if_match(&initial_etag)
+            .json(&change)
+    })
+    .await;
+    assert_eq!(status, 200, "{updated}");
+    let saved_etag = etag(&headers, "updated draft");
+    assert_ne!(initial_etag, saved_etag);
+    assert_eq!(updated["revision"], 2);
+
+    cluster.restart("a").await;
+    cluster.wait_until_all_ready().await;
+    let evidence = format!("{POLICY_ROUTE}/evidence");
+    let export = |replica: &str, who: &str, at: &str| {
+        cluster.post(replica, &evidence).bearer(who).json(&json!({
+            "schema_version": "policy-evidence-request.v1",
+            "draft": {"draft_id": draft_id, "draft_etag": at}
+        }))
+    };
+    let (status, _, refused) = send_settled(|| export("a", &owner, &initial_etag)).await;
+    assert_eq!(
+        (status, refused["reason"].as_str()),
+        (412, Some("policy_draft_stale"))
+    );
+    let (status, _, refused) = send_settled(|| export("b", &other, &saved_etag)).await;
+    assert_eq!(
+        (status, refused["reason"].as_str()),
+        (404, Some("policy_draft_not_found"))
+    );
+
+    let (status, _, first) = send_settled(|| export("a", &owner, &saved_etag)).await;
+    assert_eq!(status, 200, "{first}");
+    assert_eq!(first["schema_version"], "policy-evidence.v1");
+    assert_eq!(first["report"]["candidate_kind"], "draft");
+    let binding = &first["report"]["draft"];
+    assert_eq!(binding["draft_id"], draft_id);
+    assert_eq!(binding["revision"], 2);
+    assert_eq!(binding["draft_etag"], saved_etag);
+    assert_eq!(
+        first["manifest"]
+            .as_array()
+            .expect("artifact manifest")
+            .len(),
+        2
+    );
+    let (status, _, second) = send_settled(|| export("b", &owner, &saved_etag)).await;
+    assert_eq!(status, 200, "{second}");
+    for member in ["report", "manifest", "report_markdown"] {
+        assert_eq!(
+            first[member], second[member],
+            "replicas disagree on {member}"
+        );
+    }
+    let (status, headers, _) = send_settled(|| cluster.get("b", POLICY_ROUTE).bearer(&owner)).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        etag(&headers, "live policy after evidence export"),
+        live_etag
+    );
+}
+
 /// Two admins, two replicas, one ETag: the policy authority admits one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn identical_if_match_policy_writes_admit_exactly_one() {
