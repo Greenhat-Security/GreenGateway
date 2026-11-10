@@ -36,6 +36,9 @@ use crate::{
     inbound_tls::{ClientCertMode, TlsMinVersion},
 };
 
+/// A development deployment stays local even when an older bundle omitted its address.
+pub const DEVELOPMENT_LISTEN_ADDR: &str = "127.0.0.1:8080";
+
 /// The listener block's inputs, as the reader returned them.
 pub(super) struct ListenerInputs {
     listen_addr: RawInput,
