@@ -7027,7 +7027,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::routing::register_metrics#1",
-      "sha256": "c1eeb7bfaa806a6504af052a457dc827686a0660bf8b03ebdbfe729c9a2cbe6b",
+      "sha256": "dddf232e0233cdc1838442b006ae7b4c921da6cb57aead70aaf0f4e058566fc2",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -7450,6 +7450,26 @@
       "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/admin_policy_simulations.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::admin_policy_simulations::policy_simulations_endpoint#1",
+      "sha256": "7ba58531a47630e53592c12d9c74c29dcd574052c59a49fcf529e7069abaa60d",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Record the authorized admin response count using a bounded status class and the duration in fixed buckets."
+    },
+    {
+      "file": "gateway/src/admin_policy_simulations.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::admin_policy_simulations::simulate_authorized#1",
+      "sha256": "37f0cbac656b0f3c035a8fdb5a2d35099abc6fa3783e3987f07c84430b188606",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Count returned reports at the stage trace cap. The counter takes no labels and the evaluator emits no metric."
     },
     {
       "file": "gateway/src/admin_policy_replays.rs",

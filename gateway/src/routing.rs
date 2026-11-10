@@ -937,13 +937,33 @@ pub(super) fn install_metrics_recorder(
 /// The exporter configuration [`install_metrics_recorder`] installs, so a
 /// test can render a fresh registry exactly as `/metrics` would.
 pub(super) fn metrics_recorder_builder() -> PrometheusBuilder {
-    PrometheusBuilder::new().with_recommended_naming(true)
+    PrometheusBuilder::new()
+        .with_recommended_naming(true)
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(
+                metrics::POLICY_SIMULATION_DURATION_SECONDS.to_owned(),
+            ),
+            &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0],
+        )
+        .expect("static policy simulation duration buckets are valid")
 }
 
 /// Everything [`install_metrics_recorder`] does to the registry once the
 /// recorder is in place.
 pub(super) fn register_metrics(cluster: bool) {
     ::metrics::describe_counter!(REQUEST_COUNTER, "HTTP requests served by GreenGateway");
+    ::metrics::describe_counter!(
+        metrics::POLICY_SIMULATIONS_TOTAL,
+        "Authorized policy simulation responses by outcome"
+    );
+    ::metrics::describe_histogram!(
+        metrics::POLICY_SIMULATION_DURATION_SECONDS,
+        "Seconds from authorization to a policy simulation response"
+    );
+    ::metrics::describe_counter!(
+        metrics::POLICY_SIMULATION_TRACES_TRUNCATED_TOTAL,
+        "Policy simulation responses with truncated stage traces"
+    );
     ::metrics::describe_counter!(
         audit::AUDIT_EVENTS_DROPPED_TOTAL,
         "Audit events dropped by the bounded asynchronous audit channel"
