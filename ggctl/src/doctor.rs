@@ -151,6 +151,7 @@ impl Stage {
             | Code::NotRepresentable
             | Code::InvalidEgressSetting
             | Code::InvalidRuntimeSetting
+            | Code::InvalidDeploymentSetting
             | Code::InvalidAuthProvider
             | Code::InvalidAdminLogin
             | Code::InlineSecretValue

@@ -97,6 +97,8 @@ struct DeploymentRecord {
     sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offline_compiler: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -139,6 +141,13 @@ impl BundleRecord {
                 file: manifest.deployment.as_str().to_owned(),
                 sha256: bundle.map(|bundle| bundle.deployment.sha256.clone()),
                 profile: bundle.map(|bundle| bundle.deployment.profile.as_str()),
+                offline_compiler: bundle.map(|bundle| {
+                    if bundle.deployment.offline_plan().is_some() {
+                        "compiled"
+                    } else {
+                        "not_checked"
+                    }
+                }),
             },
             policy: manifest.policy.as_ref().map(|declaration| {
                 ResourceRecord::of(
@@ -177,6 +186,9 @@ impl BundleRecord {
             }
             Some(profile) => writeln!(out, " (profile {profile})")?,
             None => writeln!(out)?,
+        }
+        if let Some(status) = self.deployment.offline_compiler {
+            writeln!(out, "  compiler       {status}")?;
         }
         for (label, resource) in [("policy", &self.policy), ("tools", &self.tools)] {
             let Some(resource) = resource else {

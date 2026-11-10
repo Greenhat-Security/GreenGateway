@@ -62,18 +62,30 @@ pub struct ConfigPlan {
 /// Compiles the configuration a reader describes into a validated plan, or
 /// into every problem it has, each with its value-free diagnostic.
 pub fn compile(
+    get_var: impl FnMut(&str) -> Result<String, VarError>,
+) -> Result<ConfigPlan, ConfigError> {
+    compile_source(get_var, false)
+}
+
+/// A validated bundle can supply policy bytes from its pinned resource.
+/// The host-routing rule needs this fact, independently of a legacy path.
+pub(crate) fn compile_source(
     mut get_var: impl FnMut(&str) -> Result<String, VarError>,
+    bundle_policy: bool,
 ) -> Result<ConfigPlan, ConfigError> {
     // How each lookup came back -- unset, empty, not Unicode, or set, never
     // the value -- is remembered so a refusal can also be reported as
     // value-free diagnostics. Every lookup still reaches the caller's reader
     // exactly as before, in the same order.
     let mut lookups = Lookups::default();
-    let (plan, report) = compile_blocks(|name: &str| {
-        let value = get_var(name);
-        lookups.record(name, &value);
-        value
-    });
+    let (plan, report) = compile_blocks(
+        |name: &str| {
+            let value = get_var(name);
+            lookups.record(name, &value);
+            value
+        },
+        bundle_policy,
+    );
     if report.is_empty() {
         Ok(plan)
     } else {
@@ -92,6 +104,7 @@ pub fn compile(
 /// every problem. It is a validated plan only when the report is empty.
 pub(super) fn compile_blocks(
     mut get_var: impl FnMut(&str) -> Result<String, VarError>,
+    bundle_policy: bool,
 ) -> (ConfigPlan, Report) {
     let mut report = Report::default();
 
@@ -146,7 +159,7 @@ pub(super) fn compile_blocks(
         RoutingInputs::read(&mut get_var),
         trusted_proxy,
         &identity,
-        documents.policy_file_configured(),
+        documents.policy_file_configured() || bundle_policy,
     )
     .report(&mut report);
     let egress = egress::compile(EgressInputs::read(&mut get_var)).report(&mut report);
@@ -180,6 +193,35 @@ pub(super) fn compile_blocks(
 }
 
 impl ConfigPlan {
+    fn provenance_blocks_mut(&mut self) -> [&mut Vec<Provenance>; 7] {
+        [
+            &mut self.listeners.provenance,
+            &mut self.identity.provenance,
+            &mut self.proxy.provenance,
+            &mut self.storage.provenance,
+            &mut self.connections.provenance,
+            &mut self.egress.provenance,
+            &mut self.runtime.provenance,
+        ]
+    }
+
+    /// This plan was built from document values and defaults. The shared
+    /// stages already distinguish supplied values from computed defaults.
+    pub(crate) fn mark_bundle_sources(&mut self, development_listen_default: bool) {
+        for fields in self.provenance_blocks_mut() {
+            for field in fields {
+                if field.source == super::stage::Source::Environment {
+                    field.source =
+                        if development_listen_default && field.setting == super::LISTEN_ADDR {
+                            super::stage::Source::Profile
+                        } else {
+                            super::stage::Source::Bundle
+                        };
+                }
+            }
+        }
+    }
+
     /// Where every input came from, in the order the inputs are read: its
     /// setting and its source, never its value.
     pub fn provenance(&self) -> Vec<Provenance> {
@@ -201,15 +243,7 @@ impl ConfigPlan {
     /// their values alone, as two `Config`s are.
     #[cfg(test)]
     pub(super) fn without_provenance(mut self) -> Self {
-        for provenance in [
-            &mut self.listeners.provenance,
-            &mut self.identity.provenance,
-            &mut self.proxy.provenance,
-            &mut self.storage.provenance,
-            &mut self.connections.provenance,
-            &mut self.egress.provenance,
-            &mut self.runtime.provenance,
-        ] {
+        for provenance in self.provenance_blocks_mut() {
             provenance.clear();
         }
         self
