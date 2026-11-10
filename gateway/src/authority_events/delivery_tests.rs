@@ -70,6 +70,18 @@ fn evidence(source: JournalSource, action: &str) -> JournaledEvidence {
         JournalSource::DocumentChange => (None, document_of(action), Some(3), Some(4)),
         JournalSource::CatalogChange => (None, CATALOG_MARKER, Some(2), Some(3)),
         // The read leaves every column the session table lacks empty.
+        JournalSource::MutationApprovalPrepare => {
+            return JournaledEvidence {
+                source,
+                resource_owner: None,
+                resource_id: Some(SESSION_MARKER.to_owned()),
+                prior_version: None,
+                new_version: None,
+                security_revision: None,
+                operation_id: Some(crate::auth::tokens::test_revoke_operation_id(4).to_string()),
+                ..evidence(JournalSource::JwtRevocation, action)
+            };
+        }
         JournalSource::AdminSession => {
             return JournaledEvidence {
                 source,
@@ -290,6 +302,67 @@ fn negotiated_revocation_uses_the_issuer_scoped_subject_and_closed_v1_contract()
         let old_bytes = serde_json::to_string(&project(&fallback, &keyring).unwrap()).unwrap();
         let mixed = super::project(&fallback, &keyring, format).unwrap();
         assert_eq!(mixed.wire_json(format).unwrap(), old_bytes);
+    }
+}
+
+#[test]
+fn qualified_prepare_requires_negotiated_format_and_provider_attribution() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let row = evidence(
+        JournalSource::MutationApprovalPrepare,
+        "mutation_approval.prepare",
+    );
+    assert!(matches!(
+        project(&row, &keyring),
+        Err(ProjectionError::QualifiedFormatRequired)
+    ));
+    let format = AuthorityEventFormat::QualifiedV1;
+    let projected = super::project(&row, &keyring, format).unwrap();
+    assert!(projected
+        .wire_json(AuthorityEventFormat::DeliveryV1)
+        .is_err());
+    let wire = projected.wire_json(format).unwrap();
+    let event: Value = serde_json::from_str(&wire).unwrap();
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../../docs/schemas/authority_event.v1.schema.json"
+    ))
+    .unwrap();
+    jsonschema::validator_for(&schema)
+        .unwrap()
+        .validate(&event)
+        .unwrap();
+    assert_eq!(
+        event["revision"],
+        serde_json::json!({"axis":"mutation_approval","before":null,"after":"1","security":null})
+    );
+    assert_eq!(
+        event["resource"]["ref"],
+        keyring
+            .derive(ReferenceDomain::MutationApproval, &[SESSION_MARKER])
+            .unwrap()
+            .as_str()
+    );
+    assert_eq!(
+        event["actor"]["subject_ref"],
+        keyring
+            .derive(
+                ReferenceDomain::ActorSubject,
+                &[ACTOR_ISSUER_MARKER, ACTOR_MARKER]
+            )
+            .unwrap()
+            .as_str()
+    );
+    for raw in [SESSION_MARKER, ACTOR_MARKER, ACTOR_ISSUER_MARKER] {
+        assert!(!wire.contains(raw));
+    }
+    let mut wrong_version = row.clone();
+    wrong_version.operation_id = Some(Uuid::new_v4().to_string());
+    for invalid in [
+        wrong_version,
+        with_actor(row.clone(), None, None, None),
+        with_actor(row, Some("service_token"), Some("service_token"), None),
+    ] {
+        assert!(super::project(&invalid, &keyring, format).is_err());
     }
 }
 
@@ -605,6 +678,9 @@ fn references_name_the_recorded_identities_and_carry_none_of_them() {
                 _ => (ReferenceDomain::Policy, vec![DOCUMENT_POLICY]),
             },
             JournalSource::CatalogChange => (ReferenceDomain::Catalog, vec![CATALOG_MARKER]),
+            JournalSource::MutationApprovalPrepare => {
+                (ReferenceDomain::MutationApproval, vec![SESSION_MARKER])
+            }
         };
         assert_eq!(
             keyring.verify(domain, &components, &record.resource.reference),

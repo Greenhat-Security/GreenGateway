@@ -9,6 +9,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Production readiness fixes
 
+- PostgreSQL can prepare an approval with a caller-bound operation ID and recover its receipt after response loss or expiry. The approval and its qualified evidence commit together. [Mutation approvals](docs/connections/operator-guide.md). Part of #425 and #757.
+
 - Add opt-in delivery of issuer-scoped `authority_event.v1` records for caller-bound PostgreSQL service-token revocations. Each record declares its wire version. [Delivery format](docs/configuration.md#authority_event_format). Part of #425.
 
 - Service-token administrators can retry a revocation after a lost response using a caller-bound UUIDv7. Both SQLite and PostgreSQL return the same revocation receipt on a matching retry and reject conflicting use of the key. [Service token admin API](docs/configuration.md#service_token_cache_ttl_ms). Part of #425.

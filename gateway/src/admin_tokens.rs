@@ -165,18 +165,10 @@ pub(super) async fn token_revoke_endpoint(
         if !actor.can_bind_operation() {
             return forbidden();
         }
-        let mut keys = parts.headers.get_all("idempotency-key").iter();
-        let key = keys.next().and_then(|value| value.to_str().ok());
-        let Some(operation_id) = key.and_then(|raw| {
-            uuid::Uuid::parse_str(raw).ok().filter(|id| {
-                auth::tokens::valid_revoke_operation_id(*id) && id.hyphenated().to_string() == raw
-            })
-        }) else {
-            return bad_request("Idempotency-Key must be one canonical lowercase UUIDv7");
+        let operation_id = match caller_operation_id(&parts.headers) {
+            Ok(id) => id,
+            Err(reason) => return bad_request(reason),
         };
-        if keys.next().is_some() {
-            return bad_request("Idempotency-Key must occur exactly once");
-        }
         if parts.uri.query().is_some()
             || parts
                 .headers

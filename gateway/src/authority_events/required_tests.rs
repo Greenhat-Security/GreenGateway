@@ -131,6 +131,8 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
     for operation in refused_in_cluster {
         let why = if operation == AuthorityOperation::PolicyFileReload {
             "does not perform it"
+        } else if operation == AuthorityOperation::MutationApprovalPrepare {
+            "requires a caller-bound preparation with qualified_v1"
         } else {
             "records no durable evidence of it"
         };

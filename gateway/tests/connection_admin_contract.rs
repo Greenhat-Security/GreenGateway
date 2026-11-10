@@ -186,6 +186,14 @@ const EXPECTED_OPERATIONS: &[ExpectedOperation] = &[
         response_definition: "MutationApproval",
     },
     ExpectedOperation {
+        path: "/v1/admin/tools/{id}/mutation-approvals",
+        method: "put",
+        operation_id: "prepareToolMutationApprovalWithReceipt",
+        request_definition: Some("PlaygroundRequest"),
+        success_status: "200",
+        response_definition: "MutationPrepareReceipt",
+    },
+    ExpectedOperation {
         path: "/v1/admin/mutation-approvals/{id}",
         method: "get",
         operation_id: "getMutationApproval",
@@ -751,6 +759,7 @@ fn connection_admin_json_schema_is_strict_resolvable_and_secret_safe() {
         "SecretDeleted",
         "CapabilityList",
         "CapabilityDetail",
+        "MutationPrepareReceipt",
         "PlaygroundResult",
         "Error",
         "ReasonedError",

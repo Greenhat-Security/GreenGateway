@@ -169,11 +169,12 @@ async fn tool_invocation(
             return bad_request("If-Match must contain exactly one strong entity tag");
         }
     };
-    // Opaque IDs are resolved only against the active registry. This does not
-    // inspect connection/catalog/provider/DNS state.
-    let Some(definition) = state.inventory.registered_tool(&raw_id) else {
+    let keyed_prepare =
+        matches!(purpose, ToolInvocationOperation::PrepareMutation) && parts.method == Method::PUT;
+    let definition = state.inventory.registered_tool(&raw_id);
+    if !keyed_prepare && definition.is_none() {
         return not_found("capability was not found");
-    };
+    }
     let body = match read_request_body(
         body,
         state
@@ -184,6 +185,19 @@ async fn tool_invocation(
     {
         Ok(body) => body,
         Err(response) => return *response,
+    };
+    let binding = if keyed_prepare {
+        match prepare_binding_or_receipt(&state, &parts, &principal, &raw_id, &supplied_etag, &body)
+            .await
+        {
+            Ok(binding) => Some(binding),
+            Err(response) => return *response,
+        }
+    } else {
+        None
+    };
+    let Some(definition) = definition else {
+        return not_found("capability was not found");
     };
     let request = match serde_json::from_slice::<tools::playground::ToolPlaygroundRequest>(&body) {
         Ok(request) => request,
@@ -275,15 +289,17 @@ async fn tool_invocation(
         if context.caller.is_none() {
             return mutation_approval_denied(&state, &parts, &principal, "prepare");
         }
-        if let Err(response) = admit_authority_change(
-            &state.authority_evidence,
-            authority_events::required::AuthorityOperation::MutationApprovalPrepare,
-            &state.audit,
-            &parts,
-            &principal,
-            &state.client_ip_policy,
-        ) {
-            return *response;
+        if binding.is_none() {
+            if let Err(response) = admit_authority_change(
+                &state.authority_evidence,
+                authority_events::required::AuthorityOperation::MutationApprovalPrepare,
+                &state.audit,
+                &parts,
+                &principal,
+                &state.client_ip_policy,
+            ) {
+                return *response;
+            }
         }
         let action = match state
             .executor
@@ -293,6 +309,17 @@ async fn tool_invocation(
             Ok(action) => action,
             Err(error) => return tool_playground_runtime_error_response(error, None),
         };
+        if let Some(binding) = binding {
+            let receipt = match state.connections.managed_store() {
+                Ok(store) => {
+                    store
+                        .create_keyed_mutation_approval(&action, &binding)
+                        .await
+                }
+                Err(_) => Err(connections::mutation_approval::ApprovalError::Unavailable),
+            };
+            return mutation_approval_receipt_result(&state, &parts, &principal, receipt);
+        }
         let record = match state.connections.managed_store() {
             Ok(store) => store.create_mutation_approval(action).await,
             Err(_) => Err(connections::mutation_approval::ApprovalError::Unavailable),

@@ -84,6 +84,56 @@ impl ApprovalPrincipal {
     }
 }
 
+/// Caller-owned identity for one keyed preparation. Only the bounded digest
+/// enters storage; the argument bytes and execution ETag never reach the
+/// receipt or journal projection.
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))] // Only the PostgreSQL authority stores bindings.
+#[derive(Clone)]
+pub(crate) struct PrepareBinding {
+    pub(crate) id: uuid::Uuid,
+    pub(crate) actor: crate::auth::change_actor::ChangeActor,
+    pub(crate) request_digest: String,
+}
+
+impl PrepareBinding {
+    pub(crate) fn new(
+        id: uuid::Uuid,
+        actor: crate::auth::change_actor::ChangeActor,
+        tool_id: &str,
+        etag: &str,
+        request_body: &[u8],
+    ) -> Result<Self, ApprovalError> {
+        use sha2::{Digest, Sha256};
+        if !crate::auth::tokens::valid_caller_operation_id(id)
+            || !actor.can_bind_operation()
+            || actor.kind() != crate::auth::change_actor::ActorKind::Principal
+        {
+            return Err(ApprovalError::Invalid);
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"greengateway.approval.prepare.request.v1");
+        for field in [tool_id.as_bytes(), etag.as_bytes(), request_body] {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field);
+        }
+        Ok(Self {
+            id,
+            actor,
+            request_digest: hex::encode(digest.finalize()),
+        })
+    }
+}
+
+/// Immutable result of committing a pending occurrence. The occurrence can
+/// subsequently expire, be reviewed or be removed independently.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct PrepareReceipt {
+    pub(crate) operation_id: String,
+    pub(crate) occurrence_id: String,
+    pub(crate) prepared_at: i64,
+    pub(crate) expires_at: i64,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct MutationAction {
     pub caller: ApprovalPrincipal,

@@ -52,11 +52,10 @@ SQLite transactions, and migration 13 of the same database adds
 `catalog_change_evidence` for managed catalog and overlay publication. Migration 14
 of the same database, and the token database's open-time schema, add the delivery
 state those tables are delivered after, so a standalone gateway with a sink delivers
-them without a journal. None of them is a standalone revision ledger, and no row is
-qualified for the required-durability contract.
-`AUTHORITY_EVIDENCE_DURABILITY=required` ([Required-durability mode](#required-durability-mode))
-refuses the rows that cannot be evidenced rather than qualifying any. Storage
-selection is unchanged.
+them without a journal. Migration 35 adds a seventh PostgreSQL journal source
+for keyed approval preparations. The required-mode contract for preparation
+admits only an issuer-bound caller using the negotiated format.
+[Approval preparation](#postgresql-approval-preparation)
 
 `AUDIT_DURABILITY=required`, the default since the request-path slice of this issue,
 is a different and narrower guarantee: the authentication and authorization stages
@@ -67,7 +66,9 @@ make any authority-change row below qualified: an admin mutation's evidence is
 still its own transaction's rows, its journal entry, or the ordinary audit event its
 handler emits after the commit. The inventory's `required_durability_mode` is
 `refuses_unsupported`: the separate, opt-in `AUTHORITY_EVIDENCE_DURABILITY=required`
-refuses every row whose `required_mode` is not `admitted`, and still qualifies none.
+checks each reachable mutation against its storage authority and refuses writes
+that lack the required evidence. PostgreSQL approval preparation has a separate
+`caller_key_required` admission rule.
 
 Run the executable inventory and proposed event-contract tests with the pinned
 Node version from `build-tools.json`:
@@ -77,10 +78,10 @@ node scripts/check-authority-evidence.mjs
 node --test scripts/test-authority-evidence.mjs
 ```
 
-The existing CI `supply-chain` job runs both commands. The checker covers 32
-operations in both storage modes, checks live source/test anchors, rejects
-missing/duplicate dispositions, and discovers unreviewed mutation endpoints in
-the four reviewed admin modules. It checks source traceability and contract
+The CI `supply-chain` job runs both commands. The checker covers every listed
+operation in both storage modes, checks live source and test anchors, rejects
+missing or duplicate coverage, and detects new mutation endpoints in the reviewed
+admin modules. It checks source traceability and contract
 shape, not transaction behavior. Adding a command, scheduler or storage writer
 outside those modules still requires explicit inventory review. Tests cited in
 the inventory are existing regression anchors, not a statement that they were
@@ -106,6 +107,7 @@ or unconfigured individual stores.
 | Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox, plus one non-cascading `catalog_change_evidence` row (action derived from the write, event/operation UUIDs, the actor's subject, kind, auth mode and canonical issuer, catalog revision transition, compiled overlay revision, shared revision, database-clock time) that outlives the replacement and the Connection's deletion, journaled and delivered since migration 32. Standalone writes the same evidence, without a shared revision, in the Connections database's own transaction (its migration 13) | Caller-bound operation identity and an issuer-scoped subject reference; standalone records are delivered without a shared security revision |
 | Service-token issue | Token row with creator, row/shared revisions and outbox, plus since migration 27 a `service_token_change_evidence` row with action `service_token.issue` (actor, event/operation UUIDs, no prior revision and row revision 1, the create outbox row's shared revision, database-clock time) in the create's transaction, journaled and delivered. Standalone writes the same row in the token database's own create transaction. Neither store records the returned plaintext or its hash | A caller-bound operation identity and an issuer-scoped subject reference; tokens issued before the evidence existed keep only `created_by`; standalone records are delivered without a shared security revision |
 | Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction. In PostgreSQL the change also journals its evidence and is delivered since PR 3. Both stores record the actor's kind, auth mode and canonical issuer (migration 24 and the token database's own columns). The keyed revoke endpoint binds the caller, action and target to the supplied operation UUID in that same transaction | Rotation and unkeyed revocation lack caller-bound operation identities. Issuer-scoped subject references and the qualified event are available for the negotiated PostgreSQL keyed-revoke path only; standalone records are delivered without a shared security revision |
+| Approval preparation | The PostgreSQL keyed PUT commits a pending occurrence, its caller-bound receipt, and its journal record in one transaction. Required mode admits this operation with `qualified_v1`. | The ordinary POST is available in best-effort mode. Standalone preparation and subsequent review, revocation and consumption in either backend have no durable authority journal. |
 | JWT revocation | Scoped JTI digest, actor row, shared revision and outbox, plus one non-cascading `jwt_revocation_evidence` row per effective revoke (actor, JTI digest, resulting expiry, shared revision) that extension, reactivation and expiry cleanup never rewrite, journaled in the same transaction and delivered since PR 3; since migration 24 the CLI's actor is recorded as kind `system`, auth mode `system` and no issuer | The CLI actor stays system provenance, not a named human; a caller-bound operation identity |
 | Admin session grant/withdrawal (#424) | With `ADMIN_SESSION_MODE=cluster_postgres`, the session row, one non-cascading `admin_session_evidence` row (event/operation UUIDs, session ID, action, reason, subject and issuer, absolute deadline, database-clock time) and, since migration 26, its journal row commit together in one statement for each grant and each withdrawal; a replacement's withdrawal and grant share one operation ID. Delivered since migration 26 on the `session` axis with keyed safe references; a grant holds journal capacity for its withdrawal, so no withdrawal is refused at capacity ([Admin session withdrawals and journal capacity](#admin-session-withdrawals-and-journal-capacity)) | Migration 33 records and delivers the verified login on grant and replacement and the system on rejection and expiry. Logout accepts a cookie or login binding without authenticating a caller. An issuer-scoped subject reference, delivery of the withdrawal reason and a caller-bound operation identity remain open. Standalone sessions are process-local memory with no durable record and stay `unsupported_future_operation` |
 
@@ -113,10 +115,11 @@ These foundations are already sufficient for their **existing atomic change-reco
 purpose**. The inventory uses `missing_metadata` and `missing_delivery` for
 remaining requirements of the proposed event contract. It does not label all
 control-plane writes lossy or ask for a second reconciliation outbox.
-`already_sufficient` is reserved for a fully qualified row; no current row
-has demonstrated all required-mode metadata and delivery requirements. The nested
-`qualified_delivery_paths` entry specifies the tested PostgreSQL keyed-revoke
-path and its consumer settings. [Authority event v1](#authority-event-v1)
+`already_sufficient` covers one operation and storage mode here. Every
+PostgreSQL approval preparation admitted by required mode has a caller-bound
+receipt and a journaled `authority_event.v1`. The inventory also records the
+specific Unix file delivery guarantees for this operation and the keyed revoke
+path. [Authority event v1](#authority-event-v1)
 
 Important standalone and operator boundaries:
 
@@ -194,10 +197,10 @@ the operation ID lacks caller binding and delivery omits the withdrawal reason.
 
 ## Authority event v1
 
-A consumer that opts in to `AUTHORITY_EVENT_FORMAT=qualified_v1` receives
-`authority_event.v1` for a PostgreSQL service-token revoke committed through
-`POST /v1{ADMIN_PREFIX}/tokens/{id}/revoke` by an authenticated principal
-with a canonical provider issuer. The UUIDv7 in the request binds the action,
+With `AUTHORITY_EVENT_FORMAT=qualified_v1`, PostgreSQL delivers `authority_event.v1`
+for a caller-bound approval preparation and for a keyed service-token revocation.
+The revocation path is `POST /v1{ADMIN_PREFIX}/tokens/{id}/revoke`, called by
+an authenticated principal with a canonical provider issuer. The UUIDv7 in the request binds the action,
 target and caller. Projection checks that the token revision advanced by one
 and that the row has a shared security revision. The actor's `subject_ref` is
 a keyed reference over the canonical issuer and subject together. The issuer
@@ -205,24 +208,24 @@ and token also have their own domain-separated references. The wire record
 contains those references, the event and operation IDs, authority ID, commit
 time and revision transition. [Event schema](schemas/authority_event.v1.schema.json)
 
-The inventory qualifies this path for durable delivery through the configured
-file sink on a Unix filesystem that honors file and directory sync, using shared
+Both keyed paths support durable delivery through the file sink on a Unix
+filesystem that honors file and directory sync, using shared
 storage or storage shipped to the same durable consumer. The file and its
 parent directory are synced before the cursor advances. A sync failure leaves
 the batch pending. An interrupted cursor update
 can redeliver the event. Consumers deduplicate on the authority and event IDs.
 The opt-in log sink writes the same representation with process-log acceptance.
 
-Consumers select the parser for each record by its `schema_version`. The default
-format, unkeyed requests, gateway service-token actors and every standalone row
-retain `authority_event_delivery.v1`. On a PostgreSQL keyed revoke, an impossible
+Consumers select the parser for each record by its `schema_version`. Legacy evidence keeps `authority_event_delivery.v1` under the default format.
+Unkeyed token revocations, gateway service-token actors and every standalone
+row also keep that representation on an opted-in stream. On a PostgreSQL keyed revoke, an impossible
 actor shape, a missing revision or a noncontiguous token revision stalls the
 opted-in stream at that batch. Historical UUIDv4 rows remain eligible for
 delivery in their existing format. No actor or operation identity is backfilled.
 [Format configuration](configuration.md#authority_event_format)
 
 Revision transitions are operation-specific. Resource creation (`connection.create`,
-`secret.create`, `service_token.issue`, `admin_session.grant`) has no prior revision; replacement,
+`secret.create`, `service_token.issue`, `admin_session.grant`, `mutation_approval.prepare`) has no prior revision; replacement,
 rotation, revocation and edits to existing authority require one. In particular,
 creating a policy rule advances its containing policy rather than creating a new
 policy authority. Publication and activation may initialize or advance a snapshot.
@@ -295,6 +298,61 @@ timestamps, imprecise numeric revisions and invalid transitions. These tests do
 not prove runtime redaction; future producer tests must construct events from
 real safe mutation inputs with synthetic sensitive markers and inspect stored
 records, logs and metrics.
+
+### PostgreSQL approval preparation
+
+Creating an occurrence with `PUT /v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals` requires PostgreSQL,
+`AUTHORITY_EVENT_FORMAT=qualified_v1`, an authorized principal with a canonical
+issuer, one strong `If-Match` ETag and one caller-supplied RFC UUIDv7
+`Idempotency-Key`. Schema 35 reserves that key across this operation and keyed
+service-token revocations. The transaction writes the pending occurrence, its
+immutable receipt and a journal entry. A journal capacity or evidence-write
+failure rolls back all three and the key reservation. The receipt survives
+approval expiry, cleanup and deletion of the Connection.
+
+After losing a response, the caller can repeat the PUT with the same identity
+and auth mode, key, tool ID, ETag and exact request body. The stored receipt
+identifies the original occurrence and its original expiry. An exact receipt remains
+readable after a downgrade to `delivery_v1`. Replaying the receipt
+does not extend its life or prepare another action. Reusing the key with a
+different binding returns a conflict. The ordinary best-effort POST continues to
+create a fresh occurrence on each request. Required mode refuses that POST.
+
+The event carries the persisted operation and event IDs, issuer-scoped caller
+reference, issuer reference, occurrence reference and database timestamp.
+Preparing a new occurrence sets its `mutation_approval` revision to 1, with
+a null prior and shared security revision. Request bytes, the ETag, digests,
+tool details and raw caller or occurrence identifiers stay out of the event.
+A dispatcher reconfigured to `delivery_v1` holds its cursor on an existing
+prepare receipt until an operator restores `qualified_v1`. In best-effort mode
+with the sink disabled, the first keyed prepare starts holding journal capacity
+until a dispatcher checkpoints the records. File delivery has
+the Unix sync and shared-storage conditions above. The log sink provides only
+local tracing acceptance.
+
+Every distinct committed keyed prepare permanently adds one row to
+`greengateway.authority_caller_operation_ids` and one to
+`greengateway.mutation_approval_prepare_evidence`. A keyed token revocation
+also adds one operation reservation. Exact retries add zero rows. The 15-minute
+approval lifetime, the active-approval limits and journal retention leave these
+tables intact. PostgreSQL storage capacity limits their growth. The gateway
+provides no receipt quota, expiry, size watermark or supported manual purge.
+Monitor the free space on the database volume and track both tables and their
+indexes, for example with this read-only size query.
+
+```sql
+SELECT pg_total_relation_size('greengateway.authority_caller_operation_ids') AS reservation_bytes,
+       pg_total_relation_size('greengateway.mutation_approval_prepare_evidence') AS receipt_bytes;
+```
+
+Provision more database capacity before the volume fills. A full journal has a
+separate limit, `AUTHORITY_EVENT_JOURNAL_CAPACITY` (default 1,000,000
+units, range 1 to 1,000,000,000). Monitor
+`greengateway_authority_event_journal_retained` against
+`greengateway_authority_event_journal_capacity`. Restore a working
+`qualified_v1` consumer, allow delivered entries to age out, shorten journal
+retention, or raise the capacity across the cluster. Removing a cursor cannot
+reclaim space after the first keyed preparation.
 
 ## Keyed safe references
 
@@ -524,10 +582,11 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
   deletes, one bounded step per pass, journal rows at or below the dispatcher's
   cursor and journaled at least `AUTHORITY_EVENT_RETENTION_HOURS` ago (default 168),
   and gives their capacity back. Once a dispatcher has claimed the cursor, no
-  undelivered row is ever pruned, whatever its age. Before any dispatcher has run
-  there is no required consumer, and rows are pruned by age alone. Retention never
-  touches an evidence table: the evidence rows remain the append-only record.
-- **What is delivered.** Each record carries the persisted `authority_id`, the
+  undelivered row is ever pruned, whatever its age. With no cursor, age-only
+  pruning applies until the first keyed approval preparation commits. That
+  receipt protects the entire journal until the dispatcher checkpoints it.
+  Retention preserves all evidence rows, including the preparation receipt.
+- **Default delivery format.** Each legacy record carries the persisted `authority_id`, the
   evidence row's `event_id` and `operation_id`, the journal position as
   `sequence`, the operation, `result: committed`, the evidence row's
   database-clock `committed_at`, `actor.recorded_ref` (the `actor.recorded`
@@ -574,7 +633,9 @@ the cursor stays a required consumer when the sink is later turned off: its
 cursor keeps holding undelivered rows. To stop delivering deliberately, remove the
 cursor as the migration role (`DELETE FROM greengateway.authority_event_cursors WHERE
 consumer = 'dispatcher'`) after the sink is off on every replica; retention then
-prunes by age.
+resumes age-only pruning if the deployment has never committed a keyed approval
+prepare. Once a prepare receipt exists, restore a working dispatcher to free
+capacity. Removing the cursor in that deployment holds the entire journal.
 
 A database restore rewinds the journal, the cursor and the evidence together. Events
 committed after the backup are gone with the changes they describe; events delivered
@@ -594,9 +655,8 @@ Not covered by PR 3, and still open:
 - **Standalone mode** has no journal; its evidence is delivered straight from the
   SQLite stores that own it, after a cursor in each
   ([Standalone delivery](#standalone-delivery)).
-- **The v1 contract.** Caller-bound operation identities beyond the keyed token revoke, and
-  an issuer-scoped subject reference, after which the delivered record can become
-  `authority_event.v1` for the actors that have an issuer. Kind, auth mode and
+- **The v1 contract.** Other operations need caller-bound identities and
+  issuer-scoped subject references before they can qualify for `authority_event.v1`. Kind, auth mode and
   issuer are recorded since migration 24 ([Actor metadata](#actor-metadata)).
 - **Service-token issue (migration 27).** A create writes its
   `service_token_change_evidence` row with action `service_token.issue` after the
@@ -1025,10 +1085,9 @@ protocol.
 
 `AUTHORITY_EVIDENCE_DURABILITY=required` ([configuration](configuration.md#authority_evidence_durability))
 is the mode PR 4 asks for: it refuses the authority changes a deployment mode cannot
-evidence instead of performing them and leaving no durable record. It does not
-make any change better evidenced, so it qualifies no row (`required_durability_supported`
-stays `false` everywhere); it decides, per row, what runs. The default,
-`best_effort`, performs every change as before. The setting is separate from
+evidence. Each row states which requests the mode admits. PostgreSQL keyed
+approval preparation has the complete caller-bound event and its tested delivery
+path. Other rows list their remaining gaps. The default is `best_effort`. The setting is separate from
 `AUDIT_DURABILITY`, whose `required` default covers request decisions only: tying
 this contract to that default would have stopped every standalone gateway from
 editing its policy and every cluster replica without a pseudonym key from starting.
@@ -1037,13 +1096,14 @@ The contract is the inventory's `required_mode` for each row, and
 `gateway/src/authority_events/required.rs` enforces it. A change is `admitted` only
 where the row's record shows that the change's own transaction durably names who
 made it, beside the change; the evidence may still lack metadata or delivery, and
-the row's other dispositions say what. Every other row is refused, unavailable or
-outside the gateway:
+the row's other dispositions identify the gaps. A `caller_key_required` row checks
+the operation key and negotiated format before admission.
 
 | `required_mode` | Rows | What required mode does |
 | --- | --- | --- |
 | `admitted` | Cluster policy, tools, Connection create, replace and delete, catalogs, token issue and change, JWT revocation, admin sessions and import, and standalone Connection create, replace and delete, local-secret create, rotate, delete and re-encryption, catalog publication and overlays, and token issue and rotate/revoke | Runs it. Its evidence is the row's `record` |
-| `refused` | Mutation approval preparation, review, revocation and consumption in both modes. Standalone policy mutations, policy file reloads, and tools publication (admin API and file reloads) | Refuses it when asked, before anything is written |
+| `caller_key_required` | PostgreSQL mutation approval preparation | Admits only the issuer-bound keyed PUT with `qualified_v1`. Required mode refuses ordinary POST. |
+| `refused` | Standalone mutation approval preparation and mutation approval review, revocation and consumption in both modes. Standalone policy mutations, policy file reloads, and tools publication (admin API and file reloads) | Refuses it when asked, before anything is written |
 | `refused_at_startup` | Standalone admin sessions (`ADMIN_SESSION_MODE=standalone_memory`) | Refuses to start |
 | `unavailable` | Cluster policy file reload and local secrets, standalone JWT revocation and import, configuration export | Nothing to refuse: the mode or the build has no such operation. A gate that is asked anyway refuses it |
 | `outside_gateway` | External secret-provider rotation | Not covered: the provider owns the write and the gateway cannot refuse it |

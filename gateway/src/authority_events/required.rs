@@ -102,6 +102,8 @@ impl From<DocumentAction> for AuthorityOperation {
 pub(crate) enum RequiredMode {
     /// The change's own transaction durably records who made it.
     Admitted,
+    /// Only PostgreSQL's caller-keyed prepare persists an immutable receipt and event.
+    CallerKeyRequired,
     /// The mode records no such evidence; the change is refused.
     Refused,
     /// The mode cannot perform the change at all, whatever the durability:
@@ -116,6 +118,7 @@ impl RequiredMode {
         match self {
             Self::Admitted => "admitted",
             Self::Refused => "refused",
+            Self::CallerKeyRequired => "caller_key_required",
             Self::Unavailable => "unavailable",
         }
     }
@@ -146,7 +149,8 @@ impl AuthorityOperation {
 
     /// What required mode does with this operation in a deployment mode.
     ///
-    /// Approval rows are mutable and expire in both modes. Cluster mode
+    /// Live approvals expire in both modes. PostgreSQL retains a separate
+    /// receipt and journal entry for caller-keyed preparation. It also
     /// commits the other supported changes with evidence in one
     /// PostgreSQL transaction, and has no policy file to reload. Standalone
     /// mode records none of them: the policy and tools files, their reloads
@@ -158,8 +162,8 @@ impl AuthorityOperation {
         match backend {
             StateBackend::Postgres => match self {
                 Self::PolicyFileReload => RequiredMode::Unavailable,
+                Self::MutationApprovalPrepare => RequiredMode::CallerKeyRequired,
                 Self::MutationApprovalConsume
-                | Self::MutationApprovalPrepare
                 | Self::MutationApprovalReview
                 | Self::MutationApprovalRevoke => RequiredMode::Refused,
                 Self::PolicyPublish
@@ -209,6 +213,9 @@ impl EvidenceRefusal {
     /// and never anything from the request.
     pub(crate) fn message(&self) -> String {
         let why = match self.mode {
+            RequiredMode::CallerKeyRequired => {
+                "requires a caller-bound preparation with qualified_v1"
+            }
             RequiredMode::Unavailable => "does not perform it",
             RequiredMode::Admitted | RequiredMode::Refused => "records no durable evidence of it",
         };
@@ -246,6 +253,7 @@ impl RefusalOrigin {
 /// settings it holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AuthorityEvidenceGate {
+    format: crate::config::AuthorityEventFormat,
     durability: AuthorityEvidenceDurability,
     backend: StateBackend,
 }
@@ -258,11 +266,15 @@ impl AuthorityEvidenceGate {
         Self {
             durability,
             backend,
+            format: crate::config::AuthorityEventFormat::DeliveryV1,
         }
     }
 
     pub(crate) fn from_config(config: &Config) -> Self {
-        Self::new(config.authority_events.durability, config.state_backend)
+        Self {
+            format: config.authority_events.format,
+            ..Self::new(config.authority_events.durability, config.state_backend)
+        }
     }
 
     /// A gate that admits every change: `best_effort` in standalone mode.
@@ -283,15 +295,25 @@ impl AuthorityEvidenceGate {
                 RequiredMode::Admitted => None,
                 // An operation the mode cannot perform is refused too: the
                 // gate never admits what it cannot vouch for.
-                mode @ (RequiredMode::Refused | RequiredMode::Unavailable) => {
-                    Some(EvidenceRefusal {
-                        operation,
-                        backend: self.backend,
-                        mode,
-                    })
-                }
+                mode @ (RequiredMode::Refused
+                | RequiredMode::Unavailable
+                | RequiredMode::CallerKeyRequired) => Some(EvidenceRefusal {
+                    operation,
+                    backend: self.backend,
+                    mode,
+                }),
             },
         }
+    }
+
+    pub(crate) fn has_prepare_receipts(&self) -> bool {
+        AuthorityOperation::MutationApprovalPrepare.required_mode(self.backend)
+            == RequiredMode::CallerKeyRequired
+    }
+
+    pub(crate) fn supports_keyed_prepare(&self) -> bool {
+        self.has_prepare_receipts()
+            && self.format == crate::config::AuthorityEventFormat::QualifiedV1
     }
 
     /// Admits `operation`, or records its refusal -- one warning and one

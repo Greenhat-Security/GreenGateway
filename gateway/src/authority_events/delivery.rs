@@ -8,7 +8,7 @@
 //! below validate every projection against.
 //!
 //! The default envelope retains its original format. An opted-in sink can
-//! receive an `authority_event.v1` for a caller-bound PostgreSQL token revoke. That
+//! receive an `authority_event.v1` for a caller-bound PostgreSQL token revoke or approval preparation. That
 //! contract names every actor by an issuer-scoped subject reference, an issuer
 //! reference, a kind and an authentication mode. Since migration 24 the
 //! evidence rows record the actor's kind, auth mode and, for a principal that
@@ -243,6 +243,14 @@ impl DeliveryRecord {
                 revision: &self.revision,
             });
         }
+        // The closed legacy schema has no approval operation. A sink must
+        // reject a mismatched batch even if the caller bypassed projection.
+        if self.operation == "mutation_approval.prepare" {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "qualified_format_required",
+            )));
+        }
         serde_json::to_string(self)
     }
 }
@@ -296,6 +304,8 @@ pub(crate) enum ProjectionError {
     MissingEvidence,
     /// The evidence row's action is not one its table may hold.
     UnknownAction,
+    /// This journal source has no representation in the legacy delivery schema.
+    QualifiedFormatRequired,
     /// A stored identifier, revision or timestamp is out of shape.
     InvalidEvidence,
     /// A reference could not be derived.
@@ -307,6 +317,7 @@ impl ProjectionError {
         match self {
             Self::MissingEvidence => "missing_evidence",
             Self::UnknownAction => "unknown_action",
+            Self::QualifiedFormatRequired => "qualified_format_required",
             Self::InvalidEvidence => "invalid_evidence",
             Self::Reference(_) => "reference",
         }
@@ -355,9 +366,9 @@ enum Transition {
     AdvanceFromZero,
     /// No prior version; the shared security revision is the new one.
     PublishOnSecurityAxis,
-    /// An admin session's grant: no prior revision, [`SESSION_REVISION`]
+    /// A prepared occurrence or an admin session's grant: no prior revision, [`SESSION_REVISION`]
     /// after, and no shared revision.
-    SessionGrant,
+    LocalCreate,
     /// An admin session's withdrawal: [`SESSION_REVISION`] before, nothing
     /// after, and no shared revision.
     SessionWithdraw,
@@ -373,7 +384,7 @@ impl Transition {
     /// Whether the change took the shared security revision. Every
     /// delivered change does except an admin session's.
     const fn takes_security_revision(self) -> bool {
-        !matches!(self, Self::SessionGrant | Self::SessionWithdraw)
+        !matches!(self, Self::LocalCreate | Self::SessionWithdraw)
     }
 }
 
@@ -434,11 +445,19 @@ fn action_shape(
             axis: "jwt_revocation",
             transition: Transition::PublishOnSecurityAxis,
         }),
+        (JournalSource::MutationApprovalPrepare, "mutation_approval.prepare") => {
+            Some(ActionShape {
+                resource_kind: "mutation_approval",
+                domain: ReferenceDomain::MutationApproval,
+                axis: "mutation_approval",
+                transition: Transition::LocalCreate,
+            })
+        }
         (JournalSource::AdminSession, ACTION_ADMIN_SESSION_GRANT) => Some(ActionShape {
             resource_kind: "admin_session",
             domain: ReferenceDomain::AdminSession,
             axis: "session",
-            transition: Transition::SessionGrant,
+            transition: Transition::LocalCreate,
         }),
         (JournalSource::AdminSession, ACTION_ADMIN_SESSION_WITHDRAW) => Some(ActionShape {
             resource_kind: "admin_session",
@@ -572,7 +591,7 @@ pub(crate) fn project(
             }
             (None, security_revision)
         }
-        Transition::SessionGrant => {
+        Transition::LocalCreate => {
             if evidence.prior_version.is_some() || evidence.new_version.is_some() {
                 return Err(ProjectionError::InvalidEvidence);
             }
@@ -608,6 +627,24 @@ pub(crate) fn project(
     .map_err(ProjectionError::Reference)?;
     let actor = journal_actor(evidence, actor, keyring)?;
     let qualified_actor = match format {
+        AuthorityEventFormat::DeliveryV1
+            if evidence.source == JournalSource::MutationApprovalPrepare =>
+        {
+            return Err(ProjectionError::QualifiedFormatRequired)
+        }
+        AuthorityEventFormat::QualifiedV1
+            if evidence.source == JournalSource::MutationApprovalPrepare =>
+        {
+            let id =
+                Uuid::parse_str(&operation_id).map_err(|_| ProjectionError::InvalidEvidence)?;
+            if !crate::auth::tokens::valid_caller_operation_id(id)
+                || Uuid::parse_str(resource_id).map(|id| id.get_version_num()) != Ok(4)
+                || canonical_uuid(resource_id)? != resource_id
+            {
+                return Err(ProjectionError::InvalidEvidence);
+            }
+            Some(qualified_principal_actor(evidence, &actor, keyring)?)
+        }
         AuthorityEventFormat::DeliveryV1 => None,
         AuthorityEventFormat::QualifiedV1 => qualified_revoke_actor(evidence, &actor, keyring)?,
     };
@@ -653,31 +690,42 @@ fn qualified_revoke_actor(
     }
     let id = Uuid::parse_str(required(evidence.operation_id.as_deref())?)
         .map_err(|_| ProjectionError::InvalidEvidence)?;
-    if !crate::auth::tokens::valid_revoke_operation_id(id) {
+    if !crate::auth::tokens::valid_caller_operation_id(id) {
         return Ok(None);
     }
     let prior = positive(evidence.prior_version)?;
     if prior.checked_add(1) != evidence.new_version {
         return Err(ProjectionError::InvalidEvidence);
     }
-    match (actor.kind.as_deref(), evidence.actor_issuer.as_deref()) {
-        (Some("service_token"), None) => Ok(None),
-        (Some("principal"), Some(issuer))
-            if canonical_issuer(issuer).as_deref() == Some(issuer) =>
-        {
-            let subject = required(evidence.actor_user_id.as_deref())?;
-            let reference = keyring
-                .derive(ReferenceDomain::ActorSubject, &[issuer, subject])
-                .map_err(ProjectionError::Reference)?;
-            Ok(Some(QualifiedActor {
-                kind: "principal",
-                subject_ref: reference.as_str().to_owned(),
-                issuer_ref: required(actor.issuer_ref.as_deref())?.to_owned(),
-                auth_mode: required(actor.auth_mode.as_deref())?.to_owned(),
-            }))
-        }
-        _ => Err(ProjectionError::InvalidEvidence),
+    if actor.kind.as_deref() == Some("service_token") && evidence.actor_issuer.is_none() {
+        return Ok(None);
     }
+    qualified_principal_actor(evidence, actor, keyring).map(Some)
+}
+
+#[cfg(feature = "postgres")]
+fn qualified_principal_actor(
+    evidence: &JournaledEvidence,
+    actor: &DeliveryActor,
+    keyring: &PseudonymKeyring,
+) -> Result<QualifiedActor, ProjectionError> {
+    let issuer =
+        required(evidence.actor_issuer.as_deref()).map_err(|_| ProjectionError::InvalidEvidence)?;
+    if actor.kind.as_deref() != Some("principal")
+        || canonical_issuer(issuer).as_deref() != Some(issuer)
+    {
+        return Err(ProjectionError::InvalidEvidence);
+    }
+    let subject = required(evidence.actor_user_id.as_deref())?;
+    let reference = keyring
+        .derive(ReferenceDomain::ActorSubject, &[issuer, subject])
+        .map_err(ProjectionError::Reference)?;
+    Ok(QualifiedActor {
+        kind: "principal",
+        subject_ref: reference.as_str().to_owned(),
+        issuer_ref: required(actor.issuer_ref.as_deref())?.to_owned(),
+        auth_mode: required(actor.auth_mode.as_deref())?.to_owned(),
+    })
 }
 
 /// A journaled row's actor. A document row is first read in migration 24's
@@ -805,7 +853,7 @@ pub(super) fn non_negative(value: Option<i64>) -> Result<i64, ProjectionError> {
 }
 
 /// The lowercase hyphenated form of a versioned RFC 4122 UUID, the shape the
-/// schema requires. The stores mint v4 UUIDs; anything else is refused.
+/// schema requires. The gateway mints v4 IDs and accepts v7 caller keys.
 pub(super) fn canonical_uuid(value: &str) -> Result<String, ProjectionError> {
     let parsed = Uuid::parse_str(value).map_err(|_| ProjectionError::InvalidEvidence)?;
     let version = parsed.get_version_num();

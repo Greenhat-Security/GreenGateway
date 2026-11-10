@@ -1,4 +1,8 @@
 //! Exercise mutation preparation and independent review through authenticated HTTP.
+#[cfg(feature = "postgres")]
+#[path = "issue_757_mutation_approvals_cluster.rs"]
+mod postgres;
+
 use super::*;
 use sha2::{Digest, Sha256};
 
@@ -45,13 +49,23 @@ pub(super) async fn call(
         header::AUTHORIZATION,
         format!("Bearer {token}").parse().unwrap(),
     );
+    assert_response(router, request, token, expected).await
+}
+
+async fn assert_response(
+    router: &Router,
+    request: Request<Body>,
+    token: &str,
+    expected: StatusCode,
+) -> (HeaderMap, Value) {
+    let path = request.uri().path().to_owned();
     let response = router.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let headers = response.headers().clone();
     let wire = body_string(response).await;
     assert!(!wire.contains(PRIVATE_ID) && !wire.contains("private%20widget"));
     assert!(!wire.contains(PRIVATE_NAME) && !wire.contains(token));
-    assert_eq!(status, expected, "{uri}: {wire}");
+    assert_eq!(status, expected, "{path}: {wire}");
     (headers, serde_json::from_str(&wire).unwrap_or(Value::Null))
 }
 
@@ -84,11 +98,67 @@ pub(super) async fn prepare_route(router: &Router, token: &str, name: &str) -> (
     )
 }
 
+async fn create_widget_connection(
+    router: &Router,
+    operator: &str,
+    origin: &str,
+) -> (String, String, Value) {
+    let (headers, _) = call(
+        router,
+        Method::GET,
+        CONNECTIONS_ADMIN_ROUTE,
+        operator,
+        None,
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    let (headers, connection) = call(
+        router,
+        Method::POST,
+        CONNECTIONS_ADMIN_ROUTE,
+        operator,
+        Some(headers[CONNECTION_COLLECTION_ETAG_HEADER].to_str().unwrap()),
+        Some(
+            json!({"display_name":"Widgets","kind":"http_api","enabled":true,
+            "endpoint":{"base_url":origin, "base_path":"/v1"}, "authentication":{"type":"none"},
+            "discovery":{"type":"managed_openapi","use_connection_authentication":false}}),
+        ),
+        StatusCode::CREATED,
+    )
+    .await;
+    let connection_id = connection["id"].as_str().unwrap();
+    let connection_etag = headers[header::ETAG].to_str().unwrap();
+    let registered = register_widgets(router, operator, connection_id, connection_etag).await;
+    (
+        connection_id.to_owned(),
+        connection_etag.to_owned(),
+        registered,
+    )
+}
+
 pub(super) async fn register_widgets(
     router: &Router,
     operator: &str,
     connection_id: &str,
     connection_etag: &str,
+) -> Value {
+    register_operations(
+        router,
+        operator,
+        connection_id,
+        connection_etag,
+        &["getWidget", "updateWidget"],
+    )
+    .await
+}
+
+async fn register_operations(
+    router: &Router,
+    operator: &str,
+    connection_id: &str,
+    connection_etag: &str,
+    names: &[&str],
 ) -> Value {
     let catalog = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi");
     let (_, preview) = call(
@@ -101,13 +171,19 @@ pub(super) async fn register_widgets(
         StatusCode::OK,
     )
     .await;
+    let confirmations: Vec<_> = preview["security_confirmations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|confirmation| names.contains(&confirmation["tool_name"].as_str().unwrap()))
+        .collect();
     let registration = json!({
         "spec": SPEC,
         "spec_digest": preview["spec_digest"],
         "expected_spec_revision": preview["spec_revision"],
         "expected_catalog_revision": preview["catalog_revision"],
-        "security_confirmations": preview["security_confirmations"],
-        "selected_tool_names": ["getWidget", "updateWidget"]
+        "security_confirmations": confirmations,
+        "selected_tool_names": names
     });
     let (_, registered) = call(
         router,
@@ -120,6 +196,27 @@ pub(super) async fn register_widgets(
     )
     .await;
     registered
+}
+
+fn keyed_request(
+    path: &str,
+    token: &str,
+    etag: Option<&str>,
+    body: &str,
+    keys: &[&str],
+) -> Request<Body> {
+    let mut request =
+        connection_admin_request(Method::PUT, path, None, Some(body.to_owned()), etag, false);
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    for key in keys {
+        request
+            .headers_mut()
+            .append("idempotency-key", key.parse().unwrap());
+    }
+    request
 }
 
 #[tokio::test]
@@ -175,33 +272,8 @@ async fn mutation_approval_binds_rendered_request_and_enforces_independent_revie
     let reviewer = signed_token_with_issuer("bob", &["reviewer"], ISSUER);
     let requester_as_reviewer = signed_token_with_issuer("alice", &["reviewer"], ISSUER);
 
-    let (headers, _) = call(
-        &router,
-        Method::GET,
-        CONNECTIONS_ADMIN_ROUTE,
-        &operator,
-        None,
-        None,
-        StatusCode::OK,
-    )
-    .await;
-    let (headers, connection) = call(
-        &router,
-        Method::POST,
-        CONNECTIONS_ADMIN_ROUTE,
-        &operator,
-        Some(headers[CONNECTION_COLLECTION_ETAG_HEADER].to_str().unwrap()),
-        Some(
-            json!({"display_name":"Widgets","kind":"http_api","enabled":true,
-            "endpoint":{"base_url":origin, "base_path":"/v1"}, "authentication":{"type":"none"},
-            "discovery":{"type":"managed_openapi","use_connection_authentication":false}}),
-        ),
-        StatusCode::CREATED,
-    )
-    .await;
-    let connection_id = connection["id"].as_str().unwrap();
-    let connection_etag = headers[header::ETAG].to_str().unwrap();
-    let registered = register_widgets(&router, &operator, connection_id, connection_etag).await;
+    let (connection_id, connection_etag, registered) =
+        create_widget_connection(&router, &operator, &origin).await;
     let (read_only, read_etag) = prepare_route(&router, &requester, "getWidget").await;
     let (_, unsupported) = call(
         &router,
@@ -327,6 +399,15 @@ async fn mutation_approval_binds_rendered_request_and_enforces_independent_revie
         test_audit_event_sender(),
     )
     .unwrap();
+    let key = auth::tokens::test_revoke_operation_id(1).to_string();
+    let raw_body = body.as_ref().unwrap().to_string();
+    for (instance, expected) in [
+        (&router, StatusCode::NOT_IMPLEMENTED),
+        (&required, StatusCode::CONFLICT),
+    ] {
+        let request = keyed_request(&prepare, &requester, etag, &raw_body, &[&key]);
+        assert_response(instance, request, &requester, expected).await;
+    }
     let revoke = format!("{record}/revoke");
     let execute = format!("{prepare}/{}/execute", pending["id"].as_str().unwrap());
     for (path, token, tag, payload, operation) in [
