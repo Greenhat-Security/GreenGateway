@@ -8,9 +8,10 @@
 //! back with [`read_bundle`](super::read_bundle), and only then renames them
 //! into place.
 //!
-//! The deployment document records its profile. Development bundles also
-//! spell out their loopback public listener. Resource ownership depends on
-//! the selected topology:
+//! The deployment document records its profile and state backend. Standalone
+//! selects the local audit store for required audit durability, while a
+//! cluster uses the PostgreSQL audit store. Development bundles also spell
+//! out their loopback public listener. Resource ownership depends on topology:
 //!
 //! - **standalone** topology: a policy that denies by default and enforces
 //!   its decisions, with no role at all unless the answers bind an operator,
@@ -382,7 +383,7 @@ fn is_encoded_provider_name(name: &str) -> bool {
 /// and then each file in the order the manifest references it. The
 /// `.gitattributes` beside them is [`GITATTRIBUTES`].
 pub fn scaffold(profile: Profile, answers: &Answers) -> Vec<SourceFile> {
-    let deployment = deployment_document(profile).into_bytes();
+    let deployment = deployment_document(profile, answers.topology).into_bytes();
     let deployment_pin = super::sha256_pin(&deployment);
     let mut files = vec![SourceFile {
         role: FileRole::Deployment,
@@ -468,7 +469,7 @@ pub fn scaffold(profile: Profile, answers: &Answers) -> Vec<SourceFile> {
     files
 }
 
-fn deployment_document(profile: Profile) -> String {
+fn deployment_document(profile: Profile, topology: Topology) -> String {
     let notice = match profile {
         Profile::Development => {
             "# The development profile is for local evaluation, not for production.\n"
@@ -488,6 +489,10 @@ fn deployment_document(profile: Profile) -> String {
             "  listeners:\n    public:\n      address: \"{address}\"\n"
         ));
     }
+    deployment.push_str(match topology {
+        Topology::Standalone => "  state:\n    backend: sqlite\n    stores: [audit]\n",
+        Topology::Cluster => "  state:\n    backend: postgres\n",
+    });
     deployment
 }
 
