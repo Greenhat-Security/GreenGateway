@@ -234,6 +234,9 @@ export function PolicyStudioView() {
   const draftRef = useRef<PolicyDraft | null>(null);
   const serverSourceRef = useRef('');
   const sourceRef = useRef('');
+  // A manual Source edit can contain duplicate keys that JSON.parse drops.
+  // Verify that exact text before the condition editor rewrites the tree.
+  const sourceFromStructuredEditor = useRef(false);
   const [activeSection, setActiveSection] = useState<StudioSection>('overview');
   const [validation, setValidation] = useState<ValidationState>({ kind: 'idle' });
   const [busy, setBusy] = useState<BusyAction | null>(null);
@@ -268,7 +271,8 @@ export function PolicyStudioView() {
   const [bindingProblems, setBindingProblems] = useState<ReadonlyMap<string, string>>(new Map());
   const [reviewInto, setReviewInto] = useState<ReviewInto>('new');
 
-  const setSource = useCallback((next: string) => {
+  const setSource = useCallback((next: string, formatted = false) => {
+    sourceFromStructuredEditor.current = formatted;
     sourceRef.current = next;
     setSourceState(next);
   }, []);
@@ -1113,7 +1117,7 @@ export function PolicyStudioView() {
         return;
       }
       if (result.converted && result.policy !== null) {
-        setSource(formatCandidate(result.policy));
+        setSource(formatCandidate(result.policy), true);
         setConversion(result);
         setNotice({
           title: 'Converted to policy v1',
@@ -1810,7 +1814,7 @@ export function PolicyStudioView() {
   }
 
   function updateDocument(next: JsonObject) {
-    setSource(formatCandidate(next));
+    setSource(formatCandidate(next), true);
   }
 
   function showDiagnostic(diagnostic: PolicyDiagnostic) {
@@ -2232,6 +2236,9 @@ export function PolicyStudioView() {
                   ) : activeSection === 'rules' ? (
                     <RulesSection
                       key={`${draft.summary.draft_id}:${draft.etag}`}
+                      conditionSourceReady={
+                        source === serverSource || sourceFromStructuredEditor.current || currentInspection?.valid === true
+                      }
                       document={parsed.document}
                       diagnostics={diagnostics}
                       disabled={!editable}

@@ -805,6 +805,10 @@
               "description": "AUTHORITY_EVENT_SINK in environment mode: docs/configuration.md#authority_event_sink.",
               "enum": ["none", "log", "file"]
             },
+            "event_format": {
+              "description": "AUTHORITY_EVENT_FORMAT in environment mode: docs/configuration.md#authority_event_format.",
+              "enum": ["delivery_v1", "qualified_v1"]
+            },
             "pseudonym_key_alias": {
               "description": "AUTHORITY_PSEUDONYM_KEY_ALIAS in environment mode: docs/configuration.md#authority_pseudonym_key_alias.",
               "$ref": "#/$defs/text"

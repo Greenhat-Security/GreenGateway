@@ -152,6 +152,27 @@ pub(super) fn read(document: &JsonValue) -> (Option<document::Deployment>, Vec<B
     (deployment, diagnostics)
 }
 
+#[test]
+fn every_document_runtime_field_reaches_the_shared_compiler() {
+    let mut spec = envelope();
+    for field in FIELDS
+        .iter()
+        .filter(|field| field.domain == catalog::Domain::RuntimeSettings)
+    {
+        let input = match field.environment {
+            "CORS_ALLOW_ORIGINS" => json!(["https://console.example"]),
+            "VALIDATION_ALLOWED_CONTENT_TYPES" => json!(["application/json"]),
+            _ => valid(field),
+        };
+        set(&mut spec, field.document_path().unwrap(), input);
+    }
+    let node = node(&spec);
+    let mut diagnostics = Vec::new();
+    let deployment = document::deployment(&node, &file(), &mut diagnostics).unwrap();
+    diagnostics.extend(deployment.settings.public_diagnostics(&node, &file()));
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
 /// The codes and pointers of a refused document.
 pub(super) fn refusals(document: &JsonValue) -> Vec<(Code, String)> {
     let (deployment, diagnostics) = read(document);

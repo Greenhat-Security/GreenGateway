@@ -9,6 +9,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Production readiness fixes
 
+- Add opt-in delivery of issuer-scoped `authority_event.v1` records for caller-bound PostgreSQL service-token revocations. Each record declares its wire version. [Delivery format](docs/configuration.md#authority_event_format). Part of #425.
+
 - Service-token administrators can retry a revocation after a lost response using a caller-bound UUIDv7. Both SQLite and PostgreSQL return the same revocation receipt on a matching retry and reject conflicting use of the key. [Service token admin API](docs/configuration.md#service_token_cache_ttl_ms). Part of #425.
 
 - Update the MCP SDK to rmcp 3.9.0, the first release that fixes [RUSTSEC-2026-0462](https://rustsec.org/advisories/RUSTSEC-2026-0462.html). The gateway keeps the response-size limits in its custom MCP client.

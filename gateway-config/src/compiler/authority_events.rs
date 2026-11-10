@@ -34,6 +34,7 @@ use crate::{connections::MAX_SECRET_ID_BYTES, opaque_id::is_valid_opaque_id};
 
 pub const AUTHORITY_EVIDENCE_DURABILITY: &str = "AUTHORITY_EVIDENCE_DURABILITY";
 pub const AUTHORITY_EVENT_SINK: &str = "AUTHORITY_EVENT_SINK";
+pub const AUTHORITY_EVENT_FORMAT: &str = "AUTHORITY_EVENT_FORMAT";
 pub const AUTHORITY_EVENT_FILE: &str = "AUTHORITY_EVENT_FILE";
 pub const AUTHORITY_PSEUDONYM_KEY_ALIAS: &str = "AUTHORITY_PSEUDONYM_KEY_ALIAS";
 pub const AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS: &str = "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS";
@@ -113,6 +114,38 @@ impl AuthorityEventSinkSetting {
     }
 }
 
+/// The record schemas that an authority-event consumer accepts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AuthorityEventFormat {
+    /// Emit every record as `authority_event_delivery.v1`.
+    #[default]
+    DeliveryV1,
+    /// Emit qualifying records as `authority_event.v1` and the rest
+    /// as `authority_event_delivery.v1`.
+    QualifiedV1,
+}
+
+impl AuthorityEventFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DeliveryV1 => "delivery_v1",
+            Self::QualifiedV1 => "qualified_v1",
+        }
+    }
+}
+
+impl FromStr for AuthorityEventFormat {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "delivery_v1" => Ok(Self::DeliveryV1),
+            "qualified_v1" => Ok(Self::QualifiedV1),
+            _ => Err("expected one of delivery_v1, qualified_v1"),
+        }
+    }
+}
+
 /// The validated settings. The defaults deliver nothing and refuse no change
 /// for its evidence, in either mode.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +153,7 @@ pub struct AuthorityEventSettings {
     /// Whether a change this deployment cannot evidence is refused.
     pub durability: AuthorityEvidenceDurability,
     pub sink: AuthorityEventSinkSetting,
+    pub format: AuthorityEventFormat,
     /// The secret alias of the current pseudonym key; required when a sink
     /// is configured.
     pub pseudonym_key_alias: Option<String>,
@@ -134,6 +168,7 @@ impl Default for AuthorityEventSettings {
         Self {
             durability: AuthorityEvidenceDurability::BestEffort,
             sink: AuthorityEventSinkSetting::None,
+            format: AuthorityEventFormat::DeliveryV1,
             pseudonym_key_alias: None,
             previous_pseudonym_key_alias: None,
             journal_capacity: DEFAULT_AUTHORITY_EVENT_JOURNAL_CAPACITY,
@@ -192,6 +227,7 @@ impl fmt::Display for UnknownSink {
 pub(super) struct AuthorityEventInputs {
     durability: RawInput,
     sink: RawInput,
+    format: RawInput,
     file: RawInput,
     pseudonym_key_alias: RawInput,
     previous_pseudonym_key_alias: RawInput,
@@ -208,6 +244,7 @@ impl AuthorityEventInputs {
                 get_var(AUTHORITY_EVIDENCE_DURABILITY),
             ),
             sink: RawInput::new(AUTHORITY_EVENT_SINK, get_var(AUTHORITY_EVENT_SINK)),
+            format: RawInput::new(AUTHORITY_EVENT_FORMAT, get_var(AUTHORITY_EVENT_FORMAT)),
             file: RawInput::new(AUTHORITY_EVENT_FILE, get_var(AUTHORITY_EVENT_FILE)),
             pseudonym_key_alias: RawInput::new(
                 AUTHORITY_PSEUDONYM_KEY_ALIAS,
@@ -232,6 +269,7 @@ impl AuthorityEventInputs {
         [
             &self.durability,
             &self.sink,
+            &self.format,
             &self.file,
             &self.pseudonym_key_alias,
             &self.previous_pseudonym_key_alias,
@@ -275,6 +313,15 @@ pub(super) fn compile(
             sink_raw,
             SinkKind::None,
             "authority event sink",
+            problems,
+        )
+    });
+    let format = findings.input(AUTHORITY_EVENT_FORMAT, |problems| {
+        parse_var(
+            AUTHORITY_EVENT_FORMAT,
+            inputs.format.value(),
+            AuthorityEventFormat::DeliveryV1,
+            "authority event format",
             problems,
         )
     });
@@ -456,6 +503,7 @@ pub(super) fn compile(
     AuthorityEventSettings {
         durability,
         sink,
+        format,
         pseudonym_key_alias: key,
         previous_pseudonym_key_alias: previous,
         journal_capacity,

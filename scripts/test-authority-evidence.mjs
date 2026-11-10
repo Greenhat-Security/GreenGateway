@@ -23,6 +23,24 @@ test("inventory covers each required operation in both modes with live source an
   assert.equal(validateInventory(inventory()).operationModePairs, OPERATIONS.length * 2);
 });
 
+test("qualification stays within the negotiated issuer-bound PostgreSQL file delivery path", () => {
+  for (const [field, value] of Object.entries({
+    storage_mode: "standalone", method: "DELETE", operation: "service_token.rotate",
+    operation_id_version: 4, actor_kind: "service_token", issuer: "optional",
+    format: "delivery_v1", durable_sink: "log", filesystem: "unknown", wire_schema: "authority_event_delivery.v1",
+  })) {
+    const changed = inventory();
+    const [path] = changed.groups.find(group => group.id === "token_change_postgres").qualified_delivery_paths;
+    path.criteria[field] = value;
+    assert.throws(() => validateInventory(changed), /qualified revoke criteria/);
+  }
+  const absent = inventory();
+  const renamed = absent.groups.find(group => group.id === "token_change_postgres");
+  renamed.id = "renamed_revoke_group";
+  delete renamed.qualified_delivery_paths;
+  assert.throws(() => validateInventory(absent), /missing qualified revoke path/);
+});
+
 test("evidence anchors only in the gateway or the compiler it links", () => {
   const anchored = (path) => {
     const value = inventory();
