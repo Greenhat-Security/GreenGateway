@@ -700,10 +700,14 @@ async fn the_file_sink_holds_the_records_and_no_identifier() {
     let scratch = Scratch::new("file");
     let path = scratch.path("tokens.sqlite");
     let tokens = SqliteTokenStore::open(&path).expect("the token store opens");
-    let token_id = change_a_token(&tokens, None);
+    let revoke_id = crate::auth::tokens::test_revoke_operation_id(3);
+    let token_id = change_a_token(&tokens, Some(revoke_id));
     let authority: Arc<dyn StandaloneEvidenceAuthority> = Arc::new(tokens);
     let events = scratch.path("authority-events.jsonl");
-    let sink = FileSink::new(events.clone());
+    let sink = FileSink::new(
+        events.clone(),
+        crate::config::AuthorityEventFormat::QualifiedV1,
+    );
     let stop = CancellationToken::new();
     for mut lane in lanes_for(&authority, &generated_key_hex()).await {
         lane.deliver_until_caught_up(&sink, test_config(100), &stop)
@@ -716,6 +720,8 @@ async fn the_file_sink_holds_the_records_and_no_identifier() {
         .map(|line| serde_json::from_str(line).expect("every line is one record"))
         .collect();
     assert_eq!(lines.len(), 3);
+    assert_eq!(lines[2].schema_version, "authority_event_delivery.v1");
+    assert_eq!(lines[2].operation_id, revoke_id.to_string());
     for marker in [ACTOR_MARKER, ACTOR_ISSUER_MARKER, token_id.as_str()] {
         assert!(!written.contains(marker), "{marker} reached the file");
     }

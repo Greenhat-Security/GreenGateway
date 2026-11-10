@@ -78,7 +78,8 @@ pub mod storage;
 mod tests;
 
 pub use authority_events::{
-    AuthorityEventSettings, AuthorityEventSinkSetting, AuthorityEvidenceDurability,
+    AuthorityEventFormat, AuthorityEventSettings, AuthorityEventSinkSetting,
+    AuthorityEvidenceDurability,
 };
 pub use plan::{compile, ConfigPlan};
 

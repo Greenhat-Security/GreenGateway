@@ -1800,7 +1800,61 @@
       ],
       "required_durability_supported": false,
       "required_mode": "admitted",
-      "test_claim": "PostgreSQL-gated regression anchors for the transactional rotate/revoke evidence and its journaled delivery: commit order, crash redelivery under the same event IDs, retention floors and capacity refusal. They do not certify the proposed authority_event.v1 contract."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional rotate/revoke evidence and its journaled delivery: commit order, crash redelivery under the same event IDs, retention floors and capacity refusal. They do not certify the proposed authority_event.v1 contract.",
+      "qualified_delivery_paths": [
+        {
+          "criteria": {
+            "operation": "service_token.revoke",
+            "storage_mode": "postgres",
+            "method": "POST",
+            "route": "/v1{ADMIN_PREFIX}/tokens/{id}/revoke",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "wire_schema": "authority_event.v1",
+            "filesystem": "unix_file_and_directory_sync"
+          },
+          "guarantee": "The actor-bound revoke, one contiguous token row revision, the outbox security revision and the journal append commit together. The negotiated file sink syncs the qualified event and its parent directory on Unix before cursor advance. Consumers deduplicate on (authority_id, event_id). Durable cluster file delivery assumes shared storage or shipping to the same durable consumer. The opt-in log sink emits the same representation with process-log acceptance only. Unkeyed requests, service-token callers and standalone stores do not qualify for this path.",
+          "sources": [
+            {
+              "path": "gateway/src/authority_events/delivery.rs",
+              "anchor": "fn qualified_revoke_actor("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery.rs",
+              "anchor": "struct QualifiedEvent<"
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn append_synced("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/authority_events/delivery_tests.rs",
+              "anchor": "fn negotiated_revocation_uses_the_issuer_scoped_subject_and_closed_v1_contract("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery_tests.rs",
+              "anchor": "fn negotiated_revocation_refuses_impossible_keyed_evidence("
+            },
+            {
+              "path": "gateway/src/authority_events/dispatcher_tests.rs",
+              "anchor": "async fn negotiated_file_sink_redelivers_qualified_revocation_and_legacy_records("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn qualified_file_sync_handles_a_symlink_and_refuses_a_replaced_name("
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "token_change_standalone",

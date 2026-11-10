@@ -108,6 +108,7 @@ export const GREEN_GATEWAY_ENV_KEYS = [
   // Standalone delivery of the SQLite stores' authority evidence: required
   // durability refuses to start without a sink.
   "AUTHORITY_EVENT_SINK",
+  "AUTHORITY_EVENT_FORMAT",
   "AUTHORITY_EVENT_FILE",
   "AUTHORITY_PSEUDONYM_KEY_ALIAS",
   "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS",

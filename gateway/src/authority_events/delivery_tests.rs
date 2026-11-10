@@ -4,6 +4,13 @@ use super::*;
 use crate::authority_events::pseudonym::{test_support::generated_keyring, ReferenceCheck};
 use crate::authority_events::standalone_delivery::{StandaloneShape, STANDALONE_SHAPES};
 
+fn project(
+    row: &JournaledEvidence,
+    keyring: &PseudonymKeyring,
+) -> Result<DeliveryRecord, ProjectionError> {
+    super::project(row, keyring, AuthorityEventFormat::DeliveryV1)
+}
+
 // Synthetic markers standing in for real identifiers. If any of them reaches
 // a serialized record, the projection leaked an identifier.
 const ACTOR_MARKER: &str = "actor-marker@example.test";
@@ -183,6 +190,136 @@ fn delivery_schema() -> jsonschema::Validator {
     )
     .expect("the delivery schema should be JSON");
     jsonschema::validator_for(&schema).expect("the delivery schema should compile")
+}
+
+#[test]
+fn negotiated_revocation_uses_the_issuer_scoped_subject_and_closed_v1_contract() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let mut row = evidence(
+        JournalSource::ServiceTokenChange,
+        ACTION_SERVICE_TOKEN_REVOKE,
+    );
+    let caller_id = crate::auth::tokens::test_revoke_operation_id(1).to_string();
+    row.operation_id = Some(caller_id.clone());
+    let format = AuthorityEventFormat::QualifiedV1;
+    let selected = super::project(&row, &keyring, format).expect("a keyed revoke qualifies");
+    let encoded = selected.wire_json(format).unwrap();
+    let event: Value = serde_json::from_str(&encoded).unwrap();
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../../docs/schemas/authority_event.v1.schema.json"
+    ))
+    .unwrap();
+    jsonschema::validator_for(&schema)
+        .unwrap()
+        .validate(&event)
+        .unwrap();
+    assert_eq!(event["schema_version"], "authority_event.v1");
+    assert_eq!(event["event_id"], row.event_id);
+    assert_eq!(event["operation_id"], caller_id);
+    assert_eq!(
+        event["revision"],
+        serde_json::json!({"axis":"token","before":"1","after":"2","security":"17"})
+    );
+    let reference = keyring
+        .derive(
+            ReferenceDomain::ActorSubject,
+            &[ACTOR_ISSUER_MARKER, ACTOR_MARKER],
+        )
+        .unwrap();
+    assert_eq!(event["actor"]["subject_ref"], reference.as_str());
+    assert_eq!(
+        event["actor"]["issuer_ref"],
+        selected.actor.issuer_ref.as_deref().unwrap()
+    );
+    assert_ne!(reference.as_str(), selected.actor.recorded_ref);
+    for raw in [ACTOR_MARKER, ACTOR_ISSUER_MARKER, TOKEN_MARKER] {
+        assert!(!encoded.contains(raw), "raw actor or resource in output");
+    }
+    let second_issuer = with_actor(
+        row.clone(),
+        Some("principal"),
+        Some("session_cookie"),
+        Some("https://second.example.test"),
+    );
+    let other: Value = serde_json::from_str(
+        &super::project(&second_issuer, &keyring, format)
+            .unwrap()
+            .wire_json(format)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(other["actor"]["subject_ref"], event["actor"]["subject_ref"]);
+
+    let legacy = project(&row, &keyring).unwrap();
+    let previous_bytes = serde_json::to_string(&legacy).unwrap();
+    assert_eq!(
+        selected
+            .wire_json(AuthorityEventFormat::DeliveryV1)
+            .unwrap(),
+        previous_bytes
+    );
+    assert_eq!(
+        legacy.wire_json(AuthorityEventFormat::DeliveryV1).unwrap(),
+        previous_bytes
+    );
+    for fallback in [
+        evidence(
+            JournalSource::ServiceTokenChange,
+            ACTION_SERVICE_TOKEN_REVOKE,
+        ),
+        evidence(
+            JournalSource::ServiceTokenChange,
+            ACTION_SERVICE_TOKEN_ROTATE,
+        ),
+        with_actor(
+            row.clone(),
+            Some("service_token"),
+            Some("service_token"),
+            None,
+        ),
+        with_actor(
+            evidence(
+                JournalSource::ServiceTokenChange,
+                ACTION_SERVICE_TOKEN_REVOKE,
+            ),
+            None,
+            None,
+            None,
+        ),
+    ] {
+        let old_bytes = serde_json::to_string(&project(&fallback, &keyring).unwrap()).unwrap();
+        let mixed = super::project(&fallback, &keyring, format).unwrap();
+        assert_eq!(mixed.wire_json(format).unwrap(), old_bytes);
+    }
+}
+
+#[test]
+fn negotiated_revocation_refuses_impossible_keyed_evidence() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let mut row = evidence(
+        JournalSource::ServiceTokenChange,
+        ACTION_SERVICE_TOKEN_REVOKE,
+    );
+    row.operation_id = Some(crate::auth::tokens::test_revoke_operation_id(2).to_string());
+    let mut skipped_revision = row.clone();
+    skipped_revision.new_version = Some(3);
+    for invalid in [
+        skipped_revision,
+        with_actor(row.clone(), None, None, None),
+        with_actor(row.clone(), Some("system"), Some("system"), None),
+        with_actor(row.clone(), Some("principal"), Some("bearer_token"), None),
+        with_actor(
+            row,
+            Some("principal"),
+            Some("bearer_token"),
+            Some(" https://issuer.example.test/ "),
+        ),
+    ] {
+        assert!(matches!(
+            super::project(&invalid, &keyring, AuthorityEventFormat::QualifiedV1),
+            Err(ProjectionError::InvalidEvidence)
+        ));
+    }
 }
 
 #[test]
