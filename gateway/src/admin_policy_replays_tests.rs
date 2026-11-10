@@ -872,10 +872,11 @@ impl Drop for ReplayTestDirectory {
 /// the real worker is waiting for its completion audit receipt.
 #[tokio::test]
 async fn standalone_replay_crash_child() {
-    let Some(dir) = std::env::var_os("GATEWAY_TEST_STANDALONE_REPLAY_CRASH_DIR") else {
+    let dir = std::env::current_dir().unwrap();
+    let request = dir.join("standalone-replay-crash-request.json");
+    if !request.is_file() {
         return;
-    };
-    let dir = std::path::PathBuf::from(dir);
+    }
     #[derive(Default)]
     struct HoldCompletion(std::sync::Mutex<Option<audit::DurableAck>>);
     impl audit::AuditSink for HoldCompletion {
@@ -894,7 +895,7 @@ async fn standalone_replay_crash_child() {
     let sink = Arc::new(HoldCompletion::default());
     let audit = audit::AuditLog::new_required(sink.clone(), Duration::from_secs(60));
     let router = restart_router(&dir, audit).expect("child gateway starts");
-    let body = std::fs::read_to_string(dir.join("request.json")).unwrap();
+    let body = std::fs::read_to_string(request).unwrap();
     let response = start(&router, operator("restart-owner"), body).await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let job = json_body(response).await;
@@ -930,13 +931,17 @@ async fn startup_interrupts_a_crashed_job_and_keeps_owner_and_retry_binding() {
     .unwrap();
     let mut body = replay_body(&registry_etag(), json!({"source":"active"}));
     body["idempotency_key"] = json!("restart-key-canary");
-    std::fs::write(path.join("request.json"), body.to_string()).unwrap();
+    std::fs::write(
+        path.join("standalone-replay-crash-request.json"),
+        body.to_string(),
+    )
+    .unwrap();
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "tests::admin_policy_replays_tests::standalone_replay_crash_child",
         ])
-        .env("GATEWAY_TEST_STANDALONE_REPLAY_CRASH_DIR", path)
+        .current_dir(path)
         .spawn()
         .unwrap();
     let mut child = Child(child);
