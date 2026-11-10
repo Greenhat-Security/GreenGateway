@@ -51,6 +51,12 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("{err}");
             std::process::exit(1);
         }
+        Err(StartupFailure::Bundle(diagnostics)) => {
+            for diagnostic in diagnostics {
+                eprintln!("{diagnostic}");
+            }
+            std::process::exit(1);
+        }
         Err(StartupFailure::Stage(error)) => Err(error),
     }
 }

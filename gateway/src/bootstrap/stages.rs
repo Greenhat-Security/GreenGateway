@@ -8,6 +8,8 @@ use super::*;
 pub(crate) enum StartupFailure {
     /// The configuration compiler refused the environment. No stage ran.
     Configuration(config::ConfigError),
+    /// The pinned bundle failed the same reader as the offline tools.
+    Bundle(Vec<gateway_config::bundle::BundleDiagnostic>),
     /// Preflight, activation or serving failed.
     Stage(Box<dyn std::error::Error>),
 }
@@ -97,14 +99,10 @@ impl ServingFailure {
 
 /// Serving startup: the configuration compiler, then the stages.
 ///
-/// The compiler runs first and alone. It is handed the environment reader
-/// and nothing else -- no file system, resolver, client, store, provider or
-/// database -- so a configuration it refuses stops startup before anything
-/// has been opened, resolved or connected to, and the configuration every
-/// stage receives is that one compiled result. Its effective values and the
-/// order its problems are reported in are `Config::from_env`'s, and the
-/// stages run the startup work in the order it has always run in, so a
-/// startup that fails still fails with the same error.
+/// Source selection checks for competing environment settings before any I/O.
+/// Environment mode hands the shared compiler only the environment reader and
+/// passes its result to every stage. Bundle mode reads one pinned generation,
+/// checks its standalone state requirements and stops before activation.
 ///
 /// Serving starts only with a gateway activation built in full. When
 /// preflight or activation fails, or serving fails before any listener
@@ -113,9 +111,36 @@ impl ServingFailure {
 /// says it might.
 pub(crate) async fn start_serving<S: StartupStages>(
     stages: &mut S,
-    get_var: impl FnMut(&str) -> Result<String, std::env::VarError>,
+    mut get_var: impl FnMut(&str) -> Result<String, std::env::VarError>,
 ) -> Result<(), StartupFailure> {
-    let plan = config::source::compile_selected(get_var).map_err(StartupFailure::Configuration)?;
+    let selected = config::source::select(&mut get_var).map_err(StartupFailure::Configuration)?;
+    let plan = match selected {
+        config::source::SelectedSource::Environment => {
+            config::compile(get_var).map_err(StartupFailure::Configuration)?
+        }
+        config::source::SelectedSource::Bundle(mount) => {
+            use gateway_config::bundle::{read_bundle, ProductionValidators, ReadOptions};
+            let report = read_bundle(
+                &mount.directory,
+                ReadOptions::default(),
+                &ProductionValidators,
+            );
+            let Some(bundle) = report.bundle else {
+                return Err(StartupFailure::Bundle(report.diagnostics));
+            };
+            for warning in report.diagnostics {
+                tracing::warn!(code = warning.code.as_str(), "configuration bundle warning");
+            }
+            mount
+                .state_directory(!bundle.deployment.standalone_stores.is_empty())
+                .map_err(StartupFailure::Configuration)?;
+            // Activation must install the validated resources as read-only
+            // authorities before the gateway can serve this configuration.
+            return Err(StartupFailure::Configuration(
+                config::source::mode_unavailable(),
+            ));
+        }
+    };
     let config = config::into_config(plan);
     // Each stage's future is boxed: an unoptimized build would otherwise
     // hold all of them inline, and the main thread's stack on Windows is

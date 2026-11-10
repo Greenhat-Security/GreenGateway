@@ -1,6 +1,6 @@
 # Configuration bundles (`v1alpha1`)
 
-**Status: alpha format, not yet selectable.** This page is the reference for the
+**Status: alpha.** This page is the reference for the
 versioned configuration bundle format and the reader that validates it (issue
 #242). The reader lives in the shared `gateway-config` crate, so the gateway and
 [`ggctl validate` and `ggctl doctor`](ggctl.md#validate) run the same code, and
@@ -8,9 +8,12 @@ versioned configuration bundle format and the reader that validates it (issue
 new bundle for a deployment profile ([generated bundles](#generated-bundles)) and
 [`ggctl convert`](ggctl.md#convert) converts one between document versions.
 Gateway startup currently uses [environment configuration](configuration.md).
-The gateway checks the ADR-0008 source selectors before startup. A request to
-activate a bundle or ledger fails with a [source diagnostic](ggctl.md#source-diagnostics)
-before it can open a file, store, or listener.
+When native startup selects bundle mode, it checks for competing environment
+settings before reading the mount. It verifies the bundle's pins and documents
+with the same reader as `ggctl validate`. It then requires `GATEWAY_STATE_DIR`
+exactly when the deployment enables standalone stores. Serving from a bundle
+or ledger remains unavailable. A valid bundle reaches `source.mode_unavailable`
+before any state directory, store or listener opens.
 
 The design this follows is
 [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md) (setup, operator

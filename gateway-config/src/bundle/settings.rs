@@ -580,6 +580,47 @@ impl Settings {
             .map(|setting| &setting.value)
     }
 
+    /// The validated standalone declarations in canonical order. A cluster
+    /// has only its PostgreSQL authority.
+    pub(super) fn standalone_stores(
+        &self,
+        document: &Node,
+        file: &FileName,
+    ) -> Result<Vec<StandaloneStore>, BundleDiagnostic> {
+        let Some(value) = self.own_value(STORES_PATH) else {
+            return Ok(Vec::new());
+        };
+        let refused = || {
+            at_setting(
+                Code::InvalidDeploymentSetting,
+                file,
+                document,
+                ["spec", "state", "stores"],
+            )
+        };
+        let SettingValue::Words(words) = value else {
+            return Err(refused());
+        };
+        if !words.is_empty()
+            && self.values.iter().any(|setting| {
+                setting.field.environment == compiler::STATE_BACKEND
+                    && setting.value == SettingValue::Word("postgres")
+            })
+        {
+            return Err(refused());
+        }
+        words
+            .iter()
+            .map(|word| {
+                STANDALONE_STORES
+                    .iter()
+                    .find(|store| store.name == *word)
+                    .copied()
+                    .ok_or_else(refused)
+            })
+            .collect()
+    }
+
     /// The compatibility behaviors the document acknowledges.
     pub(crate) fn acknowledged(&self) -> Vec<Compatibility> {
         match self.own_value(ACKNOWLEDGED_PATH) {
