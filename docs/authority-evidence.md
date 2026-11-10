@@ -105,7 +105,7 @@ or unconfigured individual stores.
 | Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) and its journal row in the same transaction; delivered with keyed safe references since PR 3; since migration 24 the actor's kind, auth mode and canonical issuer too. Standalone writes the same deletion evidence, without a shared revision, in the Connections database's own transaction | A caller-bound operation identity and an issuer-scoped subject reference, without which the delivered record cannot be `authority_event.v1`; standalone records are delivered without a shared security revision |
 | Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox, plus one non-cascading `catalog_change_evidence` row (action derived from the write, event/operation UUIDs, the actor's subject, kind, auth mode and canonical issuer, catalog revision transition, compiled overlay revision, shared revision, database-clock time) that outlives the replacement and the Connection's deletion, journaled and delivered since migration 32. Standalone writes the same evidence, without a shared revision, in the Connections database's own transaction (its migration 13) | Caller-bound operation identity and an issuer-scoped subject reference; standalone records are delivered without a shared security revision |
 | Service-token issue | Token row with creator, row/shared revisions and outbox, plus since migration 27 a `service_token_change_evidence` row with action `service_token.issue` (actor, event/operation UUIDs, no prior revision and row revision 1, the create outbox row's shared revision, database-clock time) in the create's transaction, journaled and delivered. Standalone writes the same row in the token database's own create transaction. Neither store records the returned plaintext or its hash | A caller-bound operation identity and an issuer-scoped subject reference; tokens issued before the evidence existed keep only `created_by`; standalone records are delivered without a shared security revision |
-| Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction. In PostgreSQL the change also journals its evidence and is delivered since PR 3. Both stores record the actor's kind, auth mode and canonical issuer (migration 24 and the token database's own columns). The keyed revoke endpoint binds the caller, action and target to the supplied operation UUID in that same transaction | Rotation and unkeyed revocation lack caller-bound operation identities. Delivery still needs an issuer-scoped subject reference; standalone records are delivered without a shared security revision |
+| Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction. In PostgreSQL the change also journals its evidence and is delivered since PR 3. Both stores record the actor's kind, auth mode and canonical issuer (migration 24 and the token database's own columns). The keyed revoke endpoint binds the caller, action and target to the supplied operation UUID in that same transaction | Rotation and unkeyed revocation lack caller-bound operation identities. Issuer-scoped subject references and the qualified event are available for the negotiated PostgreSQL keyed-revoke path only; standalone records are delivered without a shared security revision |
 | JWT revocation | Scoped JTI digest, actor row, shared revision and outbox, plus one non-cascading `jwt_revocation_evidence` row per effective revoke (actor, JTI digest, resulting expiry, shared revision) that extension, reactivation and expiry cleanup never rewrite, journaled in the same transaction and delivered since PR 3; since migration 24 the CLI's actor is recorded as kind `system`, auth mode `system` and no issuer | The CLI actor stays system provenance, not a named human; a caller-bound operation identity |
 | Admin session grant/withdrawal (#424) | With `ADMIN_SESSION_MODE=cluster_postgres`, the session row, one non-cascading `admin_session_evidence` row (event/operation UUIDs, session ID, action, reason, subject and issuer, absolute deadline, database-clock time) and, since migration 26, its journal row commit together in one statement for each grant and each withdrawal; a replacement's withdrawal and grant share one operation ID. Delivered since migration 26 on the `session` axis with keyed safe references; a grant holds journal capacity for its withdrawal, so no withdrawal is refused at capacity ([Admin session withdrawals and journal capacity](#admin-session-withdrawals-and-journal-capacity)) | Migration 33 records and delivers the verified login on grant and replacement and the system on rejection and expiry. Logout accepts a cookie or login binding without authenticating a caller. An issuer-scoped subject reference, delivery of the withdrawal reason and a caller-bound operation identity remain open. Standalone sessions are process-local memory with no durable record and stay `unsupported_future_operation` |
 
@@ -114,7 +114,9 @@ purpose**. The inventory uses `missing_metadata` and `missing_delivery` for
 remaining requirements of the proposed event contract. It does not label all
 control-plane writes lossy or ask for a second reconciliation outbox.
 `already_sufficient` is reserved for a fully qualified row; no current row
-has demonstrated all required-mode metadata and delivery requirements.
+has demonstrated all required-mode metadata and delivery requirements. The nested
+`qualified_delivery_paths` entry specifies the tested PostgreSQL keyed-revoke
+path and its consumer settings. [Authority event v1](#authority-event-v1)
 
 Important standalone and operator boundaries:
 
@@ -190,26 +192,34 @@ Migration 33 records and delivers the acting login for a grant or replacement
 and the system actor for expiry or rejection. The row stays incomplete while
 the operation ID lacks caller binding and delivery omits the withdrawal reason.
 
-## Proposed authority event v1
+## Authority event v1
 
-[The closed JSON schema](schemas/authority_event.v1.schema.json) and the checker
-define a **proposed** safe projection. Current `security_outbox` rows,
-`connection_change_evidence` rows and `audit_event.v0` events do not already
-satisfy this schema, and neither do migration 18's `service_token_change_evidence`
-and `jwt_revocation_evidence` rows, migration 19's `admin_session_evidence` rows,
-migration 23's `document_change_evidence` and `catalog_change_evidence` rows or
-the standalone token, Connection and local-secret evidence rows: the evidence rows hold the internal actor
-ID, not a keyed safe reference, and no `authority_id`. Since PR 3 the dispatcher
-delivers the journaled evidence with keyed references under a persisted
-`authority_id`, but as `authority_event_delivery.v1` ([Durable delivery](#durable-delivery)),
-not as this schema. Since migration 24 the journaled evidence records the actor's kind, auth
-mode and, for a principal that has one, canonical issuer
-([Actor metadata](#actor-metadata)), but a v1 event still cannot be produced
-faithfully: its `subject_ref` binds the subject to its issuer and its `issuer_ref`
-is required, while a service token, an operator command, an issuer-less principal and
-every row committed before migration 24 have no issuer to bind, and only keyed service-token revocation binds an operation ID to the caller. Migration 23's catalog rows carry the same
-actor metadata since migration 25, and its document rows an actor kind, issuer and
-auth mode in their own vocabulary, but neither is journaled yet.
+A consumer that opts in to `AUTHORITY_EVENT_FORMAT=qualified_v1` receives
+`authority_event.v1` for a PostgreSQL service-token revoke committed through
+`POST /v1{ADMIN_PREFIX}/tokens/{id}/revoke` by an authenticated principal
+with a canonical provider issuer. The UUIDv7 in the request binds the action,
+target and caller. Projection checks that the token revision advanced by one
+and that the row has a shared security revision. The actor's `subject_ref` is
+a keyed reference over the canonical issuer and subject together. The issuer
+and token also have their own domain-separated references. The wire record
+contains those references, the event and operation IDs, authority ID, commit
+time and revision transition. [Event schema](schemas/authority_event.v1.schema.json)
+
+The inventory qualifies this path for durable delivery through the configured
+file sink on a Unix filesystem that honors file and directory sync, using shared
+storage or storage shipped to the same durable consumer. The file and its
+parent directory are synced before the cursor advances. A sync failure leaves
+the batch pending. An interrupted cursor update
+can redeliver the event. Consumers deduplicate on the authority and event IDs.
+The opt-in log sink writes the same representation with process-log acceptance.
+
+Consumers select the parser for each record by its `schema_version`. The default
+format, unkeyed requests, gateway service-token actors and every standalone row
+retain `authority_event_delivery.v1`. On a PostgreSQL keyed revoke, an impossible
+actor shape, a missing revision or a noncontiguous token revision stalls the
+opted-in stream at that batch. Historical UUIDv4 rows remain eligible for
+delivery in their existing format. No actor or operation identity is backfilled.
+[Format configuration](configuration.md#authority_event_format)
 
 Revision transitions are operation-specific. Resource creation (`connection.create`,
 `secret.create`, `service_token.issue`, `admin_session.grant`) has no prior revision; replacement,
@@ -259,8 +269,7 @@ retry returns the same receipt (operation UUID, target token ID and revocation t
 and emits no second evidence row.
 A different binding conflicts. Caller IDs use UUIDv7. Earlier and unkeyed
 changes use generated UUIDv4 IDs and cannot be claimed as keyed operations.
-The delivery record carries the supplied UUID as
-its operation ID. [Service token admin API](configuration.md#service_token_cache_ttl_ms)
+Both negotiated representations carry the supplied UUID as their operation ID. [Service token admin API](configuration.md#service_token_cache_ttl_ms)
 
 Each revision axis has explicit semantics. Connection/secret deletion projects
 `after: null` with its previous revision; preserve the existing outbox's

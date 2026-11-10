@@ -181,12 +181,21 @@ const REQUIRED_MODES = new Set(["admitted", "refused", "refused_at_startup", "un
 // evidence rows anchor on.
 const SOURCE_ROOTS = ["gateway/src/", "gateway-config/src/"];
 
+// One reviewed route and delivery configuration qualify. The inventory also
+// covers unkeyed DELETE, other actors and rotation in the containing row.
+const qualifiedRevoke = {
+  operation: "service_token.revoke", storage_mode: "postgres", method: "POST",
+  route: "/v1{ADMIN_PREFIX}/tokens/{id}/revoke", operation_id_version: 7,
+  actor_kind: "principal", issuer: "canonical_provider", format: "qualified_v1",
+  durable_sink: "file", filesystem: "unix_file_and_directory_sync", wire_schema: "authority_event.v1",
+};
+
 export function validateInventory(inventory, readSource = (path) => readFileSync(resolve(ROOT, path), "utf8")) {
   check(inventory.version === 1 && inventory.issue === 425, "unknown inventory contract");
   check(/^[0-9a-f]{40}$/.test(inventory.reviewed_revision), "missing reviewed revision");
   assert.deepEqual(inventory.storage_modes, MODES, "storage modes changed without contract review");
-  // The mode refuses what is unsupported; it qualifies nothing, so every row
-  // keeps required_durability_supported false below.
+  // Required-mode admission and qualification of a specific delivery path
+  // are separate. No whole operation group qualifies.
   check(inventory.required_durability_mode === "refuses_unsupported", "inventory cannot enable runtime durability");
   const seen = new Set();
   const ids = new Set();
@@ -213,6 +222,19 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
       check(typeof group[field] === "string" && group[field].trim().length >= 4, `${group.id}: missing ${field}`);
     }
     check(group.required_durability_supported === false, `${group.id}: unproven durability claim`);
+    if (group.operations.includes("service_token.revoke") && group.modes.includes("postgres")) {
+      const paths = group.qualified_delivery_paths;
+      check(Array.isArray(paths) && paths.length === 1, "missing qualified revoke path");
+      const [path] = paths;
+      assert.deepEqual(path.criteria, qualifiedRevoke, "qualified revoke criteria changed without review");
+      check(group.operations.includes(path.criteria.operation) && group.modes.includes(path.criteria.storage_mode), "qualified path outside its inventory group");
+      check(typeof path.guarantee === "string" && path.guarantee.length > 0, "missing qualified path guarantee");
+      check(path.sources.length > 0 && path.tests.length > 0, "missing qualified path evidence");
+      for (const ref of [...path.sources, ...path.tests]) reference(ref);
+      for (const ref of path.tests) check(/(?:async )?fn [a-z0-9_]+\(/.test(ref.anchor), "qualified test anchor must name a function");
+    } else {
+      check(group.qualified_delivery_paths === undefined, "unreviewed qualified path");
+    }
     check(REQUIRED_MODES.has(group.required_mode), `${group.id}: unknown required mode`);
     // An unsupported operation is never run as if it had evidence, and a
     // row with an entry point a request reaches cannot be waved through.
@@ -256,7 +278,7 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const result = validateInventory(readJson("docs/authority-evidence-inventory.json"));
-    console.log(`Authority evidence inventory valid: ${result.groups} groups, ${result.operationModePairs} operation/mode pairs, ${result.sourceReferences} source references. Required mode refuses unsupported rows; no row is qualified.`);
+    console.log(`Authority evidence inventory valid: ${result.groups} groups, ${result.operationModePairs} operation/mode pairs, ${result.sourceReferences} source references. One PostgreSQL keyed-revoke delivery path qualifies. Required mode refuses unsupported rows.`);
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;

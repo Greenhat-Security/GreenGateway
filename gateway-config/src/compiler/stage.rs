@@ -213,8 +213,9 @@ impl<T> Checked<T> {
 
     /// The inventoried inputs after which the stage reports findings. Never
     /// exposes the environment-mode problem text, which may quote values.
-    pub(super) fn finding_inputs(self) -> impl Iterator<Item = &'static str> {
-        self.findings.found.into_iter().map(|finding| finding.after)
+    pub(super) fn collect_refusals(self, refused: &mut impl Extend<&'static str>) -> T {
+        refused.extend(self.findings.found.into_iter().map(|finding| finding.after));
+        self.value
     }
 
     /// Appends the findings, each with the rule behind it, to the report in

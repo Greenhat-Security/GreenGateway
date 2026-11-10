@@ -328,7 +328,7 @@ describe('Policy Studio workbench', () => {
     await openDraft();
     openView('Impact');
     const impact = viewPanel('Impact');
-    expect(within(impact).getByText(/shows\s+neither newly allowed nor newly denied traffic/)).toBeTruthy();
+    expect(within(impact).getByText(/compare both policy decisions and forwarding changes/)).toBeTruthy();
     fireEvent.change(within(impact).getByLabelText('Record bound'), { target: { value: '500' } });
     fireEvent.click(within(impact).getByRole('button', { name: 'Start replay' }));
 

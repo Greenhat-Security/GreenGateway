@@ -31,8 +31,8 @@
 //! - no field accepts an unresolved placeholder.
 //!
 //! The reader checks shape and per-field bounds here. It runs the compiler's
-//! egress stage after reading these settings. The other domains still need
-//! their compiler mappings.
+//! egress, runtime, authentication provider and admin login rules after reading these
+//! settings. The other compiler rules still need their document mappings.
 //!
 //! Some members are the document's own rather than one field's
 //! ([`OWN_MEMBERS`]): the standalone stores a deployment keeps beneath its
@@ -50,11 +50,14 @@ mod structured_tests;
 #[cfg(test)]
 mod tests;
 
-use std::{collections::BTreeMap, env::VarError};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env::VarError,
+};
 
 use crate::{
     catalog::{self, DecimalBound, DecimalRange, Domain, Field, FieldType, Sensitivity, FIELDS},
-    compiler::egress,
+    compiler::{self, egress, runtime, AdminClientPresence, AdminLoginRefusal},
     state_dir::StateFile,
 };
 
@@ -421,66 +424,141 @@ pub(crate) struct Settings {
 }
 
 impl Settings {
-    /// Compile the document's public egress settings independently of the
-    /// process environment. A list entry cannot contain a comma, so joining
-    /// it preserves exactly the entries the egress stage will read.
-    pub(super) fn egress_diagnostics(
+    /// Compile the document's public runtime and egress settings. A list
+    /// entry cannot contain a comma, and the canonical decimal has the same
+    /// floating-point value as its source spelling.
+    pub(super) fn public_diagnostics(
         &self,
         document: &Node,
         file: &FileName,
     ) -> Vec<BundleDiagnostic> {
         let mut inputs = BTreeMap::new();
-        let mut unsupported = Vec::new();
-        for setting in self
-            .values
-            .iter()
-            .filter(|setting| setting.field.domain == Domain::Egress)
-        {
+        let mut refused = BTreeSet::new();
+        for setting in self.values.iter().filter(|setting| {
+            matches!(
+                setting.field.domain,
+                Domain::Egress | Domain::RuntimeSettings
+            )
+        }) {
+            if setting.field.sensitivity != Sensitivity::Public {
+                refused.insert(setting.field.environment);
+                continue;
+            }
             let input = match &setting.value {
                 SettingValue::Boolean(value) => value.to_string(),
                 SettingValue::Integer(value) => value.to_string(),
+                SettingValue::Decimal(value) => value.canonical().to_owned(),
+                SettingValue::Word(value) => (*value).to_owned(),
                 SettingValue::List(entries) => entries.join(","),
                 _ => {
-                    unsupported.push(setting.field.environment);
+                    refused.insert(setting.field.environment);
                     continue;
                 }
             };
             inputs.insert(setting.field.environment, input);
         }
-        if inputs.is_empty() && unsupported.is_empty() {
+        if inputs.is_empty() && refused.is_empty() {
             return Vec::new();
         }
-        let mut refused =
-            egress::refused_settings(|name| inputs.remove(name).ok_or(VarError::NotPresent));
+        let mut read = |name: &str| inputs.remove(name).ok_or(VarError::NotPresent);
+        egress::collect_refusals(&mut read, &mut refused);
+        runtime::collect_refusals(read, &mut refused);
         // The stage requests each input once. A new catalog field that it
         // never requested must not silently pass validation.
         refused.extend(inputs.into_keys());
-        refused.extend(unsupported);
         refused
             .into_iter()
             .map(|name| {
-                let mut pointer = Pointer::root();
-                let mut node = document;
-                if let Some(path) = catalog::field(name).and_then(Field::document_path) {
-                    for segment in path.split('/').skip(1) {
-                        let Some(next) = node
-                            .as_object()
-                            .and_then(|members| member(members, segment))
-                        else {
-                            break;
-                        };
-                        pointer = pointer.member(segment);
-                        node = next;
-                    }
-                }
-                BundleDiagnostic::at(
-                    Code::InvalidEgressSetting,
-                    file,
-                    pointer,
-                    Some(node.position),
-                )
+                let field = catalog::field(name);
+                let code = match field.map(|field| field.domain) {
+                    Some(Domain::Egress) => Code::InvalidEgressSetting,
+                    Some(Domain::RuntimeSettings) => Code::InvalidRuntimeSetting,
+                    _ => Code::InvalidValue,
+                };
+                let path = field.and_then(Field::document_path).unwrap_or("");
+                at_setting(code, file, document, path.split('/').skip(1))
             })
             .collect()
+    }
+
+    /// Checks explicit providers and the client of the one selected for
+    /// admin login. Only presence crosses the compiler boundary for client
+    /// fields, and an alias is never read, serialized, or resolved here.
+    pub(super) fn provider_diagnostics(
+        &self,
+        document: &Node,
+        file: &FileName,
+    ) -> Vec<BundleDiagnostic> {
+        let setting = |name| {
+            self.values
+                .iter()
+                .find(|setting| setting.field.environment == name)
+                .map(|setting| &setting.value)
+        };
+        let invalid_providers = || {
+            at_setting(
+                Code::InvalidAuthProvider,
+                file,
+                document,
+                ["spec", "authentication", "providers"],
+            )
+        };
+        let invalid_login = |field| {
+            at_setting(
+                Code::InvalidAdminLogin,
+                file,
+                document,
+                ["spec", "admin_login", field],
+            )
+        };
+        let providers = match setting(compiler::AUTH_PROVIDERS) {
+            None => Some(Vec::new()),
+            Some(SettingValue::Structured(structured)) if structured.secrets.is_empty() => {
+                serde_json::from_value(structured.environment.clone()).ok()
+            }
+            // A future secret-bearing provider member needs an explicit mapping.
+            Some(_) => None,
+        };
+        let Some(providers) = providers else {
+            return vec![invalid_providers()];
+        };
+        let login = match setting(compiler::ADMIN_LOGIN_PROVIDER) {
+            Some(SettingValue::Text(name)) => Some(name.as_str()),
+            None => None,
+            _ => return vec![invalid_login("provider")],
+        };
+        let client = AdminClientPresence {
+            client_id: matches!(
+                self.own_value("/spec/admin_login/client_id"),
+                Some(SettingValue::Text(_))
+            ),
+            client_secret: matches!(
+                self.own_value("/spec/admin_login/client_secret"),
+                Some(SettingValue::Secret(_))
+            ),
+            redirect_uri: matches!(
+                self.own_value("/spec/admin_login/redirect_uri"),
+                Some(SettingValue::Text(_))
+            ),
+        };
+        let (valid, login_refusals) = compiler::check_document_providers(providers, login, client);
+        let mut diagnostics = Vec::new();
+        if !valid {
+            diagnostics.push(invalid_providers());
+        }
+        for refusal in login_refusals {
+            let field = match refusal {
+                AdminLoginRefusal::Client(field) => field,
+                AdminLoginRefusal::Unknown
+                | AdminLoginRefusal::Type
+                | AdminLoginRefusal::Issuer => "provider",
+            };
+            let diagnostic = invalid_login(field);
+            if !diagnostics.contains(&diagnostic) {
+                diagnostics.push(diagnostic);
+            }
+        }
+        diagnostics
     }
 
     /// The value the document gave the member of its own at `path`.
@@ -534,6 +612,29 @@ impl Settings {
             }
         }
     }
+}
+
+/// A missing required member is located at the closest enclosing node.
+/// Pointer segments come only from the schema or the compiler's fixed fields.
+fn at_setting(
+    code: Code,
+    file: &FileName,
+    document: &Node,
+    path: impl IntoIterator<Item = &'static str>,
+) -> BundleDiagnostic {
+    let mut pointer = Pointer::root();
+    let mut node = Some(document);
+    let mut position = document.position;
+    for segment in path {
+        pointer = pointer.member(segment);
+        node = node
+            .and_then(|node| node.as_object())
+            .and_then(|members| member(members, segment));
+        if let Some(node) = node {
+            position = node.position;
+        }
+    }
+    BundleDiagnostic::at(code, file, pointer, Some(position))
 }
 
 /// What one member of a `spec` object is.

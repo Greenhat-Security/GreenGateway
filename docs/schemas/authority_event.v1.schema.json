@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Proposed GreenGateway authority event v1 (not emitted by current runtime)",
-  "description": "Safe committed-change projection; no raw mutation/document/credential payload. Runtime adoption and durable dispatch remain #425 PR2-4.",
+  "title": "GreenGateway authority event v1",
+  "description": "A committed authority change with an issuer-scoped subject reference. The negotiated PostgreSQL keyed service-token revoke by a provider-authenticated principal is the first runtime producer.",
   "type": "object",
   "additionalProperties": false,
   "required": [
