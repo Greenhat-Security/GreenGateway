@@ -329,6 +329,81 @@ fn cases_by_id(report: &Value) -> HashMap<String, Value> {
 }
 
 #[tokio::test]
+async fn simulation_metrics_count_authorized_responses_with_fixed_labels() {
+    let harness = harness();
+    let etag = current_etag(&harness).await;
+    let recorder = metrics_recorder_builder().build_recorder();
+    let handle = recorder.handle();
+    let _guard = ::metrics::set_default_local_recorder(&recorder);
+    let stale = simulation(
+        "\"sha256:0000\"",
+        json!({ "source": "active" }),
+        side_effect_cases("pool:x"),
+    );
+    for (principal, body, status) in [
+        (None, SUBJECT_CANARY.to_owned(), StatusCode::UNAUTHORIZED),
+        (
+            Some(test_principal(&["policy-reader"])),
+            SUBJECT_CANARY.to_owned(),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            simulator(),
+            SUBJECT_CANARY.to_owned(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            simulator(),
+            stale.to_string(),
+            StatusCode::PRECONDITION_FAILED,
+        ),
+    ] {
+        let response = simulate_request(&harness, principal, body).await;
+        assert_eq!(response.status(), status);
+    }
+    let rendered = handle.render();
+    let outcomes: Vec<_> = rendered
+        .lines()
+        .filter(|line| rendered_metric_name(line) == metrics::POLICY_SIMULATIONS_TOTAL)
+        .collect();
+    assert_eq!(outcomes.len(), 2);
+    for outcome in ["conflict", "refused"] {
+        let metric = metrics::POLICY_SIMULATIONS_TOTAL;
+        let expected = format!("{metric}{{outcome=\"{outcome}\"}} 1");
+        assert!(outcomes.contains(&expected.as_str()));
+    }
+    let duration = metrics::POLICY_SIMULATION_DURATION_SECONDS;
+    assert!(rendered.contains(&format!("{duration}_count 2\n")));
+    assert!(rendered.contains(&format!("{duration}_bucket{{le=\"2\"}}")));
+    assert!(!rendered.contains(SUBJECT_CANARY));
+
+    let cases = (0..policy_simulation::request::MAX_SIMULATION_CASES)
+        .map(|index| {
+            json!({
+                "id": format!("case-{index}"),
+                "kind": "http",
+                "request": {"method": "GET", "path": "/orders/7"},
+                "principal": caller(),
+            })
+        })
+        .collect();
+    let edits = json!({
+        "source": "edits",
+        "edits": [{"op": "set", "field": "default_action", "value": "allow"}]
+    });
+    let request = simulation(&etag, edits, Value::Array(cases));
+    let response = simulate_request(&harness, simulator(), request.to_string()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["trace"]["stages_truncated"], true);
+    let rendered = handle.render();
+    assert!(rendered.contains(&format!(
+        "{} 1\n",
+        metrics::POLICY_SIMULATION_TRACES_TRUNCATED_TOTAL
+    )));
+    assert!(rendered.contains(&format!("{duration}_count 3\n")));
+}
+
+#[tokio::test]
 async fn a_simulation_needs_authentication_policy_read_and_simulate() {
     let harness = harness();
     let etag = current_etag(&harness).await;
@@ -717,8 +792,8 @@ async fn a_cancelled_request_keeps_its_slot_until_its_blocking_work_ends() {
 }
 
 /// The acceptance criterion of #243 slices 10 and 12: a simulation produces
-/// no audit record but its own, no metric beyond its own request's
-/// admission, no rate-bucket charge, no tool admission or permit, no name
+/// no audit record but its own, no data-plane metric or rate-bucket
+/// charge, no tool admission or permit, no name
 /// resolution and no upstream traffic -- for cases that, live, would do all
 /// of them, isolated rate sequences and egress cases for the upstream's own
 /// address included. The audit, resolver, egress and bucket "none"s are
@@ -727,7 +802,7 @@ async fn a_cancelled_request_keeps_its_slot_until_its_blocking_work_ends() {
 /// every admission and refusal, and acquires a permit only after admission.
 #[test]
 fn a_simulation_has_no_side_effect_but_its_own_audit_record() {
-    let recorder = PrometheusBuilder::new().build_recorder();
+    let recorder = metrics_recorder_builder().build_recorder();
     let handle = recorder.handle();
     // The recorder is installed per thread; a current-thread runtime polls
     // every task on this one, so the handler's and the middleware's emissions
@@ -817,12 +892,16 @@ fn a_simulation_has_no_side_effect_but_its_own_audit_record() {
         [audit::event::POLICY_SIMULATION_RUN]
     );
 
-    // Metrics: only the simulation request's own envelope moved -- its admin
-    // request count, the in-flight gauge, and the bucket the generic `write`
-    // limiter admits every POST with. A simulated case that reached the
-    // policy rate lane would add a `limiter="policy"` bucket; one that reached
-    // authorization, a tool or an upstream would add its own series.
+    // Only the admin request's envelope and its control-plane response metrics
+    // moved. Evaluating individual cases must never create a data-plane series.
     let rendered = handle.render();
+    let duration = metrics::POLICY_SIMULATION_DURATION_SECONDS;
+    assert!(rendered.contains(&format!(
+        "{}{{outcome=\"completed\"}} 1\n",
+        metrics::POLICY_SIMULATIONS_TOTAL
+    )));
+    assert!(rendered.contains(&format!("{duration}_count 1\n")));
+    assert!(!rendered.contains(metrics::POLICY_SIMULATION_TRACES_TRUNCATED_TOTAL));
     for line in rendered.lines().filter(|line| !line.starts_with('#')) {
         let name = rendered_metric_name(line);
         if name.is_empty() {
@@ -835,9 +914,14 @@ fn a_simulation_has_no_side_effect_but_its_own_audit_record() {
                 .find(|(label, _)| label == key)
                 .map(|(_, value)| value.as_str())
         };
-        let own_envelope = (name == REQUEST_COUNTER && label("route") == Some(SIMULATIONS))
+        let own_envelope = (name == format!("{REQUEST_COUNTER}_total")
+            && label("route") == Some(SIMULATIONS))
             || name == metrics::INFLIGHT_REQUESTS
-            || (name == metrics::RATE_LIMIT_BUCKETS && label("limiter") == Some("write"));
+            || (name == metrics::RATE_LIMIT_BUCKETS && label("limiter") == Some("write"))
+            || (name == metrics::POLICY_SIMULATIONS_TOTAL && label("outcome") == Some("completed"))
+            || name == format!("{duration}_sum")
+            || name == format!("{duration}_count")
+            || (name == format!("{duration}_bucket") && label("le").is_some());
         assert!(own_envelope, "a simulation recorded {line}");
     }
 

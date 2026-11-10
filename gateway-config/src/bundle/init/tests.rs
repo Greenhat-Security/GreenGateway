@@ -231,6 +231,7 @@ fn the_manifest_and_deployment_document_are_the_documented_text() {
             "kind: GatewayDeployment\n",
             "spec:\n",
             "  profile: development\n",
+            "  listeners:\n    public:\n      address: \"127.0.0.1:8080\"\n",
         )
     );
     let pin = |name: &str| crate::bundle::sha256_pin(text(name).as_bytes());

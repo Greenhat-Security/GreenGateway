@@ -53,9 +53,10 @@ A refusal is `caller_assertion_not_enforced` for a Connection that carries a
 refusals happens before any DNS lookup, secret read, token request or upstream
 byte of the refused request;
 nothing is ever sent without the assertion or with a shared identity in place
-of the caller's. A stored block that only an earlier release accepted --
-`bind_approval: true`, an assertion header that matches an additional header,
-or a plain HTTP endpoint -- is refused on every lane. The lane rule is
+of the caller's. Legacy approval-bound blocks without explicit enrollment, conflicting headers
+and plain HTTP endpoints are refused. An explicitly enrolled
+`managed_http_mutation_v1` Connection serves only the authenticated approved
+dispatch endpoint for a direct managed OpenAPI mutation. The lane rule is
 [`caller_assertion_servable_on`](#where-it-is-enforced) for the block and
 `credential_servable_on` for the credential; the managed OpenAPI catalog
 lifecycle asks the same two functions, so what cannot be served cannot be
@@ -630,14 +631,13 @@ through the setup step by step.
   The `forward_cookie_session` route option, which passes on a validated
   browser session for one trusted upstream, is rejected on Connection routes
   and is not a per-caller credential mechanism.
-- **Approval binding (`bind_approval`).** The block reserves the field for an
-  assertion that would also carry the approval that authorised a mutation.
-  No approval subsystem exists, so new and replacement writes refuse
-  `bind_approval: true` (`caller_assertion.bind_approval`,
-  `unsupported_binding`), the published write schemas accept only `false`,
-  and a block an earlier release stored with `true` is refused on every lane
-  with `caller_assertion_not_enforced` rather than signed without the approval
-  it promises. Editing such a block in the admin UI turns it off.
+- **Approval binding on other lanes.** An explicitly enrolled HTTPS Connection
+  can attest an independently reviewed mutation on a direct, named managed
+  OpenAPI operation. Manual tools, composites, proxy routes, managed MCP,
+  discovery fetches and stored tests cannot carry that approval. Delegated
+  credentials and additional Connection headers are outside the supported
+  transport configuration. A legacy `bind_approval: true` block without
+  `approval_mode: managed_http_mutation_v1` stays refused.
 - **Consent flows and refresh tokens.** No Connection runs an
   authorization-code, PKCE or device-code flow, and the gateway stores no
   upstream refresh token. Users connect their accounts at the issuer. An
@@ -725,9 +725,17 @@ run uses checked-in fixtures. Provider account access and production
 deployment qualification require separate evidence.
 [Snapshot sources and verification command](operator-guide.md#verify-the-full-slack-and-gmail-documents)
 
-The delegated exchange uses a signed caller assertion. The inbound bearer
-stays at the gateway. Approval-bound mutations require a separate authority
-that records who approved the exact action and verifies that decision before
-dispatch. Until that authority exists, `bind_approval: true` is refused.
+The delegated exchange uses a signed caller assertion and keeps the inbound
+bearer at the gateway. For enrolled managed HTTP mutations, the Connection
+authority records a separate decision for each rendered request. The
+requester's issuer and subject must match at dispatch, and the reviewer must
+hold a distinct identity. One consume transaction checks the current policy,
+Connection, registered definition and expiry before the dedicated HTTPS
+transport can send. The gateway signs the verified occurrence ID, method,
+path and query, body digest and absolute URL digest. The upstream verifies
+these claims and atomically deduplicates the occurrence before applying the
+write. A consumed occurrence stays spent even if the response is lost.
+[Preparation, upstream verification and recovery](operator-guide.md#preparing-and-reviewing-a-mutation).
+
 [Phase 8 scope](https://github.com/Greenhat-Security/GreenGateway/issues/446) ·
 [Approval authority follow-up](https://github.com/Greenhat-Security/GreenGateway/issues/757)

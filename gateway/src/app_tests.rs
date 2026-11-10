@@ -3576,6 +3576,8 @@ mod issue_373_oauth_bootstrap;
 mod issue_446_acceptance;
 #[path = "tests/issue_463_caller_assertion_jwks.rs"]
 mod issue_463_caller_assertion_jwks;
+#[path = "tests/issue_757_mutation_approvals.rs"]
+mod issue_757_mutation_approvals;
 
 #[path = "admin_policy_test_runs_tests.rs"]
 mod admin_policy_test_runs_tests;

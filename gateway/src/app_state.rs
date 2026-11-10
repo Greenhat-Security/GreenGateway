@@ -105,6 +105,13 @@ pub(super) const MANAGED_OPENAPI_JSON_ENVELOPE_OVERHEAD_BYTES: usize = 64 * 1024
 pub(super) const TOOLS_ADMIN_ROUTE: &str = "/v1/admin/tools";
 pub(super) const TOOL_ADMIN_ROUTE: &str = "/v1/admin/tools/{id}";
 pub(super) const TOOL_EXECUTE_ADMIN_ROUTE: &str = "/v1/admin/tools/{id}/execute";
+pub(super) const TOOL_MUTATION_APPROVAL_CREATE_ROUTE: &str =
+    "/v1/admin/tools/{id}/mutation-approvals";
+pub(super) const TOOL_MUTATION_APPROVAL_EXECUTE_ROUTE: &str =
+    "/v1/admin/tools/{id}/mutation-approvals/{approval_id}/execute";
+pub(super) const MUTATION_APPROVAL_ROUTE: &str = "/v1/admin/mutation-approvals/{id}";
+pub(super) const MUTATION_APPROVAL_REVIEW_ROUTE: &str = "/v1/admin/mutation-approvals/{id}/review";
+pub(super) const MUTATION_APPROVAL_REVOKE_ROUTE: &str = "/v1/admin/mutation-approvals/{id}/revoke";
 pub(super) const TOOLS_OPENAPI_PREVIEW_ADMIN_ROUTE: &str = "/v1/admin/tools/openapi/preview";
 pub(super) const TOOLS_OPENAPI_REGISTER_ADMIN_ROUTE: &str = "/v1/admin/tools/openapi/register";
 pub(super) const OPENAPI_TOOLS_UNSUPPORTED_AUTH_REQUIREMENTS_ERROR: &str = "cannot register selected OpenAPI tools: upstream API-key header injection is not yet supported; see issue #36's known limitation";
@@ -314,6 +321,11 @@ pub(super) struct AdminRoutes {
     pub(super) tools_route: String,
     pub(super) tool_route: String,
     pub(super) tool_execute_route: String,
+    pub(super) tool_mutation_approval_create_route: String,
+    pub(super) tool_mutation_approval_execute_route: String,
+    pub(super) mutation_approval_route: String,
+    pub(super) mutation_approval_review_route: String,
+    pub(super) mutation_approval_revoke_route: String,
     pub(super) tools_openapi_preview_route: String,
     pub(super) tools_openapi_register_route: String,
     pub(super) schema_coverage_route: String,
@@ -442,6 +454,19 @@ impl AdminRoutes {
             tools_route: format!("{api_prefix}/tools"),
             tool_route: format!("{api_prefix}/tools/{{id}}"),
             tool_execute_route: format!("{api_prefix}/tools/{{id}}/execute"),
+            tool_mutation_approval_create_route: format!(
+                "{api_prefix}/tools/{{id}}/mutation-approvals"
+            ),
+            tool_mutation_approval_execute_route: format!(
+                "{api_prefix}/tools/{{id}}/mutation-approvals/{{approval_id}}/execute"
+            ),
+            mutation_approval_route: format!("{api_prefix}/mutation-approvals/{{id}}"),
+            mutation_approval_review_route: format!(
+                "{api_prefix}/mutation-approvals/{{id}}/review"
+            ),
+            mutation_approval_revoke_route: format!(
+                "{api_prefix}/mutation-approvals/{{id}}/revoke"
+            ),
             tools_openapi_preview_route: format!("{api_prefix}/tools/openapi/preview"),
             tools_openapi_register_route: format!("{api_prefix}/tools/openapi/register"),
             schema_coverage_route: format!("{api_prefix}/schema/coverage"),
@@ -610,6 +635,7 @@ pub(super) struct ConnectionAdminState {
 
 #[derive(Clone)]
 pub(super) struct ToolAdminState {
+    pub(super) connections: connections::control_plane::ConnectionControlPlane,
     pub(super) tools_file: Option<PathBuf>,
     pub(super) registry: tools::definitions::ToolRegistry,
     pub(super) inventory: tools::inventory::CapabilityInventory,

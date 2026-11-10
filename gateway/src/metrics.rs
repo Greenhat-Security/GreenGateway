@@ -1,4 +1,12 @@
 pub const LOCK_POISON_RECOVERIES_TOTAL: &str = "lock_poison_recoveries_total";
+/// Responses to authorized simulation requests, by fixed outcome class.
+pub const POLICY_SIMULATIONS_TOTAL: &str = "greengateway_policy_simulations_total";
+/// Elapsed time from authorization to a simulation response, across all outcomes.
+pub const POLICY_SIMULATION_DURATION_SECONDS: &str =
+    "greengateway_policy_simulation_duration_seconds";
+/// Successful simulation responses whose optional stage traces reached their bound.
+pub const POLICY_SIMULATION_TRACES_TRUNCATED_TOTAL: &str =
+    "greengateway_policy_simulation_traces_truncated_total";
 /// Committed background write checks, with fixed store and outcome labels.
 pub const SQLITE_STORAGE_CHECKS_TOTAL: &str = "greengateway_sqlite_storage_checks_total";
 /// Last security-store check succeeded and is no more than 45 seconds old.

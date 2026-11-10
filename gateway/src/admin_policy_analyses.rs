@@ -30,7 +30,7 @@ use super::*;
 use policy_analysis::{
     checks::{analyze, AnalysisResources},
     report::AnalysisBinding,
-    request::{parse_request, AnalysisFormat},
+    request::{parse_request, AnalysisFormat, AnalysisRequest},
     suppression, AnalysisError,
 };
 use policy_simulation::request::CandidateSource;
@@ -77,7 +77,7 @@ fn emit_policy_analysis_run(
     state: &PolicyAdminState,
     parts: &http::request::Parts,
     principal: &auth::Principal,
-    format: AnalysisFormat,
+    request: &AnalysisRequest,
     binding: &AnalysisBinding<'_>,
     outcome: &policy_analysis::AnalysisOutcome,
     suppressions: &suppression::SuppressionOutcome,
@@ -91,7 +91,7 @@ fn emit_policy_analysis_run(
         "candidate_source": binding.source,
         "candidate_etag": binding.analyzed_etag,
         "edits": binding.edit_count,
-        "format": format.as_str(),
+        "format": request.format.as_str(),
         "complete": outcome.complete,
         "limitations": outcome
             .limitations
@@ -108,6 +108,9 @@ fn emit_policy_analysis_run(
         "tool_semantics_version": policy_eval::tools::TOOL_SEMANTICS_VERSION,
     });
     if let Some(payload) = payload.as_object_mut() {
+        if request.replay_job_id.is_some() {
+            payload.insert("replay_attached".into(), Value::Bool(true));
+        }
         if let Some(revision) = binding.security_revision {
             payload.insert("security_revision".to_owned(), json!(revision));
         }
@@ -131,6 +134,7 @@ fn emit_policy_analysis_run(
 pub(super) async fn policy_analyses_endpoint(
     State(state): State<PolicyAdminState>,
     Extension(limiter): Extension<Arc<PolicyEvaluationLimiter>>,
+    Extension(replay_jobs): Extension<Arc<PolicyReplayJobs>>,
     request: AxumRequest,
 ) -> Response {
     record_request(POLICY_ANALYSES_ADMIN_ROUTE);
@@ -183,6 +187,11 @@ pub(super) async fn policy_analyses_endpoint(
         Err(diagnostics) => return analysis_invalid(&diagnostics),
     };
 
+    if analysis.replay_job_id.is_some() {
+        if let Err(response) = authorized_replay_state(&state, &principal) {
+            return *response;
+        }
+    }
     let (base, base_etag, authority) = match simulation_base(&state, rbac_state).await {
         Ok(base) => base,
         Err(response) => return *response,
@@ -228,6 +237,43 @@ pub(super) async fn policy_analyses_endpoint(
             return internal_server_error("policy ETag computation failed");
         }
     };
+    let replay = if let Some(id) = &analysis.replay_job_id {
+        match replay_job_evidence(&state, &replay_jobs, &principal, id).await {
+            Ok(job) if job.base_etag == base_etag && job.candidate_etag == analyzed_etag => {
+                Some(job)
+            }
+            Ok(_) => {
+                return analysis_refusal(
+                    StatusCode::CONFLICT,
+                    "the replay compared a different base or candidate policy",
+                    "policy_analysis_replay_binding_stale",
+                )
+            }
+            Err(ReplayJobEvidenceRefusal::NotFound) => {
+                return analysis_refusal(
+                    StatusCode::NOT_FOUND,
+                    "replay job was not found",
+                    "policy_analysis_replay_not_found",
+                )
+            }
+            Err(ReplayJobEvidenceRefusal::Unfinished(_)) => {
+                return analysis_refusal(
+                    StatusCode::CONFLICT,
+                    "the replay has no retained finished result",
+                    "policy_analysis_replay_unfinished",
+                )
+            }
+            Err(ReplayJobEvidenceRefusal::Unavailable) => {
+                return analysis_refusal(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the replay job store is unavailable",
+                    "policy_replay_store_unavailable",
+                )
+            }
+        }
+    } else {
+        None
+    };
     let alias_paths = rbac_state.mcp_alias_paths();
     let alias_count = alias_paths.len();
     // The resources the cross-resource checks read, read once, as a
@@ -252,10 +298,14 @@ pub(super) async fn policy_analyses_endpoint(
         Ok(digest) => digest,
         Err(response) => return *response,
     };
-    let outcome = match slot
+    let (outcome, observed_replay) = match slot
         .run_blocking(move || {
             let deadline = Instant::now() + POLICY_ANALYSIS_DEADLINE;
-            analyze(
+            let observed = replay
+                .as_ref()
+                .map(|job| policy_analysis::observations::from_evidence(&job.view, job.complete))
+                .transpose()?;
+            let outcome = analyze(
                 &analyzed,
                 &AnalysisResources {
                     mcp_alias_paths: &alias_paths,
@@ -264,7 +314,8 @@ pub(super) async fn policy_analyses_endpoint(
                     resource_view: &resource_view,
                 },
                 deadline,
-            )
+            )?;
+            Ok((outcome, observed))
         })
         .await
     {
@@ -321,7 +372,14 @@ pub(super) async fn policy_analyses_endpoint(
     let (content_type, rendered) = match analysis.format {
         AnalysisFormat::Json => (
             "application/json",
-            policy_analysis::report::to_json(&outcome, &binding, &suppressions),
+            policy_analysis::report::to_json(&outcome, &binding, &suppressions).map(
+                |mut report| {
+                    if let Some(observed) = observed_replay {
+                        report["observed_replay"] = observed;
+                    }
+                    report
+                },
+            ),
         ),
         AnalysisFormat::Sarif => (
             "application/sarif+json",
@@ -350,7 +408,7 @@ pub(super) async fn policy_analyses_endpoint(
         &state,
         &parts,
         &principal,
-        analysis.format,
+        &analysis,
         &binding,
         &outcome,
         &suppressions,

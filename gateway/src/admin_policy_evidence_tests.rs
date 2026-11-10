@@ -36,6 +36,8 @@ fn roles() -> Value {
             ]
         },
         "evidence-only": { "permissions": [ADMIN_POLICY_EVIDENCE_READ_PERMISSION] },
+        "analyst-simulator": { "permissions": [ADMIN_POLICY_READ_PERMISSION, ADMIN_POLICY_ANALYZE_PERMISSION, ADMIN_POLICY_SIMULATE_PERMISSION] },
+        "analyst-auditor": { "permissions": [ADMIN_POLICY_READ_PERMISSION, ADMIN_POLICY_ANALYZE_PERMISSION, ADMIN_AUDIT_READ_PERMISSION] },
         "policy-reader": { "permissions": [ADMIN_POLICY_READ_PERMISSION] },
         "orders-reader": { "permissions": ["orders:read"] }
     })
@@ -831,6 +833,110 @@ async fn a_replay_job_is_bound_to_the_publication_it_replayed() {
     unknown["replay_job_id"] = json!("rpl_ffffffffffffffffffffffffffffffff");
     let (status, _) = refusal(request_evidence(router, admin(), &unknown).await).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn optimize_binds_owned_replay_observations_to_both_policies() {
+    let harness = harness();
+    let router = &harness.router;
+    let initial = live_etag(router).await;
+    let base = put_policy(router, &second_document(), &initial).await;
+    {
+        let mut db = rusqlite::Connection::open(&harness.audit_db.path).unwrap();
+        audit::sqlite_sink::write_events(&mut db, &[retained("/orders/restricted")]).unwrap();
+    }
+    let candidate = json!({"source": "inline", "policy": first_document()});
+    let job = finished_replay(router, &base, candidate.clone()).await;
+    let mut analysis = json!({"schema_version": "policy-analysis.v1", "base_etag": base,
+        "candidate": candidate, "replay_job_id": job["job_id"]});
+    let post = |principal, analysis: &Value| {
+        send(
+            router,
+            policy_admin_request(
+                Method::POST,
+                POLICY_ANALYSES_ADMIN_ROUTE,
+                principal,
+                Some(analysis.to_string()),
+                None,
+            ),
+        )
+    };
+    let response = post(admin(), &analysis).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let report = json_body(response).await;
+    let observed = &report["observed_replay"];
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../docs/schemas/policy-analysis-results.v1.schema.json"
+    ))
+    .unwrap();
+    jsonschema::validator_for(&schema)
+        .unwrap()
+        .validate(&report)
+        .unwrap();
+    assert_eq!(observed["proof_basis"], "bounded_replay");
+    assert_eq!(observed["result_digest"], job["result_digest"]);
+    assert_eq!(observed["window"], job["window"]);
+    assert_eq!(observed["cutoff"]["selected_records"], 1);
+    assert_eq!(
+        observed["findings"],
+        json!([
+            {"code":"newly_allowed","count":1,"lane":"http","projection":"as_authored"},
+            {"code":"newly_forwarded","count":1,"lane":"http","projection":"as_authored"}
+        ])
+    );
+    assert!(!observed.to_string().contains("/orders"));
+    assert!(!observed.to_string().contains(SUBJECT_CANARY));
+    let mut shadow = second_document();
+    shadow["rules"][1]["action"] = json!("shadow");
+    let shadow = json!({"source": "inline", "policy": shadow});
+    let replay = finished_replay(router, &base, shadow.clone()).await;
+    let mut shadow_analysis = analysis.clone();
+    shadow_analysis["candidate"] = shadow;
+    shadow_analysis["replay_job_id"] = replay["job_id"].clone();
+    let shadow_report = json_body(post(admin(), &shadow_analysis).await).await;
+    assert_eq!(
+        shadow_report["observed_replay"]["findings"],
+        json!([
+            {"code":"newly_forwarded","count":1,"lane":"http","projection":"as_authored"}
+        ]),
+        "a deny now shadowed forwards, while the logical decision remains deny"
+    );
+    for role in ["analyst-simulator", "analyst-auditor"] {
+        assert_eq!(
+            post(Some(test_principal(&[role])), &analysis)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    let mut other = test_principal(&["admin"]);
+    other.user_id = "other-analyst".to_owned();
+    assert_eq!(
+        post(Some(other), &analysis).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    analysis["candidate"] = json!({"source":"active"});
+    assert_eq!(
+        post(admin(), &analysis).await.status(),
+        StatusCode::CONFLICT
+    );
+    // Publishing the very same candidate makes only the replay's base stale.
+    let next = put_policy(router, &first_document(), &base).await;
+    analysis["base_etag"] = json!(next);
+    let (status, refused) = refusal(post(admin(), &analysis).await).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(refused["reason"], "policy_analysis_replay_binding_stale");
+    // A fresh identity comparison is readable and has no positive observations.
+    let unchanged = finished_replay(router, &next, json!({"source":"active"})).await;
+    analysis["replay_job_id"] = unchanged["job_id"].clone();
+    let report = json_body(post(admin(), &analysis).await).await;
+    assert_eq!(report["observed_replay"]["findings"], json!([]));
+    assert_eq!(report["observed_replay"]["coverage"][0]["compared"], 1);
+    analysis["format"] = json!("sarif");
+    assert_eq!(
+        post(admin(), &analysis).await.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
 }
 
 /// Version 2 with a copy of its `public` rule after it: a rule the analyzer

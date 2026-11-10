@@ -140,6 +140,18 @@ struct CallerAssertionBinding {
 }
 
 impl CallerAssertionBinding {
+    fn config(&self) -> CallerAssertionConfig<'_> {
+        CallerAssertionConfig {
+            issuer: &self.issuer,
+            audience: &self.audience,
+            token_type: &self.token_type,
+            lifetime_seconds: self.lifetime_seconds,
+            claims: &self.claims,
+            bind_request: self.bind_request,
+            bind_approval: self.bind_approval,
+        }
+    }
+
     fn from_settings(
         settings: &CallerAssertionSettings,
         configuration: Arc<super::control_plane::ConnectionRuntimeSnapshot>,
@@ -172,6 +184,7 @@ impl CallerAssertionBinding {
 /// [`Self::sign`], which consumes the signer so a call signs exactly once.
 pub struct CallerAssertionSigner<'target> {
     binding: &'target CallerAssertionBinding,
+    target: &'target ConnectionHttpTarget,
     key: AssertionSigningKey,
     /// The origin-form request target, when the assertion binds the request.
     request_target: Option<String>,
@@ -211,6 +224,33 @@ impl CallerAssertionSigner<'_> {
             method,
             body,
         )
+    }
+
+    /// Signs only for the committed approval and this signer's own target.
+    pub fn sign_approved(
+        self,
+        receipt: super::mutation_approval::ConsumedMutationApproval,
+        tool: &crate::tools::definitions::ToolDefinition,
+        caller: &AttestedCaller,
+        request_id: &str,
+        method: &Method,
+        body: &[u8],
+    ) -> Result<SignedCallerAssertion, CallerAssertionError> {
+        let token = super::caller_assertion::sign_approved_caller_assertion(
+            &self.key,
+            &self.binding.config(),
+            request_id,
+            unix_now()?,
+            super::caller_assertion::ApprovedCallerRequest {
+                receipt,
+                target: self.target,
+                tool,
+                caller,
+                method,
+                body,
+            },
+        )?;
+        signed_header(self.binding, request_id, token)
     }
 
     /// Whether the assertion covers the request body, which a lane must then
@@ -259,23 +299,22 @@ fn sign_bound_request(
     body: &[u8],
 ) -> Result<SignedCallerAssertion, CallerAssertionError> {
     let request_binding = request_target.map(|path| RequestBinding { method, path, body });
-    let config = CallerAssertionConfig {
-        issuer: &binding.issuer,
-        audience: &binding.audience,
-        token_type: &binding.token_type,
-        lifetime_seconds: binding.lifetime_seconds,
-        claims: &binding.claims,
-        bind_request: binding.bind_request,
-        bind_approval: binding.bind_approval,
-    };
     let token = sign_caller_assertion(
         key,
-        &config,
+        &binding.config(),
         Some(&caller.identity()),
         jti,
         unix_now()?,
         request_binding.as_ref(),
     )?;
+    signed_header(binding, jti, token)
+}
+
+fn signed_header(
+    binding: &CallerAssertionBinding,
+    jti: &str,
+    token: String,
+) -> Result<SignedCallerAssertion, CallerAssertionError> {
     let mut value =
         HeaderValue::from_str(&token).map_err(|_| CallerAssertionError::SignatureFailed)?;
     value.set_sensitive(true);
@@ -858,6 +897,20 @@ impl ConnectionHttpRuntime {
         self.attesting_http_target(connection_id, path_and_query, AttestingLane::OpenApiTool)
     }
 
+    /// Only the authenticated approval workflow may use this target. The
+    /// normal tool, proxy and MCP constructors refuse the enrolled record.
+    pub(crate) fn approved_openapi_tool_target(
+        &self,
+        connection_id: &str,
+        path_and_query: &str,
+    ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
+        self.attesting_http_target(
+            connection_id,
+            path_and_query,
+            AttestingLane::ApprovedOpenApiTool,
+        )
+    }
+
     /// The target of one leaf request of a composite tool: a forward step,
     /// one iteration of a fan-out, or a compensation. Each leaf calls one of
     /// the managed OpenAPI tools the composite is built from, so it is
@@ -945,6 +998,16 @@ impl ConnectionHttpRuntime {
         &self,
         connection_id: &str,
     ) -> Result<(), ConnectionHttpError> {
+        let id = ConnectionId::parse(connection_id)
+            .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
+        let snapshot = self.effective_snapshot();
+        let record = snapshot
+            .managed()
+            .get(&id)
+            .ok_or(ConnectionHttpError::ConnectionNotFound)?;
+        if record.write.uses_managed_mutation_approval() {
+            return validate_http_connection(record);
+        }
         self.openapi_tool_target(connection_id, "/").map(|_| ())
     }
 
@@ -1060,6 +1123,7 @@ impl ConnectionHttpRuntime {
         };
         Ok(Some(CallerAssertionSigner {
             binding,
+            target,
             key,
             request_target,
         }))
@@ -2196,7 +2260,7 @@ fn connection_transport_partition(
 /// them onto the request line. This is what `bind_request` attests, so an
 /// upstream compares it with the request line it received rather than with a
 /// reconstruction.
-fn origin_form_request_target(url: &str) -> Result<String, CallerAssertionError> {
+pub(super) fn origin_form_request_target(url: &str) -> Result<String, CallerAssertionError> {
     let parsed = url::Url::parse(url).map_err(|_| CallerAssertionError::InvalidClaim("path"))?;
     Ok(parsed[url::Position::BeforePath..url::Position::AfterQuery].to_owned())
 }
@@ -2333,6 +2397,8 @@ pub enum AttestingLane {
     /// Connection, for the catalogs bound to it (issue #443), but never a
     /// `google_domain_wide_delegation` one.
     OpenApiTool,
+    /// Direct managed OpenAPI mutation with a durable, independently approved occurrence.
+    ApprovedOpenApiTool,
     /// One leaf request of a composite tool, each signed separately.
     CompositeLeaf,
     /// A request a connection-bound proxy route forwards.
@@ -2363,6 +2429,9 @@ pub enum AttestingLane {
 /// [`ConnectionWrite::caller_assertion_enforceable`]:
 ///     super::model::ConnectionWrite::caller_assertion_enforceable
 pub fn caller_assertion_servable_on(write: &ConnectionWrite, lane: AttestingLane) -> bool {
+    if lane == AttestingLane::ApprovedOpenApiTool {
+        return write.uses_managed_mutation_approval();
+    }
     if write.caller_assertion.is_none() {
         return true;
     }
@@ -2372,6 +2441,7 @@ pub fn caller_assertion_servable_on(write: &ConnectionWrite, lane: AttestingLane
     );
     write.caller_assertion_enforceable()
         && match lane {
+            AttestingLane::ApprovedOpenApiTool => false,
             AttestingLane::ManualTool | AttestingLane::OpenApiTool => true,
             AttestingLane::ConnectionTest => delegated,
             AttestingLane::CompositeLeaf
@@ -2387,12 +2457,12 @@ fn attesting_binding(
     snapshot: &Arc<super::control_plane::ConnectionRuntimeSnapshot>,
     lane: AttestingLane,
 ) -> Result<Option<CallerAssertionBinding>, ConnectionHttpError> {
-    let Some(settings) = record.write.caller_assertion.as_ref() else {
-        return Ok(None);
-    };
     if !caller_assertion_servable_on(&record.write, lane) {
         return Err(ConnectionHttpError::CallerAssertionNotEnforced);
     }
+    let Some(settings) = record.write.caller_assertion.as_ref() else {
+        return Ok(None);
+    };
     CallerAssertionBinding::from_settings(settings, Arc::clone(snapshot)).map(Some)
 }
 
@@ -3502,6 +3572,7 @@ mod tests {
     /// lane's must still refuse before anything would sign with it.
     fn unenforced_caller_assertion() -> CallerAssertionSettings {
         CallerAssertionSettings {
+            approval_mode: None,
             signing_key_id: crate::connections::test_support::ASSERTION_SIGNING_KEY_ALIAS
                 .to_owned(),
             kid: "gw-test-1".to_owned(),
@@ -3534,6 +3605,49 @@ mod tests {
             b"proxy-header-value",
         );
         TemporaryManagedRuntime::build_with_root(name, root, write, vec![alias, header], None).await
+    }
+
+    #[tokio::test]
+    async fn enrollment_keeps_ordinary_and_legacy_targets_closed() {
+        let mut write = record("/v1").write;
+        write.discovery = Some(DiscoveryConfig::ManagedOpenapi {
+            path: None,
+            use_connection_authentication: false,
+        });
+        assert!(!caller_assertion_servable_on(
+            &write,
+            AttestingLane::ApprovedOpenApiTool
+        ));
+        write.caller_assertion = Some(CallerAssertionSettings {
+            bind_approval: true,
+            bind_request: true,
+            ..unenforced_caller_assertion()
+        });
+        assert!(write.clone().validated_persisted_v0().is_ok());
+        assert!(!caller_assertion_servable_on(
+            &write,
+            AttestingLane::ApprovedOpenApiTool
+        ));
+        write.caller_assertion.as_mut().unwrap().approval_mode =
+            Some(super::super::model::ApprovalMode::ManagedHttpMutationV1);
+        let temporary = attested_runtime("enrollment-lanes", write).await;
+        let id = temporary.connection_id.as_str();
+        let runtime = &temporary.runtime;
+        for target in [
+            runtime.tool_call_target(id, "/"),
+            runtime.openapi_tool_target(id, "/"),
+            runtime.composite_leaf_target(id, "/"),
+            runtime.proxy_route_target(id, "/"),
+            runtime.target(id, "/"),
+        ] {
+            assert_eq!(
+                target.err(),
+                Some(ConnectionHttpError::CallerAssertionNotEnforced)
+            );
+        }
+        assert!(runtime.validate_openapi_tool_binding(id).is_ok());
+        assert_eq!(temporary.cached_client_count(), 0);
+        assert!(runtime.approved_openapi_tool_target(id, "/").is_ok());
     }
 
     #[tokio::test]
@@ -4510,6 +4624,140 @@ mod tests {
             Some(CallerAssertionError::InvalidClaim("jti"))
         );
         assert_eq!(overlong.seal(), None);
+    }
+
+    #[tokio::test]
+    async fn mutation_approval_signing_rechecks_the_rendered_call_and_caps_the_assertion_lifetime()
+    {
+        use crate::connections::{
+            caller_assertion::{
+                body_digest, sign_approved_caller_assertion, ApprovedCallerRequest,
+            },
+            model::ApprovalMode,
+            mutation_approval::{
+                ApprovalStatus, ConsumedMutationApproval, MutationAction, MutationApproval,
+            },
+        };
+        let mut write = record("/v1").write;
+        write.discovery = Some(DiscoveryConfig::ManagedOpenapi {
+            path: None,
+            use_connection_authentication: false,
+        });
+        write.caller_assertion = Some(CallerAssertionSettings {
+            approval_mode: Some(ApprovalMode::ManagedHttpMutationV1),
+            bind_approval: true,
+            bind_request: true,
+            ..unenforced_caller_assertion()
+        });
+        let temporary = attested_runtime("approved-signer", write).await;
+        let connection_id = temporary.connection_id.as_str();
+        let target = temporary
+            .runtime
+            .approved_openapi_tool_target(connection_id, "/charges?unit=2")
+            .unwrap();
+        let other_target = temporary
+            .runtime
+            .approved_openapi_tool_target(connection_id, "/charges?unit=3")
+            .unwrap();
+        let signer = temporary
+            .runtime
+            .caller_assertion_signer(&target)
+            .await
+            .unwrap()
+            .unwrap();
+        let alice =
+            AttestedCaller::from_principal(&principal(crate::auth::AuthMethod::Bearer)).unwrap();
+        let mut other = principal(crate::auth::AuthMethod::Bearer);
+        other.user_id = "other".to_owned();
+        let other = AttestedCaller::from_principal(&other).unwrap();
+        let mapping = json!({"method":"POST","path_template":"/charges"});
+        let tool: crate::tools::definitions::ToolDefinition = serde_json::from_value(json!({
+            "name":"create_charge","description":"Create a charge","input_json_schema":{"type":"object"},
+            "upstream":mapping,
+            "source":{"type":"open_api","connection_id":connection_id,"operation_id":"createCharge","catalog_revision":1},
+            "target":{"type":"http","connection_id":connection_id,"mapping":mapping}
+        })).unwrap();
+        let body = br#"{"amount": 2}"#;
+        let approved_action =
+            MutationAction::for_http_tool(&alice, &target, &tool, &Method::POST, body).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let reviewer = crate::connections::mutation_approval::ApprovalPrincipal {
+            issuer: "https://idp.example.test".to_owned(),
+            subject: "independent-reviewer".to_owned(),
+        };
+        let authority_row = MutationApproval {
+            id,
+            action: approved_action,
+            status: ApprovalStatus::Approved,
+            created_at: 100,
+            expires_at: 1000,
+            reviewer: Some(reviewer),
+            reviewed_at: Some(500),
+            revoked_by: None,
+            revoked_at: None,
+            consumed_at: None,
+        };
+        authority_row.validate().unwrap();
+        let sign = |now, caller, actual_target, actual_tool, method, bytes| {
+            sign_approved_caller_assertion(
+                &signer.key,
+                &signer.binding.config(),
+                "request-approved",
+                now,
+                ApprovedCallerRequest {
+                    receipt: ConsumedMutationApproval::new(authority_row.clone(), 995),
+                    target: actual_target,
+                    tool: actual_tool,
+                    caller,
+                    method,
+                    body: bytes,
+                },
+            )
+        };
+        let token = sign(997, &alice, &target, &tool, &Method::POST, body).unwrap();
+        let jwk = serde_json::from_value(signer.key.public_jwk().clone()).unwrap();
+        let key = jsonwebtoken::DecodingKey::from_jwk(&jwk).unwrap();
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256);
+        validation.set_issuer(&["https://gateway.example.test"]);
+        validation.set_audience(&["https://billing.example.test"]);
+        validation.validate_exp = false; // The authority clock is fixed for these boundary cases.
+        let claims = jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation)
+            .unwrap()
+            .claims;
+        assert_eq!(claims["approval_id"], id.to_string());
+        assert_eq!(claims["iat"], 997);
+        assert_eq!(claims["exp"], 1000);
+        assert_eq!(claims["method"], "POST");
+        assert_eq!(claims["path"], "/v1/charges?unit=2");
+        assert_eq!(claims["request_sha256"], body_digest(body));
+        assert_eq!(
+            claims["target_sha256"],
+            body_digest(target.url().as_bytes())
+        );
+        let mut changed_tool = tool.clone();
+        changed_tool.description.push('!');
+        for mismatch in [
+            sign(997, &other, &target, &tool, &Method::POST, body),
+            sign(997, &alice, &other_target, &tool, &Method::POST, body),
+            sign(997, &alice, &target, &changed_tool, &Method::POST, body),
+            sign(997, &alice, &target, &tool, &Method::DELETE, body),
+            sign(
+                997,
+                &alice,
+                &target,
+                &tool,
+                &Method::POST,
+                br#"{"amount":2}"#,
+            ),
+        ] {
+            assert_eq!(mismatch, Err(CallerAssertionError::ApprovalRequired));
+        }
+        for time in [994, 1000] {
+            assert_eq!(
+                sign(time, &alice, &target, &tool, &Method::POST, body),
+                Err(CallerAssertionError::InvalidLifetime)
+            );
+        }
     }
 
     #[test]

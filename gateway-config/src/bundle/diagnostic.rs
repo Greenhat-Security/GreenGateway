@@ -174,7 +174,10 @@ pub enum Code {
     NotApplicable,
     NotRepresentable,
     InvalidEgressSetting,
+    InvalidListenerSetting,
+    DevelopmentListenerNotLoopback,
     InvalidRuntimeSetting,
+    InvalidDeploymentSetting,
     InvalidAuthProvider,
     InvalidAdminLogin,
     // References between bundle files.
@@ -264,7 +267,10 @@ impl Code {
         Self::NotApplicable,
         Self::NotRepresentable,
         Self::InvalidEgressSetting,
+        Self::InvalidListenerSetting,
+        Self::DevelopmentListenerNotLoopback,
         Self::InvalidRuntimeSetting,
+        Self::InvalidDeploymentSetting,
         Self::InvalidAuthProvider,
         Self::InvalidAdminLogin,
         Self::InvalidPath,
@@ -538,6 +544,14 @@ impl Code {
                 "reference.source_unsupported",
                 "the resource cannot be supplied by this source in this document version",
             ),
+            Self::InvalidListenerSetting => (
+                "bundle.invalid_listener_setting",
+                "the listener configuration compiler refused this setting or its combination with other listener settings",
+            ),
+            Self::DevelopmentListenerNotLoopback => (
+                "profile.listener_not_loopback",
+                "the development profile requires every enabled listener to bind a loopback address",
+            ),
             Self::InvalidEgressSetting => (
                 "bundle.invalid_egress_setting",
                 "the egress configuration compiler refused this setting",
@@ -545,6 +559,10 @@ impl Code {
             Self::InvalidRuntimeSetting => (
                 "bundle.invalid_runtime_setting",
                 "the runtime configuration compiler refused this setting",
+            ),
+            Self::InvalidDeploymentSetting => (
+                "bundle.invalid_deployment_setting",
+                "the configuration compiler refused this deployment setting or its combination with other settings",
             ),
             Self::InvalidAuthProvider => (
                 "bundle.invalid_auth_provider",

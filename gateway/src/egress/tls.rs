@@ -153,9 +153,10 @@ impl TlsClientIdentity {
 /// than inheriting whatever the last arm happened to return.
 fn alpn_protocols(profile: ProtocolProfile) -> &'static [&'static [u8]] {
     match profile {
-        ProtocolProfile::Http1AndHttp2 | ProtocolProfile::Sse | ProtocolProfile::UpgradeHttp1 => {
-            HTTP1_ALPN
-        }
+        ProtocolProfile::Http1AndHttp2
+        | ProtocolProfile::ApprovedMutation
+        | ProtocolProfile::Sse
+        | ProtocolProfile::UpgradeHttp1 => HTTP1_ALPN,
         ProtocolProfile::Grpc => H2_ALPN,
     }
 }
@@ -328,6 +329,12 @@ pub(super) fn client_config(
         None => builder.with_no_client_auth(),
     };
 
+    if profile == ProtocolProfile::ApprovedMutation {
+        // TLS 1.3 early data can be replayed. Wait for the handshake before
+        // the transport releases an independently approved mutation.
+        config.enable_early_data = false;
+    }
+
     // Not decoration, and not inherited: `.http1_only()` pins ALPN only on the
     // backend reqwest builds itself (`client.rs:823-827`), and the
     // `BuiltRustls` arm never touches `alpn_protocols`. Leaving this unset
@@ -433,6 +440,7 @@ mod tests {
     fn every_reqwest_backed_profile_negotiates_http1_and_nothing_else() {
         for profile in [
             ProtocolProfile::Http1AndHttp2,
+            ProtocolProfile::ApprovedMutation,
             ProtocolProfile::Sse,
             ProtocolProfile::UpgradeHttp1,
         ] {

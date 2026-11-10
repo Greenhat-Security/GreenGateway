@@ -31,7 +31,7 @@
 //! - no field accepts an unresolved placeholder.
 //!
 //! The reader checks shape and per-field bounds here. It runs the compiler's
-//! egress, runtime, authentication provider and admin login rules after reading these
+//! listener, egress, runtime, authentication provider and admin login rules after reading these
 //! settings. The other compiler rules still need their document mappings.
 //!
 //! Some members are the document's own rather than one field's
@@ -43,6 +43,8 @@
 //! (ADR-0008, "Bootstrap inputs"): the document states the intent, and the
 //! locators stay in the environment.
 
+mod listeners;
+mod plan;
 mod render;
 pub(crate) mod structured;
 #[cfg(test)]
@@ -402,6 +404,22 @@ pub(crate) enum SettingValue {
     Words(Vec<&'static str>),
 }
 
+impl SettingValue {
+    /// A value the legacy stages can read without resolving a reference or
+    /// flattening a structured document. Callers check field sensitivity.
+    fn public_input(&self) -> Option<String> {
+        Some(match self {
+            Self::Boolean(value) => value.to_string(),
+            Self::Integer(value) => value.to_string(),
+            Self::Decimal(value) => value.canonical().to_owned(),
+            Self::Word(value) => (*value).to_owned(),
+            Self::Text(value) => value.clone(),
+            Self::List(entries) => entries.join(","),
+            Self::Secret(_) | Self::Structured(_) | Self::Words(_) => return None,
+        })
+    }
+}
+
 /// One setting a document gave.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Setting {
@@ -444,16 +462,9 @@ impl Settings {
                 refused.insert(setting.field.environment);
                 continue;
             }
-            let input = match &setting.value {
-                SettingValue::Boolean(value) => value.to_string(),
-                SettingValue::Integer(value) => value.to_string(),
-                SettingValue::Decimal(value) => value.canonical().to_owned(),
-                SettingValue::Word(value) => (*value).to_owned(),
-                SettingValue::List(entries) => entries.join(","),
-                _ => {
-                    refused.insert(setting.field.environment);
-                    continue;
-                }
+            let Some(input) = setting.value.public_input() else {
+                refused.insert(setting.field.environment);
+                continue;
             };
             inputs.insert(setting.field.environment, input);
         }

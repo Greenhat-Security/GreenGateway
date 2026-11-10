@@ -975,6 +975,7 @@ export function CallerAssertionSection({
       {problemAlert}
       {mode === 'edit' ? (
         <CallerAssertionEditor
+          requireRequestBinding={stored?.approval_mode !== undefined}
           draft={form.callerAssertionDraft}
           errors={errors}
           secrets={secrets}
@@ -1048,6 +1049,7 @@ export function CallerAssertionSection({
 }
 
 function CallerAssertionEditor({
+  requireRequestBinding,
   draft,
   errors,
   secrets,
@@ -1055,6 +1057,7 @@ function CallerAssertionEditor({
   disabled,
   onUpdate,
 }: {
+  requireRequestBinding: boolean;
   draft: CallerAssertionDraft;
   errors: FieldErrors;
   secrets: ConnectionSecretMetadata[];
@@ -1218,8 +1221,8 @@ function CallerAssertionEditor({
           <input
             type="checkbox"
             id="connection-caller-assertion-bind-request"
-            checked={draft.bindRequest}
-            disabled={disabled}
+            checked={requireRequestBinding || draft.bindRequest}
+            disabled={disabled || requireRequestBinding}
             onChange={(event) =>
               patchDraft({ bindRequest: event.target.checked })
             }

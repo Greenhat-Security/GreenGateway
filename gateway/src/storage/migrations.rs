@@ -398,6 +398,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("df9f32836823b3a7544061f015c020d67c3afa75fabcc36dc187990693a73b76"),
+        Migration::new(
+            34,
+            "connection_mutation_approvals",
+            include_str!("migrations/0034_connection_mutation_approvals.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("55acc97a426c487820b02c33c23720163ca54cb2c76b39d2f9f97a4dfbd49ef1"),
     ]
 });
 
@@ -430,8 +437,9 @@ impl SchemaCompatibility {
     }
 }
 
-// This build's manifest ends at 33, and it serves exactly schema 33: it
-// approves no migration above its manifest, and it does not serve schema 32.
+// This build serves exactly schema 34. Mutation approvals use the new
+// Connection-owned table, and schema 33 has no approved extension for it.
+// Drain the fleet before applying migration 34.
 // Schema 32 writers would omit the actor on grants, replacements and system
 // withdrawals. Drain the fleet before applying migration 33.
 // The move from 31 to 32 (policy, tools and catalog change evidence in the
@@ -474,7 +482,7 @@ impl SchemaCompatibility {
 // the same explicit column list (`connections::pg_store::
 // record_catalog_change_evidence`). This build is not that successor: it
 // carries migration 25 byte for byte, so its migrator records the approved
-// checksum, but it serves only schema 33, so from a prepared fleet it is a
+// checksum, but it serves only schema 34, so from a prepared fleet it is a
 // coordinated drain/migrate/restart like every other step.
 // That shared column list left out the three columns; this build's catalog
 // writer records all three.
@@ -505,8 +513,8 @@ impl SchemaCompatibility {
 // covering every binary that can serve this database: none that predates it
 // accepts this ledger either.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (33, 33),
-    write: (33, 33),
+    read: (34, 34),
+    write: (34, 34),
     approved_extensions: &[],
 };
 
@@ -541,7 +549,7 @@ const APPROVED_EXTENSION_SOURCES: &[ExtensionSource] = &[];
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 33.
+/// contract the schema. The shipped contract accepts only schema 34.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1461,18 +1469,18 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            33,
+            34,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (33, 33));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (33, 33));
-        assert_eq!(schema_version_range(), (33, 33));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (34, 34));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (34, 34));
+        assert_eq!(schema_version_range(), (34, 34));
         assert!(
             BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty(),
             "this build approves no migration above its manifest"
         );
         // Readiness samples the manifest and one row more.
-        assert_eq!(runtime_ledger_row_limit(), 34);
+        assert_eq!(runtime_ledger_row_limit(), 35);
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
             Ok(SchemaStatus::Current)
@@ -1480,18 +1488,18 @@ mod tests {
         // The next migration is refused whatever it is: nothing prepared this
         // build for one.
         let mut beyond = ledger_for(&MANIFEST, MANIFEST.len(), "");
-        beyond.push((34, hex_checksum("-- migration 34")));
+        beyond.push((35, hex_checksum("-- migration 35")));
         assert_eq!(
             validate_runtime_ledger(&beyond),
             Err(LedgerProblem::UnknownVersion)
         );
 
-        // The previous releases' schemas are not served: schemas 32, 31, 30, 29, 28,
+        // The previous releases' schemas are not served: schemas 33, 32, 31, 30, 29, 28,
         // 27, 26 and 25 are left by coordinated upgrades, and so are the
         // prepared release's schema 24 and every earlier point. The overlap of
         // the rolling step from 24 to 25 belonged to the prepared release and
         // the schema-25 successor, both of which serve 25; this build serves
-        // none of 24 through 32.
+        // none of 24 through 33.
         for behind in 1..=16 {
             assert_eq!(
                 validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - behind, "")),
@@ -2665,6 +2673,7 @@ mod tests {
                  DROP TABLE greengateway.policy_replay_jobs; \
                  DROP SEQUENCE greengateway.policy_replay_job_fence; \
                  DROP TABLE greengateway.policy_analysis_suppressions; \
+                 DROP TABLE greengateway.connection_mutation_approvals; \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await
@@ -5182,7 +5191,7 @@ mod tests {
     /// refuses naming the missing migrations and readiness reports the schema
     /// incompatible, so a replica of it started before the migration stalls
     /// the rollout rather than serving. Its `migrate check` reports exactly
-    /// migrations 25 through 33 unapplied, and its `migrate up` applies them
+    /// migrations 25 through 34 unapplied, and its `migrate up` applies them
     /// and nothing else, recording for migration 25 exactly the checksum the
     /// prepared release approved. From then on it serves, with and without
     /// development auto-migration, and its migrator has nothing left to do.
@@ -5239,7 +5248,7 @@ mod tests {
 
         // The prepared release's schema: not served here.
         let missing = MANIFEST.len() - through_v24;
-        assert_eq!(missing, 9, "migrations 25 through 33");
+        assert_eq!(missing, 10, "migrations 25 through 34");
         let authority = PostgresReadinessAuthority::new(pool.clone());
         assert_eq!(
             read_and_validate_runtime(pool).await,
@@ -5254,9 +5263,9 @@ mod tests {
                 error,
                 PostgresFoundationError::SchemaNotReady {
                     applied: 24,
-                    missing: 9,
+                    missing: actual_missing,
                     auto_migrate: false
-                }
+                } if actual_missing == missing
             ),
             "{error}"
         );
@@ -5272,7 +5281,7 @@ mod tests {
             })
         );
 
-        // The migration role's `migrate up`: migrations 25 through 33 and
+        // The migration role's `migrate up`: migrations 25 through 34 and
         // nothing else, migration 25 under the approved checksum.
         assert_eq!(
             execute(&strict, false).await,
@@ -5302,7 +5311,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 33 }
+            AuthorityObservation::Writable { schema_version: 34 }
         );
         assert_eq!(
             execute(&strict, true).await,
@@ -5342,7 +5351,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 33 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 34 }
         );
         drop(client);
         clean_database(pool).await;

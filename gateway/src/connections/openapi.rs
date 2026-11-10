@@ -2983,7 +2983,9 @@ fn connection_revision_from_etag(
     Ok(connection)
 }
 
-fn definition_digest(definition: &ToolDefinition) -> Result<[u8; 32], ConnectionStoreError> {
+pub(super) fn definition_digest(
+    definition: &ToolDefinition,
+) -> Result<[u8; 32], ConnectionStoreError> {
     let encoded = serde_json::to_vec(definition).map_err(|source| ConnectionStoreError::Json {
         operation: "OpenAPI definition digest",
         source,
@@ -3044,7 +3046,9 @@ fn managed_openapi_catalog_withdrawal_reason(
     if !record.write.enabled {
         return Some(OpenApiCatalogError::ConnectionDisabled);
     }
-    if !caller_assertion_servable_on(&record.write, AttestingLane::OpenApiTool) {
+    if !record.write.uses_managed_mutation_approval()
+        && !caller_assertion_servable_on(&record.write, AttestingLane::OpenApiTool)
+    {
         return Some(OpenApiCatalogError::CallerAssertionNotEnforced);
     }
     if !credential_servable_on(&record.write, AttestingLane::OpenApiTool) {

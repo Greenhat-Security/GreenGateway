@@ -29,10 +29,9 @@
 //! - `inconclusive`: a structural relation the evaluator did not confirm on
 //!   its witness. It is reported, never dropped, and carries no patch.
 //!
-//! `bounded_replay`, the basis of a finding informed by retained traffic, is
-//! reserved: this analyzer reads no traffic, so nothing it reports is about
-//! what was or was not observed, and nothing is ever called unreachable
-//! because it was not seen.
+//! [`observations`] projects the separate `bounded_replay` findings from a
+//! finished, caller-owned replay. The structural checks do not consume
+//! traffic and never call an element unreachable because it was not seen.
 //!
 //! ## False-positive bias
 //!
@@ -79,6 +78,7 @@
 
 pub(crate) mod checks;
 pub(crate) mod coverage;
+pub(crate) mod observations;
 pub(crate) mod report;
 pub(crate) mod request;
 pub(crate) mod suppression;

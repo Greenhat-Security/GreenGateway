@@ -7,9 +7,9 @@
 //!
 //! A simulation is a read with no side effects. It needs
 //! `admin:policy:read` and `admin:policy:simulate`, both checked before the
-//! body is read; persists, activates and rewrites nothing; and leaves exactly
-//! one record, the `policy.simulation_run` audit event, which carries digests,
-//! ETags and counts -- never a case, fixture value or policy content. The
+//! body is read. A completed run emits one `policy.simulation_run` audit
+//! event carrying digests, ETags and counts. The authorized HTTP handler
+//! measures responses, latency and trace truncation without case labels. The
 //! evaluation is the pure [`policy_simulation::run`] on a blocking thread,
 //! behind a per-replica and a per-actor bound on concurrent simulations
 //! and a deadline, and nothing about it touches a rate bucket, tool permit,
@@ -672,6 +672,29 @@ pub(super) async fn policy_simulations_endpoint(
     if !rbac_state.principal_has_permission(&principal, ADMIN_POLICY_SIMULATE_PERMISSION) {
         return admin_permission_denied_response(ADMIN_POLICY_SIMULATE_PERMISSION.to_owned());
     }
+    let started = Instant::now();
+    let response = simulate_authorized(&state, rbac_state, &limiter, &principal, parts, body).await;
+    let outcome = match response.status() {
+        StatusCode::OK => "completed",
+        StatusCode::TOO_MANY_REQUESTS => "busy",
+        StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => "conflict",
+        status if status.is_client_error() => "refused",
+        _ => "failed",
+    };
+    ::metrics::counter!(metrics::POLICY_SIMULATIONS_TOTAL, "outcome" => outcome).increment(1);
+    ::metrics::histogram!(metrics::POLICY_SIMULATION_DURATION_SECONDS)
+        .record(started.elapsed().as_secs_f64());
+    response
+}
+
+async fn simulate_authorized(
+    state: &PolicyAdminState,
+    rbac_state: &middleware::rbac::RbacState,
+    limiter: &Arc<PolicyEvaluationLimiter>,
+    principal: &auth::Principal,
+    parts: http::request::Parts,
+    body: Body,
+) -> Response {
     let body_limit = state.max_body_size.min(MAX_POLICY_SIMULATION_BODY_BYTES);
     let body = match read_request_body(body, body_limit).await {
         Ok(body) => body,
@@ -679,7 +702,7 @@ pub(super) async fn policy_simulations_endpoint(
     };
     // Admitted once the body is in hand, so a slot bounds simulations doing
     // work rather than uploads in flight.
-    let Some(slot) = limiter.try_acquire(policy_evaluation_actor(&principal)) else {
+    let Some(slot) = limiter.try_acquire(policy_evaluation_actor(principal)) else {
         return simulation_refusal(
             StatusCode::TOO_MANY_REQUESTS,
             "too many policy simulations are in progress; retry later",
@@ -708,7 +731,7 @@ pub(super) async fn policy_simulations_endpoint(
         Err(diagnostics) => return simulation_invalid(&diagnostics),
     };
 
-    let (base, base_etag, authority) = match simulation_base(&state, rbac_state).await {
+    let (base, base_etag, authority) = match simulation_base(state, rbac_state).await {
         Ok(base) => base,
         Err(response) => return *response,
     };
@@ -730,9 +753,9 @@ pub(super) async fn policy_simulations_endpoint(
         policy: candidate,
         stored,
     } = match simulation_candidate(
-        &state,
+        state,
         rbac_state,
-        &principal,
+        principal,
         &base,
         &base_etag,
         &simulation.candidate,
@@ -828,6 +851,7 @@ pub(super) async fn policy_simulations_endpoint(
             return internal_server_error("policy simulation failed");
         }
     };
+    let truncated = outcome.stages_truncated;
     let summary = outcome.summary.clone();
     let report = simulation_report(&simulation, &binding, &resource_binding, outcome);
     let body = match serde_json::to_vec(&report) {
@@ -844,7 +868,10 @@ pub(super) async fn policy_simulations_endpoint(
             "policy_simulation_result_too_large",
         );
     }
-    emit_policy_simulation_run(&state, &parts, &principal, &simulation, &binding, &summary);
+    if truncated {
+        ::metrics::counter!(metrics::POLICY_SIMULATION_TRACES_TRUNCATED_TOTAL).increment(1);
+    }
+    emit_policy_simulation_run(state, &parts, principal, &simulation, &binding, &summary);
     (
         StatusCode::OK,
         [

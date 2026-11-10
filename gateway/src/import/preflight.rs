@@ -247,6 +247,34 @@ pub(super) async fn live_members_admit(
     stale_window: std::time::Duration,
     requirement: &OperationRequirement,
 ) -> Result<(), ImportError> {
+    admit_import_write(pool, deployment_id, stale_window, requirement, false).await
+}
+
+/// Apply raises the enrollment fence under the same roster and migration locks
+/// used by a serving replica. A dry run only reads and evaluates the target.
+pub(super) async fn managed_mutation_enrollment(
+    pool: &deadpool_postgres::Pool,
+    deployment_id: &str,
+    stale_window: std::time::Duration,
+    apply: bool,
+) -> Result<(), ImportError> {
+    admit_import_write(
+        pool,
+        deployment_id,
+        stale_window,
+        &compatibility::MANAGED_HTTP_MUTATION_V1,
+        apply,
+    )
+    .await
+}
+
+async fn admit_import_write(
+    pool: &deadpool_postgres::Pool,
+    deployment_id: &str,
+    stale_window: std::time::Duration,
+    requirement: &OperationRequirement,
+    raise_fence: bool,
+) -> Result<(), ImportError> {
     let refused = |refusal: OperationRefusal| {
         if let OperationRefusal::MembersLackRequirement { lacking, live } = &refusal {
             for member in lacking {
@@ -266,7 +294,8 @@ pub(super) async fn live_members_admit(
         }
     };
     if !compatibility::OPERATION_REQUIREMENTS.contains(requirement)
-        || requirement.activation != compatibility::Activation::LiveMembers
+        || (requirement.activation != compatibility::Activation::LiveMembers
+            && requirement != &compatibility::MANAGED_HTTP_MUTATION_V1)
         || requirement.backfill != compatibility::Backfill::NotRequired
     {
         return Err(refused(OperationRefusal::NotSupportedByThisBinary));
@@ -276,6 +305,40 @@ pub(super) async fn live_members_admit(
         deployment_id,
         crate::ha::InstanceIdentity::generate(),
     );
+    if raise_fence {
+        use crate::storage::FenceRaise;
+        let result = store
+            .raise_contract_fence(stale_window, None, requirement.operation, |decision| {
+                if migrations::validate_runtime_ledger(decision.ledger)
+                    != Ok(migrations::SchemaStatus::Current)
+                {
+                    return Err(OperationRefusal::SchemaNotServed);
+                }
+                let advertisements: Vec<_> = decision
+                    .members
+                    .iter()
+                    .map(compatibility::MemberAdvertisement::from)
+                    .collect();
+                compatibility::evaluate_without_own_row(
+                    requirement,
+                    &compatibility::BinaryContract::shipped(),
+                    &advertisements,
+                    decision.fence,
+                    None,
+                )?;
+                Ok((
+                    (),
+                    compatibility::fence_target(decision.fence, requirement)?,
+                ))
+            })
+            .await
+            .map_err(|_| refused(OperationRefusal::ActivationFenceUnavailable))?;
+        return match result {
+            FenceRaise::Raised { .. } | FenceRaise::Unchanged { .. } => Ok(()),
+            FenceRaise::Refused(reason) => Err(refused(reason)),
+            FenceRaise::MigrationInProgress => Err(refused(OperationRefusal::MigrationInProgress)),
+        };
+    }
     let fence = store
         .contract_fence()
         .await

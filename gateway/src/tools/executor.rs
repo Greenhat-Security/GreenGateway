@@ -30,7 +30,9 @@ use crate::{
             ConnectionHttpError, ConnectionHttpRuntime, ConnectionHttpTarget,
             IssuedCallerAssertion, IssuedSessionCallerAssertions,
         },
+        managed_store::ManagedConnectionStore,
         mcp::McpConnectionCatalogRuntime,
+        mutation_approval::{ApprovalError, MutationAction},
         openapi::OpenApiConnectionCatalogRuntime,
     },
     egress::{EgressClient, EgressError, EgressRequestBody, EgressResponse},
@@ -300,6 +302,50 @@ pub enum ToolExecutionResult {
     Http(HttpToolExecutionResult),
     McpCallToolResult(CallToolResult),
     Composite(CompositeResult),
+}
+
+#[derive(Debug)]
+enum ToolWorkResult {
+    Executed(ToolExecutionResult),
+    Prepared(Box<MutationAction>),
+}
+
+impl ToolWorkResult {
+    fn application_failure_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Executed(result) => result.application_failure_reason(),
+            Self::Prepared(_) => None,
+        }
+    }
+
+    fn unexpected(tool_name: &str) -> ToolRuntimeError {
+        ToolRuntimeError::WorkFailed {
+            tool_name: tool_name.to_owned(),
+            message: "unexpected internal tool operation result".to_owned(),
+            reason: Some("tool_operation_failed".to_owned()),
+            details: None,
+        }
+    }
+}
+
+/// Only the authenticated management handler builds a dispatch request.
+pub(crate) struct ApprovedMutationDispatch {
+    pub(crate) id: uuid::Uuid,
+    pub(crate) store: ManagedConnectionStore,
+    pub(crate) rbac: crate::middleware::rbac::RbacState,
+    pub(crate) principal: crate::auth::Principal,
+}
+
+enum ToolRequestPurpose {
+    Execute,
+    PrepareMutation,
+    Approved(Box<ApprovedMutationDispatch>),
+}
+
+struct CheckedMutation {
+    dispatch: Box<ApprovedMutationDispatch>,
+    action: MutationAction,
+    recheck: Arc<dyn Fn() -> Option<i64> + Send + Sync>,
 }
 
 impl ToolExecutionResult {
@@ -1049,6 +1095,78 @@ impl ToolExecutor {
         cancel: CancellationToken,
         precondition: Option<ToolExecutionPrecondition>,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        match self
+            .run_tool(
+                tool_name,
+                args,
+                context,
+                cancel,
+                precondition,
+                ToolRequestPurpose::Execute,
+            )
+            .await?
+        {
+            ToolWorkResult::Executed(result) => Ok(result),
+            ToolWorkResult::Prepared(_) => Err(ToolWorkResult::unexpected(tool_name)),
+        }
+    }
+
+    pub(crate) async fn execute_approved_mutation(
+        &self,
+        tool_name: &str,
+        args: Value,
+        context: ToolInvocationContext,
+        precondition: ToolExecutionPrecondition,
+        dispatch: ApprovedMutationDispatch,
+    ) -> Result<ToolExecutionResult, ToolRuntimeError> {
+        match self
+            .run_tool(
+                tool_name,
+                args,
+                context,
+                CancellationToken::new(),
+                Some(precondition),
+                ToolRequestPurpose::Approved(Box::new(dispatch)),
+            )
+            .await?
+        {
+            ToolWorkResult::Executed(result) => Ok(result),
+            ToolWorkResult::Prepared(_) => Err(ToolWorkResult::unexpected(tool_name)),
+        }
+    }
+
+    pub(crate) async fn prepare_mutation(
+        &self,
+        tool_name: &str,
+        args: Value,
+        context: ToolInvocationContext,
+        precondition: ToolExecutionPrecondition,
+    ) -> Result<MutationAction, ToolRuntimeError> {
+        match self
+            .run_tool(
+                tool_name,
+                args,
+                context,
+                CancellationToken::new(),
+                Some(precondition),
+                ToolRequestPurpose::PrepareMutation,
+            )
+            .await?
+        {
+            ToolWorkResult::Prepared(action) => Ok(*action),
+            ToolWorkResult::Executed(_) => Err(ToolWorkResult::unexpected(tool_name)),
+        }
+    }
+
+    async fn run_tool(
+        &self,
+        tool_name: &str,
+        args: Value,
+        context: ToolInvocationContext,
+        cancel: CancellationToken,
+        precondition: Option<ToolExecutionPrecondition>,
+        purpose: ToolRequestPurpose,
+    ) -> Result<ToolWorkResult, ToolRuntimeError> {
         let started = Instant::now();
         if context.source != ToolInvocationSource::AdminPlayground
             && self
@@ -1098,11 +1216,12 @@ impl ToolExecutor {
                             &work_context,
                             &work_cancel,
                             precondition.as_ref(),
+                            purpose,
                         )
                         .await
                 },
                 executor_work_error_disposition,
-                ToolExecutionResult::application_failure_reason,
+                ToolWorkResult::application_failure_reason,
                 Some(move |pointers: &[String]| {
                     self.admission_arguments(
                         tool_name,
@@ -1359,8 +1478,34 @@ impl ToolExecutor {
         context: &ToolInvocationContext,
         cancel: &CancellationToken,
         precondition: Option<&ToolExecutionPrecondition>,
-    ) -> Result<ToolExecutionResult, ToolExecutorError> {
+        purpose: ToolRequestPurpose,
+    ) -> Result<ToolWorkResult, ToolExecutorError> {
         let tool = self.registered_tool(tool_name, context)?;
+        if !matches!(purpose, ToolRequestPurpose::Execute)
+            && (context.caller.is_none()
+                || tool.composite.is_some()
+                || !matches!(
+                    (&tool.source, &tool.target),
+                    (
+                        ToolSource::OpenApi {
+                            operation_id: Some(_),
+                            catalog_revision: Some(_),
+                            ..
+                        },
+                        Some(ToolTarget::Http { .. })
+                    )
+                )
+                || tool.upstream.mcp_proxy_mapping().is_some()
+                || !matches!(
+                    tool.upstream.method.as_str(),
+                    "POST" | "PUT" | "PATCH" | "DELETE"
+                ))
+        {
+            return Err(ToolExecutorError::Connection {
+                tool_name: tool.name.clone(),
+                reason: "mutation_approval_unsupported",
+            });
+        }
         let validation_started = Instant::now();
         self.validate_call(&tool, &args, context)?;
 
@@ -1384,7 +1529,8 @@ impl ToolExecutor {
                 .await?;
             return self
                 .execute_composite(&tool, composite, connection_id, &args, context, cancel)
-                .await;
+                .await
+                .map(ToolWorkResult::Executed);
         }
 
         if matches!(tool.target, Some(ToolTarget::Composite { .. })) {
@@ -1415,7 +1561,8 @@ impl ToolExecutor {
             }
             return self
                 .execute_mcp_proxy(context, &tool, mapping, args, captured_connection_target)
-                .await;
+                .await
+                .map(ToolWorkResult::Executed);
         }
 
         let wire_args = match apply_request_transform(tool.transform.as_ref(), &args) {
@@ -1468,7 +1615,7 @@ impl ToolExecutor {
         // post-check below detects that race, while successful execution keeps
         // using only this captured target instead of rebuilding it from mutable
         // control-plane state.
-        let captured_connection_target = match (&tool.target, &tool.source) {
+        let mut captured_connection_target = match (&tool.target, &tool.source) {
             (
                 Some(ToolTarget::Http { connection_id, .. }),
                 ToolSource::OpenApi {
@@ -1521,7 +1668,30 @@ impl ToolExecutor {
                         if matches!(source, ToolSource::Manual) {
                             runtime.tool_call_target(connection_id, &request.path_and_query)
                         } else {
-                            runtime.openapi_tool_target(connection_id, &request.path_and_query)
+                            match &purpose {
+                                ToolRequestPurpose::Execute => runtime
+                                    .openapi_tool_target(connection_id, &request.path_and_query),
+                                ToolRequestPurpose::Approved(_) => runtime
+                                    .approved_openapi_tool_target(
+                                        connection_id,
+                                        &request.path_and_query,
+                                    ),
+                                ToolRequestPurpose::PrepareMutation => runtime
+                                    .openapi_tool_target(connection_id, &request.path_and_query)
+                                    .or_else(|error| {
+                                        if matches!(
+                                            error,
+                                            ConnectionHttpError::CallerAssertionNotEnforced
+                                        ) {
+                                            runtime.approved_openapi_tool_target(
+                                                connection_id,
+                                                &request.path_and_query,
+                                            )
+                                        } else {
+                                            Err(error)
+                                        }
+                                    }),
+                            }
                         }
                         .map_err(|error| connection_tool_error(&tool, error))
                     });
@@ -1564,6 +1734,79 @@ impl ToolExecutor {
             });
         }
 
+        let checked_approval = if !matches!(purpose, ToolRequestPurpose::Execute) {
+            // No signing key, credential or network I/O has happened. All request
+            // transforms and the pinned and live authorization checks have completed.
+            let target = captured_connection_target.take().ok_or_else(|| {
+                ToolExecutorError::Connection {
+                    tool_name: tool.name.clone(),
+                    reason: "mutation_approval_unsupported",
+                }
+            })??;
+            if !self
+                .openapi_catalog_runtime
+                .as_ref()
+                .is_some_and(|catalog| {
+                    catalog.definition_is_current(&tool, target.connection_etag())
+                })
+            {
+                return Err(ToolExecutorError::PreconditionFailed {
+                    tool_name: tool.name.clone(),
+                });
+            }
+            if !self.authorize_mutation_target_path(&tool, &request, &target, context) {
+                return Err(ToolExecutorError::HttpRuleDenied {
+                    tool_name: tool.name.clone(),
+                });
+            }
+            let caller =
+                context
+                    .caller
+                    .as_deref()
+                    .ok_or_else(|| ToolExecutorError::Connection {
+                        tool_name: tool.name.clone(),
+                        reason: "mutation_approval_no_principal",
+                    })?;
+            let action = MutationAction::for_http_tool(
+                caller,
+                &target,
+                &tool,
+                &request.method,
+                request.body.as_deref().unwrap_or_default(),
+            )
+            .map_err(|_| ToolExecutorError::Connection {
+                tool_name: tool.name.clone(),
+                reason: "mutation_approval_unsupported",
+            })?;
+            captured_connection_target = Some(Ok(target));
+            match purpose {
+                ToolRequestPurpose::Approved(dispatch) => {
+                    dispatch
+                        .store
+                        .check_mutation_approval(dispatch.id, action.clone())
+                        .await
+                        .map_err(|error| approval_tool_error(&tool, error))?;
+                    let recheck = Arc::new(dispatch.rbac.mutation_dispatch_guard(
+                        dispatch.principal.clone(),
+                        crate::ADMIN_TOOLS_EXECUTE_PERMISSION,
+                    ));
+                    if recheck().is_none() {
+                        return Err(approval_tool_error(&tool, ApprovalError::Conflict));
+                    }
+                    Some(CheckedMutation {
+                        dispatch,
+                        action,
+                        recheck,
+                    })
+                }
+                ToolRequestPurpose::PrepareMutation => {
+                    return Ok(ToolWorkResult::Prepared(Box::new(action)))
+                }
+                ToolRequestPurpose::Execute => None,
+            }
+        } else {
+            None
+        };
         let mut issued_assertion = None;
         let (result, connection_id) = match (&tool.target, captured_connection_target) {
             (Some(ToolTarget::Http { connection_id, .. }), target) => {
@@ -1581,6 +1824,7 @@ impl ToolExecutor {
                             target,
                             request,
                             &mut issued_assertion,
+                            checked_approval,
                         )
                         .await
                     }
@@ -1647,10 +1891,9 @@ impl ToolExecutor {
                     },
                 );
                 let warnings = self.apply_http_response_transform(context, &tool, &mut response);
-                Ok(ToolExecutionResult::Http(HttpToolExecutionResult {
-                    response,
-                    warnings,
-                }))
+                Ok(ToolWorkResult::Executed(ToolExecutionResult::Http(
+                    HttpToolExecutionResult { response, warnings },
+                )))
             }
             Err(error) => {
                 let outcome = executor_failure_observation_outcome(latency_ms, &error);
@@ -1671,6 +1914,33 @@ impl ToolExecutor {
                 Err(error)
             }
         }
+    }
+
+    /// An approval also binds the upstream path after the Connection's base
+    /// path is applied. Either policy snapshot may refuse that destination.
+    fn authorize_mutation_target_path(
+        &self,
+        tool: &ToolDefinition,
+        request: &ToolUpstreamRequest,
+        target: &ConnectionHttpTarget,
+        context: &ToolInvocationContext,
+    ) -> bool {
+        let Ok(url) = url::Url::parse(target.url()) else {
+            return false;
+        };
+        let path = url.path();
+        path == request.path
+            || (self.runtime.authorize_http_operation(
+                &tool.name,
+                request.method.as_str(),
+                path,
+                context,
+            ) && self.runtime.authorize_http_operation_live(
+                &tool.name,
+                request.method.as_str(),
+                path,
+                context,
+            ))
     }
 
     fn apply_http_response_transform(
@@ -2514,6 +2784,7 @@ impl ToolExecutor {
                 Some(deadline),
                 &jti,
                 &mut issued_assertion,
+                None,
             )
             .await;
         leaf_assertions.record(issued_assertion.as_ref());
@@ -2709,6 +2980,7 @@ impl ToolExecutor {
         target: ConnectionHttpTarget,
         request: ToolUpstreamRequest,
         issued_assertion: &mut Option<IssuedCallerAssertion>,
+        approval: Option<CheckedMutation>,
     ) -> Result<EgressResponse, ToolExecutorError> {
         // A tool call sends one request, whose assertion carries the call's
         // request ID as `jti`.
@@ -2720,6 +2992,7 @@ impl ToolExecutor {
             None,
             &context.request_id,
             issued_assertion,
+            approval,
         )
         .await
         .map_err(|classified| *classified.error)
@@ -2739,6 +3012,7 @@ impl ToolExecutor {
         deadline: Option<tokio::time::Instant>,
         assertion_jti: &str,
         issued_assertion: &mut Option<IssuedCallerAssertion>,
+        approval: Option<CheckedMutation>,
     ) -> Result<EgressResponse, ClassifiedConnectionError> {
         let runtime = self
             .connection_http
@@ -2929,38 +3203,105 @@ impl ToolExecutor {
         // The assertion is signed last, once, over the request exactly as it
         // is about to be sent, and written as the last header so nothing
         // after it can replace or repeat it.
+        let approved = approval.is_some();
+        let approval_refused = |error| ClassifiedConnectionError {
+            error: Box::new(approval_tool_error(tool, error)),
+            request_sent: false,
+        };
+        if approved && assertion_signer.is_none() {
+            return Err(approval_refused(ApprovalError::Mismatch));
+        }
         if let Some(signer) = assertion_signer {
             let refused = |error| ClassifiedConnectionError {
                 error: Box::new(caller_assertion_tool_error(tool, error)),
                 request_sent: false,
             };
-            let issued = signer
-                .sign(
+            let body = request.body.as_deref().unwrap_or_default();
+            let signed = if let Some(checked) = approval {
+                let caller = context
+                    .caller
+                    .as_deref()
+                    .ok_or_else(|| refused(CallerAssertionError::NoPrincipal))?;
+                let check_current = || {
+                    runtime.target_is_current(&target)
+                        && self
+                            .openapi_catalog_runtime
+                            .as_ref()
+                            .is_some_and(|catalog| {
+                                catalog.definition_is_current(tool, target.connection_etag())
+                            })
+                        && self.runtime.authorize_http_operation_live(
+                            &tool.name,
+                            request.method.as_str(),
+                            &request.path,
+                            context,
+                        )
+                        && self.authorize_mutation_target_path(tool, &request, &target, context)
+                        && (checked.recheck)().is_some()
+                };
+                if !check_current() {
+                    return Err(approval_refused(ApprovalError::Conflict));
+                }
+                let guard = Arc::clone(&checked.recheck);
+                let receipt = checked
+                    .dispatch
+                    .store
+                    .consume_mutation_approval(checked.dispatch.id, checked.action, move || {
+                        guard().ok_or(ApprovalError::Conflict)
+                    })
+                    .await
+                    .map_err(approval_refused)?;
+                self.audit.emit(AuditEvent::new(
+                    audit::event::CONNECTION_MUTATION_APPROVAL,
+                    &context.request_id, &context.source_ip, context.actor.clone(),
+                    json!({"operation":"consume", "outcome":"success", "approval_id":receipt.id().to_string(),"connection_id":target.connection_id().as_str()}),
+                ));
+                if !check_current() {
+                    return Err(approval_refused(ApprovalError::Conflict));
+                }
+                signer.sign_approved(receipt, tool, caller, assertion_jti, &request.method, body)
+            } else {
+                signer.sign(
                     context.caller.as_deref(),
                     assertion_jti,
                     &request.method,
-                    request.body.as_deref().unwrap_or_default(),
+                    body,
                 )
+            };
+            let issued = signed
                 .map_err(refused)?
                 .inject(&mut request.headers)
                 .map_err(refused)?;
             *issued_assertion = Some(issued);
         }
 
-        let response = run_before_deadline(
-            deadline,
-            prepared
-                .client()
-                .stream_request_with_body_at_checked_destination(
-                    prepared.destination(),
-                    request.method,
-                    target.url(),
-                    request.headers,
-                    request
-                        .body
-                        .map_or(EgressRequestBody::Empty, EgressRequestBody::Buffered),
-                ),
-        )
+        let response = run_before_deadline(deadline, async {
+            if approved {
+                prepared
+                    .client()
+                    .stream_approved_mutation_at_checked_destination(
+                        prepared.destination(),
+                        request.method,
+                        target.url(),
+                        request.headers,
+                        request.body,
+                    )
+                    .await
+            } else {
+                prepared
+                    .client()
+                    .stream_request_with_body_at_checked_destination(
+                        prepared.destination(),
+                        request.method,
+                        target.url(),
+                        request.headers,
+                        request
+                            .body
+                            .map_or(EgressRequestBody::Empty, EgressRequestBody::Buffered),
+                    )
+                    .await
+            }
+        })
         .await
         .map_err(|_| ClassifiedConnectionError {
             error: Box::new(ToolExecutorError::Connection {
@@ -4265,6 +4606,13 @@ fn caller_assertion_tool_error(
     tool: &ToolDefinition,
     error: CallerAssertionError,
 ) -> ToolExecutorError {
+    ToolExecutorError::Connection {
+        tool_name: tool.name.clone(),
+        reason: error.safe_reason(),
+    }
+}
+
+fn approval_tool_error(tool: &ToolDefinition, error: ApprovalError) -> ToolExecutorError {
     ToolExecutorError::Connection {
         tool_name: tool.name.clone(),
         reason: error.safe_reason(),
