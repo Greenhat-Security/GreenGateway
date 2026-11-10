@@ -8483,6 +8483,26 @@
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
+      "file": "gateway-config/src/compiler.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::compiler::validate_admin_login_provider#1",
+      "sha256": "c0574d589c8569908da1688f33e5956c3100af92583da834a11e175ecb534eb6",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242: formats typed provider refusals, including missing client fields, into the existing environment diagnostics using only the supplied input."
+    },
+    {
+      "file": "gateway-config/src/compiler.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::compiler::admin_login_refusals#1",
+      "sha256": "8f18c0eff83cfb64d370a00b84a102b52aed3bc1670841c6bb666eb5d9c11811",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242: records a missing admin client field as the Client variant of the validation result. The function checks presence, provider type and issuer using the supplied configuration."
+    },
+    {
       "file": "gateway/src/config.rs",
       "reasons": [
         "unexpanded-attribute"
@@ -15794,6 +15814,16 @@
       "sha256": "67031b72b45f8e2122272ed02ecfb4dbbe3c961229ad8ca55d7d77adc31cd21c",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed for #242 PR 15 (standalone backup create): imports PermissionsExt to read the Unix mode bits of the written archive, not followed, and refuse to publish one the filesystem left readable by group or other. Read-only metadata; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/bundle/settings.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::bundle::settings::impl  Settings::provider_diagnostics#1",
+      "sha256": "2ac99155787002aeadc0b049af51e41db06d42564fa9820e4f87ca1e713941ae",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242: maps typed deployment fields to provider rules and maps their client-field refusals back to schema pointers. A secret reference supplies a presence flag. This code performs in-memory validation."
     },
     {
       "file": "gateway/src/authority_events/dispatcher.rs",
