@@ -668,7 +668,7 @@ impl Settings {
 
 /// A missing required member is located at the closest enclosing node.
 /// Pointer segments come only from the schema or the compiler's fixed fields.
-fn at_setting(
+pub(super) fn at_setting(
     code: Code,
     file: &FileName,
     document: &Node,

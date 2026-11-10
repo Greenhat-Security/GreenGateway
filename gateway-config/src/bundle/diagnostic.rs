@@ -201,6 +201,11 @@ pub enum Code {
     PolicyDefaultAllow,
     PolicyShadowMode,
     PolicyWildcardRole,
+    AuthDisabled,
+    AuthObserveOnly,
+    PrivateEgressAllowed,
+    CsrfDisabled,
+    AuditBestEffort,
 }
 
 impl Code {
@@ -290,6 +295,11 @@ impl Code {
         Self::PolicyDefaultAllow,
         Self::PolicyShadowMode,
         Self::PolicyWildcardRole,
+        Self::AuthDisabled,
+        Self::AuthObserveOnly,
+        Self::PrivateEgressAllowed,
+        Self::CsrfDisabled,
+        Self::AuditBestEffort,
     ];
 
     /// The stable code.
@@ -612,6 +622,11 @@ impl Code {
                 "profile.policy_shadow_mode",
                 "the deployment profile requires the policy to enforce its decisions, not shadow them",
             ),
+            Self::AuthDisabled => ("profile.auth_disabled", "the deployment profile requires authentication to be enabled"),
+            Self::AuthObserveOnly => ("profile.auth_observe_only", "the deployment profile requires authentication to be enforced"),
+            Self::PrivateEgressAllowed => ("profile.private_egress_allowed", "the deployment profile requires private-address egress to be denied by default"),
+            Self::CsrfDisabled => ("profile.csrf_disabled", "the deployment profile requires CSRF protection"),
+            Self::AuditBestEffort => ("profile.audit_best_effort", "the deployment profile requires durable audit delivery"),
             Self::PolicyWildcardRole => (
                 "profile.wildcard_role",
                 "the deployment profile forbids a role that grants every permission",

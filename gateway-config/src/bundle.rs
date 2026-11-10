@@ -663,6 +663,7 @@ fn read_deployment(
         profile,
         acknowledged: settings.acknowledged(),
     };
+    profile::deployment(&rules, &settings, &node, &reference.file, diagnostics);
     // Bundle documents hold safe integers only, so this cannot fail; if it
     // ever did, the document is refused rather than given no canonical form.
     let Ok(canonical_json) = canonical_json::canonical_json_bytes(&document) else {
