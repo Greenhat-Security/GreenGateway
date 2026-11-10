@@ -116,10 +116,16 @@ fn every_profile_and_answer_set_scaffolds_a_bundle_the_reader_accepts_strictly()
             assert_eq!(bundle.name, answers.name());
             assert_eq!(bundle.deployment.profile, profile);
             assert!(bundle.connections_from_server);
+            let deployment: serde_json::Value =
+                serde_json::from_slice(&bundle.deployment.canonical_json).unwrap();
             // The reader saw exactly the files the scaffold wrote, in order.
             assert_eq!(bundle.source_files(), files);
             match answers.topology() {
                 Topology::Standalone => {
+                    assert_eq!(
+                        deployment["spec"]["state"],
+                        json!({"backend":"sqlite","stores":["audit"]})
+                    );
                     let Some(BundledResource::Bundle { document, .. }) = &bundle.policy else {
                         panic!("a standalone bundle supplies its policy");
                     };
@@ -133,6 +139,7 @@ fn every_profile_and_answer_set_scaffolds_a_bundle_the_reader_accepts_strictly()
                     assert_eq!(files.len(), 4);
                 }
                 Topology::Cluster => {
+                    assert_eq!(deployment["spec"]["state"], json!({"backend":"postgres"}));
                     assert!(matches!(bundle.policy, Some(BundledResource::Server)));
                     assert!(matches!(bundle.tools, Some(BundledResource::Server)));
                     assert_eq!(files.len(), 2);
@@ -232,6 +239,7 @@ fn the_manifest_and_deployment_document_are_the_documented_text() {
             "spec:\n",
             "  profile: development\n",
             "  listeners:\n    public:\n      address: \"127.0.0.1:8080\"\n",
+            "  state:\n    backend: sqlite\n    stores: [audit]\n",
         )
     );
     let pin = |name: &str| crate::bundle::sha256_pin(text(name).as_bytes());

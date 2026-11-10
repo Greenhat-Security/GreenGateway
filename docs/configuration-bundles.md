@@ -879,13 +879,16 @@ accepts strictly with the production policy and tools validators, which `init`
 reads it back with, and `gateway-config`'s tests hold every one it can write to
 them and to the policy enforcement it configures. The output is deterministic:
 the same profile and answers always give the same bytes, and so the same
-digests. `init` writes the profile into the deployment document and spells out
-the loopback public address for development. Other settings keep their defaults.
+digests. `init` writes the profile, state backend and the development public
+address when applicable. Standalone selects the SQLite audit store for the
+default required audit durability. The operator supplies its state directory
+at startup. Cluster selects PostgreSQL, where the existing control planes own
+policy, tools and audit data.
 
 | File | Standalone topology (default) | Cluster topology |
 | --- | --- | --- |
 | `bundle.yaml` | Pins every file below; `connections` from the server | Policy, tools and Connections all from the server, which is their writer in cluster mode (the PostgreSQL control planes) |
-| `deployment.yaml` | `spec.profile`, the development public bind when applicable, and a comment on development and migration bundles | The same |
+| `deployment.yaml` | The chosen profile, development public bind when applicable, `state.backend: sqlite` and `state.stores: [audit]` | The chosen profile, development public bind when applicable and `state.backend: postgres` |
 | `policy.json` | `default_action: deny`, `enforcement_mode: enforce`, no route, and no role unless the answers bind an operator | Not written |
 | `tools.json` | No tools | Not written |
 | `.gitattributes` | `* text eol=lf`, so a Windows checkout cannot change a pinned file's bytes; the reader ignores it | The same |
