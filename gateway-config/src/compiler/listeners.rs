@@ -11,7 +11,7 @@
 //! file: loading TLS material is activation's work, and a path that does not
 //! exist is accepted here exactly as the legacy parser accepts it.
 
-use std::env::VarError;
+use std::{collections::BTreeSet, env::VarError};
 
 use super::{
     compose_inbound_client_auth,
@@ -446,48 +446,7 @@ fn validate(
         admin_client_cert_crl_file,
     } = parsed;
 
-    // An address that did not parse has been replaced by a default, and a
-    // default compared with anything says nothing about the operator's
-    // configuration, so the collision checks run only while every address
-    // read so far parsed. Once one collision is found the gRPC checks are
-    // skipped too, as they always have been.
-    let mut addresses_clean =
-        !findings.refused(LISTEN_ADDR) && !findings.refused(ADMIN_LISTEN_ADDR);
-    if addresses_clean && admin_listen_addr == Some(listen_addr) {
-        findings.refuse(
-            ADMIN_LISTEN_ADDR,
-            ConfigRule::AdminListenerCollision,
-            format!(
-                "{ADMIN_LISTEN_ADDR} must not be the same address as {LISTEN_ADDR} (both resolved to {listen_addr}); choose a different port for the admin listener or leave {ADMIN_LISTEN_ADDR} unset"
-            ),
-        );
-        addresses_clean = false;
-    }
-    // Sharing a socket with either existing listener is refused rather than
-    // resolved. The gRPC listener speaks HTTP/2 and nothing else, and the
-    // other two refuse an HTTP/2 preface outright, so a collision is not a
-    // preference to reconcile -- one of the two listeners would simply
-    // never answer.
-    if addresses_clean && !findings.refused(GRPC_LISTEN_ADDR) && grpc_listen_addr.is_some() {
-        if grpc_listen_addr == Some(listen_addr) {
-            findings.refuse(
-                GRPC_LISTEN_ADDR,
-                ConfigRule::GrpcListenerCollision,
-                format!(
-                    "{GRPC_LISTEN_ADDR} must not be the same address as {LISTEN_ADDR} (both resolved to {listen_addr}); the gRPC listener serves HTTP/2 and the data listener refuses it"
-                ),
-            );
-        }
-        if admin_listen_addr.is_some() && grpc_listen_addr == admin_listen_addr {
-            findings.refuse(
-                GRPC_LISTEN_ADDR,
-                ConfigRule::GrpcListenerCollision,
-                format!(
-                    "{GRPC_LISTEN_ADDR} must not be the same address as {ADMIN_LISTEN_ADDR}; the gRPC listener serves HTTP/2 and the admin listener refuses it"
-                ),
-            );
-        }
-    }
+    check_addresses(listen_addr, admin_listen_addr, grpc_listen_addr, findings);
 
     // Half a pair is the shape that quietly serves plaintext on a listener
     // an operator believes is protected, so it is a startup failure rather
@@ -516,17 +475,11 @@ fn validate(
     // has its own listener. Accepting the settings without one would leave
     // the admin surface on the data listener's scheme while its own
     // settings say otherwise.
-    if admin_listen_addr.is_none()
-        && (admin_tls_cert_files.is_some() || admin_tls_key_files.is_some())
-    {
-        findings.refuse(
-            ADMIN_TLS_KEY_FILE,
-            ConfigRule::AdminTlsWithoutAdminListener,
-            format!(
-                "{ADMIN_TLS_CERT_FILE} and {ADMIN_TLS_KEY_FILE} require {ADMIN_LISTEN_ADDR} to be set; without a separate admin listener there is nothing for them to terminate"
-            ),
-        );
-    }
+    check_admin_listener(
+        admin_listen_addr,
+        admin_tls_cert_files.is_some() || admin_tls_key_files.is_some(),
+        findings,
+    );
 
     // Client-certificate authentication, per listener. It depends on the
     // certificate/key pair: a listener that terminates no TLS cannot ask for
@@ -577,18 +530,13 @@ fn validate(
     // An identity source with nothing to apply it to is a setting that
     // reads as "client certificates are configured" and does nothing. Say
     // so rather than ignoring it.
-    if client_cert_identity_source.is_some()
-        && client_cert_mode == ClientCertMode::Off
-        && admin_client_cert_mode == ClientCertMode::Off
-    {
-        findings.refuse(
-            ADMIN_CLIENT_CERT_CRL_FILE,
-            ConfigRule::ClientCertIdentitySourceUnused,
-            format!(
-                "{CLIENT_CERT_IDENTITY_SOURCE} is set while {CLIENT_CERT_MODE} and {ADMIN_CLIENT_CERT_MODE} are both off; set one of them to `optional` or `required`, or unset the identity source"
-            ),
-        );
-    }
+    check_identity_source(
+        client_cert_identity_source,
+        client_cert_mode,
+        admin_client_cert_mode,
+        ADMIN_CLIENT_CERT_CRL_FILE,
+        findings,
+    );
 
     ListenerPlan {
         listen_addr,
@@ -604,6 +552,189 @@ fn validate(
         client_cert_auth,
         admin_client_cert_auth,
         provenance,
+    }
+}
+
+fn check_admin_listener(
+    admin_listen_addr: Option<SocketAddr>,
+    has_material: bool,
+    findings: &mut Findings,
+) {
+    if has_material && admin_listen_addr.is_none() {
+        findings.refuse(
+            ADMIN_TLS_KEY_FILE,
+            ConfigRule::AdminTlsWithoutAdminListener,
+            format!(
+                "{ADMIN_TLS_CERT_FILE} and {ADMIN_TLS_KEY_FILE} require {ADMIN_LISTEN_ADDR} to be set; without a separate admin listener there is nothing for them to terminate"
+            ),
+        );
+    }
+}
+
+fn check_identity_source(
+    source: Option<ClientCertIdentitySource>,
+    public_mode: ClientCertMode,
+    admin_mode: ClientCertMode,
+    after: &'static str,
+    findings: &mut Findings,
+) {
+    if source.is_some() && public_mode == ClientCertMode::Off && admin_mode == ClientCertMode::Off {
+        findings.refuse(
+            after,
+            ConfigRule::ClientCertIdentitySourceUnused,
+            format!(
+                "{CLIENT_CERT_IDENTITY_SOURCE} is set while {CLIENT_CERT_MODE} and {ADMIN_CLIENT_CERT_MODE} are both off; set one of them to `optional` or `required`, or unset the identity source"
+            ),
+        );
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct DocumentListenerIntent {
+    pub(crate) public_tls: bool,
+    pub(crate) public_crl: bool,
+    pub(crate) admin_tls: bool,
+    pub(crate) admin_crl: bool,
+}
+
+#[derive(Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum DocumentListenerRefusal {
+    Configuration(&'static str),
+    DevelopmentBind(&'static str),
+}
+
+/// Check the public document with the production parser and relationship rules.
+/// Certificate/key pairing, CA contents and CRL files require host bootstrap
+/// inputs. The unit value below records a CA requirement without inventing a path.
+pub(crate) fn check_document(
+    get_var: impl FnMut(&str) -> Result<String, VarError>,
+    intent: DocumentListenerIntent,
+    development: bool,
+) -> BTreeSet<DocumentListenerRefusal> {
+    let mut findings = Findings::default();
+    let parsed = parse(&ListenerInputs::read(get_var), &mut findings);
+    check_addresses(
+        parsed.listen_addr,
+        parsed.admin_listen_addr,
+        parsed.grpc_listen_addr,
+        &mut findings,
+    );
+    check_admin_listener(parsed.admin_listen_addr, intent.admin_tls, &mut findings);
+    check_identity_source(
+        parsed.client_cert_identity_source,
+        parsed.client_cert_mode,
+        parsed.admin_client_cert_mode,
+        CLIENT_CERT_IDENTITY_SOURCE,
+        &mut findings,
+    );
+    for (mode_setting, mode, ca_setting, crl_setting, cert_setting, tls, crl) in [
+        (
+            CLIENT_CERT_MODE,
+            parsed.client_cert_mode,
+            CLIENT_CERT_CA_FILE,
+            CLIENT_CERT_CRL_FILE,
+            TLS_CERT_FILE,
+            intent.public_tls,
+            intent.public_crl,
+        ),
+        (
+            ADMIN_CLIENT_CERT_MODE,
+            parsed.admin_client_cert_mode,
+            ADMIN_CLIENT_CERT_CA_FILE,
+            ADMIN_CLIENT_CERT_CRL_FILE,
+            ADMIN_TLS_CERT_FILE,
+            intent.admin_tls,
+            intent.admin_crl,
+        ),
+    ] {
+        let auth = RawInboundClientAuth {
+            mode_setting,
+            mode,
+            ca_setting,
+            ca_file: mode.requirement().map(|_| ()),
+            crl_setting,
+            crl_file: crl.then_some(()),
+            identity_source: parsed.client_cert_identity_source,
+            tls_certificate_setting: cert_setting,
+            tls_configured: tls,
+        };
+        let after = if mode == ClientCertMode::Off && crl {
+            crl_setting
+        } else {
+            mode_setting
+        };
+        findings.rule(after, ConfigRule::ClientCertificateAuth, |problems| {
+            auth.validated_identity(problems)
+        });
+    }
+    let mut refused = BTreeSet::new();
+    if development {
+        for (name, address) in [
+            (LISTEN_ADDR, Some(parsed.listen_addr)),
+            (ADMIN_LISTEN_ADDR, parsed.admin_listen_addr),
+            (GRPC_LISTEN_ADDR, parsed.grpc_listen_addr),
+        ] {
+            if !findings.refused(name) && address.is_some_and(|address| !address.ip().is_loopback())
+            {
+                refused.insert(DocumentListenerRefusal::DevelopmentBind(name));
+            }
+        }
+    }
+    refused.extend(
+        Checked::new((), findings)
+            .finding_inputs()
+            .map(DocumentListenerRefusal::Configuration),
+    );
+    refused
+}
+
+fn check_addresses(
+    listen_addr: SocketAddr,
+    admin_listen_addr: Option<SocketAddr>,
+    grpc_listen_addr: Option<SocketAddr>,
+    findings: &mut Findings,
+) {
+    // An address that did not parse has been replaced by a default, and a
+    // default compared with anything says nothing about the operator's
+    // configuration, so the collision checks run only while every address
+    // read so far parsed. Once one collision is found the gRPC checks are
+    // skipped too, as they always have been.
+    let mut addresses_clean =
+        !findings.refused(LISTEN_ADDR) && !findings.refused(ADMIN_LISTEN_ADDR);
+    if addresses_clean && admin_listen_addr == Some(listen_addr) {
+        findings.refuse(
+            ADMIN_LISTEN_ADDR,
+            ConfigRule::AdminListenerCollision,
+            format!(
+                "{ADMIN_LISTEN_ADDR} must not be the same address as {LISTEN_ADDR} (both resolved to {listen_addr}); choose a different port for the admin listener or leave {ADMIN_LISTEN_ADDR} unset"
+            ),
+        );
+        addresses_clean = false;
+    }
+    // Sharing a socket with either existing listener is refused rather than
+    // resolved. The gRPC listener speaks HTTP/2 and nothing else, and the
+    // other two refuse an HTTP/2 preface outright, so a collision is not a
+    // preference to reconcile -- one of the two listeners would simply
+    // never answer.
+    if addresses_clean && !findings.refused(GRPC_LISTEN_ADDR) && grpc_listen_addr.is_some() {
+        if grpc_listen_addr == Some(listen_addr) {
+            findings.refuse(
+                GRPC_LISTEN_ADDR,
+                ConfigRule::GrpcListenerCollision,
+                format!(
+                    "{GRPC_LISTEN_ADDR} must not be the same address as {LISTEN_ADDR} (both resolved to {listen_addr}); the gRPC listener serves HTTP/2 and the data listener refuses it"
+                ),
+            );
+        }
+        if admin_listen_addr.is_some() && grpc_listen_addr == admin_listen_addr {
+            findings.refuse(
+                GRPC_LISTEN_ADDR,
+                ConfigRule::GrpcListenerCollision,
+                format!(
+                    "{GRPC_LISTEN_ADDR} must not be the same address as {ADMIN_LISTEN_ADDR}; the gRPC listener serves HTTP/2 and the admin listener refuses it"
+                ),
+            );
+        }
     }
 }
 

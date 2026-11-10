@@ -497,6 +497,9 @@ stage and uses its findings in offline validation. This covers the hostname
 grammar and NAT64 prefix and overlap checks. The reader also runs the shared
 authentication-provider and admin-login validation. It passes the presence of
 the login client's typed secret reference to that rule without resolving it.
+The listener adapter runs the compiler's address and client-authentication
+rules over public bind addresses and declared TLS intent. Development binds
+must be loopback. Files referenced by a host still need activation checks.
 Other domains and profile
 invariants on deployment settings still need compiler integration. A front end
 gives a decimal setting the `f64` its text parses to, which is the value the
