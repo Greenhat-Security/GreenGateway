@@ -83,6 +83,18 @@ That is necessary but not sufficient. GreenGateway ignores forwarded headers unl
 
 Both variables are forwarded by the wrapper. Determine the peer CIDR for your deployment rather than copying one: read the `client_ip` recorded in an audit event from a known caller, and confirm it changes per caller once the CIDR is set. Setting `TRUSTED_PROXY_CIDRS` wider than the actual peer range would let a caller that can reach the container directly spoof its own identity, so keep it as narrow as the observed peer address allows.
 
+### Configuration changes and recovery
+
+The one-click Worker starts the singleton gateway from Worker variables and secrets. Keep the approved configuration and its bindings in your deployment system.
+
+| Operation | One-click deployment |
+| --- | --- |
+| Apply or roll back a durable gateway configuration revision | Unsupported. The container has no persistent configuration ledger. To roll back, redeploy the previous Worker configuration with the corresponding secrets and restart the container. |
+| Mount a bundle as read-only configuration | Unsupported. The Worker rejects the `bundle` selector before starting the container. You can validate a proposed bundle offline and configure the supported Worker bindings for this deployment. |
+| Back up or restore gateway state across container replacement | Unsupported. The writable disk is ephemeral. The `ggctl backup` commands operate on a state directory or archive on the machine running the CLI. They cannot target a Worker URL. |
+
+A redeploy restores configuration choices. Any audit history or SQLite records kept on the container's writable disk are lost when it is replaced. The [standalone recovery guide](standalone-disaster-recovery.md) covers deployments with a persistent state directory.
+
 ### Connections storage and secret providers
 
 The wrapper recognizes all four Connections storage and secret settings:
