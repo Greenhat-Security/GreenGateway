@@ -49,7 +49,7 @@ serde.workspace = true
 # instead of from a `Value` that has already dropped repeated members.
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
-sse-stream = "0.2"
+sse-stream = "0.3"
 time.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
