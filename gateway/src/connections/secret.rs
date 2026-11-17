@@ -1778,7 +1778,9 @@ mod tests {
         fs::remove_dir_all(moved_root).expect("moved root should remove");
     }
 
-    #[cfg(unix)]
+    // rustix offers no FIFO creation on Apple targets, so this test cannot
+    // compile on macOS. Production and CI's gateway suite run on Linux.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     #[tokio::test]
     async fn unix_fifo_leaf_fails_closed_without_blocking_a_provider_slot() {
         use rustix::fs::{mkfifoat, Mode, CWD};
