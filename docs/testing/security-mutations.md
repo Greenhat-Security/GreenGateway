@@ -189,9 +189,11 @@ Builds use four Cargo jobs, matching the hosted runner's four vCPUs, and
 incremental compilation. Each mutant changes one function body, so rustc
 reuses the rest of the crate rather than recompiling it. Applying or restoring
 a mutant rewrites the file after the previous build, so Cargo always reruns
-rustc, which reuses only results whose fingerprints still match. An
-incremental fault would surface as an internal compiler error, classified as
-`harness_error`, or as a stale survivor; both fail the campaign. The baseline
+rustc, which reuses only results whose fingerprints still match. Barring a
+rustc bug, the binary matches the source. An incremental fault would most
+likely surface as an internal compiler error, classified as `harness_error`,
+or as a stale survivor; either fails the campaign unless survival is already
+that mutant's approved outcome. The baseline
 build fills the cache, and mutant rebuilds are several times faster than full
 ones.
 

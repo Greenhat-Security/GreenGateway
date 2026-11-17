@@ -666,6 +666,7 @@ class ExecutionAndEvidenceTests(unittest.TestCase):
 
 
 PINS = {"rust_ci": "1.0.0", "node": "1.0.0", "npm": "1.0.0", "python": "1.0.0"}
+STATUS = ["status", "--porcelain", "--untracked-files=no"]
 
 
 class PinnedEnvironmentTests(unittest.TestCase):
@@ -679,7 +680,6 @@ class PinnedEnvironmentTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"CARGO_INCREMENTAL": "0", "CARGO_BUILD_JOBS": "1"}):
                 _, env = mutations.pin_environment(root, lambda command, cwd, env: mutations.ProcessResult(0, output[command[0]], b"", 0))
         self.assertEqual(("1", "4", "1.0.0"), (env["CARGO_INCREMENTAL"], env["CARGO_BUILD_JOBS"], env["RUSTUP_TOOLCHAIN"]))
-STATUS = ["status", "--porcelain", "--untracked-files=no"]
 
 
 class ReadOnlyGitTests(unittest.TestCase):
