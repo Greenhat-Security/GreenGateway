@@ -129,7 +129,7 @@ and embedded UI build remain part of compilation.
 
 ```sh
 export RUSTUP_TOOLCHAIN="$(python -c "import json;print(json.load(open('build-tools.json'))['rust_ci'])")"
-export CARGO_BUILD_JOBS=1
+export CARGO_BUILD_JOBS=4
 python scripts/test_security_mutations.py
 python scripts/test_security_mutations_workflows.py
 python scripts/security_mutations.py --validate-registry
@@ -179,11 +179,17 @@ The scheduled workflow raises the complete-campaign bound with
 | One selected test: CPU time per process | 20 seconds |
 | Tests and short metadata commands: virtual address space per process | 2,048 MiB |
 | Complete campaign: wall time | 7,200 seconds; 12,600 in the scheduled workflow |
-| Cargo build concurrency | One job |
+| Cargo build concurrency | Four jobs, incremental |
 | Captured build output, per output stream | 8 MiB |
 | Captured test output, per output stream | 64 KiB |
 | Report size | 256 KiB |
 | Scheduled/manual CI job | 240 minutes |
+
+Builds use four Cargo jobs, matching the hosted runner's four vCPUs, and
+incremental compilation. Each mutant changes one function body, so rustc
+reuses the rest of the crate rather than recompiling it, and its cache keys
+each source file on a content hash. The baseline build fills that cache;
+mutant rebuilds are several times faster than full ones.
 
 CPU limits are inherited by child processes; they are not an aggregate CPU
 quota for a compiler process tree. Wall timeouts terminate the process group.

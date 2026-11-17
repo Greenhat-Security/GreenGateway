@@ -472,7 +472,12 @@ def pin_environment(root: Path, call: Any) -> tuple[dict, dict[str, str]]:
         raise HarnessError("invalid_toolchain_pins")
     if sys.version.split()[0] != pins["python"]:
         raise HarnessError("python_pin_mismatch")
-    env = dict(os.environ, RUSTUP_TOOLCHAIN=pins["rust_ci"], CARGO_BUILD_JOBS="1", CARGO_TERM_COLOR="never")
+    # Each mutant changes one function body, so incremental compilation reuses
+    # the rest of the crate instead of rebuilding it from scratch, and four jobs
+    # match the hosted runner's four vCPUs. Cargo reruns rustc whenever a mutant
+    # is applied or restored, and rustc's incremental cache keys each file on its
+    # content hash, so a reused result always matches the bytes on disk.
+    env = dict(os.environ, RUSTUP_TOOLCHAIN=pins["rust_ci"], CARGO_BUILD_JOBS="4", CARGO_INCREMENTAL="1", CARGO_TERM_COLOR="never")
     checks = ((["rustc", "--version"], r"rustc " + re.escape(pins["rust_ci"]) + r"(?: |$)"),
               (["cargo", "--version"], r"cargo " + re.escape(pins["rust_ci"]) + r"(?: |$)"),
               (["node", "--version"], "v" + re.escape(pins["node"]) + r"\s*\Z"),
