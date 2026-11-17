@@ -474,9 +474,12 @@ def pin_environment(root: Path, call: Any) -> tuple[dict, dict[str, str]]:
         raise HarnessError("python_pin_mismatch")
     # Each mutant changes one function body, so incremental compilation reuses
     # the rest of the crate instead of rebuilding it from scratch, and four jobs
-    # match the hosted runner's four vCPUs. Cargo reruns rustc whenever a mutant
-    # is applied or restored, and rustc's incremental cache keys each file on its
-    # content hash, so a reused result always matches the bytes on disk.
+    # match the hosted runner's four vCPUs. Applying or restoring a mutant rewrites
+    # the file after the previous build, so Cargo reruns rustc, which reuses only
+    # results whose fingerprints still match. Barring a rustc bug the binary
+    # matches the source; an incremental fault shows up as an internal compiler
+    # error (harness_error) or a stale survivor, and both fail the campaign.
+    # The toolchain action exports CARGO_INCREMENTAL=0, which this overrides.
     env = dict(os.environ, RUSTUP_TOOLCHAIN=pins["rust_ci"], CARGO_BUILD_JOBS="4", CARGO_INCREMENTAL="1", CARGO_TERM_COLOR="never")
     checks = ((["rustc", "--version"], r"rustc " + re.escape(pins["rust_ci"]) + r"(?: |$)"),
               (["cargo", "--version"], r"cargo " + re.escape(pins["rust_ci"]) + r"(?: |$)"),

@@ -666,6 +666,19 @@ class ExecutionAndEvidenceTests(unittest.TestCase):
 
 
 PINS = {"rust_ci": "1.0.0", "node": "1.0.0", "npm": "1.0.0", "python": "1.0.0"}
+
+
+class PinnedEnvironmentTests(unittest.TestCase):
+    def test_builds_are_incremental_on_four_jobs_whatever_the_caller_exports(self):
+        pins = dict(PINS, python=sys.version.split()[0])
+        output = {"rustc": b"rustc 1.0.0 (x)", "cargo": b"cargo 1.0.0 (x)", "node": b"v1.0.0\n", "npm": b"1.0.0\n"}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "build-tools.json").write_text(json.dumps(pins))
+            # The toolchain action exports CARGO_INCREMENTAL=0 into every later step.
+            with mock.patch.dict(os.environ, {"CARGO_INCREMENTAL": "0", "CARGO_BUILD_JOBS": "1"}):
+                _, env = mutations.pin_environment(root, lambda command, cwd, env: mutations.ProcessResult(0, output[command[0]], b"", 0))
+        self.assertEqual(("1", "4", "1.0.0"), (env["CARGO_INCREMENTAL"], env["CARGO_BUILD_JOBS"], env["RUSTUP_TOOLCHAIN"]))
 STATUS = ["status", "--porcelain", "--untracked-files=no"]
 
 

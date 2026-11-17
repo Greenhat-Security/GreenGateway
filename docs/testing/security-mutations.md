@@ -187,12 +187,17 @@ The scheduled workflow raises the complete-campaign bound with
 
 Builds use four Cargo jobs, matching the hosted runner's four vCPUs, and
 incremental compilation. Each mutant changes one function body, so rustc
-reuses the rest of the crate rather than recompiling it, and its cache keys
-each source file on a content hash. The baseline build fills that cache;
-mutant rebuilds are several times faster than full ones.
+reuses the rest of the crate rather than recompiling it. Applying or restoring
+a mutant rewrites the file after the previous build, so Cargo always reruns
+rustc, which reuses only results whose fingerprints still match. An
+incremental fault would surface as an internal compiler error, classified as
+`harness_error`, or as a stale survivor; both fail the campaign. The baseline
+build fills the cache, and mutant rebuilds are several times faster than full
+ones.
 
 CPU limits are inherited by child processes; they are not an aggregate CPU
-quota for a compiler process tree. Wall timeouts terminate the process group.
+quota for a compiler process tree. A multi-threaded rustc spends its own
+limit across all of its threads. Wall timeouts terminate the process group.
 `--memory-mib` changes the virtual-address-space limit for tests and short
 metadata commands, within 512–32,768 MiB. Cargo builds have no address-space
 limit because the embedded UI build's JavaScript runtime reserves a large
