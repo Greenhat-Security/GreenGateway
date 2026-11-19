@@ -273,6 +273,15 @@ offline checks. Its complete plan is reported as `not_checked`. Deployment
 profile enforcement and activation are separate stages (see
 [deployment profiles](#deployment-profiles)).
 
+On native startup, `listeners.public.tls: required` requires
+`TLS_CERT_FILE` and `TLS_KEY_FILE`. Each certificate list must have one
+private key per entry. An admin listener uses the matching `ADMIN_` mounts.
+Optional or required client certificates require the listener's CA file. A
+required client-certificate CRL requires its CRL file. An omitted or off
+feature refuses its corresponding mounts. Native preflight checks the
+locator settings and their pairing. Reading certificate contents and serving
+the listener belong to activation. Offline validation reads no host locator.
+
 Some environment variables have no document form:
 
 - The host locators (certificate, key, CA, CRL, secret-root, database-URL and

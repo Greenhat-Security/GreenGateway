@@ -45,11 +45,11 @@
 //! ([`MAX_RETAINED_POLICY_REPLAYS_PER_ACTOR`] per principal). Over any bound
 //! is `429`; no job is ever evicted to make room for another.
 //!
-//! ## Standalone jobs are process-local
+//! ## Standalone restart
 //!
-//! A standalone job lives in this replica's memory. Shutting the application
-//! down cancels it, and a restart forgets it: a job id from before it is
-//! `404`, never resumed, and never a partial result.
+//! The standalone journal retains owner-scoped bindings and committed
+//! aggregate results beside the policy history. Startup marks unfinished
+//! work interrupted and verifies each retained result before serving it.
 //!
 //! ## Cluster jobs are durable
 //!
@@ -90,6 +90,8 @@ use policy_simulation::{
 mod cluster;
 #[cfg(feature = "postgres")]
 pub(crate) use cluster::ClusterPolicyReplays;
+#[path = "admin_policy_replays_standalone.rs"]
+mod standalone;
 
 /// Most replay jobs queued or running at once across this replica: the
 /// bound of the replay route's [`PolicyEvaluationLimiter`], which also holds
@@ -122,7 +124,8 @@ pub(super) const POLICY_REPLAY_JOB_SCHEMA_VERSION: &str = "policy-replay-job.v1"
 const POLICY_REPLAY_JOB_ID_PREFIX: &str = "rpl_";
 const POLICY_REPLAY_JOB_ID_HEX_LEN: usize = 32;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum ReplayJobState {
     Queued,
     Running,
@@ -130,9 +133,7 @@ enum ReplayJobState {
     CompletedIncomplete,
     Failed,
     Cancelled,
-    /// A cluster job a replica took over but could not continue: its pins or
-    /// its checkpoint could not be rebuilt under this build's engine, or it
-    /// was taken over too often. Never a standalone job's state.
+    /// Work the current process cannot continue or return as a completed result.
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     Interrupted,
     Expired,
@@ -181,27 +182,40 @@ impl ReplayJobState {
 
 /// A finished job's result: the `policy-replay-results.v1` document and its
 /// semantic digest.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReplayJobResult {
     document: Value,
     digest: String,
+}
+
+#[derive(Clone, Copy)]
+struct ReplayFinishTime {
+    at: OffsetDateTime,
+    observed: Instant,
+    // A reboot can reset the monotonic clock. Carry the already elapsed time
+    // separately and use the new process's clock from recovery onward.
+    age_at_observation: Duration,
 }
 
 /// What changes over a job's life. Guarded by the job's own lock, which is
 /// never held across an `.await` and never taken before the registry's.
 struct ReplayJobRecord {
     state: ReplayJobState,
-    failure: Option<&'static str>,
+    failure: Option<String>,
     cancel_requested: bool,
     started_at: Option<OffsetDateTime>,
-    finished: Option<(Instant, OffsetDateTime)>,
+    finished: Option<ReplayFinishTime>,
     result: Option<Arc<ReplayJobResult>>,
 }
 
 /// The policies a job was pinned to when it was admitted, and the
 /// projections it compares them under.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReplayJobBinding {
     base_etag: String,
-    candidate_source: &'static str,
+    candidate_source: String,
     candidate_etag: String,
     edit_count: usize,
     /// The draft or history version the candidate was read as.
@@ -219,7 +233,7 @@ impl ReplayJobBinding {
 
     fn candidate_view(&self) -> Value {
         candidate_view(
-            self.candidate_source,
+            &self.candidate_source,
             &self.candidate_etag,
             self.edit_count,
             self.stored.as_ref(),
@@ -235,9 +249,10 @@ struct ReplayJob {
     created_at: OffsetDateTime,
     /// The admitting request's envelope, which every lifecycle event of the
     /// job carries.
-    actor: audit::Actor,
+    actor: Option<audit::Actor>,
     request_id: String,
     source_ip: String,
+    journal: Option<Arc<standalone::Journal>>,
     binding: ReplayJobBinding,
     scope: ReplayScope,
     control: Arc<ReplayControl>,
@@ -255,11 +270,11 @@ impl ReplayJob {
 
     /// The job as its representations read it, under its record's lock.
     fn view<'a>(&'a self, record: &'a ReplayJobRecord) -> ReplayJobView<'a> {
-        let finished_at = record.finished.map(|(_, finished)| finished);
+        let finished_at = record.finished.map(|finished| finished.at);
         ReplayJobView {
             id: &self.id,
             state: record.state,
-            failure: record.failure,
+            failure: record.failure.as_deref(),
             cancel_requested: record.cancel_requested,
             created_at: Some(self.created_at),
             started_at: record.started_at,
@@ -311,6 +326,8 @@ struct PreparedReplay {
 /// Why a job was not admitted.
 enum ReplayAdmission {
     Admitted,
+    AuditUnavailable,
+    StoreUnavailable,
     /// The principal already started a job with this idempotency key and
     /// this exact request.
     Existing(Arc<ReplayJob>),
@@ -323,6 +340,9 @@ enum ReplayAdmission {
 /// The replay jobs of one router. Shared by the routes that start, poll and
 /// cancel them.
 pub(super) struct PolicyReplayJobs {
+    journal: Option<Arc<standalone::Journal>>,
+    /// Serialize durable admissions and deletions without holding the live read map.
+    mutations: tokio::sync::Mutex<()>,
     jobs: Mutex<HashMap<String, Arc<ReplayJob>>>,
     /// Admission: the replay route's own bound on jobs queued or running,
     /// per replica and per actor, so replays never take a simulation's or a
@@ -335,6 +355,8 @@ pub(super) struct PolicyReplayJobs {
 impl PolicyReplayJobs {
     pub(super) fn new() -> Self {
         Self {
+            journal: None,
+            mutations: tokio::sync::Mutex::new(()),
             jobs: Mutex::new(HashMap::new()),
             admission: Arc::new(PolicyEvaluationLimiter::new(MAX_PENDING_POLICY_REPLAYS)),
             run_permits: Arc::new(tokio::sync::Semaphore::new(MAX_RUNNING_POLICY_REPLAYS)),
@@ -351,17 +373,19 @@ impl PolicyReplayJobs {
         let mut expired = Vec::new();
         jobs.retain(|_, job| {
             let mut record = job.record();
-            let Some((finished, _)) = record.finished else {
+            let Some(finished) = record.finished else {
                 return true;
             };
-            let age = now.saturating_duration_since(finished);
+            let age = finished
+                .age_at_observation
+                .saturating_add(now.saturating_duration_since(finished.observed));
             if age >= POLICY_REPLAY_RESULT_TTL + POLICY_REPLAY_EXPIRED_RETENTION {
                 return false;
             }
             if age >= POLICY_REPLAY_RESULT_TTL {
                 record.state = ReplayJobState::Expired;
                 record.result = None;
-                expired.push((finished, job.id.clone()));
+                expired.push((finished.at, job.id.clone()));
             }
             true
         });
@@ -391,29 +415,6 @@ impl PolicyReplayJobs {
             .cloned()
     }
 
-    /// Admit `job`, or say why not, in one critical section, so two
-    /// concurrent requests can neither both pass a quota nor both claim one
-    /// idempotency key.
-    fn admit(&self, job: &Arc<ReplayJob>) -> ReplayAdmission {
-        let mut jobs = self.swept(Instant::now());
-        if let Some(key) = job.idempotency_key.as_deref() {
-            if let Some(existing) = jobs.values().find(|other| {
-                other.owner == job.owner && other.idempotency_key.as_deref() == Some(key)
-            }) {
-                return if existing.request_digest == job.request_digest {
-                    ReplayAdmission::Existing(Arc::clone(existing))
-                } else {
-                    ReplayAdmission::IdempotencyConflict
-                };
-            }
-        }
-        if let Some(refusal) = Self::over_quota(&jobs, &job.owner) {
-            return refusal;
-        }
-        jobs.insert(job.id.clone(), Arc::clone(job));
-        ReplayAdmission::Admitted
-    }
-
     /// Whether `owner` may hold another job now, or
     /// [`ReplayAdmission::QuotaExhausted`]. How many may be pending is the
     /// admission slot's bound, taken before this is asked.
@@ -436,7 +437,7 @@ impl PolicyReplayJobs {
 
     /// The quota check alone, before a request does the work of fixing a
     /// cutoff: a caller over its quota costs no read of the audit log.
-    /// [`Self::admit`] checks again, atomically with the insertion.
+    /// Admission checks again inside the mutation lock before persisting the job.
     fn precheck(&self, owner: &str) -> Option<ReplayAdmission> {
         Self::over_quota(&self.swept(Instant::now()), owner)
     }
@@ -657,7 +658,10 @@ fn replay_owner(principal: &auth::Principal) -> String {
         .as_deref()
         .and_then(auth::principal::canonical_issuer)
         .unwrap_or_default();
-    format!("{issuer}\u{0}{}", principal.user_id)
+    hex::encode(Sha256::digest(format!(
+        "{issuer}\u{0}{}",
+        principal.user_id
+    )))
 }
 
 /// A fresh job identifier from operating-system randomness, or `None` when
@@ -847,7 +851,7 @@ fn lifecycle_event(job: &ReplayJob, event_type: &str, payload: Value) -> audit::
         event_type,
         job.request_id.clone(),
         job.source_ip.clone(),
-        Some(job.actor.clone()),
+        job.actor.clone(),
         payload,
     )
 }
@@ -924,7 +928,7 @@ fn completed_payload(
 /// not the event is accepted: a job without a result has nothing to withhold.
 async fn finish_without_result(
     audit: &audit::AuditLog,
-    job: &ReplayJob,
+    job: &Arc<ReplayJob>,
     started: Instant,
     stop: ReplayStop,
 ) {
@@ -974,10 +978,7 @@ async fn finish_without_result(
     if let Err(error) = recorded {
         tracing::error!(error = %error, "policy replay job's terminal audit event was not recorded");
     }
-    let mut record = job.record();
-    record.state = state;
-    record.failure = failure;
-    record.finished = Some((Instant::now(), OffsetDateTime::now_utc()));
+    job.finish(state, failure, None).await;
 }
 
 /// The job's worker: wait for the replica's run slot, run the engine on a
@@ -1083,19 +1084,19 @@ async fn run_replay_job(
     .await;
     if let Err(error) = recorded {
         tracing::error!(error = %error, "policy replay job's completion was not recorded; its result is withheld");
-        let mut record = job.record();
-        record.state = ReplayJobState::Failed;
-        record.failure = Some("audit_unavailable");
-        record.finished = Some((Instant::now(), OffsetDateTime::now_utc()));
+        job.finish(ReplayJobState::Failed, Some("audit_unavailable"), None)
+            .await;
         return;
     }
-    let mut record = job.record();
-    record.state = state;
-    record.result = Some(Arc::new(ReplayJobResult {
-        document: outcome.result,
-        digest: outcome.digest,
-    }));
-    record.finished = Some((Instant::now(), OffsetDateTime::now_utc()));
+    job.finish(
+        state,
+        None,
+        Some(Arc::new(ReplayJobResult {
+            document: outcome.result,
+            digest: outcome.digest,
+        })),
+    )
+    .await;
 }
 
 /// `POST .../policy/replays`: validate a `policy-replay.v1` request, pin its
@@ -1161,7 +1162,9 @@ pub(super) async fn policy_replay_create_endpoint(
     if let Some(key) = replay.idempotency_key.as_deref() {
         match backend {
             ReplayBackend::Standalone(_) => {
-                if let Some(existing) = jobs.find_idempotent(&owner, key) {
+                if let Some(existing) =
+                    jobs.find_idempotent(&owner, &hex::encode(Sha256::digest(key)))
+                {
                     return if existing.request_digest == replay.digest {
                         let current =
                             base_etag_is_current(&state, rbac_state, &existing.binding.base_etag)
@@ -1252,7 +1255,7 @@ pub(super) async fn policy_replay_create_endpoint(
     };
     let binding = ReplayJobBinding {
         base_etag,
-        candidate_source: replay.candidate.as_str(),
+        candidate_source: replay.candidate.as_str().to_owned(),
         candidate_etag,
         edit_count,
         stored,
@@ -1302,10 +1305,14 @@ pub(super) async fn policy_replay_create_endpoint(
     let job = Arc::new(ReplayJob {
         id,
         owner,
-        idempotency_key: replay.idempotency_key.clone(),
+        idempotency_key: replay
+            .idempotency_key
+            .as_ref()
+            .map(|key| hex::encode(Sha256::digest(key))),
         request_digest: replay.digest.clone(),
         created_at,
-        actor: auth::actor_from_principal(&principal),
+        actor: Some(auth::actor_from_principal(&principal)),
+        journal: jobs.journal.clone(),
         request_id: client_ip::request_id(&parts.headers, &parts.extensions),
         source_ip: client_ip::canonical_client_ip(
             &parts.headers,
@@ -1332,28 +1339,8 @@ pub(super) async fn policy_replay_create_endpoint(
             result: None,
         }),
     });
-    if let Some(refusal) = admission_refusal(jobs.admit(&job)) {
-        return refusal;
-    }
-    // A job whose start is not on the record is never queued.
-    if let Err(error) = record_lifecycle(
-        &state.audit,
-        &job,
-        audit::event::POLICY_REPLAY_STARTED,
-        started_payload(&job),
-    )
-    .await
-    {
-        tracing::error!(error = %error, "policy replay start was not recorded; the job is not queued");
-        jobs.remove(&job.id);
-        return replay_refusal(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "the policy replay could not be recorded; retry later",
-            "policy_replay_audit_unavailable",
-        );
-    }
     let source_path = query_store.sqlite_query_store().path().to_path_buf();
-    tokio::spawn(run_replay_job(
+    let worker = run_replay_job(
         Arc::clone(&jobs.run_permits),
         Arc::clone(&job),
         slot,
@@ -1361,7 +1348,54 @@ pub(super) async fn policy_replay_create_endpoint(
         candidate,
         source_path,
         state.audit.clone(),
-    ));
+    );
+    // Once admission begins it owns both the reservation and the worker, even if the
+    // client disconnects while SQLite or the audit sink acknowledges the start.
+    let queued = Arc::clone(&job);
+    let admission = tokio::spawn(async move {
+        let _mutation = jobs.mutations.lock().await;
+        if let Some(key) = queued.idempotency_key.as_deref() {
+            if let Some(existing) = jobs.find_idempotent(&queued.owner, key) {
+                return if queued.request_digest == existing.request_digest {
+                    ReplayAdmission::Existing(existing)
+                } else {
+                    ReplayAdmission::IdempotencyConflict
+                };
+            }
+        }
+        if let Some(refusal) = jobs.precheck(&queued.owner) {
+            return refusal;
+        }
+        if let Some(journal) = &jobs.journal {
+            if journal.reserve(Arc::clone(&queued)).await.is_err() {
+                return ReplayAdmission::StoreUnavailable;
+            }
+        }
+        if let Err(error) = record_lifecycle(
+            &state.audit,
+            &queued,
+            audit::event::POLICY_REPLAY_STARTED,
+            started_payload(&queued),
+        )
+        .await
+        {
+            tracing::error!(error = %error, "policy replay start was not recorded");
+            if let Some(journal) = &jobs.journal {
+                if journal.remove(queued.id.clone(), true).await.is_err() {
+                    return ReplayAdmission::StoreUnavailable;
+                }
+            }
+            return ReplayAdmission::AuditUnavailable;
+        }
+        jobs.swept(Instant::now()).insert(queued.id.clone(), queued);
+        tokio::spawn(worker);
+        ReplayAdmission::Admitted
+    })
+    .await
+    .unwrap_or(ReplayAdmission::StoreUnavailable);
+    if let Some(refusal) = admission_refusal(admission) {
+        return refusal;
+    }
     let mut response = job_response(StatusCode::ACCEPTED, &job, Some(true));
     if let Ok(location) = HeaderValue::from_str(&format!("{}/{}", parts.uri.path(), job.id)) {
         response.headers_mut().insert(header::LOCATION, location);
@@ -1373,6 +1407,16 @@ pub(super) async fn policy_replay_create_endpoint(
 fn admission_refusal(admission: ReplayAdmission) -> Option<Response> {
     match admission {
         ReplayAdmission::Admitted => None,
+        ReplayAdmission::AuditUnavailable => Some(replay_refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the policy replay could not be recorded; retry later",
+            "policy_replay_audit_unavailable",
+        )),
+        ReplayAdmission::StoreUnavailable => Some(replay_refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the policy replay job store is unavailable",
+            "policy_replay_store_unavailable",
+        )),
         ReplayAdmission::Existing(existing) => Some(job_response(StatusCode::OK, &existing, None)),
         ReplayAdmission::IdempotencyConflict => Some(replay_idempotency_conflict()),
         ReplayAdmission::QuotaExhausted => Some(replay_quota_exhausted()),
@@ -1500,8 +1544,25 @@ pub(super) async fn policy_replay_delete_endpoint(
         pending
     };
     if !pending {
-        jobs.remove(&job.id);
-        return StatusCode::NO_CONTENT.into_response();
+        let id = job.id.clone();
+        // Commit deletion in both stores even when the client goes away mid-write.
+        return match tokio::spawn(async move {
+            let _mutation = jobs.mutations.lock().await;
+            if let Some(journal) = &jobs.journal {
+                journal.remove(id.clone(), false).await?;
+            }
+            jobs.remove(&id);
+            Ok::<_, ()>(())
+        })
+        .await
+        {
+            Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+            _ => replay_refusal(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the policy replay job store is unavailable",
+                "policy_replay_store_unavailable",
+            ),
+        };
     }
     job.control.cancel();
     job.cancel_signal.notify_one();

@@ -7017,7 +7017,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "f504a0bfca63b6169d53aac87ca9ded3b82e3d904b790c04d3675ee71a85ed4f",
+      "sha256": "1f2db578627d5d5ebae7a518139b1bfdf54ffb33d95a3a7ec0dfe7e95b22af8f",
       "owner": "GreenGateway maintainers",
       "purpose": "Registers authenticated approval, keyed preparation and token revocation routes alongside the owner-scoped policy replay registry."
     },
@@ -7552,12 +7552,42 @@
       "purpose": "tokio::select! in the replay worker's idle wait: shutdown, a local admission's wake-up, or the poll timer. Local task coordination only; no network, socket or process capability."
     },
     {
+      "file": "gateway/src/admin_policy_replays_standalone.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_replays::standalone::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reuse bounded replay types, digests and constants from the parent replay authority."
+    },
+    {
+      "file": "gateway/src/admin_policy_replays_standalone.rs",
+      "reasons": [
+        "capability-in-macro-input"
+      ],
+      "scope": "gateway::admin_policy_replays::standalone::impl  PolicyReplayJobs::start_retention#1",
+      "sha256": "cc16fda3c2388e34f6cb58cfe41cb2a2a78234ba39268de5547a657c9a4c47a9",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Periodically clear expired aggregates using the existing lifecycle cancellation token and a blocking SQLite worker."
+    },
+    {
+      "file": "gateway/src/admin_policy_replays_standalone.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::admin_policy_replays::standalone::recover#1",
+      "sha256": "6a886cc5674e8fe7b8dd073d4e925f1d8b1ab02a4ed1a6c21b02becd4cf320ef",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Read bounded and verified binding and result records into the standalone job registry; no network operations."
+    },
+    {
       "file": "gateway/src/admin_policy_replays.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
       "scope": "gateway::admin_policy_replays::ReplayJobState#1",
-      "sha256": "25fdca6b32d077304ade6ca860ce9d5a17cb272eed18eee89f13acb6ceb23ba1",
+      "sha256": "bfc5fdd54a86d3c56a28b4f489ea8f24ddea83ce058421cb6aebd52702ebc28b",
       "owner": "policy replay contexts (#243)",
       "purpose": "Narrow cfg_attr(not(feature = \"postgres\"), allow(dead_code)) on the interrupted job state, which only cluster replay jobs reach. Dead-code gating only; no transport or process capability."
     },

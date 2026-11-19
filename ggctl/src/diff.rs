@@ -9,11 +9,9 @@
 //! the CLI cannot approximate either. Two environment files are each
 //! compiled by the gateway's own configuration compiler, exactly as
 //! `ggctl validate --env` compiles one, and their plans compared by
-//! `compiler::semantic_diff::plans`, setting by setting. An environment file
-//! and a bundle are read and reported but never compared: no front end maps
-//! a bundle onto the compiler's settings yet, and an environment plan holds
-//! no policy or tools document, so there is no common ground to compare
-//! (`diff.not_comparable`). The change is from the `--against` side to the
+//! `compiler::semantic_diff::plans`, setting by setting. Mixed inputs fail with
+//! `diff.not_comparable` because only a bundle declares resource ownership
+//! and can carry policy or tools documents. The change is from the `--against` side to the
 //! other. Everything written is value-free because the diff is:
 //!
 //! - human: one line per change, then the sorted risk codes;

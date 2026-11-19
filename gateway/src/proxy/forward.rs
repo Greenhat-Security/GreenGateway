@@ -4875,6 +4875,8 @@ mod tests {
 
     #[tokio::test]
     async fn sse_circuit_permit_stays_pending_until_stream_completion() {
+        const OPEN_MS: u64 = 30;
+        let clock = Arc::new(super::super::circuit::FakeClock::new());
         let (addr, server) = spawn_sse_upstream(SseTestBody::Pending).await;
         let (proxy, sink, _) = retry_proxy_with_options(
             [addr, addr],
@@ -4889,10 +4891,11 @@ mod tests {
                 }),
                 circuit_config: Some(config::UpstreamCircuitBreakerConfig {
                     failure_threshold: 1,
-                    open_ms: 30,
+                    open_ms: OPEN_MS,
                     half_open_max_requests: 1,
                     recovery_threshold: 1,
                 }),
+                circuit_clock: clock.clone(),
                 ..RetryProxyOptions::default()
             },
         );
@@ -4924,7 +4927,8 @@ mod tests {
             "late SSE idle failure must open the endpoint circuit"
         );
 
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        // Waiting for the audit sink must not age the circuit's open interval.
+        clock.advance(Duration::from_millis(OPEN_MS));
         pool.next_selection.store(0, Ordering::Relaxed);
         let half_open = Request::builder()
             .uri("/")
@@ -6849,6 +6853,7 @@ mod tests {
     struct RetryProxyOptions {
         retry: Option<config::UpstreamRetryConfig>,
         circuit_config: Option<config::UpstreamCircuitBreakerConfig>,
+        circuit_clock: Arc<dyn super::super::circuit::CircuitClock>,
         timeout: Duration,
         response_idle_timeout: Option<Duration>,
         limits: config::UpstreamPoolLimitsConfig,
@@ -6864,6 +6869,7 @@ mod tests {
             Self {
                 retry: None,
                 circuit_config: None,
+                circuit_clock: Arc::new(super::super::circuit::SystemCircuitClock),
                 timeout: Duration::from_secs(2),
                 response_idle_timeout: None,
                 limits: config::UpstreamPoolLimitsConfig::default(),
@@ -6935,11 +6941,12 @@ mod tests {
                     health: health_states[index].clone(),
                     health_config: health_config.clone(),
                     circuit: circuit_config.as_ref().map(|config| {
-                        super::super::circuit::CircuitBreaker::new(
+                        super::super::circuit::CircuitBreaker::new_with_clock(
                             Arc::from("payments"),
                             Arc::from(id),
                             config.clone(),
                             options.retry.as_ref(),
+                            Arc::clone(&options.circuit_clock),
                             Some(audit.clone()),
                         )
                     }),

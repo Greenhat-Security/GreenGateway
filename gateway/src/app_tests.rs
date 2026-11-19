@@ -3481,7 +3481,7 @@ impl TempDb {
 
 impl Drop for TempDb {
     fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", ".policy-replays.lock"] {
             let path = PathBuf::from(format!("{}{}", self.path.display(), suffix));
             let _ = fs::remove_file(path);
         }
@@ -3515,7 +3515,7 @@ impl Drop for TempPolicyFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
         let history_path = default_policy_history_sqlite_path(&self.path.to_string_lossy());
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", ".policy-replays.lock"] {
             let path = PathBuf::from(format!("{}{}", history_path.display(), suffix));
             let _ = fs::remove_file(path);
         }

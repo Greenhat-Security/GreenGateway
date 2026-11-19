@@ -320,7 +320,7 @@ fn binding_from(spec: &PolicyReplayJobSpec) -> Option<ReplayJobBinding> {
         .collect::<Option<Vec<_>>>()?;
     Some(ReplayJobBinding {
         base_etag: spec.base_etag.clone(),
-        candidate_source,
+        candidate_source: candidate_source.to_owned(),
         candidate_etag: spec.candidate_etag.clone(),
         edit_count: usize::try_from(spec.edit_count).ok()?,
         stored,

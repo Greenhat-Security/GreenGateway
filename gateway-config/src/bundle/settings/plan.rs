@@ -23,6 +23,7 @@ impl Settings {
         document: &Node,
         file: &FileName,
         bound_stores: Option<(&StateDirectory, &[StandaloneStore])>,
+        listener_bootstrap: Option<BTreeMap<&'static str, String>>,
     ) -> Result<Option<Box<ConfigPlan>>, Vec<BundleDiagnostic>> {
         let unsupported = |path: &'static str| {
             vec![at_setting(
@@ -32,7 +33,8 @@ impl Settings {
                 path.split('/').skip(1),
             )]
         };
-        let mut inputs = BTreeMap::new();
+        let listeners_bound = listener_bootstrap.is_some();
+        let mut inputs = listener_bootstrap.unwrap_or_default();
         for setting in &self.own {
             match (setting.member.path, &setting.value) {
                 // The profile stage handles acknowledgements separately.
@@ -63,6 +65,13 @@ impl Settings {
                     | "/spec/listeners/admin/client_certificate_crl",
                     SettingValue::Word("off"),
                 ) => {}
+                (
+                    "/spec/listeners/public/tls"
+                    | "/spec/listeners/admin/tls"
+                    | "/spec/listeners/public/client_certificate_crl"
+                    | "/spec/listeners/admin/client_certificate_crl",
+                    SettingValue::Word("required"),
+                ) if listeners_bound => {}
                 (
                     "/spec/admin_login/client_id" | "/spec/admin_login/redirect_uri",
                     SettingValue::Text(_),
@@ -126,11 +135,12 @@ impl Settings {
         );
         let mut diagnostics = Vec::new();
         let mut refuse = |field: Option<&'static Field>| {
-            let path = if field.is_some_and(|field| bootstrap.contains(field.environment)) {
-                STORES_PATH
-            } else {
-                field.and_then(Field::document_path).unwrap_or("/spec")
-            };
+            let path =
+                if let Some(bound) = field.filter(|field| bootstrap.contains(field.environment)) {
+                    super::listeners::mount_path(bound.environment).unwrap_or(STORES_PATH)
+                } else {
+                    field.and_then(Field::document_path).unwrap_or("/spec")
+                };
             let diagnostic = at_setting(
                 Code::InvalidDeploymentSetting,
                 file,

@@ -849,6 +849,7 @@ pub(super) struct PrincipalAdminState {
 
 #[derive(Clone)]
 pub(super) struct AdminApiStates {
+    pub(super) replay_jobs: Arc<PolicyReplayJobs>,
     pub(super) audit: AuditAdminState,
     pub(super) auth: Option<AdminAuthState>,
     pub(super) status: StatusAdminState,

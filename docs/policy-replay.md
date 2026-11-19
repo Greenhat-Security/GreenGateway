@@ -598,18 +598,17 @@ are counted by the job store ([cluster jobs](#cluster-jobs)).
 | --- | --- |
 | `completed` | Every record the cutoff selected was read and classified, the window was unchanged at the end, and at least one record was replayed |
 | `completed_incomplete` | A result whose `limitations` say what it does not cover: `scan_truncated`, `deadline_exceeded`, `source_changed`, `source_pruned` (cluster audit stream only: rows the window may have held are gone), or `no_data` when nothing in the window was replayable. It satisfies no gate |
-| `failed` | No result, with a stable `failure.reason`: `source_unavailable`, `compile_failed`, `evaluator_failed` (the evaluator broke its own contract; nothing it counted is an answer), `result_too_large`, `checkpoint_too_large` (cluster only), `audit_unavailable` or `internal` |
+| `failed` | No result, with a stable `failure.reason`: `source_unavailable`, `compile_failed`, `evaluator_failed` (the evaluator broke its own contract; nothing it counted is an answer), `result_too_large`, `checkpoint_too_large` (cluster only), `store_unavailable` (standalone journal write failed), `audit_unavailable` or `internal` |
 | `cancelled` | No result. A queued job stops at once; a running one before its next record |
-| `interrupted` | Cluster only. No result: a replica took the job over and could not continue it, with `failure.reason` `pins_unreadable` (a pinned policy no longer validates or reproduces its ETag), `engine_version_changed` (the job was admitted under another evaluator, replay-context, checkpoint or result version), `checkpoint_unreadable` or `takeover_limit` ([cluster jobs](#cluster-jobs)) |
+| `interrupted` | Standalone startup found unfinished work (`standalone_restart`) or a retained result from another engine (`engine_version_changed`). No result is supplied. In cluster mode, a replica took the job over and could not continue it, with `failure.reason` `pins_unreadable` (a pinned policy no longer validates or reproduces its ETag), `engine_version_changed` (the job was admitted under another evaluator, replay-context, checkpoint or result version), `checkpoint_unreadable` or `takeover_limit` ([cluster jobs](#cluster-jobs)) |
 | `expired` | 15 minutes have passed since the job finished: its result, if it had one, is gone, and it no longer counts against any quota |
 
 `completed` does not mean every record was decided: records the candidate
 answered `indeterminate`, records the adapters could not use and records the
 evaluator refused are all counted, by code.
 
-Every job leaves exactly its own lifecycle records: `policy.replay_started`
-when it is admitted, and one of `policy.replay_completed`,
-`policy.replay_cancelled`, `policy.replay_failed` or (cluster only)
+An executing worker emits `policy.replay_started` at admission and one of `policy.replay_completed`,
+`policy.replay_cancelled`, `policy.replay_failed` or
 `policy.replay_interrupted` when it ends. They carry
 the job id, the base and candidate ETags, the request digest, the projections,
 the window and cutoff (the start also names a stored candidate by its
@@ -622,7 +621,7 @@ other policy content -- and the envelope of the request that started the
 job. A job is queued only once the audit log accepts its start
 (otherwise `503 policy_replay_audit_unavailable`, and no job), and its result
 is published only once the audit log accepts its completion: a result whose
-completion is not accepted is `failed` with `audit_unavailable`. "Accepted"
+completion is not accepted is `failed` with `audit_unavailable`. Recovery events carry the job ID and reason without copying the previous request envelope. "Accepted"
 is what `AUDIT_DURABILITY` makes it: committed to the audit store under
 `required`, queued for the writer under `best_effort`.
 
@@ -748,14 +747,37 @@ cutoff, base, candidate, projections and evaluator produce byte-identical
 results, however the log was paged. A job stopped by its deadline is the one
 exception, and says so. No replay result says a policy is safe.
 
-### Standalone jobs are process-local
+### Standalone job recovery
 
-A standalone job lives in the memory of the replica that admitted it, and
-runs there. Shutting the gateway down cancels every job, and a running one
-stops before its next record. A restart forgets every job: its id is `404`
-afterwards, never resumed and never a partial result. Without a standalone
-audit log (`AUDIT_SQLITE_PATH` unset) the start route is
-`503 audit_evidence_unavailable`, never an empty result.
+A standalone gateway records each admitted job in the policy history SQLite
+database (`POLICY_HISTORY_SQLITE_PATH`, default `<POLICY_FILE>.history.sqlite`).
+The bounded worker still reads retained events from `AUDIT_SQLITE_PATH`. A
+start without an audit source returns `503 audit_evidence_unavailable`.
+
+The journal retains the job's owner and retry key as digests, the request
+digest, cutoff, window, policy bindings and versions. A completed audit
+receipt precedes the transaction that makes the aggregate result available.
+A fresh process verifies the stored digests before serving a result. A crash
+before that transaction leaves an interrupted job with reason
+`standalone_restart` and no result. If the audit sink already accepted the
+completion, its record may precede the restart interruption in the audit log.
+The recovery audit event contains the job ID and interruption reason. The
+journal determines whether an aggregate is available for evidence. A retry
+by its owner returns the same job ID, and reusing the key for a different
+request returns `409`. Jobs from versions predating the journal had no
+durable identity and continue to return `404` after an upgrade.
+
+Results expire 15 minutes after completion, including time the gateway was
+offline. The gateway clears expired aggregates on startup, on the next
+admission, and every minute while it runs. It retains up to 32 expired
+status records for up to a further hour. The owner's delete action removes
+a finished job from the journal. Raw events, source IPs, subjects, retry
+keys, policy documents and credentials are excluded from the journal.
+
+A process holds an OS lock on `<history database>.policy-replays.lock`
+while it owns replay work. Stop the old gateway before starting another
+against the same standalone policy history. The OS releases the lock when
+the process exits. The lock file stays in place across restarts.
 
 ### Cluster jobs
 

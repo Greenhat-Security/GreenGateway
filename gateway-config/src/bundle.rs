@@ -204,15 +204,52 @@ impl StandalonePlan {
     }
 }
 
+/// A native preflight result. Store-backed plans own their state lock.
+pub enum MountedPlan {
+    WithoutStores(Box<crate::compiler::ConfigPlan>),
+    WithStores(StandalonePlan),
+}
+
+impl MountedPlan {
+    pub fn plan(&self) -> &crate::compiler::ConfigPlan {
+        match self {
+            Self::WithoutStores(plan) => plan,
+            Self::WithStores(bound) => bound.plan(),
+        }
+    }
+}
+
 impl ProductionBundle {
-    /// Bind a deployment's declared standalone stores. Reuse the exact
-    /// pinned deployment bytes in memory, even if the mount has changed.
-    /// Other host requirements can still leave the plan pending. A refusal
-    /// or pending plan releases the directory and opens no store.
+    /// Bind a deployment's declared standalone stores without supplying
+    /// listener mounts. Offline callers still wait on other host requirements.
     pub fn bind_standalone_stores(
         &self,
         directory: crate::state_dir::StateDirectory,
     ) -> Result<Option<StandalonePlan>, Vec<BundleDiagnostic>> {
+        self.compile_bound(Some(&directory), None::<fn(&str) -> _>)
+            .map(|plan| plan.map(|plan| StandalonePlan { plan, directory }))
+    }
+
+    /// Compile against the real listener mounts and optional state lock.
+    /// All document values come from the pinned generation already in memory.
+    /// This checks locator configuration without opening any TLS material.
+    pub fn bind_mounted(
+        &self,
+        directory: Option<crate::state_dir::StateDirectory>,
+        get_var: impl FnMut(&str) -> Result<String, std::env::VarError>,
+    ) -> Result<Option<MountedPlan>, Vec<BundleDiagnostic>> {
+        let plan = self.compile_bound(directory.as_ref(), Some(get_var))?;
+        Ok(plan.map(|plan| match directory {
+            Some(directory) => MountedPlan::WithStores(StandalonePlan { plan, directory }),
+            None => MountedPlan::WithoutStores(plan),
+        }))
+    }
+
+    fn compile_bound(
+        &self,
+        directory: Option<&crate::state_dir::StateDirectory>,
+        get_var: Option<impl FnMut(&str) -> Result<String, std::env::VarError>>,
+    ) -> Result<Option<Box<crate::compiler::ConfigPlan>>, Vec<BundleDiagnostic>> {
         let Some(source) = self
             .files
             .iter()
@@ -235,7 +272,7 @@ impl ProductionBundle {
         let stores = settings
             .standalone_stores(&node, &source.name)
             .map_err(|issue| vec![issue])?;
-        if stores.is_empty() {
+        if directory.is_some() == stores.is_empty() {
             return Err(vec![BundleDiagnostic::file(
                 Code::InvalidDeploymentSetting,
                 &source.name,
@@ -245,15 +282,17 @@ impl ProductionBundle {
             .files
             .iter()
             .any(|source| source.role == FileRole::Policy);
-        Ok(settings
-            .compile_plan(
-                profile,
-                pinned_policy,
-                &node,
-                &source.name,
-                Some((&directory, &stores)),
-            )?
-            .map(|plan| StandalonePlan { plan, directory }))
+        let listeners = get_var
+            .map(|get| settings.listener_bootstrap(profile, &node, &source.name, get))
+            .transpose()?;
+        settings.compile_plan(
+            profile,
+            pinned_policy,
+            &node,
+            &source.name,
+            directory.map(|dir| (dir, stores.as_slice())),
+            listeners,
+        )
     }
 }
 
@@ -718,21 +757,22 @@ fn read_deployment(
     diagnostics.extend(settings.listener_diagnostics(profile, &node, &reference.file));
     diagnostics.extend(settings.public_diagnostics(&node, &reference.file));
     diagnostics.extend(settings.provider_diagnostics(&node, &reference.file));
-    let plan = match settings.compile_plan(profile, bundled_policy, &node, &reference.file, None) {
-        Ok(plan) => plan,
-        Err(found) => {
-            // Keep the dedicated stage's more specific code at a pointer it
-            // already refused, and also return independent cross-domain findings.
-            for issue in found {
-                if !diagnostics[initial..].iter().any(|prior| {
-                    prior.severity == Severity::Error && prior.pointer == issue.pointer
-                }) {
-                    diagnostics.push(issue);
+    let plan =
+        match settings.compile_plan(profile, bundled_policy, &node, &reference.file, None, None) {
+            Ok(plan) => plan,
+            Err(found) => {
+                // Keep the dedicated stage's more specific code at a pointer it
+                // already refused, and also return independent cross-domain findings.
+                for issue in found {
+                    if !diagnostics[initial..].iter().any(|prior| {
+                        prior.severity == Severity::Error && prior.pointer == issue.pointer
+                    }) {
+                        diagnostics.push(issue);
+                    }
                 }
+                None
             }
-            None
-        }
-    };
+        };
     // Decimals take their shortest exact spelling and the word sets their
     // canonical order, so neither changes the canonical bytes.
     let mut document = node.to_json();

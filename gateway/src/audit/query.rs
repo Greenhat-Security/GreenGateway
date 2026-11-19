@@ -334,7 +334,8 @@ pub struct ShadowRuleWouldDenySample {
 /// job is created ([`AuditQueryStore::replay_cutoff`]). The cluster audit
 /// stream's reader (`storage::postgres_audit_replay`) fills the same fields
 /// with stream positions where this log has row ids.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReplayCutoff {
     /// The newest row id stored when the job was created.
     pub(crate) high_water: i64,
