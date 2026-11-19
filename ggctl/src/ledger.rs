@@ -584,7 +584,7 @@ fn ledger_diagnostic(error: &LedgerError) -> ReportDiagnostic {
 /// The code for a ledger refusal or failure: the one `gateway-config` gives
 /// it, except an idempotency key already used, which no offline command
 /// sends.
-fn ledger_code(error: &LedgerError) -> Code {
+pub(crate) fn ledger_code(error: &LedgerError) -> Code {
     match error {
         LedgerError::UnsafeLocation => Code::LedgerUnsafeLocation,
         LedgerError::Missing => Code::LedgerMissing,

@@ -286,6 +286,10 @@ fn every_check_and_reason_is_documented() {
         rows(&section("Environment doctor checks")),
         ENVIRONMENT_CHECKS
     );
+    assert_eq!(
+        rows(&section("State directory doctor checks")),
+        STATE_DIR_CHECKS
+    );
     let reasons: Vec<_> = Reason::ALL.iter().map(|reason| reason.as_str()).collect();
     assert_eq!(rows(&section("Doctor reasons")), reasons);
 }
@@ -310,6 +314,7 @@ fn the_report_schema_lists_every_check() {
         .map(|stage| stage.id())
         .chain(OTHER_CHECKS.iter().copied())
         .chain(ENVIRONMENT_CHECKS.iter().copied())
+        .chain(STATE_DIR_CHECKS.iter().copied())
         .collect();
     assert_eq!(listed, checks);
 }
