@@ -766,11 +766,7 @@ GreenGateway is open source under the Apache License 2.0.
 
 You may use, copy, modify, merge, publish, distribute, sublicense, and sell copies of the software under the terms of the Apache License 2.0.
 
-See:
-
-```text
-LICENSE
-```
+See [LICENSE](LICENSE).
 
 ---
 
