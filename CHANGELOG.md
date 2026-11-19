@@ -9,6 +9,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Production readiness fixes
 
+- Standalone policy replay jobs survive a gateway restart. The gateway records each admitted job in its policy history SQLite database and, on startup, serves a completed job's result again once its stored digests verify. Unfinished work becomes `interrupted` with reason `standalone_restart`. An OS lock keeps a second process from taking over a live worker's jobs. Jobs from versions before the journal still return `404` after an upgrade. [Standalone job recovery](docs/policy-replay.md#standalone-job-recovery). Part of #243.
+
+- Native bundle preflight checks the public and admin listener TLS certificate, key, CA and CRL locators against the pinned deployment's listener declarations, in both directions, and pairs one key with each certificate. Errors name the deployment field, never the host path. Reading the certificates and serving the listener still belong to activation, and offline `ggctl` validation reads no host locator. [The deployment document](docs/configuration-bundles.md#the-deployment-document). Part of #242.
+
 - PostgreSQL can prepare an approval with a caller-bound operation ID and recover its receipt after response loss or expiry. The approval and its qualified evidence commit together. [Mutation approvals](docs/connections/operator-guide.md). Part of #425 and #757.
 
 - Add opt-in delivery of issuer-scoped `authority_event.v1` records for caller-bound PostgreSQL service-token revocations. Each record declares its wire version. [Delivery format](docs/configuration.md#authority_event_format). Part of #425.

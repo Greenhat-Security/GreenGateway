@@ -4,18 +4,20 @@
 and [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md) ("Change
 classes" and "Plan, risk acknowledgment, and conditional apply"): what it
 compares, how it classifies each change, the stable risk codes, and what it
-never shows. [`ggctl diff`](ggctl.md#diff) reports it for two bundles. The
+never shows. [`ggctl diff`](ggctl.md#diff) reports it for two bundles or two
+environment files. The
 gateway compares two compiled environment configurations, `ggctl diff` and the
 gateway compare two bundles read with the production validators, and the
 standalone ledger's plans
 ([configuration-ledger.md](configuration-ledger.md#plans-and-conditional-apply))
 diff a candidate against the head this way and require every risk code to be
 acknowledged before an apply. Nothing serves or logs those comparisons yet:
-the admin routes are a later #242 slice. `ggctl diff --env` and
-`--against-env` need an environment-file front end over the compiler, which
-`ggctl` can now link (`gateway_config::compiler`), and `--server` needs those
-routes. Nothing here changes how a gateway is configured, started or
-reloaded.
+the admin routes are a later #242 slice.
+`ggctl diff --env FILE --against-env FILE` compiles both files with the
+gateway's own configuration compiler (`gateway_config::compiler`) and
+compares the two plans ([environment files](ggctl.md#environment-files));
+`ggctl diff --server` needs those routes. Nothing here changes how a gateway
+is configured, started or reloaded.
 
 ## What it compares
 
@@ -205,3 +207,8 @@ ledger's plans do: spelling out a default moves only the pin. It writes:
 
 `--check` exits `4` (`diff.drift_found`) when anything differs and `0`
 otherwise; an invalid bundle is not compared and exits `3`.
+
+[`ggctl diff --env FILE --against-env FILE`](ggctl.md#diff) compares two
+environment files' compiled plans the same way and writes the same outputs,
+each change named by its environment variable. A bundle compared with an
+environment file is `diff.not_comparable` (exit `3`).
