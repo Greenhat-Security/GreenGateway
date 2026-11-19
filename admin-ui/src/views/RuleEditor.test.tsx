@@ -20,7 +20,22 @@ describe('RuleEditor', () => {
       fireEvent.change(screen.getByLabelText('Role constraints'), { target: { value: role } });
       fireEvent.click(screen.getByRole('button', { name: 'Add role' }));
     }
-    expect(screen.getByLabelText('Policy expression').textContent).toContain('(principal.roles contains "support" OR principal.roles contains "admin")');
+    expect(JSON.parse(screen.getByLabelText('Rule JSON').textContent ?? '').principal.roles)
+      .toEqual(['support', 'admin']);
+    expect(screen.getByLabelText('Deprecated policy expression').textContent).toContain('(principal.roles contains "support" OR principal.roles contains "admin")');
+  });
+
+  it('labels the browser pseudo-expression as deprecated and display-only', async () => {
+    vi.stubGlobal('fetch', policyBackedFetch(policyFixture(), 'W/"policy-1"'));
+    renderRuleEditor();
+    await screen.findByLabelText('Path pattern');
+
+    expect(screen.queryByLabelText('Policy expression')).toBeNull();
+    const deprecated = screen.getByText('Deprecated policy expression');
+    expect(deprecated.tagName).toBe('SUMMARY');
+    const details = deprecated.closest('details');
+    expect(details?.open).toBe(false);
+    expect(details?.textContent).toContain('the gateway never parses it');
   });
 
   it('starts from the unchanged blank form when no prefill params are present', async () => {
@@ -86,21 +101,24 @@ describe('RuleEditor', () => {
     ).toContain(
       'Log-only POST requests to /api/reports/{id} for role support, issuer https://idp.example/, auth method session cookie, and principal user-123.',
     );
-    expect(
-      screen.getByLabelText('Policy expression').textContent,
-    ).toContain('request.method in ["POST"]');
-    expect(
-      screen.getByLabelText('Policy expression').textContent,
-    ).toContain('request.path matches "/api/reports/{id}"');
-    expect(
-      screen.getByLabelText('Policy expression').textContent,
-    ).toContain('principal.roles contains "support"');
-    expect(
-      screen.getByLabelText('Policy expression').textContent,
-    ).toContain('principal.issuer in ["https://idp.example/"]');
-    expect(
-      screen.getByLabelText('Policy expression').textContent,
-    ).toContain('decision = "shadow"');
+    // The rule JSON is the policy document's own structure, members sorted.
+    expect(screen.getByLabelText('Rule JSON').textContent).toBe(
+      JSON.stringify(
+        {
+          action: 'shadow',
+          methods: ['POST'],
+          path: '/api/reports/{id}',
+          principal: {
+            auth_methods: ['session_cookie'],
+            issuers: ['https://idp.example/'],
+            principal_ids: ['user-123'],
+            roles: ['support'],
+          },
+        },
+        null,
+        2,
+      ),
+    );
   });
 
   it('saves a contextless dispatch binding from traffic prefill', async () => {
@@ -112,9 +130,8 @@ describe('RuleEditor', () => {
     );
 
     expect(await screen.findByDisplayValue('/local/{id}')).toBeTruthy();
-    expect(screen.getByLabelText('Policy expression').textContent).toContain(
-      'proxy.dispatch_kind == "contextless"',
-    );
+    expect(JSON.parse(screen.getByLabelText('Rule JSON').textContent ?? '').dispatch)
+      .toEqual({ kind: 'contextless' });
     fireEvent.click(screen.getByRole('button', { name: 'Save rule' }));
     expect(await screen.findByText('Rule saved.')).toBeTruthy();
 
@@ -136,9 +153,8 @@ describe('RuleEditor', () => {
     );
 
     expect(await screen.findByDisplayValue('/legacy/{id}')).toBeTruthy();
-    expect(screen.getByLabelText('Policy expression').textContent).toContain(
-      'proxy.upstream_origin == "https://legacy.internal"',
-    );
+    expect(JSON.parse(screen.getByLabelText('Rule JSON').textContent ?? '').dispatch)
+      .toEqual({ kind: 'legacy', upstream_origin: 'https://legacy.internal' });
     fireEvent.click(screen.getByRole('button', { name: 'Save rule' }));
     expect(await screen.findByText('Rule saved.')).toBeTruthy();
 
@@ -285,9 +301,8 @@ describe('RuleEditor', () => {
       (screen.getByRole('radio', { name: 'MCP tool' }) as HTMLInputElement)
         .disabled,
     ).toBe(true);
-    expect(screen.getByLabelText('Policy expression').textContent).toContain(
-      'proxy.upstream_origin == "https://api.example.test"',
-    );
+    expect(JSON.parse(screen.getByLabelText('Rule JSON').textContent ?? '').dispatch)
+      .toEqual({ kind: 'legacy', upstream_origin: 'https://api.example.test' });
   });
 
   it('validates path patterns before submitting', async () => {
@@ -691,7 +706,9 @@ describe('RuleEditor', () => {
 
     expect(await screen.findByDisplayValue('/api/users/{id}')).toBeTruthy();
     expect(screen.getByLabelText('Rule summary').textContent).toContain('additional policy condition');
-    expect(screen.getByLabelText('Policy expression').textContent).toContain('Review the complete rule');
+    expect(JSON.parse(screen.getByLabelText('Rule JSON').textContent ?? '').conditions)
+      .toEqual({ all: [{ source_network: { cidrs: ['192.0.2.0/24'] } }] });
+    expect(screen.getByLabelText('Deprecated policy expression').textContent).toContain('Review the complete rule');
     expect(screen.getByRole('link', { name: /Review this condition/ }).getAttribute('href'))
       .toBe('/policy/studio?rule_id=support-read');
     expect(screen.getByText('Historical preview unavailable')).toBeTruthy();

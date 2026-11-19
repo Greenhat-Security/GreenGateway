@@ -151,6 +151,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- The rule builder's Rule logic section shows the rule as policy JSON instead of a browser-generated policy expression (part of #243). The JSON carries the rule's matcher, principal, action, dispatch binding and full condition tree, with members sorted by name, so a conditioned rule is no longer reduced to a pointer to Policy Studio. The old expression moves to a collapsed **Deprecated policy expression** disclosure; see Deprecated below. [Rule builder](docs/configuration.md#policy_file).
+
 - Take the mid-November patch and minor Dependabot updates that need no code change (part of #420): `syn` 3.0.10, `rustls-webpki` 0.103.17 and `uuid` 1.29.2 in the lockfile, `vite` 8.3.8 and `@vitejs/plugin-react` 6.3.0 in the admin UI, `@cloudflare/workers-types` 5.20261112.1 for the Worker, and `taiki-e/install-action` 2.90.3 in CI. The duplicate-version exceptions and the transport guard graph record the new versions. The Node 26.13.1 image, Wrangler 4.161.0 and `notify` 8.2.2 each needed their own pin or policy review and arrive with the contributor rollup in the next entry; `sse-stream` 0.3 is not included.
 
 - Mid-November dependency refresh (part of #420). This rolls up Dependabot PRs #803–#812 into one change; the RustSec fixes that ride along are under Security. `rustls-webpki` 0.103.17 only adds SPKI and SCT accessors. `syn` 3.0.10 skips rescanning operands that already failed, and the transport guard reproduces every reviewed scope hash with it. `uuid` 1.29.2 fixes v7 monotonicity bugs and adds wasm64 support; neither affects the gateway, which builds only `v4`. `notify` 8.2.2 raises its MSRV to 1.88, which is below `rust_ci`, and fixes a Windows deadlock on watch shutdown. On macOS it replaces `fsevent-sys` with `objc2-core-services`, and it moves to `windows-sys` 0.61. That drops `windows-sys` 0.60 and the whole `windows-targets` 0.53 family from the lock, so their duplicate exceptions are gone too. Its exact CC0-1.0 license exception moves to 8.2.2; the license is unchanged. In the admin UI, `vite` moves to 8.3.8 (bug fixes) and `@vitejs/plugin-react` to 6.3.0 (refresh include/exclude options and React Compiler preset worker support). For the Worker, Wrangler moves to 4.161.0 and the Worker types to 5.20261112.1. Wrangler brings workerd 1.20261110.1, whose denied `postinstall` `install.js` differs from 1.20261104.1 only in its embedded version strings. Its reviewed identity, integrity and source hash move in `npm-script-policy.json`, the `allowScripts` pin and the lifecycle policy doc. Node moves to 26.13.1, a security release; npm stays 11.20.0. `.node-version`, `build-tools.json`, both `engines` fields and the Docker Node image move together. In CI, `taiki-e/install-action` 2.90.3 changes only other tools' manifests. `sse-stream` 0.3 (#748) is left out: `rmcp` still depends on 0.2, and the gateway passes `sse_stream` types to it, so the bump does not compile until `rmcp` moves.
@@ -411,6 +413,17 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   major release. Issue #240 assigns no removal version. Any removal requires a
   future major release, advance release-note notice, a supported migration
   path, and published rollback guidance.
+- The rule builder's browser-generated policy expression
+  (`request.method in [...]`, `principal.roles contains ...`) is marked
+  deprecated in the UI as advance notice. It is display-only pseudo-syntax
+  that the gateway never parses; use the rule JSON shown above it. ADR-0004
+  rollout step 8 deprecates it "only after compatible server-backed
+  replacements ship and a documented migration window passes". The rule JSON
+  is built in the browser from the editor's form, not by the server, so that
+  condition is not met yet: the migration window has not started and the
+  expression stays. The window's start, length and removal release are still
+  open under #243 and will be announced here before any removal.
+  [Rule builder](docs/configuration.md#policy_file). Part of #243.
 
 ### Migration
 

@@ -1219,13 +1219,50 @@ function RuleLogicSummary({ rule }: { rule: PolicyRule }) {
         </p>
       </div>
       <div className="rule-expression-box">
-        <span className="stat-label">Policy expression</span>
-        <pre aria-label="Policy expression">
+        <span className="stat-label">Rule JSON</span>
+        <pre aria-label="Rule JSON">
+          <code>{canonicalRuleJson(rule)}</code>
+        </pre>
+        <p className="rule-hint">
+          This rule's matcher, dispatch binding, principal, action and
+          condition as policy JSON, with members sorted by name. Its ID and
+          enabled state are not shown.
+        </p>
+      </div>
+      <details className="rule-expression-box">
+        <summary>Deprecated policy expression</summary>
+        <pre aria-label="Deprecated policy expression">
           <code>{generatedExpression(rule)}</code>
         </pre>
-      </div>
+        <p className="rule-hint">
+          Deprecated. The browser generates this pseudo-syntax for display
+          only; the gateway never parses it. Use the rule JSON above.
+        </p>
+      </details>
     </section>
   );
+}
+
+// Policy JSON for the rule as this editor holds it. Members are sorted by
+// UTF-16 code unit, as RFC 8785 orders them, so equal rules read the same
+// whatever order the form or the server produced them in. Undefined members
+// are omitted, as they are from the request body.
+function canonicalRuleJson(rule: PolicyRule): string {
+  return JSON.stringify(sortedJsonMembers(rule), null, 2);
+}
+
+function sortedJsonMembers(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortedJsonMembers);
+  }
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([key, item]) => [key, sortedJsonMembers(item)]),
+    );
+  }
+  return value;
 }
 
 function plainEnglishRuleSummary(rule: PolicyRule): string {
@@ -1242,6 +1279,11 @@ function plainEnglishRuleSummary(rule: PolicyRule): string {
   return `${actionSummaryVerb(rule.action)} ${target}${principal}${dispatch}${condition}.`;
 }
 
+// Marked deprecated in the UI as advance notice (issue #243): display-only
+// pseudo-syntax that the gateway never parses. ADR-0004 rollout step 8
+// deprecates it only after a compatible server-backed replacement ships and a
+// documented migration window passes. The rule JSON is built in the browser,
+// so that condition is not met yet; keep this until it is.
 function generatedExpression(rule: PolicyRule): string {
   if (rule.conditions != null) {
     return 'The additional policy condition is defined in the policy document. Review the complete rule in Policy Studio.';
