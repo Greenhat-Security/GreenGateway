@@ -410,11 +410,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   future major release, advance release-note notice, a supported migration
   path, and published rollback guidance.
 - The rule builder's browser-generated policy expression
-  (`request.method in [...]`, `principal.roles contains ...`) is deprecated.
-  It is display-only pseudo-syntax that the gateway never parses; use the
-  rule JSON shown above it. Under ADR-0004 rollout step 8 it is removed only
-  after a migration window. No removal release is assigned yet, and the
-  removal will be announced here first.
+  (`request.method in [...]`, `principal.roles contains ...`) is marked
+  deprecated in the UI as advance notice. It is display-only pseudo-syntax
+  that the gateway never parses; use the rule JSON shown above it. ADR-0004
+  rollout step 8 deprecates it "only after compatible server-backed
+  replacements ship and a documented migration window passes". The rule JSON
+  is built in the browser from the editor's form, not by the server, so that
+  condition is not met yet: the migration window has not started and the
+  expression stays. The window's start, length and removal release are still
+  open under #243 and will be announced here before any removal.
   [Rule builder](docs/configuration.md#policy_file). Part of #243.
 
 ### Migration

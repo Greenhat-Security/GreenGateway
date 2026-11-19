@@ -1279,9 +1279,11 @@ function plainEnglishRuleSummary(rule: PolicyRule): string {
   return `${actionSummaryVerb(rule.action)} ${target}${principal}${dispatch}${condition}.`;
 }
 
-// Deprecated (issue #243): display-only pseudo-syntax that the gateway never
-// parses. The rule JSON replaces it; ADR-0004 rollout step 8 removes it only
-// after a documented migration window.
+// Marked deprecated in the UI as advance notice (issue #243): display-only
+// pseudo-syntax that the gateway never parses. ADR-0004 rollout step 8
+// deprecates it only after a compatible server-backed replacement ships and a
+// documented migration window passes. The rule JSON is built in the browser,
+// so that condition is not met yet; keep this until it is.
 function generatedExpression(rule: PolicyRule): string {
   if (rule.conditions != null) {
     return 'The additional policy condition is defined in the policy document. Review the complete rule in Policy Studio.';
