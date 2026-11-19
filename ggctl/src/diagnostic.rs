@@ -272,6 +272,7 @@ pub(crate) enum Code {
     StateDirLocked,
     StateDirLockUnsupported,
     StateDirUnavailable,
+    StateDirNetworkFilesystem,
     // The revision ledger and its offline commands.
     LedgerMissing,
     LedgerExists,
@@ -514,6 +515,7 @@ impl Code {
         Self::StateDirLocked,
         Self::StateDirLockUnsupported,
         Self::StateDirUnavailable,
+        Self::StateDirNetworkFilesystem,
         Self::LedgerMissing,
         Self::LedgerExists,
         Self::LedgerUnsafeLocation,
@@ -1137,6 +1139,11 @@ impl Code {
                 "state_dir.unavailable",
                 "the state directory or its lock file could not be inspected, opened or locked",
                 Failure,
+            ),
+            Self::StateDirNetworkFilesystem => (
+                "state_dir.network_filesystem",
+                "the state directory is on a recognised network filesystem, where locks and SQLite are unsupported",
+                Success,
             ),
             Self::LedgerMissing => (
                 "ledger.missing",

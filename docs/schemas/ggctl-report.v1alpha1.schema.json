@@ -623,7 +623,7 @@
       "pattern": "^[0-9a-f]{64}$"
     },
     "check": {
-      "description": "One offline doctor check. severity is error for a required check, whose failure fails the doctor, and warning for advice; skipped never counts as pass. reason is a bundle reader code, an environment file or configuration compiler code, or a doctor reason. docs/ggctl.md lists every check and reason.",
+      "description": "One offline doctor check. severity is error for a required check, whose failure fails the doctor, and warning for advice; skipped never counts as pass. reason is a bundle reader code, an environment file or configuration compiler code, a state directory, backup or ledger code, or a doctor reason. docs/ggctl.md lists every check and reason.",
       "type": "object",
       "additionalProperties": false,
       "required": ["id", "severity", "status", "reason", "remediation", "durationMs"],
@@ -648,14 +648,23 @@
             "production.csrf",
             "production.private_egress",
             "production.audit_durability",
-            "production.client_secrets"
+            "production.client_secrets",
+            "state_dir.lock",
+            "state_dir.filesystem",
+            "store.audit",
+            "store.discovery",
+            "store.principals",
+            "store.connections",
+            "store.service_tokens",
+            "store.policy_history",
+            "store.config_ledger"
           ]
         },
         "severity": {"enum": ["error", "warning"]},
         "status": {"enum": ["pass", "warning", "fail", "skipped"]},
         "reason": {
           "type": "string",
-          "pattern": "^(doctor|bundle|syntax|json|yaml|compat|schema|reference|secret|resource|profile|env|config|source)\\.[a-z][a-z0-9_]*$"
+          "pattern": "^(doctor|bundle|syntax|json|yaml|compat|schema|reference|secret|resource|profile|env|config|source|state_dir|backup|ledger)\\.[a-z][a-z0-9_]*$"
         },
         "remediation": {
           "enum": [
@@ -663,7 +672,10 @@
             "docs/configuration-bundles.md#diagnostics",
             "docs/ggctl.md#env-diagnostics",
             "docs/ggctl.md#config-diagnostics",
-            "docs/ggctl.md#source-diagnostics"
+            "docs/ggctl.md#source-diagnostics",
+            "docs/ggctl.md#state_dir-diagnostics",
+            "docs/ggctl.md#backup-diagnostics",
+            "docs/ggctl.md#ledger-diagnostics"
           ]
         },
         "durationMs": {

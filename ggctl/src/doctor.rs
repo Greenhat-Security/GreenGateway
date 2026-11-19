@@ -1,8 +1,8 @@
-//! `ggctl doctor (BUNDLE | --env FILE) [--format human|json]`: the offline
-//! doctor (ADR-0008, "Doctor").
+//! `ggctl doctor (BUNDLE | --env FILE | --state-dir DIR) [--format
+//! human|json]`: the offline doctor (ADR-0008, "Doctor").
 //!
-//! An environment file has checks of its own (`environment`); what follows
-//! describes a bundle's.
+//! An environment file and a standalone state directory have checks of their
+//! own (`environment`, `state`); what follows describes a bundle's.
 //!
 //! The doctor runs the same shared bundle reader as `validate`, once, with
 //! the production validators, and reports each of its stages as a check of
@@ -22,6 +22,7 @@
 
 use std::{
     io::{self, Write},
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -37,9 +38,15 @@ use crate::{
 };
 
 mod environment;
+mod state;
 
 #[cfg(test)]
 pub(crate) use environment::CHECKS as ENVIRONMENT_CHECKS;
+#[cfg(test)]
+pub(crate) use state::CHECKS as STATE_DIR_CHECKS;
+
+const HINT_ONE_SOURCE: &str =
+    "give a bundle directory, an environment file with --env or a state directory with --state-dir, only one of them";
 
 /// Where `docs/ggctl.md` explains every check and reason.
 const DOCTOR_REMEDIATION: &str = "docs/ggctl.md#doctor-checks";
@@ -207,6 +214,12 @@ pub(crate) enum Reason {
     PrivateEgressAllowed,
     AuditBestEffort,
     InlineClientSecret,
+    // A standalone state directory.
+    FilesystemUnchecked,
+    NotPresent,
+    JournalPending,
+    WalPending,
+    StoreIdentityMismatch,
 }
 
 impl Reason {
@@ -225,6 +238,11 @@ impl Reason {
         Self::PrivateEgressAllowed,
         Self::AuditBestEffort,
         Self::InlineClientSecret,
+        Self::FilesystemUnchecked,
+        Self::NotPresent,
+        Self::JournalPending,
+        Self::WalPending,
+        Self::StoreIdentityMismatch,
     ];
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -242,6 +260,11 @@ impl Reason {
             Self::PrivateEgressAllowed => "doctor.private_egress_allowed",
             Self::AuditBestEffort => "doctor.audit_best_effort",
             Self::InlineClientSecret => "doctor.inline_client_secret",
+            Self::FilesystemUnchecked => "doctor.filesystem_unchecked",
+            Self::NotPresent => "doctor.not_present",
+            Self::JournalPending => "doctor.journal_pending",
+            Self::WalPending => "doctor.wal_pending",
+            Self::StoreIdentityMismatch => "doctor.store_identity_mismatch",
         }
     }
 }
@@ -445,8 +468,11 @@ struct DoctorResult {
 }
 
 pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
+    if let Some((argument, path)) = invocation.value("--state-dir") {
+        return run_state_dir(invocation, io, argument, Path::new(path));
+    }
     let started = Instant::now();
-    let (result, mut diagnostics, title) = match validate::source(invocation) {
+    let (result, diagnostics, title) = match validate::source(invocation) {
         Err(diagnostic) => return report::error(io, diagnostic),
         Ok(Source::Bundle(path)) => {
             let read = validate::read_path(path, false);
@@ -474,6 +500,37 @@ pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
             (result, read.diagnostics, "environment file".to_owned())
         }
     };
+    finish(invocation, io, &result, diagnostics, &title)
+}
+
+/// `doctor --state-dir DIR`, whose `--state-dir` is at `argument`: the one
+/// source, never beside `BUNDLE` or `--env`.
+fn run_state_dir(invocation: &Invocation, io: &mut Io<'_>, argument: usize, path: &Path) -> Exit {
+    if invocation.has_positional(0) || invocation.value("--env").is_some() {
+        return report::error(
+            io,
+            Diagnostic::at(diagnostic::Code::ConflictingOptions, argument)
+                .with_hint(HINT_ONE_SOURCE),
+        );
+    }
+    let (checks, diagnostics) = state::checks(path, argument);
+    let result = DoctorResult {
+        bundle: None,
+        environment: None,
+        checks,
+    };
+    finish(invocation, io, &result, diagnostics, "state directory")
+}
+
+/// Reports `result`, adding `doctor.required_check_failed` when a required
+/// check failed.
+fn finish(
+    invocation: &Invocation,
+    io: &mut Io<'_>,
+    result: &DoctorResult,
+    mut diagnostics: Vec<ReportDiagnostic>,
+    title: &str,
+) -> Exit {
     let failed = result.checks.iter().any(CheckRecord::failed_required);
     if failed {
         diagnostics.push(Diagnostic::new(diagnostic::Code::RequiredCheckFailed).into());
@@ -482,9 +539,9 @@ pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
         io,
         Format::of(invocation),
         "doctor",
-        &result,
+        result,
         &diagnostics,
-        |result, out| human(result, &title, failed, out),
+        |result, out| human(result, title, failed, out),
     )
 }
 

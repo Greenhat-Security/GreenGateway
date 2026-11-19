@@ -1295,4 +1295,115 @@ fn errors_are_value_free_and_name_only_codes_stores_and_positions() {
     assert!(!format!("{refused:?}").contains(CANARY));
 }
 
+// --- check_store ------------------------------------------------------------------
+
+#[test]
+fn a_store_is_checked_in_place_through_its_write_ahead_log_and_nothing_is_written() {
+    let state = State::new("check-wal");
+    assert_eq!(
+        check_store(state.held(), StateFile::Audit),
+        Ok(StoreCheck::Absent)
+    );
+    let path = state.file(StateFile::Audit);
+    store(&path, &[("audit_events", 1)]);
+    assert_eq!(
+        check_store(state.held(), StateFile::Audit),
+        Ok(StoreCheck::Passed { wal_pending: false })
+    );
+
+    // A writer that keeps rows in the write-ahead log: the check reads
+    // through it, reports it, and changes neither file.
+    let writer = Connection::open(&path).expect("writer");
+    writer
+        .execute_batch("PRAGMA wal_autocheckpoint = 0;")
+        .expect("no checkpoints");
+    writer
+        .execute("INSERT INTO audit_events (value) VALUES ('logged')", [])
+        .expect("row");
+    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    let main_before = fs::read(&path).expect("main file");
+    let wal_before = fs::read(&wal).expect("the log holds the row");
+    assert_eq!(
+        check_store(state.held(), StateFile::Audit),
+        Ok(StoreCheck::Passed { wal_pending: true })
+    );
+    assert_eq!(fs::read(&path).expect("main file"), main_before);
+    assert_eq!(fs::read(&wal).expect("log"), wal_before);
+    drop(writer);
+}
+
+#[test]
+fn a_pending_rollback_journal_keeps_the_store_unopened() {
+    let state = State::new("check-journal");
+    let path = state.file(StateFile::Discovery);
+    store(&path, &[("endpoints", 1)]);
+    let journal = PathBuf::from(format!("{}-journal", path.display()));
+    fs::write(&journal, CANARY).expect("journal");
+    assert_eq!(
+        check_store(state.held(), StateFile::Discovery),
+        Ok(StoreCheck::JournalPending)
+    );
+    assert_eq!(fs::read(&journal).expect("journal"), CANARY.as_bytes());
+    // An empty journal is not an interrupted transaction.
+    fs::write(&journal, b"").expect("journal");
+    assert_eq!(
+        check_store(state.held(), StateFile::Discovery),
+        Ok(StoreCheck::Passed { wal_pending: false })
+    );
+}
+
+#[test]
+fn a_corrupt_store_or_another_stores_database_fails_its_check() {
+    let state = State::new("check-corrupt");
+    let principals = state.file(StateFile::Principals);
+    fs::write(&principals, CANARY.repeat(256)).expect("not a database");
+    let refused = check_store(state.held(), StateFile::Principals).expect_err("corrupt");
+    assert_eq!(
+        refused,
+        BackupError::Store {
+            store: StateFile::Principals,
+            problem: StoreProblem::Corrupt,
+        }
+    );
+    assert!(!refused.to_string().contains(CANARY));
+
+    // The gateway's database under the ledger's name.
+    let ledger = state.file(StateFile::ConfigLedger);
+    store(&ledger, &[("audit_events", 1)]);
+    assert_eq!(
+        check_store(state.held(), StateFile::ConfigLedger),
+        Ok(StoreCheck::ForeignIdentity)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_store_that_is_a_link_or_others_can_write_fails_admission() {
+    let state = State::new("check-admission");
+    let elsewhere = TempDir::new("elsewhere");
+    store(&elsewhere.join("audit.sqlite3"), &[("audit_events", 1)]);
+    std::os::unix::fs::symlink(
+        elsewhere.join("audit.sqlite3"),
+        state.file(StateFile::Audit),
+    )
+    .expect("symlink");
+    assert_eq!(
+        check_store(state.held(), StateFile::Audit),
+        Err(BackupError::Store {
+            store: StateFile::Audit,
+            problem: StoreProblem::Link,
+        })
+    );
+    let tokens = state.file(StateFile::ServiceTokens);
+    store(&tokens, &[("tokens", 1)]);
+    set_mode(&tokens, 0o620);
+    assert_eq!(
+        check_store(state.held(), StateFile::ServiceTokens),
+        Err(BackupError::Store {
+            store: StateFile::ServiceTokens,
+            problem: StoreProblem::UnsafePermissions,
+        })
+    );
+}
+
 mod restore;

@@ -487,7 +487,7 @@ fn count_included(backup: &BackupRecord) -> usize {
 /// own code for a refused archive, located at its entry, and otherwise
 /// ggctl's code for the one `gateway-config` gives it, located at the
 /// argument `position` when given.
-fn diagnostic(error: &BackupError, position: Option<usize>) -> ReportDiagnostic {
+pub(crate) fn diagnostic(error: &BackupError, position: Option<usize>) -> ReportDiagnostic {
     let code = match error {
         BackupError::Refused(refusal) => return ReportDiagnostic::Archive(refusal.clone()),
         BackupError::StateDirUnavailable => Code::StateDirUnavailable,
