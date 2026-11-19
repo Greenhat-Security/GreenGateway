@@ -230,7 +230,7 @@
           "jobserver@0.1.35",
           "quinn-proto@0.11.19",
           "rand@0.10.2",
-          "uuid@1.26.1"
+          "uuid@1.29.2"
         ]
       }
     },
@@ -395,7 +395,7 @@
       "name": "syn",
       "versions": [
         "2.0.119",
-        "3.0.9"
+        "3.0.10"
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
@@ -421,7 +421,7 @@
           "zerofrom-derive@0.1.7",
           "zeroize_derive@1.5.0"
         ],
-        "3.0.9": [
+        "3.0.10": [
           "async-trait@0.1.92",
           "borsh-derive@1.8.1",
           "displaydoc@0.2.7",
@@ -512,7 +512,7 @@
         ],
         "0.9.0": [
           "ring@0.17.14",
-          "rustls-webpki@0.103.16"
+          "rustls-webpki@0.103.17"
         ]
       }
     },
