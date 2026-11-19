@@ -24,7 +24,7 @@ jobs:
     # time for the pinned tool setup and the bounded report upload on failure.
     timeout-minutes: 240
     env:
-      CARGO_BUILD_JOBS: '1'
+      CARGO_BUILD_JOBS: '4'
       CARGO_TERM_COLOR: never
     steps:
       - name: Checkout the trusted event revision
