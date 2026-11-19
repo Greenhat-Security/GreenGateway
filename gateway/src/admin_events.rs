@@ -699,11 +699,15 @@ pub(super) fn policy_audit_summary(policy: &rbac::Policy) -> Value {
     json!({
         "id": policy.id,
         "roles": policy.roles.len(),
+        // `null` when the section is absent: an empty list is still
+        // mapped-role mode, so the two must not both read as 0.
+        "identity_mappings": policy.identity_mappings.as_ref().map(Vec::len),
         "routes": policy.routes.len(),
         "rules": policy.rules.len(),
         "egress_hosts": policy.egress.hosts.len(),
         "egress_cidrs": policy.egress.cidrs.len(),
         "egress_ports": policy.egress.ports.len(),
+        "rate_limits": policy.rate_limits.len(),
         "tools": policy.tools.len(),
     })
 }
@@ -729,6 +733,9 @@ pub(super) fn changed_policy_sections(
     if before.roles != after.roles {
         sections.push("roles");
     }
+    if before.identity_mappings != after.identity_mappings {
+        sections.push("identity_mappings");
+    }
     if before.routes != after.routes {
         sections.push("routes");
     }
@@ -737,6 +744,9 @@ pub(super) fn changed_policy_sections(
     }
     if before.egress != after.egress {
         sections.push("egress");
+    }
+    if before.rate_limits != after.rate_limits {
+        sections.push("rate_limits");
     }
     if before.tools != after.tools {
         sections.push("tools");
