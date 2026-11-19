@@ -34,7 +34,7 @@ Three existing requirements are permitted only at their reviewed versions:
 
 | Dependency | License | Reason and distribution obligation |
 | --- | --- | --- |
-| notify 8.2.0 | CC0-1.0 | Existing file watcher; retain the supplied text. This does not approve new CC0 code dependencies or assert a patent grant. |
+| notify 8.2.2 | CC0-1.0 | Existing file watcher; retain the supplied text. This does not approve new CC0 code dependencies or assert a patent grant. |
 | webpki-root-certs 1.0.9 | CDLA-Permissive-2.0 | Existing certificate-root data; preserve the data license when sharing the roots. |
 | winx 0.36.4 | Apache-2.0 WITH LLVM-exception | Existing Windows filesystem binding; preserve the Apache license and its exception. |
 
@@ -74,7 +74,7 @@ only exact versions, never a skipped dependency subtree. The associated
 `cargo-policy-exceptions.json` records the complete version group, concrete
 parents, rationale, maintainer ownership, expiry and remediation condition.
 Groups largely arise from distinct RustCrypto generations, SQLite/PostgreSQL
-interfaces, random-number APIs and Windows import-library generations. Their
+interfaces, random-number APIs and Windows ABI binding generations. Their
 interfaces cannot be forcibly unified through a lockfile edit.
 
 Re-evaluate each exception when its listed parents update; remove it when their
