@@ -728,8 +728,9 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
              without waiting and checks each store beneath it where it is, read-only, with the \
              checks a backup applies to a store: admission, SQLite's integrity check, the store's \
              identity and, for the ledger, its full verification. A store the directory does not \
-             hold is skipped, and a write-ahead log not yet checkpointed is a warning. Nothing in \
-             a store is written.",
+             hold is skipped, but a directory that holds no store fails, as does a store with an \
+             interrupted transaction in its rollback journal, which cannot be checked. A \
+             write-ahead log not yet checkpointed is a warning. Nothing in a store is written.",
             "Exits 0 when no required check failed, 3 when one did, 5 when the state directory \
              is locked, and 1 when the bundle, the file or a store could not be read.",
         ],

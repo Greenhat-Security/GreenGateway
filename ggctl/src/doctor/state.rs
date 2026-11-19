@@ -2,24 +2,30 @@
 //! directory (ADR-0008, "Doctor").
 //!
 //! The doctor takes the directory's exclusive lock without waiting, as the
-//! `ledger` and `backup` commands do, so it runs only while no gateway or
-//! other `ggctl` holds the directory, and keeps it until every check ran:
+//! `ledger` and `backup` commands do, so it never runs beside another
+//! `ggctl` command or a native bundle preflight, and keeps it until every
+//! check ran. A serving gateway does not hold the lock, so the lock alone
+//! does not show that the gateway is stopped:
 //!
 //! - `state_dir.lock`: the directory was admitted and locked. Otherwise its
 //!   reason is the `state_dir` code, and every other check is `skipped`.
 //! - `state_dir.filesystem`: advice, `warning` with
 //!   `state_dir.network_filesystem` on a filesystem the best-effort check
 //!   recognises as a network one, and `skipped` where it cannot tell.
+//! - `state_dir.stores`: the directory holds at least one store of the
+//!   layout. A directory that holds none, such as a mistyped path or an
+//!   unmounted volume, fails with `doctor.no_store` instead of passing with
+//!   nothing checked.
 //! - `store.<id>` for each store of the layout ([`StateFile`]): the checks
 //!   `backup create` and `backup verify` apply to a store, run on the store
 //!   where it is (`gateway_config::backup::check_store`): admission, a
 //!   read-only open, SQLite's integrity check, the description a backup
 //!   records and the application ID its file name calls for; for the ledger,
 //!   then the full verification `ledger verify` runs. A store the directory
-//!   does not hold, or one beside a pending rollback journal, which a
-//!   read-only connection cannot roll back, is `skipped`; one whose
-//!   write-ahead log holds transactions not yet checkpointed passes with a
-//!   `warning`.
+//!   does not hold is `skipped`. A store beside a rollback journal that
+//!   holds an interrupted transaction, which a read-only connection cannot
+//!   roll back, cannot be checked, so it fails; one whose write-ahead log
+//!   holds transactions not yet checkpointed passes with a `warning`.
 //!
 //! Nothing in a store is written and nothing is copied; the lock file is
 //! created if it is missing, and SQLite may create a write-ahead store's
@@ -45,10 +51,11 @@ use crate::{
 };
 
 /// The checks of a state directory, in the order they are reported: the
-/// directory's two, then one per store in [`StateFile::ALL`] order.
+/// directory's three, then one per store in [`StateFile::ALL`] order.
 pub(crate) const CHECKS: &[&str] = &[
     "state_dir.lock",
     "state_dir.filesystem",
+    "state_dir.stores",
     "store.audit",
     "store.discovery",
     "store.principals",
@@ -141,17 +148,42 @@ pub(crate) fn checks(path: &Path, argument: usize) -> (Vec<CheckRecord>, Vec<Rep
         ),
     });
 
-    for store in StateFile::ALL {
-        checks.push(store_check(&held, store, argument, &mut diagnostics));
-    }
+    let started = Instant::now();
+    let mut present = false;
+    let stores: Vec<_> = StateFile::ALL
+        .into_iter()
+        .map(|store| store_check(&held, store, argument, &mut present, &mut diagnostics))
+        .collect();
+    // An admissible directory that holds no store at all is most likely the
+    // wrong one: nothing was checked, which never counts as a pass.
+    checks.push(if present {
+        CheckRecord::new(
+            CHECKS[2],
+            true,
+            Status::Pass,
+            Reason::Passed,
+            started.elapsed(),
+        )
+    } else {
+        CheckRecord::new(
+            CHECKS[2],
+            true,
+            Status::Fail,
+            Reason::NoStore,
+            started.elapsed(),
+        )
+    });
+    checks.extend(stores);
     (checks, diagnostics)
 }
 
-/// The check of one store, adding the diagnostic of a failure.
+/// The check of one store, adding the diagnostic of a failure and setting
+/// `present` when the directory holds the store.
 fn store_check(
     held: &StateDirectory,
     store: StateFile,
     argument: usize,
+    present: &mut bool,
     diagnostics: &mut Vec<ReportDiagnostic>,
 ) -> CheckRecord {
     let started = Instant::now();
@@ -163,9 +195,15 @@ fn store_check(
         diagnostics.push(diagnostic);
         check
     };
-    let wal_pending = match backup::check_store(held, store) {
+    let checked = backup::check_store(held, store);
+    if !matches!(checked, Ok(StoreCheck::Absent)) {
+        *present = true;
+    }
+    let wal_pending = match checked {
         Ok(StoreCheck::Absent) => return found(Status::Skipped, Reason::NotPresent),
-        Ok(StoreCheck::JournalPending) => return found(Status::Skipped, Reason::JournalPending),
+        // A required check in scope that cannot run fails (ADR-0008,
+        // "Doctor"): the store was never opened, so nothing vouches for it.
+        Ok(StoreCheck::JournalPending) => return found(Status::Fail, Reason::JournalPending),
         Ok(StoreCheck::ForeignIdentity) => {
             return found(Status::Fail, Reason::StoreIdentityMismatch)
         }

@@ -138,6 +138,7 @@ fn expected(state: &Path, stores: &[(StateFile, &str, &str)]) -> Vec<(String, St
             filesystem.0,
             filesystem.1,
         ),
+        ("state_dir.stores".to_owned(), "pass", "doctor.passed"),
     ];
     for store in StateFile::ALL {
         let (status, reason) = stores
@@ -287,11 +288,11 @@ fn a_corrupt_or_misnamed_store_fails_its_check_and_the_doctor() {
     );
     assert_eq!(found["diagnostics"][0]["location"]["argument"], 2);
     assert_eq!(
-        found["result"]["checks"][4]["remediation"],
+        found["result"]["checks"][5]["remediation"],
         "docs/ggctl.md#backup-diagnostics"
     );
     assert_eq!(
-        found["result"]["checks"][5]["remediation"],
+        found["result"]["checks"][6]["remediation"],
         "docs/ggctl.md#doctor-checks"
     );
 }
@@ -313,7 +314,7 @@ fn a_ledger_that_does_not_verify_fails_with_the_ledger_code() {
     assert_eq!(status, "fail");
     assert!(reason.starts_with("ledger."), "{reason}");
     assert_eq!(
-        found["result"]["checks"][8]["remediation"],
+        found["result"]["checks"][9]["remediation"],
         "docs/ggctl.md#ledger-diagnostics"
     );
     assert_eq!(codes(&found)[1], "doctor.required_check_failed");
@@ -331,6 +332,26 @@ fn journals_are_reported_and_never_replayed_or_removed() {
     let wal = state.beside(StateFile::ConfigLedger, "-wal");
     fs::write(&wal, CANARY).expect("log");
     let before = state.contents();
+    // A store that could not be checked fails: never a silent pass.
+    let (exit, found, _) = doctor(&state);
+    assert_eq!(exit, Exit::Invalid, "{found}");
+    assert_eq!(
+        statuses(&found),
+        expected(
+            &state.0,
+            &[
+                (StateFile::Audit, "fail", "doctor.journal_pending"),
+                (StateFile::ConfigLedger, "warning", "doctor.wal_pending"),
+            ]
+        )
+    );
+    assert_eq!(codes(&found), ["doctor.required_check_failed"]);
+    assert_eq!(state.contents(), before);
+    assert_eq!(fs::read(&journal).expect("journal"), CANARY.as_bytes());
+
+    // A journal whose header a commit in PERSIST mode zeroed holds no
+    // interrupted transaction: the store is opened and checked.
+    fs::write(&journal, [0_u8; 512]).expect("journal");
     let (exit, found, _) = doctor(&state);
     assert_eq!(exit, Exit::Success, "{found}");
     assert_eq!(
@@ -338,13 +359,37 @@ fn journals_are_reported_and_never_replayed_or_removed() {
         expected(
             &state.0,
             &[
-                (StateFile::Audit, "skipped", "doctor.journal_pending"),
+                (StateFile::Audit, "pass", "doctor.passed"),
                 (StateFile::ConfigLedger, "warning", "doctor.wal_pending"),
             ]
         )
     );
-    assert_eq!(state.contents(), before);
-    assert_eq!(fs::read(&journal).expect("journal"), CANARY.as_bytes());
+}
+
+#[test]
+fn a_directory_that_holds_no_store_fails() {
+    // An admissible directory with no store in it, as a mistyped path or an
+    // unmounted volume gives: nothing was checked, so it does not pass.
+    let state = State::new("empty");
+    fs::write(state.0.join("unrelated.txt"), CANARY).expect("an unrelated file");
+    let (exit, found, _) = doctor(&state);
+    assert_eq!(exit, Exit::Invalid, "{found}");
+    let mut wanted = expected(&state.0, &[]);
+    wanted[2] = (
+        "state_dir.stores".to_owned(),
+        "fail".to_owned(),
+        "doctor.no_store".to_owned(),
+    );
+    assert_eq!(statuses(&found), wanted);
+    assert_eq!(found["result"]["checks"][2]["severity"], "error");
+    assert_eq!(codes(&found), ["doctor.required_check_failed"]);
+
+    let (exit, captured) = run(&["doctor", "--state-dir", state.text()]);
+    assert_eq!(exit, Exit::Invalid);
+    assert!(captured
+        .stdout()
+        .contains("  fail     state_dir.stores      doctor.no_store\n"));
+    assert_no_canary(&captured);
 }
 
 #[test]
@@ -364,7 +409,22 @@ fn a_state_directory_is_one_source_among_three() {
         let (exit, captured) = run(&words);
         assert_eq!(exit, Exit::Usage, "{words:?}");
         assert!(captured.stderr().contains("usage.conflicting_options"));
+        assert!(captured.stderr().contains("--state-dir"));
         assert!(captured.stdout().is_empty());
+    }
+    // Every source error of the doctor names all three sources, the missing
+    // one and a bundle beside --env included.
+    for words in [
+        vec!["doctor"],
+        vec!["doctor", bundle.path(), "--env", bundle.path()],
+    ] {
+        let (exit, captured) = run(&words);
+        assert_eq!(exit, Exit::Usage, "{words:?}");
+        assert!(
+            captured.stderr().contains("--state-dir"),
+            "{words:?}: {}",
+            captured.stderr()
+        );
     }
 }
 
@@ -374,8 +434,8 @@ fn every_store_has_a_check_named_after_it() {
         .iter()
         .map(|store| format!("store.{}", store.id()))
         .collect();
-    // The directory's two checks come first.
-    assert_eq!(CHECKS[2..], ids);
+    // The directory's three checks come first.
+    assert_eq!(CHECKS[3..], ids);
     for store in StateFile::ALL {
         assert_eq!(store_check_id(store), format!("store.{}", store.id()));
     }

@@ -216,6 +216,7 @@ pub(crate) enum Reason {
     InlineClientSecret,
     // A standalone state directory.
     FilesystemUnchecked,
+    NoStore,
     NotPresent,
     JournalPending,
     WalPending,
@@ -239,6 +240,7 @@ impl Reason {
         Self::AuditBestEffort,
         Self::InlineClientSecret,
         Self::FilesystemUnchecked,
+        Self::NoStore,
         Self::NotPresent,
         Self::JournalPending,
         Self::WalPending,
@@ -261,6 +263,7 @@ impl Reason {
             Self::AuditBestEffort => "doctor.audit_best_effort",
             Self::InlineClientSecret => "doctor.inline_client_secret",
             Self::FilesystemUnchecked => "doctor.filesystem_unchecked",
+            Self::NoStore => "doctor.no_store",
             Self::NotPresent => "doctor.not_present",
             Self::JournalPending => "doctor.journal_pending",
             Self::WalPending => "doctor.wal_pending",
@@ -473,7 +476,9 @@ pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
     }
     let started = Instant::now();
     let (result, diagnostics, title) = match validate::source(invocation) {
-        Err(diagnostic) => return report::error(io, diagnostic),
+        // The doctor's hint names all three sources, where `validate`'s
+        // names two.
+        Err(diagnostic) => return report::error(io, diagnostic.with_hint(HINT_ONE_SOURCE)),
         Ok(Source::Bundle(path)) => {
             let read = validate::read_path(path, false);
             let checks = checks(&read, started.elapsed());

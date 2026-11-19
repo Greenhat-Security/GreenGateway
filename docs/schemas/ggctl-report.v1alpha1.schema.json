@@ -651,6 +651,7 @@
             "production.client_secrets",
             "state_dir.lock",
             "state_dir.filesystem",
+            "state_dir.stores",
             "store.audit",
             "store.discovery",
             "store.principals",

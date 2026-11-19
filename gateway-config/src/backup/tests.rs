@@ -1344,12 +1344,16 @@ fn a_pending_rollback_journal_keeps_the_store_unopened() {
         Ok(StoreCheck::JournalPending)
     );
     assert_eq!(fs::read(&journal).expect("journal"), CANARY.as_bytes());
-    // An empty journal is not an interrupted transaction.
-    fs::write(&journal, b"").expect("journal");
-    assert_eq!(
-        check_store(state.held(), StateFile::Discovery),
-        Ok(StoreCheck::Passed { wal_pending: false })
-    );
+    // An empty journal is not an interrupted transaction, and neither is
+    // one whose header a commit in PERSIST mode zeroed: SQLite opens such a
+    // store normally, so it is checked.
+    for left in [Vec::new(), vec![0_u8; 512]] {
+        fs::write(&journal, &left).expect("journal");
+        assert_eq!(
+            check_store(state.held(), StateFile::Discovery),
+            Ok(StoreCheck::Passed { wal_pending: false })
+        );
+    }
 }
 
 #[test]

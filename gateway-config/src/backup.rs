@@ -504,9 +504,9 @@ pub fn verify(archive: &Path) -> Result<BackupSummary, BackupError> {
 pub enum StoreCheck {
     /// The state directory does not hold the store.
     Absent,
-    /// A non-empty rollback journal is beside the store: an interrupted
-    /// transaction, which a read-only connection cannot roll back. The store
-    /// was not opened.
+    /// A rollback journal with a live header is beside the store: an
+    /// interrupted transaction, which a read-only connection cannot roll
+    /// back. The store was not opened, so it was not checked.
     JournalPending,
     /// The store passed SQLite's integrity check, but its application ID is
     /// not the one its file name calls for ([`StateFile::application_id`]):
@@ -528,7 +528,8 @@ pub enum StoreCheck {
 /// Nothing is copied and nothing in the store is written: not its main file,
 /// not its write-ahead log, not a checkpoint. Like any reader, SQLite may
 /// create the `-wal` and `-shm` files beside a write-ahead store. A store
-/// with a non-empty `-journal` beside it is not opened at all. The ledger
+/// whose `-journal` holds an interrupted transaction (see
+/// [`StoreCheck::JournalPending`]) is not opened at all. The ledger
 /// gets these checks only; its own verification is
 /// [`crate::ledger::RevisionLedger::inspect`].
 pub fn check_store(
@@ -541,25 +542,51 @@ pub fn check_store(
         return Ok(StoreCheck::Absent);
     }
     let refuse = |problem| BackupError::Store { store, problem };
-    let path = state_dir.file(store);
-    let holds_bytes = |suffix: &str| {
-        let mut name = OsString::from(path.as_os_str());
-        name.push(suffix);
-        match fs::symlink_metadata(PathBuf::from(name)) {
-            Ok(metadata) => Ok(metadata.len() > 0),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(_) => Err(refuse(StoreProblem::Unavailable)),
-        }
-    };
-    if holds_bytes("-journal")? {
+    if journal_pending(&directory, store)? {
         return Ok(StoreCheck::JournalPending);
     }
-    let wal_pending = holds_bytes("-wal")?;
-    let database = store::describe(&path).map_err(|failure| refuse(store_problem(failure)))?;
+    let wal_pending = match directory.symlink_metadata(format!("{}-wal", store.file_name())) {
+        Ok(metadata) => metadata.len() > 0,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(_) => return Err(refuse(StoreProblem::Unavailable)),
+    };
+    let database = store::describe(&state_dir.file(store))
+        .map_err(|failure| refuse(store_problem(failure)))?;
     if database.application_id != store.application_id() {
         return Ok(StoreCheck::ForeignIdentity);
     }
     Ok(StoreCheck::Passed { wal_pending })
+}
+
+/// Whether the rollback journal beside `store` would be rolled back by the
+/// next connection that opens the store, as SQLite decides it: the journal
+/// is not empty and its first byte is not zero. A journal that a commit in
+/// `PERSIST` mode left behind with a zeroed header, or one truncated to
+/// nothing, holds no interrupted transaction. A `-journal` that is a link or
+/// not a regular file is never followed or read, and counts as pending.
+fn journal_pending(directory: &Dir, store: StateFile) -> Result<bool, BackupError> {
+    let refuse = |problem| BackupError::Store { store, problem };
+    let name = format!("{}-journal", store.file_name());
+    match directory.symlink_metadata(&name) {
+        Ok(metadata) if !metadata.is_file() => return Ok(true),
+        Ok(metadata) if metadata.len() == 0 => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(refuse(StoreProblem::Unavailable)),
+    }
+    let mut options = CapabilityOpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    options.nonblock(true);
+    let mut journal = directory
+        .open_with(&name, &options)
+        .map_err(|_| refuse(StoreProblem::Unavailable))?;
+    let mut first = [0_u8; 1];
+    match journal.read(&mut first) {
+        Ok(0) => Ok(false),
+        Ok(_) => Ok(first[0] != 0),
+        Err(_) => Err(refuse(StoreProblem::Unavailable)),
+    }
 }
 
 /// The archive's directory and file name, which hidden names beside it are
