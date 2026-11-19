@@ -274,6 +274,95 @@ async fn policy_put_with_valid_if_match_updates_live_policy_and_emits_audit_even
 }
 
 #[tokio::test]
+async fn policy_put_changing_only_rate_limits_reports_the_rate_limits_section() {
+    let initial = policy_document("rate-policy", "test:old");
+    let policy = TempPolicyFile::new(
+        &serde_json::to_string_pretty(&initial).expect("test policy should serialize"),
+    );
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = policy_admin_router(Some(&policy), audit_log);
+    let (etag, _) = current_policy(&router).await;
+
+    let mut candidate = initial;
+    candidate["rate_limits"] = json!([{
+        "methods": ["GET"],
+        "path": "/rate-limited",
+        "requests_per_second": 10.0,
+        "burst": 5
+    }]);
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(serde_json::to_string_pretty(&candidate).expect("candidate should serialize")),
+            Some(&etag),
+        ))
+        .await
+        .expect("rate-limit policy PUT should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eventually(Duration::from_secs(1), || {
+        capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == audit::event::POLICY_CHANGED)
+    });
+    let events = capture.events();
+    let event = events
+        .iter()
+        .find(|event| event.event_type == audit::event::POLICY_CHANGED)
+        .expect("policy.changed event should be captured");
+    assert_eq!(event.payload["changed_sections"], json!(["rate_limits"]));
+    assert_eq!(event.payload["before"]["rate_limits"], json!(0));
+    assert_eq!(event.payload["after"]["rate_limits"], json!(1));
+    assert_eq!(event.payload["before"]["identity_mappings"], Value::Null);
+    assert_eq!(event.payload["after"]["identity_mappings"], Value::Null);
+}
+
+#[test]
+fn changed_policy_sections_reports_identity_mappings_and_rate_limits() {
+    let before = rbac::Policy::validate_json_value(policy_document("sections", "test:old"))
+        .expect("the policy is valid");
+
+    // Present but empty still switches the policy to mapped-role mode, so it
+    // is a change from absent, and the summary keeps the two apart.
+    let mut mapped = before.clone();
+    mapped.identity_mappings = Some(Vec::new());
+    assert_eq!(
+        crate::admin_events::changed_policy_sections(&before, &mapped),
+        ["identity_mappings"]
+    );
+    let summary = crate::admin_events::policy_audit_summary(&mapped);
+    assert_eq!(summary["identity_mappings"], json!(0));
+    assert_eq!(
+        crate::admin_events::policy_audit_summary(&before)["identity_mappings"],
+        Value::Null
+    );
+
+    let mut rated = mapped.clone();
+    rated.rate_limits = rbac::Policy::validate_json_value({
+        let mut document = policy_document("sections", "test:old");
+        document["rate_limits"] = json!([{
+            "methods": ["GET"],
+            "path": "/rate-limited",
+            "requests_per_second": 1.0,
+            "burst": 1
+        }]);
+        document
+    })
+    .expect("the policy is valid")
+    .rate_limits;
+    assert_eq!(
+        crate::admin_events::changed_policy_sections(&before, &rated),
+        ["identity_mappings", "rate_limits"]
+    );
+    assert!(crate::admin_events::changed_policy_sections(&rated, &rated).is_empty());
+}
+
+#[tokio::test]
 async fn policy_put_rejects_egress_change_without_persisting_or_swapping() {
     let initial_policy = policy_document_string("initial-policy", "test:old");
     let policy = TempPolicyFile::new(&initial_policy);
