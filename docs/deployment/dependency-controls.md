@@ -19,10 +19,25 @@ Both npm lockfiles have a high-severity audit gate. Pull requests also run GitHu
 dependency review, rejecting newly introduced advisories at moderate severity
 or higher. Review open Dependabot alerts before release as well: dependency
 review evaluates changes, and GitHub's advisory catalog can differ from RustSec.
-Cargo audit denies warnings, including yanked dependencies;
-there are no advisory exceptions. Any future exception needs a tracked owner,
-dependency chain, exposure analysis, removal condition and expiry, reviewed in
-the same PR as the exception.
+Cargo audit denies warnings, including yanked dependencies. Advisory exceptions
+are listed by ID in `.cargo/audit.toml`, which `cargo audit` reads, and each one
+is recorded below. An exception needs a tracked owner, dependency chain,
+exposure analysis, removal condition and expiry, reviewed in the same PR as the
+exception. cargo-audit cannot expire an ignore, so the date is a review date
+that maintainers check by hand; it is not enforced by CI.
+
+### Advisory exceptions
+
+- [RUSTSEC-2026-0543](https://rustsec.org/advisories/RUSTSEC-2026-0543.html),
+  `chrono` 0.4.45, informational "unmaintained". Owner: GreenGateway
+  maintainers, part of #420; approved by the repository owner on 2026-11-19.
+  Chain: `gateway` -> `rmcp` 3.9.0 -> `chrono`, and `rmcp` -> `schemars` 1.2.2
+  (`chrono04` feature, enabled by rmcp) -> `chrono`. Every rmcp 3.x release up
+  to 3.11.0 depends on chrono unconditionally, and the advisory lists no patched
+  version. Exposure: the notice reports no vulnerability; the workspace does not
+  use chrono directly, and rmcp uses it for MCP timestamps and durations.
+  Review date: 2027-01-18. Removal condition: rmcp drops or replaces chrono;
+  then remove the ID from `.cargo/audit.toml` and this entry.
 
 ## September 2026 audit reconciliation
 
@@ -71,7 +86,7 @@ the enforced lint set and the microbenchmark compiler, so it is reviewed
 separately. Coverage remains on nightly-2026-09-01 with cargo-llvm-cov 0.9.0
 and unchanged floors. Its dated compiler is deliberate, not an invitation to
 follow nightly updates.
-Node 26.13.0 and bundled npm 11.20.0 match the current pinned Node image.
+Node 26.13.1 and bundled npm 11.20.0 match the current pinned Node image.
 Gateway builds verify the actual Node/npm executable versions before installing
 UI dependencies, and Docker additionally checks its actual Rust version.
 Cargo builds use the existing lockfile without resolution updates.

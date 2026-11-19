@@ -81,14 +81,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(setup["with"], {"rust": "ci", "node": "true"})
         self.assertEqual(self.steps[2]["run"], "python -m pip install PyYAML==6.0.3")
 
-    def test_job_is_bounded_and_builds_are_serial(self):
+    def test_job_is_bounded_and_builds_match_the_runner(self):
         self.assertEqual(self.job["runs-on"], "ubuntu-latest")
         self.assertEqual(self.job["timeout-minutes"], "240")
         # The controller's own campaign bound ends the run with a bounded
         # report; the job timeout must leave room for setup and that upload.
         self.assertLessEqual(CAMPAIGN_SECONDS + 30 * 60, int(self.job["timeout-minutes"]) * 60)
         self.assertEqual(self.job["env"], {
-            "CARGO_BUILD_JOBS": "1", "CARGO_TERM_COLOR": "never",
+            "CARGO_BUILD_JOBS": "4", "CARGO_TERM_COLOR": "never",
         })
         self.assertEqual(self.workflow["concurrency"], {
             "group": "security-mutations-${{ github.ref }}",

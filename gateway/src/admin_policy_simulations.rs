@@ -62,6 +62,26 @@ pub(super) const MAX_POLICY_SIMULATION_RESULT_BYTES: usize = 8 * 1024 * 1024;
 /// The wall-clock bound on one simulation's evaluation.
 pub(super) const POLICY_SIMULATION_DEADLINE: Duration = Duration::from_secs(2);
 
+fn simulation_body_limit(configured: usize) -> usize {
+    configured.min(MAX_POLICY_SIMULATION_BODY_BYTES)
+}
+
+pub(super) fn policy_simulation_capabilities(configured_body_limit: usize) -> Value {
+    json!({
+        "request_schema": policy_simulation::SIMULATION_SCHEMA_VERSION,
+        "result_schema": RESULT_SCHEMA_VERSION,
+        "max_request_bytes": simulation_body_limit(configured_body_limit),
+        "max_result_bytes": MAX_POLICY_SIMULATION_RESULT_BYTES,
+        "max_cases": policy_simulation::request::MAX_SIMULATION_CASES,
+        "max_edits": policy_simulation::edits::MAX_EDITS,
+        "max_trace_stages": MAX_TRACE_STAGES,
+        "max_concurrent_per_replica": MAX_CONCURRENT_POLICY_SIMULATIONS,
+        // PolicyEvaluationLimiter holds one entry per issuer and subject.
+        "max_concurrent_per_actor": 1,
+        "evaluation_deadline_ms": POLICY_SIMULATION_DEADLINE.as_millis(),
+    })
+}
+
 /// The concurrency bounds of one evaluation endpoint on one router, shared by
 /// every request it serves: at most `limit` evaluations at once, and one at a
 /// time per actor, so a single caller cannot hold every slot. Each route has
@@ -695,7 +715,7 @@ async fn simulate_authorized(
     parts: http::request::Parts,
     body: Body,
 ) -> Response {
-    let body_limit = state.max_body_size.min(MAX_POLICY_SIMULATION_BODY_BYTES);
+    let body_limit = simulation_body_limit(state.max_body_size);
     let body = match read_request_body(body, body_limit).await {
         Ok(body) => body,
         Err(response) => return *response,

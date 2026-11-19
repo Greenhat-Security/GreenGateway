@@ -1,0 +1,13 @@
+# cargo-audit configuration, read by `cargo audit --deny warnings` in the
+# required `audit` CI job. Each ignored advisory needs an entry in
+# docs/deployment/dependency-controls.md ("Advisory exceptions") with its
+# owner, dependency chain, exposure, removal condition and review date.
+# cargo-audit does not enforce the review date; it is reviewed by hand.
+[advisories]
+ignore = [
+  # chrono 0.4.45 is unmaintained (informational); no patched release exists.
+  # Reachable only through rmcp and schemars (rmcp enables schemars' chrono04).
+  # Approved by the owner on 2026-11-19. Review by 2027-01-18.
+  # Remove when rmcp drops or replaces chrono.
+  "RUSTSEC-2026-0543",
+]

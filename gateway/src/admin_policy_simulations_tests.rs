@@ -422,6 +422,83 @@ async fn a_simulation_needs_authentication_policy_read_and_simulate() {
     assert!(simulation_run_events(&harness).is_empty());
 }
 
+async fn capabilities_for(harness: &Harness, role: &str) -> Value {
+    let response = harness
+        .router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::GET,
+            ADMIN_CAPABILITIES_ROUTE,
+            Some(test_principal(&[role])),
+            None,
+            None,
+        ))
+        .await
+        .expect("capabilities request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    json_body(response).await
+}
+
+#[tokio::test]
+async fn a_partial_simulation_grant_omits_the_capability() {
+    let harness = harness();
+    for (role, permission) in [
+        ("policy-reader", ADMIN_POLICY_READ_PERMISSION),
+        ("simulator-only", ADMIN_POLICY_SIMULATE_PERMISSION),
+    ] {
+        let capabilities = capabilities_for(&harness, role).await;
+        assert_eq!(capabilities["permissions"], json!([permission]));
+        assert!(capabilities.get("policy_simulation").is_none(), "{role}");
+    }
+}
+
+#[tokio::test]
+async fn simulation_capabilities_report_the_request_limit_enforced_by_this_gateway() {
+    for (configured, effective) in [(1024, 1024), (4 * 1024 * 1024, 2 * 1024 * 1024)] {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.max_body_size = configured;
+        let harness = harness_with_config(config);
+        let capabilities = capabilities_for(&harness, "simulator").await;
+        assert_eq!(
+            capabilities["policy_simulation"],
+            json!({
+                "request_schema": policy_simulation::SIMULATION_SCHEMA_VERSION,
+                "result_schema": policy_simulation::RESULT_SCHEMA_VERSION,
+                "max_request_bytes": effective,
+                "max_result_bytes": MAX_POLICY_SIMULATION_RESULT_BYTES,
+                "max_cases": policy_simulation::request::MAX_SIMULATION_CASES,
+                "max_edits": policy_simulation::edits::MAX_EDITS,
+                "max_trace_stages": policy_simulation::run::MAX_TRACE_STAGES,
+                "max_concurrent_per_replica": MAX_CONCURRENT_POLICY_SIMULATIONS,
+                "max_concurrent_per_actor": 1,
+                "evaluation_deadline_ms": POLICY_SIMULATION_DEADLINE.as_millis()
+            })
+        );
+
+        let mut body = simulation(
+            &current_etag(&harness).await,
+            json!({ "source": "active" }),
+            json!([{
+                "id": "orders", "kind": "http", "principal": "anonymous",
+                "request": { "method": "GET", "path": "/orders/7" }
+            }]),
+        )
+        .to_string();
+        body.push_str(&" ".repeat(effective - body.len()));
+        let accepted = simulate_request(&harness, simulator(), body.clone()).await;
+        assert_eq!(accepted.status(), StatusCode::OK, "{configured}");
+        body.push(' ');
+        let refused = simulate_request(&harness, simulator(), body).await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{configured}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_simulation_is_pinned_to_the_active_policy_it_was_written_against() {
     let harness = harness();
