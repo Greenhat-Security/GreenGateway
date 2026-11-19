@@ -641,6 +641,12 @@ analysis.
   the union of several elements.
 - Issuer and provider names, admin permission spellings and secret
   references, which the [cross-resource checks](configuration.md#policy_file)
-  do not check either, and the publisher's own loss of `admin:policy:write`,
-  which publication checks for the principal publishing.
-- `ggctl` integration.
+  do not check either apart from `claim_not_captured`, and the publisher's own
+  loss of `admin:policy:write`, which publication checks for the principal
+  publishing.
+- The cross-resource errors `claim_not_captured` and
+  `condition_pointer_ineligible`. Publication still refuses a policy that has
+  them, and `POST /v1{ADMIN_PREFIX}/policy/validate` reports them, but an
+  analysis has no finding for either.
+- `ggctl` integration. `ggctl policy lint` (docs/ggctl.md) calls
+  `POST /v1{ADMIN_PREFIX}/policy/validate`, not this endpoint.

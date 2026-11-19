@@ -229,8 +229,10 @@ process's configuration does not describe the gateway that served a historical
 publication (a sequence on an override still runs on the publication's own
 limits).
 
-Routes and rate overrides are named by position because the current policy
-schema gives them no identifiers; a reordered policy changes them.
+Routes and rate overrides are named by position. A 0.x policy gives them no
+identifiers, and although a policy v1 document gives each route and rate
+override a stable `id`, a suite cannot name one by it yet: in either version
+a reordered policy changes the positions.
 
 ## Storing a suite beside the policy
 
@@ -624,8 +626,8 @@ Not part of this slice, and not to be inferred from it:
 
 - Gating bundle activation or a policy file reload on the stored suite (see
   [what the gate does not cover](#requiring-the-stored-suite-before-activation)).
-- Typed claim, header, query, tool-argument and time-window matchers, and
-  stable route and rate-override identifiers (policy v1).
+- Naming a route or rate override by its policy v1 `id` in an expectation or
+  a result; both are positions ([above](#expectations)).
 - Running a suite offline. `ggctl policy test` (docs/ggctl.md) sends a suite
   to this endpoint and reports the gateway's run, as JSON or the gateway's
   own JUnit report; it does not run cases itself.
