@@ -338,6 +338,16 @@ class ToolContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "unexpected active"):
                     build_tools.verify()
 
+    def test_runtime_rejects_an_unpinned_installed_toolchain(self):
+        # rust-cache keys on every installed toolchain; the runner image's own
+        # stable must not be one of them.
+        listing = {"show": "1.99.1-x86_64-unknown-linux-gnu (environment override by RUSTUP_TOOLCHAIN)",
+                   "toolchain": "1.99.1-x86_64-unknown-linux-gnu\nstable-x86_64-unknown-linux-gnu"}
+        with patch.dict(os.environ, {"RUST_PROFILE": "production", "CHECK_NODE": "false"}):
+            with patch("build_tools.output", side_effect=lambda cmd: listing[cmd[1]]):
+                with self.assertRaisesRegex(ValueError, "unpinned Rust toolchain installed: stable-"):
+                    build_tools.verify()
+
 
 if __name__ == "__main__":
     unittest.main()

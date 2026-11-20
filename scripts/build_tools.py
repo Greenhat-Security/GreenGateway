@@ -176,6 +176,10 @@ def verify():
         active = output(["rustup", "show", "active-toolchain"]).split()[0]
         if not active.startswith(pins["rust_" + selected] + "-"):
             raise ValueError(f"unexpected active Rust toolchain: {active}")
+        # Swatinem/rust-cache hashes every installed toolchain into its key.
+        for installed in output(["rustup", "toolchain", "list", "--quiet"]).split():
+            if not installed.startswith(pins["rust_" + selected] + "-"):
+                raise ValueError(f"unpinned Rust toolchain installed: {installed}")
         print(output(["rustc", "--version"]))
         print(output(["cargo", "--version"]))
     if os.environ.get("CHECK_NODE") == "true":

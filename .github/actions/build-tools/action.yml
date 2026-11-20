@@ -23,6 +23,21 @@ runs:
       with:
         toolchain: ${{ steps.pins.outputs.rust }}
         components: ${{ steps.pins.outputs.components }}
+    - name: Remove the runner image's own Rust toolchains
+      # Swatinem/rust-cache hashes every installed toolchain into its cache
+      # key. The image's preinstalled stable changes as GitHub rolls out new
+      # images, which changed every Rust cache key and rebuilt from cold.
+      if: inputs.rust != 'none'
+      shell: bash
+      env:
+        PINNED: ${{ steps.pins.outputs.rust }}
+      run: |
+        for toolchain in $(rustup toolchain list --quiet); do
+          case "$toolchain" in
+            "$PINNED"-*) ;;
+            *) rustup toolchain uninstall "$toolchain" ;;
+          esac
+        done
     - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
       if: inputs.node == 'true'
       with:
