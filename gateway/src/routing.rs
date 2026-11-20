@@ -650,9 +650,104 @@ pub(super) fn add_admin_api_routes(
         ));
     }
 
-    router
-        .merge(api)
-        .merge(admin_auth_router(routes, admin_api_states.auth))
+    // Outermost on the admin API, so an `Idempotency-Key` this build does not
+    // honour is refused before the revision gate reads the authority or any
+    // handler runs (issue #425).
+    let keyed_routes = KeyedRouteGuard::new(&routes.admin);
+    let api = api.layer(axum::middleware::from_fn_with_state(
+        keyed_routes.clone(),
+        idempotency_key_guard_middleware,
+    ));
+    let auth = admin_auth_router(routes, admin_api_states.auth).layer(
+        axum::middleware::from_fn_with_state(keyed_routes, idempotency_key_guard_middleware),
+    );
+
+    router.merge(api).merge(auth)
+}
+
+/// One admin route that honours an `Idempotency-Key`: its method and its
+/// route pattern, spelled as the evidence inventory's qualified paths spell
+/// them (`/v1{ADMIN_PREFIX}/...`, with the router's `{name}` parameters).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct KeyedRoute {
+    pub(super) method: &'static str,
+    pub(super) route: &'static str,
+}
+
+/// The prefix every [`KeyedRoute`] starts with: the admin API prefix,
+/// `/v1` followed by `ADMIN_PREFIX`.
+pub(super) const KEYED_ROUTE_PREFIX: &str = "/v1{ADMIN_PREFIX}";
+
+/// Every admin route that honours an `Idempotency-Key` (issue #425). This is
+/// a reviewed table: the router refuses the header on every other admin
+/// mutation route with `400 idempotency_key_unsupported` before the handler
+/// runs, so a key is honoured or refused, never ignored. A route that starts
+/// binding keys is added here in the change that binds them, and the
+/// authority evidence checker (`scripts/check-authority-evidence.mjs`) holds
+/// this table and its `QUALIFIED_PATHS` to the same methods and routes.
+pub(super) const KEYED_ROUTES: &[KeyedRoute] = &[
+    // Keyed service-token revocation (issue #765).
+    KeyedRoute {
+        method: "POST",
+        route: "/v1{ADMIN_PREFIX}/tokens/{id}/revoke",
+    },
+    // Keyed approval preparation (issue #794).
+    KeyedRoute {
+        method: "PUT",
+        route: "/v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals",
+    },
+];
+
+/// [`KEYED_ROUTES`] resolved against this router's admin API prefix.
+#[derive(Clone)]
+pub(super) struct KeyedRouteGuard {
+    honoured: Arc<[(Method, String)]>,
+}
+
+impl KeyedRouteGuard {
+    pub(super) fn new(routes: &AdminRoutes) -> Self {
+        let honoured = KEYED_ROUTES
+            .iter()
+            .filter_map(|keyed| {
+                let suffix = keyed.route.strip_prefix(KEYED_ROUTE_PREFIX)?;
+                let method = Method::from_bytes(keyed.method.as_bytes()).ok()?;
+                Some((method, format!("{}{suffix}", routes.api_prefix)))
+            })
+            .collect();
+        Self { honoured }
+    }
+
+    /// Whether `method` on the route pattern `matched` honours a key.
+    pub(super) fn honours(&self, method: &Method, matched: &str) -> bool {
+        self.honoured
+            .iter()
+            .any(|(honoured, route)| honoured == method && route == matched)
+    }
+}
+
+/// Refuse an `Idempotency-Key` on an admin mutation (any method but `GET`,
+/// `HEAD` and `OPTIONS`) whose route is not in [`KEYED_ROUTES`]: before this
+/// change such a route ignored the header, and a client retrying under it
+/// would have applied its change twice. A request whose route cannot be
+/// read is refused too. Reads ignore the header: they change nothing.
+pub(super) async fn idempotency_key_guard_middleware(
+    State(guard): State<KeyedRouteGuard>,
+    request: AxumRequest,
+    next: axum::middleware::Next,
+) -> Response {
+    let method = request.method();
+    if request.headers().contains_key("idempotency-key")
+        && !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+    {
+        let honoured = request
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .is_some_and(|matched| guard.honours(method, matched.as_str()));
+        if !honoured {
+            return idempotency_key_unsupported();
+        }
+    }
+    next.run(request).await
 }
 
 /// The admin API's revision gate (issue #241, PR 7): one bound-checked read

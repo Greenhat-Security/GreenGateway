@@ -637,8 +637,9 @@ pub(super) fn caller_operation_id(headers: &HeaderMap) -> Result<uuid::Uuid, &'s
     Ok(id)
 }
 
-/// Ask the authority-evidence gate before an admin change, and record a
-/// refusal against the caller and the request that asked.
+/// Ask the authority-evidence gate before an admin change made without a
+/// caller key, and record a refusal against the caller and the request that
+/// asked.
 pub(super) fn admit_authority_change(
     gate: &authority_events::required::AuthorityEvidenceGate,
     operation: authority_events::required::AuthorityOperation,
@@ -647,8 +648,32 @@ pub(super) fn admit_authority_change(
     principal: &auth::Principal,
     client_ip_policy: &client_ip::ClientIpPolicy,
 ) -> ResponseResult<()> {
-    gate.admit(
+    admit_authority_change_for(
+        gate,
         operation,
+        authority_events::required::RequestForm::UNKEYED,
+        audit,
+        parts,
+        principal,
+        client_ip_policy,
+    )
+}
+
+/// [`admit_authority_change`] for a request in `form`: keyed or not, by an
+/// issuer-bound principal or not. Only a `caller_key_required` change looks
+/// at the form.
+pub(super) fn admit_authority_change_for(
+    gate: &authority_events::required::AuthorityEvidenceGate,
+    operation: authority_events::required::AuthorityOperation,
+    form: authority_events::required::RequestForm,
+    audit: &audit::AuditLog,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    client_ip_policy: &client_ip::ClientIpPolicy,
+) -> ResponseResult<()> {
+    gate.admit_for(
+        operation,
+        form,
         audit,
         authority_events::required::RefusalOrigin::Request {
             request_id: client_ip::request_id(&parts.headers, &parts.extensions),
@@ -661,6 +686,327 @@ pub(super) fn admit_authority_change(
         },
     )
     .map_err(|refusal| Box::new(authority_evidence_unsupported(&refusal)))
+}
+
+// --- keyed authority changes (issue #425) -----------------------------------
+//
+// Every admin change that binds an `Idempotency-Key` through these helpers
+// follows one contract (docs/authority-evidence.md, "Keyed authority
+// changes"). The keyed revoke and the keyed preparation predate it and keep
+// their own receipts and conflict answers. A handler, in this order:
+//
+// 0. authorizes the caller for the change and validates the request, as it
+//    does today, before any of the steps below. Admission can raise the
+//    durable contract fence, which is irreversible, fleet-wide and the
+//    rollback cutoff for builds without `caller_operation_keys`; admin
+//    routes are exempt from the data-plane RBAC layer and authorize
+//    themselves, so a handler that asked the gates first would let any
+//    authenticated caller, a service token without admin permission
+//    included, raise the fence with one keyed request answered `403`;
+// 1. binds the header to its request with [`caller_operation`], before it
+//    reads anything: `None` for a request without the header;
+// 2. asks [`admit_keyed_authority_change`]: the evidence gate, then, for a
+//    keyed request in cluster mode, the operation gate for
+//    `caller_operation_keys`;
+// 3. answers an exact retry with [`replayed_receipt`], the read-only
+//    pre-check, before any external I/O or post-commit side effect;
+// 4. calls its store with the `CallerOperation`, which reserves the key in
+//    the change's own transaction, and answers a `CallerOutcome::Replayed`
+//    with [`operation_receipt`] and a key bound to something else with
+//    [`caller_operation_conflict`].
+//
+// The gates come before the pre-check, an exact retry included, because the
+// pre-check reads the authority: required mode refuses a form it does not
+// admit before anything is read (I4), and a key is answered only while the
+// whole fleet honours keys. Both gates are cheap on a retry: the evidence
+// gate reads configuration only, and once the fence carries the capability
+// the operation gate answers from an unlocked read that takes no exclusive
+// lock, so concurrent keyed requests and retries admit each other.
+//
+// The route must also be listed in `routing::KEYED_ROUTES`; everywhere else
+// the router refuses the header with [`idempotency_key_unsupported`] before
+// the handler runs. No route binds a key through these helpers yet: each
+// operation family does so in its own change.
+
+/// The caller key a request carries, bound to that request: `Ok(None)` when
+/// it carries no `Idempotency-Key`. `action` is the operation code the key is
+/// reserved for; `target` the resource identifier (empty for a create);
+/// `precondition` the `If-Match` value as received (empty where the route
+/// takes none); `request` the canonical request bytes with every secret value
+/// removed (credential aliases and provider locators stay in). A malformed or
+/// repeated header is `400`; an actor that cannot own a key -- a principal
+/// without a canonical issuer -- is `403`, as for the keyed revoke. Reads
+/// nothing and writes nothing.
+#[cfg_attr(not(test), allow(dead_code))] // Called by the operation families that bind keys.
+pub(super) fn caller_operation(
+    headers: &HeaderMap,
+    actor: &auth::change_actor::ChangeActor,
+    action: &'static str,
+    target: &str,
+    precondition: &str,
+    request: &[u8],
+) -> ResponseResult<Option<authority_events::caller_operation::CallerOperation>> {
+    use authority_events::caller_operation::{
+        BindingRefusal, CallerOperation, CallerOperationBinding,
+    };
+
+    if !headers.contains_key("idempotency-key") {
+        return Ok(None);
+    }
+    let id = caller_operation_id(headers).map_err(|reason| Box::new(bad_request(reason)))?;
+    let binding = CallerOperationBinding {
+        action,
+        actor,
+        target,
+        precondition,
+        request,
+    };
+    match CallerOperation::bind(id, &binding) {
+        Ok(operation) => Ok(Some(operation)),
+        Err(BindingRefusal::ActorCannotBind) => Err(Box::new(forbidden())),
+        Err(BindingRefusal::NotCallerAssigned) => Err(Box::new(bad_request(
+            "Idempotency-Key must be one canonical lowercase UUIDv7",
+        ))),
+        Err(BindingRefusal::MissingAction) => {
+            tracing::error!("a keyed admin route bound a caller key to no action");
+            Err(Box::new(internal_server_error(
+                "the caller operation could not be bound",
+            )))
+        }
+    }
+}
+
+/// What a keyed admin change asks before its store is called: the
+/// authority-evidence gate, and in cluster mode the replica's membership,
+/// whose operation gate admits `caller_operation_keys`. The audit log and
+/// client-address policy name the request in a refusal's audit event.
+#[cfg_attr(not(test), allow(dead_code))] // Built by the operation families that bind keys.
+pub(super) struct KeyedChangeGates<'a> {
+    pub(super) evidence: &'a authority_events::required::AuthorityEvidenceGate,
+    /// `None` outside cluster mode. In cluster mode a keyed request with no
+    /// membership to ask is refused, never admitted.
+    #[cfg(feature = "postgres")]
+    pub(super) membership: Option<&'a cluster_membership::ClusterMembership>,
+    pub(super) audit: &'a audit::AuditLog,
+    pub(super) client_ip_policy: &'a client_ip::ClientIpPolicy,
+}
+
+/// What a keyed admin change is, for the evidence gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // Named by the operation families that bind keys.
+pub(super) enum KeyedChange {
+    /// A change the evidence gate decides on.
+    Gated(authority_events::required::AuthorityOperation),
+    /// A change that only removes authority, which never asks the evidence
+    /// gate: every form of it stays admitted (owner ruling 4 on issue #425).
+    /// The set is closed ([`Withdrawal`]), and a key bound to any other
+    /// action is not accepted as one.
+    ///
+    /// [`Withdrawal`]: authority_events::required::Withdrawal
+    Withdrawal(authority_events::required::Withdrawal),
+}
+
+/// Admit a keyed admin change, or answer why not. Nothing is read from or
+/// written to the authority before this admits. Call it only after the
+/// handler has authorized the caller for the change and validated the
+/// request: admitting a keyed request in cluster mode can raise the durable
+/// contract fence, which never comes down.
+///
+/// - `change` names the change for the evidence gate: a
+///   [`KeyedChange::Gated`] operation asks it, a [`KeyedChange::Withdrawal`]
+///   never does. A refusal is `409 authority_evidence_unsupported`, audited.
+///   A key reserved for a withdrawal's action on a gated change, or for
+///   another action on a withdrawal, is a handler defect: `500`, and
+///   nothing is asked or read.
+/// - A keyed request (`caller` is `Some`) in cluster mode then asks the
+///   operation gate for [`storage::compatibility::CALLER_OPERATION_KEYS`]:
+///   the key is honoured only while every live member advertises
+///   `caller_operation_keys`, and the first admission raises the durable
+///   contract fence, so a build that would ignore the key can no longer
+///   start or rejoin. A refusal is `409` when a live member lacks the
+///   capability and `503` when the gate cannot answer, audited as
+///   `cluster.operation_refused`. A request without a key does not ask.
+///
+/// [`AuthorityOperation`]: authority_events::required::AuthorityOperation
+#[cfg_attr(not(test), allow(dead_code))] // Called by the operation families that bind keys.
+pub(super) async fn admit_keyed_authority_change(
+    gates: &KeyedChangeGates<'_>,
+    change: KeyedChange,
+    caller: Option<&authority_events::caller_operation::CallerOperation>,
+    actor: &auth::change_actor::ChangeActor,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+) -> ResponseResult<()> {
+    use authority_events::required::Withdrawal;
+
+    if let Some(caller) = caller {
+        let bound_withdrawal = Withdrawal::from_code(caller.action());
+        let consistent = match change {
+            KeyedChange::Gated(_) => bound_withdrawal.is_none(),
+            KeyedChange::Withdrawal(withdrawal) => bound_withdrawal == Some(withdrawal),
+        };
+        if !consistent {
+            tracing::error!(
+                action = caller.action(),
+                "a keyed admin change named a withdrawal its caller key is not bound to, or a gated change bound to a withdrawal; it is refused"
+            );
+            return Err(Box::new(internal_server_error(
+                "the keyed change could not be admitted",
+            )));
+        }
+    }
+    if let KeyedChange::Gated(operation) = change {
+        admit_authority_change_for(
+            gates.evidence,
+            operation,
+            authority_events::required::RequestForm::of(caller.is_some(), actor),
+            gates.audit,
+            parts,
+            principal,
+            gates.client_ip_policy,
+        )?;
+    }
+    if caller.is_none() || gates.evidence.backend() != config::StateBackend::Postgres {
+        return Ok(());
+    }
+    #[cfg(feature = "postgres")]
+    {
+        let Some(membership) = gates.membership else {
+            tracing::error!(
+                "cluster mode: a keyed admin change has no cluster membership to ask; it is refused"
+            );
+            return Err(Box::new(operation_refused(
+                &storage::compatibility::OperationRefusal::RosterUnavailable,
+            )));
+        };
+        let request = cluster_membership::GatedWriteRequest {
+            request_id: client_ip::request_id(&parts.headers, &parts.extensions),
+            source_ip: client_ip::canonical_client_ip(
+                &parts.headers,
+                &parts.extensions,
+                gates.client_ip_policy,
+            ),
+            actor: Some(auth::actor_from_principal(principal)),
+        };
+        membership
+            .admit_operation(
+                &storage::compatibility::CALLER_OPERATION_KEYS,
+                gates.audit,
+                &request,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|refusal| Box::new(operation_refused(&refusal)))
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        // Cluster mode cannot be configured without the feature; refuse
+        // rather than honour a key no operation gate admitted.
+        Err(Box::new(service_unavailable(
+            "keyed admin changes in cluster mode need the postgres feature",
+        )))
+    }
+}
+
+/// The read-only pre-check of a keyed request (step 0 of the keyed
+/// contract), run before any external I/O and any post-commit side effect.
+/// `key` is the store's `read_caller_operation` for the request's
+/// `CallerOperation`, and `receipt` its read of the committed evidence row
+/// by that key; both are futures, so `receipt` runs only for an exact retry.
+/// `Ok(())` means the key is unused: go on. Otherwise the answer is the
+/// receipt (`200`) for the same action and binding, `409` for a key bound to
+/// anything else, and `503` when either read fails or a reservation has no
+/// evidence row. The answer is advisory: the change's own transaction
+/// decides again.
+#[cfg_attr(not(test), allow(dead_code))] // Called by the operation families that bind keys.
+pub(super) async fn replayed_receipt(
+    key: impl std::future::Future<
+        Output = Result<
+            authority_events::caller_operation::CallerKeyState,
+            storage::RepositoryError,
+        >,
+    >,
+    receipt: impl std::future::Future<
+        Output = Result<
+            Option<authority_events::caller_operation::OperationReceipt>,
+            storage::RepositoryError,
+        >,
+    >,
+) -> ResponseResult<()> {
+    use authority_events::caller_operation::CallerKeyState;
+
+    let unavailable = |error: Option<storage::RepositoryError>| {
+        match error {
+            Some(error) => {
+                tracing::error!(error = %error, "a caller operation could not be read")
+            }
+            None => tracing::error!(
+                "a caller operation is reserved without its evidence row; the request is refused"
+            ),
+        }
+        Box::new(service_unavailable(
+            "the caller operation could not be read",
+        ))
+    };
+    match key.await.map_err(|error| unavailable(Some(error)))? {
+        CallerKeyState::Unused => Ok(()),
+        CallerKeyState::OtherBinding => Err(Box::new(caller_operation_conflict())),
+        CallerKeyState::SameBinding => {
+            match receipt.await.map_err(|error| unavailable(Some(error)))? {
+                Some(receipt) => Err(Box::new(operation_receipt(&receipt))),
+                None => Err(unavailable(None)),
+            }
+        }
+    }
+}
+
+/// An exact retry's answer: `200` with the receipt read from the committed
+/// evidence row, never a secret, a binding digest or a raw request field.
+#[cfg_attr(not(test), allow(dead_code))] // Called by the operation families that bind keys.
+pub(super) fn operation_receipt(
+    receipt: &authority_events::caller_operation::OperationReceipt,
+) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(receipt),
+    )
+        .into_response()
+}
+
+/// The stable reason of [`caller_operation_conflict`].
+pub(super) const CALLER_OPERATION_CONFLICT_REASON: &str = "caller_operation_conflict";
+
+/// A key already reserved for another action, another binding, or without a
+/// binding (a keyed revoke or prepare): `409`, and nothing changed.
+#[cfg_attr(not(test), allow(dead_code))] // Called by the operation families that bind keys.
+pub(super) fn caller_operation_conflict() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "Idempotency-Key is bound to a different request; nothing was changed",
+            "reason": CALLER_OPERATION_CONFLICT_REASON,
+        })),
+    )
+        .into_response()
+}
+
+/// The stable reason of [`idempotency_key_unsupported`].
+pub(super) const IDEMPOTENCY_KEY_UNSUPPORTED_REASON: &str = "idempotency_key_unsupported";
+
+/// An `Idempotency-Key` on an admin mutation route that does not honour one
+/// (`routing::KEYED_ROUTES`): `400`, answered by the router before the
+/// handler runs, so nothing was read or written. A key is honoured or
+/// refused, never ignored: ignoring it would apply a retry a second time.
+pub(super) fn idempotency_key_unsupported() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "this route does not honour an Idempotency-Key; nothing was changed",
+            "reason": IDEMPOTENCY_KEY_UNSUPPORTED_REASON,
+        })),
+    )
+        .into_response()
 }
 
 pub(super) fn service_unavailable(error: &str) -> Response {

@@ -533,3 +533,181 @@ fn the_cluster_session_store_never_falls_back_to_process_memory() {
     config.storage = auth::admin_session::AdminSessionStorage::StandaloneMemory;
     assert!(admin_session_store(&config, None).is_ok());
 }
+
+/// The admin session routes refuse an `Idempotency-Key` too (issue #425): a
+/// key is honoured or refused on every admin mutation, and neither login
+/// completion nor logout honours one. A keyed completion is `400
+/// idempotency_key_unsupported` before the handler runs, so the identity
+/// provider is never asked and no session is minted; a keyed logout is `400`
+/// and the session stays live. Without the header both work as before.
+#[tokio::test]
+async fn the_admin_session_routes_refuse_an_idempotency_key_and_change_nothing() {
+    let jwks_addr = spawn_test_jwks_server().await;
+    let token_endpoint = spawn_mock_oidc_token_endpoint(Ipv4Addr::new(127, 0, 0, 2), None).await;
+    let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
+    let access = signed_token_with_issuer("admin-operator", &["admin"], &oidc.issuer);
+    token_endpoint.set_access_token(access);
+    let policy_body = json!({
+        "schema_version":"0.1.0", "default_action":"deny",
+        "roles":{"admin":{"permissions":["admin:status:read"]}},
+        "routes":[
+            {"methods":["GET"], "path_prefix":format!("{PREFIX}/status"), "permission":"admin:status:read"}
+        ]
+    });
+    let policy = TempPolicyFile::new(&policy_body.to_string());
+    let mut config = admin_oidc_login_config(&oidc.issuer);
+    config.admin_prefix = "/operations".to_owned();
+    config.admin_session = Some(auth::admin_session::AdminSessionConfig {
+        storage: auth::admin_session::AdminSessionStorage::StandaloneMemory,
+        ttl: Duration::from_secs(60),
+        idle_timeout: Duration::from_secs(60),
+        max_entries: 8,
+    });
+    config.auth_providers[0].jwks_url =
+        Some(format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port()));
+    config.auth_providers[0].redirect_uri = Some(format!("{ORIGIN}{PREFIX}/auth/callback"));
+    config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+    config.gateway_public_url = Some("https://public.example.test/mcp".to_owned());
+    config.csrf_cookie_name = "ops_csrf".to_owned();
+    config.csrf_header_name = "x-ops-csrf".to_owned();
+    config.egress_deny_private_ips = false;
+    for route in ["login", "callback", "logout", "config"] {
+        config
+            .auth_exempt_paths
+            .push(format!("{PREFIX}/auth/{route}"));
+        config
+            .rbac_exempt_paths
+            .push(format!("{PREFIX}/auth/{route}"));
+    }
+    let apps = gateway_app_with_process_started_at(
+        config,
+        PrometheusBuilder::new().build_recorder().handle(),
+        test_audit_log(),
+        test_audit_event_sender(),
+        Instant::now(),
+    )
+    .unwrap();
+    let GatewayApp::Unified(admin) = apps.http else {
+        panic!("expected a unified router");
+    };
+    let key = crate::auth::tokens::test_revoke_operation_id(9).to_string();
+    let keyed = |mut request: Request<Body>| {
+        request
+            .headers_mut()
+            .insert("idempotency-key", key.parse().unwrap());
+        request
+    };
+    let refused_for_the_key = |response: Response| async move {
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["reason"], IDEMPOTENCY_KEY_UNSUPPORTED_REASON);
+    };
+
+    let login = admin
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("{PREFIX}/auth/login"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::FOUND);
+    let login_cookies = admin_oidc_cookies(&login);
+    let csrf = login_cookies
+        .split(';')
+        .find_map(|pair| pair.trim().strip_prefix("ops_csrf="))
+        .unwrap()
+        .to_owned();
+    let query = url_query_pairs(&Url::parse(&response_location(&login)).unwrap());
+    token_endpoint.set_id_token(signed_admin_id_token(
+        &oidc.issuer,
+        "admin-ui",
+        &query["nonce"],
+    ));
+    let completion =
+        json!({"code":"generated-fixture-code", "state":query["state"], "mode":"cookie"});
+    let completion_request = || {
+        request(
+            Method::POST,
+            &format!("{PREFIX}/auth/callback"),
+            &login_cookies,
+            Some(&csrf),
+            Some(ORIGIN),
+            completion.clone(),
+        )
+    };
+
+    // A keyed completion reaches neither the handler nor the provider, and
+    // mints no session.
+    let response = admin
+        .clone()
+        .oneshot(keyed(completion_request()))
+        .await
+        .unwrap();
+    assert!(response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .all(|cookie| !cookie.to_str().unwrap().contains("ggw-admin-session-")));
+    refused_for_the_key(response).await;
+    assert!(token_endpoint.requests().is_empty());
+
+    // Without the header the same completion signs in.
+    let response = admin.clone().oneshot(completion_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let session_cookie = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .find(|cookie| cookie.to_str().unwrap().contains("ggw-admin-session-"))
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let cookies = format!(
+        "{}; ops_csrf={csrf}",
+        session_cookie.split(';').next().unwrap()
+    );
+    let logout_request = || {
+        Request::builder()
+            .method(Method::POST)
+            .uri(format!("{PREFIX}/auth/logout"))
+            .header(header::COOKIE, &cookies)
+            .header("x-ops-csrf", &csrf)
+            .header(header::ORIGIN, ORIGIN)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let status = || {
+        request(
+            Method::GET,
+            &format!("{PREFIX}/status"),
+            &cookies,
+            None,
+            None,
+            Value::Null,
+        )
+    };
+
+    // A keyed logout is refused and the session stays live.
+    let response = admin
+        .clone()
+        .oneshot(keyed(logout_request()))
+        .await
+        .unwrap();
+    refused_for_the_key(response).await;
+    let read = admin.clone().oneshot(status()).await.unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+
+    // Without the header the logout ends it.
+    let logout = admin.clone().oneshot(logout_request()).await.unwrap();
+    assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+    let read = admin.oneshot(status()).await.unwrap();
+    assert_eq!(read.status(), StatusCode::UNAUTHORIZED);
+    oidc.finish();
+    token_endpoint.abort();
+}

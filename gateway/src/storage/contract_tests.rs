@@ -7525,6 +7525,7 @@ pub(crate) mod postgres_audit_tests {
         let _guard = DATABASE.lock().await;
         let database = create_test_database(&admin_dsn).await;
         let (_store, pool) = migrated_service_token_store(&database).await;
+        raise_caller_operation_keys_fence(&pool).await;
         super::caller_operation_reservation_contract(&PostgresCallerOperations { pool }).await;
     }
 
@@ -7537,6 +7538,7 @@ pub(crate) mod postgres_audit_tests {
         let _guard = DATABASE.lock().await;
         let database = create_test_database(&admin_dsn).await;
         let (_store, pool) = migrated_service_token_store(&database).await;
+        raise_caller_operation_keys_fence(&pool).await;
         super::caller_operation_rolled_back_reservation_contract(&PostgresCallerOperations {
             pool,
         })
@@ -7552,7 +7554,275 @@ pub(crate) mod postgres_audit_tests {
         let _guard = DATABASE.lock().await;
         let database = create_test_database(&admin_dsn).await;
         let (_store, pool) = migrated_service_token_store(&database).await;
+        raise_caller_operation_keys_fence(&pool).await;
         super::caller_operation_race_contract(&PostgresCallerOperations { pool }).await;
+    }
+
+    /// Raise the contract fence the way the operation gate's first admission
+    /// of a keyed change leaves it (`CALLER_OPERATION_KEYS`), so a bound
+    /// reservation may be made.
+    async fn raise_caller_operation_keys_fence(pool: &deadpool_postgres::Pool) {
+        let requirement = &crate::storage::compatibility::CALLER_OPERATION_KEYS;
+        raise_fence_directly(
+            pool,
+            requirement.minimum_schema,
+            requirement.capability.as_str(),
+        )
+        .await;
+    }
+
+    /// A bound reservation is the store-side half of the operation gate for
+    /// `caller_operation_keys` (issue #425): it is made only in a transaction
+    /// that sees the durable contract fence carry the capability at schema 36
+    /// or above. Below that -- the open fence migration 20 seeds, a fence
+    /// raised only for another operation, or one that names the capability
+    /// at an earlier schema -- the key is refused as unavailable and nothing
+    /// is reserved, so no key is honoured that a build without the capability
+    /// could still be serving beside. Once the gate's first admission has
+    /// raised the fence, the same reservation is made.
+    #[tokio::test]
+    async fn a_bound_reservation_below_the_fence_is_refused() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_store, pool) = migrated_service_token_store(&database).await;
+        let harness = PostgresCallerOperations { pool: pool.clone() };
+        let actor = ChangeActor::for_test_with_issuer("operator", "https://one.example.test");
+        let create = super::bound_operation(
+            test_caller_key(31),
+            "connection.create",
+            &actor,
+            br#"{"name":"fixture"}"#,
+        );
+
+        let refused = |outcome: Result<CallerKeyReservation, RepositoryError>, why: &str| {
+            let error = outcome.expect_err(why);
+            assert_eq!(error.kind(), RepositoryErrorKind::Unavailable, "{why}");
+            assert_eq!(
+                error.operation(),
+                "authority_caller_operation_reserve",
+                "{why}"
+            );
+        };
+        refused(
+            harness.reserve(&create, true).await,
+            "the open fence refuses a bound reservation",
+        );
+        raise_fence_directly(&pool, 34, "managed_http_mutation_v1").await;
+        refused(
+            harness.reserve(&create, true).await,
+            "a fence raised for another operation refuses it",
+        );
+        raise_fence_directly(&pool, 35, "caller_operation_keys,managed_http_mutation_v1").await;
+        refused(
+            harness.reserve(&create, true).await,
+            "the capability below schema 36 refuses it",
+        );
+        assert!(
+            harness.reservations().await.is_empty(),
+            "a refused reservation reserves nothing"
+        );
+        // The read-only pre-check is advisory and asks no fence.
+        assert_eq!(
+            harness.read(&create).await.expect("the key reads"),
+            CallerKeyState::Unused
+        );
+
+        raise_fence_directly(&pool, 36, "caller_operation_keys,managed_http_mutation_v1").await;
+        assert_eq!(
+            harness
+                .reserve(&create, true)
+                .await
+                .expect("the raised fence admits it"),
+            CallerKeyReservation::Reserved
+        );
+        assert_eq!(harness.reservations().await.len(), 1);
+    }
+
+    /// The caller-key gate end to end (issue #425): the operation gate for
+    /// `CALLER_OPERATION_KEYS`, through a real `ClusterMembership`, and the
+    /// store's own fence check. While a live member lacks
+    /// `caller_operation_keys` the gate refuses and the store refuses the
+    /// key. Once that member is stale, two first admissions racing each
+    /// other are both admitted and raise the fence once, to schema 36 and
+    /// the capability, and the store then reserves. After that an admission
+    /// takes no exclusive lock: it is admitted while another admission holds
+    /// the fence row and the migrator's lock shared, and admissions running
+    /// at the same time admit each other. None of them writes the fence
+    /// again or is audited as a refusal.
+    #[tokio::test]
+    async fn the_caller_key_gate_raises_the_fence_once_and_then_admits_concurrent_keyed_changes() {
+        use crate::audit::{sink::tests::CaptureSink, AuditLog};
+        use crate::cluster_membership::GatedWriteRequest;
+        use crate::storage::compatibility::{
+            OperationAdmission, OperationRefusal, CALLER_OPERATION_KEYS,
+        };
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let heartbeat = Duration::from_secs(1);
+        let window = Duration::from_secs(30);
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()));
+        let request = GatedWriteRequest {
+            request_id: "request-caller-keys".to_owned(),
+            source_ip: "203.0.113.9".to_owned(),
+            actor: None,
+        };
+        let read_fence = || {
+            let pool = pool.clone();
+            async move {
+                crate::storage::read_contract_fence(&pool)
+                    .await
+                    .expect("the fence reads")
+            }
+        };
+        let harness = PostgresCallerOperations { pool: pool.clone() };
+        let actor = ChangeActor::for_test_with_issuer("operator", "https://one.example.test");
+        let create = super::bound_operation(
+            test_caller_key(41),
+            "connection.create",
+            &actor,
+            br#"{"name":"fixture"}"#,
+        );
+
+        let this = Arc::new(ClusterMembership::new(
+            member_store(&pool),
+            registration('a'),
+            heartbeat,
+            window,
+        ));
+        this.register_boot().await.expect("boot");
+        let older_store = member_store(&pool);
+        let older = ClusterMembership::new(
+            older_store.clone(),
+            prepared_registration('a'),
+            heartbeat,
+            window,
+        );
+        older.register_boot().await.expect("boot");
+        let admit_together = |count: usize| {
+            let handles: Vec<_> = (0..count)
+                .map(|_| {
+                    let this = Arc::clone(&this);
+                    let audit = audit.clone();
+                    let request = request.clone();
+                    tokio::spawn(async move {
+                        this.admit_operation(&CALLER_OPERATION_KEYS, &audit, &request)
+                            .await
+                    })
+                })
+                .collect();
+            async move {
+                let mut outcomes = Vec::new();
+                for handle in handles {
+                    outcomes.push(handle.await.expect("join"));
+                }
+                outcomes
+            }
+        };
+
+        // A live member without the capability holds every keyed change:
+        // the gate refuses and raises nothing, and the store refuses the key.
+        assert_eq!(
+            this.admit_operation(&CALLER_OPERATION_KEYS, &audit, &request)
+                .await,
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![older_store.instance_id()],
+                live: 2
+            })
+        );
+        assert_eq!(read_fence().await.generation, 0);
+        let refused = harness
+            .reserve(&create, true)
+            .await
+            .expect_err("no admission raised the fence");
+        assert_eq!(refused.kind(), RepositoryErrorKind::Unavailable);
+
+        // Once it is stale, two first admissions race: both are admitted,
+        // and the fence is raised once, to the requirement.
+        backdate_heartbeat(&pool, older_store.instance_id(), 60.0).await;
+        for outcome in admit_together(2).await {
+            assert_eq!(outcome, Ok(OperationAdmission { live_members: 1 }));
+        }
+        let raised = read_fence().await;
+        assert_eq!(raised.generation, 1);
+        assert_eq!(raised.minimum_schema, CALLER_OPERATION_KEYS.minimum_schema);
+        assert_eq!(raised.minimum_schema, 36);
+        assert_eq!(raised.capabilities, "caller_operation_keys");
+        assert_eq!(
+            harness
+                .reserve(&create, true)
+                .await
+                .expect("the raised fence admits the key"),
+            CallerKeyReservation::Reserved
+        );
+        // The member that lacks the capability cannot come back.
+        assert_eq!(
+            older_store
+                .heartbeat(
+                    &prepared_registration('a'),
+                    MemberRevisions::default(),
+                    None
+                )
+                .await
+                .expect("heartbeat"),
+            crate::storage::HeartbeatOutcome::Fenced
+        );
+
+        // An admission in flight holds the fence row and the migrator's lock
+        // shared; a repeat admission neither waits for it nor takes it for a
+        // migrator.
+        let in_flight = pool.get().await.expect("client");
+        in_flight
+            .batch_execute(&format!(
+                "BEGIN;
+                 SELECT pg_advisory_xact_lock_shared({key});
+                 SELECT 1 FROM greengateway.contract_fence WHERE singleton FOR UPDATE;",
+                key = migrations::migration_lock_key()
+            ))
+            .await
+            .expect("an admission holds the fence row");
+        let admitted = tokio::time::timeout(
+            Duration::from_secs(5),
+            this.admit_operation(&CALLER_OPERATION_KEYS, &audit, &request),
+        )
+        .await
+        .expect("a repeat admission does not wait for the fence row");
+        assert_eq!(admitted, Ok(OperationAdmission { live_members: 1 }));
+        in_flight.batch_execute("COMMIT").await.expect("commit");
+        drop(in_flight);
+
+        // Keyed changes arriving together admit each other.
+        for outcome in admit_together(4).await {
+            assert_eq!(outcome, Ok(OperationAdmission { live_members: 1 }));
+        }
+        assert_eq!(
+            read_fence().await.generation,
+            1,
+            "no admission after the first wrote the fence"
+        );
+
+        // One raise and one refusal were audited, nothing else.
+        wait_for_events(&capture, 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let events = capture.events();
+        let count = |event_type: &str| {
+            events
+                .iter()
+                .filter(|event| event.event_type == event_type)
+                .count()
+        };
+        assert_eq!(count("cluster.contract_fence_raised"), 1, "{events:?}");
+        assert_eq!(count("cluster.operation_refused"), 1, "{events:?}");
     }
 
     struct PostgresTokenIssueHarness<'a> {
@@ -12930,7 +13200,7 @@ pub(crate) mod postgres_audit_tests {
         let members = store.members(window).await.expect("members");
         assert_eq!(
             members[0].capabilities,
-            "delegated_token_purges,managed_http_mutation_v1,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
+            "caller_operation_keys,delegated_token_purges,managed_http_mutation_v1,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
              operation_requirements,policy_document_v1,policy_role_descriptions,\
              policy_rule_conditions,policy_tool_argument_conditions"
         );
@@ -12983,7 +13253,7 @@ pub(crate) mod postgres_audit_tests {
             .expect("refresh");
         assert_eq!(
             store.members(window).await.expect("members")[0].capabilities,
-            "delegated_token_purges,managed_http_mutation_v1,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
+            "caller_operation_keys,delegated_token_purges,managed_http_mutation_v1,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
              operation_requirements,policy_document_v1,policy_role_descriptions,\
              policy_rule_conditions,policy_tool_argument_conditions"
         );

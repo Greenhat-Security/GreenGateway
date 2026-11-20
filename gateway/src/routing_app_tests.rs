@@ -4667,3 +4667,188 @@ fn every_mcp_route_path_is_gateway_owned_so_an_alias_is_never_a_classified_dispa
         }
     }
 }
+
+/// The admin API routes `add_admin_api_routes` mounts, by their `AdminRoutes`
+/// field names, read from `routing.rs` itself so a route added there is
+/// covered without anyone remembering this test.
+fn admin_api_route_fields() -> Vec<String> {
+    let source = include_str!("routing.rs");
+    let start = source
+        .find("pub(super) fn add_admin_api_routes(")
+        .expect("routing.rs mounts the admin API");
+    let end = start
+        + source[start..]
+            .find("fn admin_revision_gate_middleware")
+            .expect("the admin API's body ends before the revision gate");
+    let body: String = source[start..end]
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let mut fields: Vec<String> = body
+        .split("routes.admin.")
+        .skip(1)
+        .map(|rest| {
+            rest.chars()
+                .take_while(|character| character.is_ascii_lowercase() || *character == '_')
+                .collect()
+        })
+        .filter(|field: &String| field != "api_prefix")
+        .collect();
+    fields.sort();
+    fields.dedup();
+    fields
+}
+
+/// Every `AdminRoutes` field and its route pattern, from the struct's own
+/// `Debug` rendering.
+fn admin_route_patterns(routes: &AdminRoutes) -> std::collections::BTreeMap<String, String> {
+    format!("{routes:#?}")
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.trim().split_once(": ")?;
+            let value = value.trim_end_matches(',');
+            let value = value.strip_prefix('"')?.strip_suffix('"')?;
+            Some((name.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+/// A key is honoured or refused, never ignored (issue #425). Every admin API
+/// route `routing.rs` mounts is sent each mutating method with a valid
+/// `Idempotency-Key`: only the (method, route) pairs in `KEYED_ROUTES` reach
+/// their handler, and every other pair -- including the unkeyed `DELETE` of
+/// a token and the unkeyed `POST` of a preparation, which before this change
+/// ignored the header -- is `400 idempotency_key_unsupported` from the
+/// router. A refused token issue creates no token. Reads ignore the header,
+/// and a mutation without one is untouched.
+#[tokio::test]
+async fn an_idempotency_key_on_a_route_that_does_not_honour_it_is_refused_and_changes_nothing() {
+    let token_db = TempDb::new("idempotency-key-guard");
+    let policy = TempPolicyFile::new(&token_policy_document_string());
+    let mut config = test_config(Vec::new());
+    config.auth_enabled = false;
+    config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+    config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+    // As every deployment's default exemption does, so the admin handlers'
+    // own authorization -- not the data-plane RBAC layer -- would decide.
+    config
+        .rbac_exempt_paths
+        .push(DEFAULT_ADMIN_API_PREFIX.to_owned());
+    // Hundreds of mutations from one client: the write limiter is not what
+    // this test measures.
+    config.rate_limit_write_rps = 100_000.0;
+    config.rate_limit_write_burst = 100_000;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let router = app(
+        config,
+        recorder.handle(),
+        test_audit_log(),
+        test_audit_event_sender(),
+    )
+    .expect("app should build");
+    let mut owner = test_principal(&["superadmin"]);
+    owner.issuer = Some("https://issuer.example.test".to_owned());
+    let key = crate::auth::tokens::test_revoke_operation_id(7).to_string();
+    let request = |method: Method, path: &str, keyed: bool, body: Option<String>| {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, "Bearer test-token")
+            .header(header::CONTENT_TYPE, "application/json");
+        if keyed {
+            builder = builder.header("idempotency-key", key.as_str());
+        }
+        let mut request = builder
+            .body(Body::from(body.unwrap_or_default()))
+            .expect("request builds");
+        request.extensions_mut().insert(owner.clone());
+        request
+    };
+
+    let routes = AdminRoutes::from_prefix(config::DEFAULT_ADMIN_PREFIX);
+    let patterns = admin_route_patterns(&routes);
+    let fields = admin_api_route_fields();
+    assert!(
+        fields.len() > 40,
+        "routing.rs mounts the whole admin API: {fields:?}"
+    );
+    let guard = KeyedRouteGuard::new(&routes);
+    let mut honoured = Vec::new();
+    for field in &fields {
+        let pattern = patterns
+            .get(field)
+            .unwrap_or_else(|| panic!("AdminRoutes has a {field} field"));
+        let path = pattern
+            .replace("{id}", "fixture-id")
+            .replace("{version}", "1")
+            .replace("{approval_id}", "fixture-approval");
+        assert!(!path.contains('{'), "{field}: {pattern}");
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            let response = router
+                .clone()
+                .oneshot(request(method.clone(), &path, true, None))
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = json_body(response).await;
+            if guard.honours(&method, pattern) {
+                assert_ne!(
+                    body["reason"], IDEMPOTENCY_KEY_UNSUPPORTED_REASON,
+                    "{method} {pattern} honours its key"
+                );
+                honoured.push(format!("{method} {pattern}"));
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{method} {pattern}: {body}"
+                );
+                assert_eq!(
+                    body["reason"], IDEMPOTENCY_KEY_UNSUPPORTED_REASON,
+                    "{method} {pattern}"
+                );
+            }
+        }
+    }
+    honoured.sort();
+    let mut expected: Vec<String> = KEYED_ROUTES
+        .iter()
+        .map(|keyed| {
+            format!(
+                "{} {}",
+                keyed.method,
+                keyed
+                    .route
+                    .replacen(KEYED_ROUTE_PREFIX, DEFAULT_ADMIN_API_PREFIX, 1)
+            )
+        })
+        .collect();
+    expected.sort();
+    assert_eq!(
+        honoured, expected,
+        "exactly KEYED_ROUTES reach their handlers with a key"
+    );
+
+    // A refused token issue changed nothing; the same request without the
+    // key issues the token, and a read with a key is answered as a read.
+    let issue = || Some(json!({ "scopes": ["probe-reader"] }).to_string());
+    let refused = router
+        .clone()
+        .oneshot(request(Method::POST, TOKENS_ADMIN_ROUTE, true, issue()))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let listed = router
+        .clone()
+        .oneshot(request(Method::GET, TOKENS_ADMIN_ROUTE, true, None))
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    assert_eq!(json_body(listed).await["tokens"], json!([]));
+    let issued = router
+        .clone()
+        .oneshot(request(Method::POST, TOKENS_ADMIN_ROUTE, false, issue()))
+        .await
+        .unwrap();
+    assert_eq!(issued.status(), StatusCode::CREATED);
+}

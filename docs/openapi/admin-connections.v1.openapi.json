@@ -3,7 +3,7 @@
   "info": {
     "title": "GreenGateway Connection and Capability Admin API",
     "version": "1.0.0",
-    "description": "The default paths are shown with ADMIN_PREFIX=/admin. Replace /admin with the configured ADMIN_PREFIX while retaining the /v1 API prefix. Every route requires an authenticated principal and the operation-specific RBAC permission. Safe read responses and projected playground output never expose secret IDs, provider locators, ciphertext, nonces, key/private-key material, raw DNS or transport errors, or upstream response headers."
+    "description": "The default paths are shown with ADMIN_PREFIX=/admin. Replace /admin with the configured ADMIN_PREFIX while retaining the /v1 API prefix. Every route requires an authenticated principal and the operation-specific RBAC permission. Safe read responses and projected playground output never expose secret IDs, provider locators, ciphertext, nonces, key/private-key material, raw DNS or transport errors, or upstream response headers. An Idempotency-Key header is honoured only by the routes that document it (here, the keyed preparation PUT); on any other POST, PUT, PATCH or DELETE the gateway answers 400 with reason idempotency_key_unsupported before the handler runs, and nothing changes. In cluster mode a key on a route that later starts honouring one is accepted only once every live replica advertises the caller_operation_keys capability."
   },
   "servers": [
     {
@@ -1062,7 +1062,7 @@
           "Capabilities"
         ],
         "summary": "Request review of one tool mutation",
-        "description": "Requires admin:tools:execute, permission to invoke the tool and its rendered HTTP operation, and the exact strong capability ETag. Applies to direct HTTPS managed OpenAPI tools with a named POST, PUT, PATCH or DELETE operation. The gateway validates arguments, binds the rendered request to the current Connection and catalog, and creates a pending review. Each preparation creates a distinct occurrence and sends zero upstream requests. The requester must be a validated provider principal.",
+        "description": "Requires admin:tools:execute, permission to invoke the tool and its rendered HTTP operation, and the exact strong capability ETag. Applies to direct HTTPS managed OpenAPI tools with a named POST, PUT, PATCH or DELETE operation. The gateway validates arguments, binds the rendered request to the current Connection and catalog, and creates a pending review. Each preparation creates a distinct occurrence and sends zero upstream requests. The requester must be a validated provider principal. This route does not honour an Idempotency-Key: a request carrying one is answered 400 with reason idempotency_key_unsupported and nothing is prepared; use the keyed PUT for a retryable preparation. With AUTHORITY_EVIDENCE_DURABILITY=required this form is refused with 409 authority_evidence_unsupported.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IfMatch"
@@ -1118,7 +1118,7 @@
           "Capabilities"
         ],
         "summary": "Prepare or reconcile one caller-bound mutation approval",
-        "description": "Requires PostgreSQL, a provider-authenticated admin:tools:execute caller, and an exact strong If-Match. First preparation requires AUTHORITY_EVENT_FORMAT=qualified_v1 and the current capability authorization. A matching retry returns the original receipt, including after expiry or catalog changes.",
+        "description": "Requires PostgreSQL, a provider-authenticated admin:tools:execute caller, and an exact strong If-Match. First preparation requires AUTHORITY_EVENT_FORMAT=qualified_v1 and the current capability authorization. A matching retry returns the original receipt, including after expiry or catalog changes. With AUTHORITY_EVIDENCE_DURABILITY=required a new preparation also requires AUTHORITY_EVENT_SINK=file on a Unix build, where the file sink syncs the file and its directory, and is otherwise refused with 409 authority_evidence_unsupported naming the first unmet criterion; a matching retry of a committed preparation still returns its receipt.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IfMatch"
@@ -1617,7 +1617,7 @@
     },
     "responses": {
       "AdminError": {
-        "description": "Stable sanitized error body. Authorization and availability details remain bounded.",
+        "description": "Stable sanitized error body. Authorization and availability details remain bounded. An Idempotency-Key on a route that does not honour one is 400 with reason idempotency_key_unsupported.",
         "headers": {
           "Cache-Control": {
             "$ref": "#/components/headers/NoStore"

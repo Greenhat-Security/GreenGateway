@@ -527,7 +527,12 @@ impl ClusterMembership {
     /// the one transaction that reads the ledger, the backfill and the
     /// roster under the fence's row lock and confirms every live member
     /// already meets the raised fence. A member that returns afterwards is
-    /// refused at its heartbeat; a raise refused here writes nothing.
+    /// refused at its heartbeat; a raise refused here writes nothing. Once
+    /// the fence carries the requirement, a repeat admission is answered
+    /// from an unlocked read of the same records and takes no row lock and
+    /// no exclusive lock, so admissions running at the same time -- every
+    /// keyed admin change asks this gate (issue #425) -- admit each other
+    /// rather than refuse as `migration_in_progress`.
     async fn admit_by_raising_the_fence(
         &self,
         requirement: &OperationRequirement,

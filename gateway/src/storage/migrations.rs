@@ -80,8 +80,9 @@ static MIGRATION_LOCK_KEY: LazyLock<i64> = LazyLock::new(|| {
 
 /// The migrator's advisory-lock key, for the one other decision that must
 /// not interleave with a migration: raising the durable contract fence
-/// (`storage::postgres_membership`), which takes the same key as a
-/// transaction-level try-lock and refuses while a migrator holds it.
+/// (`storage::postgres_membership`), which takes the same key as a shared
+/// transaction-level try-lock and refuses while a migrator holds it. Shared,
+/// so two raises do not refuse each other; the migrator's lock is exclusive.
 #[cfg(feature = "postgres")]
 pub(crate) fn migration_lock_key() -> i64 {
     *MIGRATION_LOCK_KEY

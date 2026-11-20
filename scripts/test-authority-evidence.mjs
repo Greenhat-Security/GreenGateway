@@ -2,10 +2,14 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import test from "node:test";
-import { OPERATIONS, ROOT, readJson, schema, validateEvent, validateInventory, validateSchema } from "./check-authority-evidence.mjs";
+import { NOT_AUTHORITY_CHANGES, OPERATIONS, QUALIFIED_PATHS, ROOT, readJson, schema, summary, validateEvent, validateInventory, validateSchema } from "./check-authority-evidence.mjs";
 
 const inventory = () => readJson("docs/authority-evidence-inventory.json");
 const source = (path) => readFileSync(resolve(ROOT, path), "utf8");
+// Hoisted, so the tests above its siblings' helpers can use it.
+function groupOf(value, id) {
+  return value.groups.find((group) => group.id === id);
+}
 const fixture = () => ({
   schema_version: "authority_event.v1",
   authority_id: "10000000-0000-4000-8000-000000000001",
@@ -23,35 +27,29 @@ test("inventory covers each required operation in both modes with live source an
   assert.equal(validateInventory(inventory()).operationModePairs, OPERATIONS.length * 2);
 });
 
-test("qualification stays within the negotiated issuer-bound PostgreSQL file delivery path", () => {
-  for (const [field, value] of Object.entries({
-    storage_mode: "standalone", method: "DELETE", operation: "service_token.rotate",
-    operation_id_version: 4, actor_kind: "service_token", issuer: "optional",
-    format: "delivery_v1", durable_sink: "log", filesystem: "unknown", wire_schema: "authority_event_delivery.v1",
-  })) {
-    const changed = inventory();
-    const [path] = changed.groups.find(group => group.id === "token_revoke_postgres").qualified_delivery_paths;
-    path.criteria[field] = value;
-    assert.throws(() => validateInventory(changed), /qualified revoke criteria/);
-  }
-  const absent = inventory();
-  const renamed = absent.groups.find(group => group.id === "token_revoke_postgres");
-  renamed.id = "renamed_revoke_group";
-  delete renamed.qualified_delivery_paths;
-  assert.throws(() => validateInventory(absent), /missing qualified revoke path/);
-});
+// Qualification is a reviewed table, QUALIFIED_PATHS, keyed by operation and
+// mode (issue #425): a path in the inventory must equal its entry, and a row
+// claims required durability exactly when every pair it holds has its
+// reviewed path, it admits only the keyed form, it says nothing else is
+// missing and it is delivered by its mode's dispatcher. These replace the
+// hard-coded revoke and prepare guards and keep every case they held.
+const pathOf = (value, id) => groupOf(value, id).qualified_delivery_paths[0];
+const routing = "gateway/src/routing.rs";
+const KEYED_ROUTES_OPEN = "pub(super) const KEYED_ROUTES: &[KeyedRoute] = &[";
+// The router's table with one more honoured route, for a table entry the
+// test adds.
+const honouring = (method, route) => (path) => path === routing
+  ? source(path).replace(KEYED_ROUTES_OPEN, `${KEYED_ROUTES_OPEN}\n    KeyedRoute {\n        method: "${method}",\n        route: "${route}",\n    },`)
+  : source(path);
 
-test("required PostgreSQL preparation is limited to its keyed operation and negotiated delivery", () => {
-  const prepare = (value) => value.groups.find((g) => g.id === "mutation_approval_prepare_postgres");
-  for (const [field, value] of Object.entries({
-    storage_mode: "standalone", method: "POST", issuer: "optional", actor_kind: "service_token",
-    operation_id_version: 4, format: "delivery_v1", durable_sink: "log", filesystem: "unknown",
-    wire_schema: "authority_event_delivery.v1",
-  })) {
-    const changed = inventory();
-    prepare(changed).qualified_delivery_paths[0].criteria[field] = value;
-    assert.throws(() => validateInventory(changed), /qualified prepare criteria/);
-  }
+test("a row is supported only when every pair has its reviewed path", () => {
+  // Today one row qualifies: PostgreSQL keyed preparation.
+  const current = validateInventory(inventory());
+  assert.deepEqual(current.qualifiedPairs, ["mutation_approval.prepare/postgres"]);
+  assert.deepEqual(current.keyedWithdrawalPairs, ["service_token.revoke/postgres"]);
+  const prepare = (value) => groupOf(value, "mutation_approval_prepare_postgres");
+  // Every part of the bar is required: the path for each pair, keyed-only
+  // admission, no remaining gap, and its mode's dispatcher.
   for (const [field, value] of Object.entries({
     operations: ["mutation_approval.prepare", "mutation_approval.review"], modes: ["postgres", "standalone"],
     required_mode: "admitted", delivery: "post_commit_telemetry", disposition: ["missing_metadata"],
@@ -59,11 +57,110 @@ test("required PostgreSQL preparation is limited to its keyed operation and nego
   })) {
     const changed = inventory();
     prepare(changed)[field] = value;
-    assert.throws(() => validateInventory(changed), /qualified prepare/);
+    assert.throws(() => validateInventory(changed), /unproven durability claim|duplicate coverage|unreviewed|qualified path|stands alone/, field);
   }
-  const refused = inventory();
-  refused.groups.find((g) => g.id === "mutation_approval_prepare_standalone").required_mode = "caller_key_required";
-  assert.throws(() => validateInventory(refused), /unreviewed caller-key admission/);
+  const unclaimed = inventory();
+  prepare(unclaimed).required_durability_supported = false;
+  assert.throws(() => validateInventory(unclaimed), /mutation_approval_prepare_postgres: a row that meets the qualification bar must claim required durability/);
+  const pathless = inventory();
+  delete prepare(pathless).qualified_delivery_paths;
+  assert.throws(() => validateInventory(pathless), /mutation_approval_prepare_postgres: unproven durability claim/);
+  const standaloneDelivery = inventory();
+  prepare(standaloneDelivery).delivery = "standalone_cursor_dispatch";
+  assert.throws(() => validateInventory(standaloneDelivery), /mutation_approval_prepare_postgres: unproven durability claim/);
+  // A row cannot claim durability, keyed-only admission or sufficiency
+  // without the bar, whatever else it says.
+  const claimed = inventory();
+  groupOf(claimed, "connection_postgres").required_durability_supported = true;
+  assert.throws(() => validateInventory(claimed), /connection_postgres: unproven durability claim/);
+  const keyedOnly = inventory();
+  groupOf(keyedOnly, "mutation_approval_prepare_standalone").required_mode = "caller_key_required";
+  assert.throws(() => validateInventory(keyedOnly), /unreviewed caller-key admission/);
+  const sufficient = inventory();
+  groupOf(sufficient, "tools_postgres").disposition = ["already_sufficient"];
+  assert.throws(() => validateInventory(sufficient), /unreviewed sufficient disposition/);
+
+  // A reviewed table entry is what earns a row, standalone included: with an
+  // entry for standalone token issue (and its route honoured by the router),
+  // the row qualifies once it meets the whole bar, and not before.
+  const issue = {
+    ...pathOf(inventory(), "mutation_approval_prepare_postgres").criteria,
+    operation: "service_token.issue", storage_mode: "standalone", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/tokens",
+  };
+  const table = { ...QUALIFIED_PATHS, "service_token.issue/standalone": issue };
+  const readSource = honouring("POST", "/v1{ADMIN_PREFIX}/tokens");
+  const flipped = inventory();
+  Object.assign(groupOf(flipped, "token_issue_standalone"), {
+    required_mode: "caller_key_required", disposition: ["already_sufficient"], required_durability_supported: true,
+    qualified_delivery_paths: [{ ...structuredClone(pathOf(flipped, "mutation_approval_prepare_postgres")), criteria: issue }],
+  });
+  assert.deepEqual(validateInventory(flipped, readSource, table).qualifiedPairs,
+    ["mutation_approval.prepare/postgres", "service_token.issue/standalone"]);
+  assert.throws(() => validateInventory(flipped, readSource), /token_issue_standalone: qualified path service_token\.issue\/standalone is outside the reviewed table/);
+  const journaled = structuredClone(flipped);
+  groupOf(journaled, "token_issue_standalone").delivery = "journaled_dispatch";
+  assert.throws(() => validateInventory(journaled, readSource, table), /token_issue_standalone: unproven durability claim/);
+});
+
+test("a path outside the reviewed table is refused", () => {
+  // Every criterion of both reviewed paths is pinned: changing any one is
+  // either a different reviewed pair, which does not exist, or a change of
+  // reviewed criteria.
+  for (const id of ["token_revoke_postgres", "mutation_approval_prepare_postgres"]) {
+    for (const [field, value] of Object.entries({
+      storage_mode: "standalone", method: "DELETE", operation: "service_token.rotate",
+      route: "/v1{ADMIN_PREFIX}/tokens/{id}", operation_id_version: 4, actor_kind: "service_token",
+      issuer: "optional", format: "delivery_v1", durable_sink: "log", filesystem: "unknown",
+      wire_schema: "authority_event_delivery.v1",
+    })) {
+      const changed = inventory();
+      pathOf(changed, id).criteria[field] = value;
+      assert.throws(() => validateInventory(changed), new RegExp(`${id}: qualified path .* (is outside the reviewed table|criteria changed without review)`), `${id} ${field}`);
+    }
+    const extra = inventory();
+    pathOf(extra, id).criteria.extra = "field";
+    assert.throws(() => validateInventory(extra), /criteria changed without review/, id);
+  }
+  // A reviewed path does not travel to a row it was not reviewed for.
+  const moved = inventory();
+  groupOf(moved, "connection_postgres").qualified_delivery_paths = structuredClone(groupOf(moved, "token_revoke_postgres").qualified_delivery_paths);
+  assert.throws(() => validateInventory(moved), /connection_postgres: qualified path outside its inventory group/);
+  const keyed = inventory();
+  groupOf(keyed, "jwt_postgres").qualified_delivery_paths = structuredClone(groupOf(keyed, "token_revoke_postgres").qualified_delivery_paths);
+  assert.throws(() => validateInventory(keyed), /jwt_postgres: (qualified path outside its inventory group|a no_caller_key row has no keyed path)/);
+  // The router honours a key on exactly the reviewed routes: a reviewed path
+  // the router would refuse, and a key the router honours with no reviewed
+  // path, both fail.
+  const unrouted = (path) => path === routing
+    ? source(path).replace(/\s*\/\/ Keyed approval preparation[^\n]*\n\s*KeyedRoute \{[\s\S]*?\n\s*\},/, "")
+    : source(path);
+  assert.notEqual(unrouted(routing), source(routing), "the test removes the preparation route");
+  assert.throws(() => validateInventory(inventory(), unrouted), /qualified path mutation_approval\.prepare\/postgres \(PUT \/v1\{ADMIN_PREFIX\}\/tools\/\{id\}\/mutation-approvals\) is not honoured by KEYED_ROUTES/);
+  assert.throws(() => validateInventory(inventory(), honouring("POST", "/v1{ADMIN_PREFIX}/tokens")),
+    /KEYED_ROUTES in gateway\/src\/routing\.rs honours POST \/v1\{ADMIN_PREFIX\}\/tokens, which no reviewed qualified path names/);
+  assert.throws(() => validateInventory(inventory(), (path) => path === routing ? source(path).replace(KEYED_ROUTES_OPEN, "const ROUTES: &[KeyedRoute] = &[") : source(path)),
+    /declares no KEYED_ROUTES/);
+  // Every entry the router could honour is read: the fields in either
+  // order, and a block comment hides only what it comments out. An entry the
+  // checker cannot read as two string literals -- a constant route, another
+  // field, an entry that is not a literal -- fails rather than going unseen.
+  const withEntry = (entry) => (path) => path === routing
+    ? source(path).replace(KEYED_ROUTES_OPEN, `${KEYED_ROUTES_OPEN}\n    ${entry}`)
+    : source(path);
+  assert.throws(() => validateInventory(inventory(), withEntry('KeyedRoute { route: "/v1{ADMIN_PREFIX}/tokens", method: "POST" },')),
+    /KEYED_ROUTES in gateway\/src\/routing\.rs honours POST \/v1\{ADMIN_PREFIX\}\/tokens, which no reviewed qualified path names/);
+  validateInventory(inventory(), withEntry('/* KeyedRoute { method: "POST", route: "/v1{ADMIN_PREFIX}/tokens" }, */'));
+  assert.throws(() => validateInventory(inventory(), withEntry('KeyedRoute { method: "POST", route: TOKENS_ROUTE },')),
+    /must name method and route once each as string literals/);
+  assert.throws(() => validateInventory(inventory(), withEntry('KeyedRoute { method: "POST", route: "/v1{ADMIN_PREFIX}/tokens", method: "PUT" },')),
+    /must name method and route once each as string literals/);
+  assert.throws(() => validateInventory(inventory(), withEntry('KeyedRoute { method: "POST" },')),
+    /must name an upper-case method and a route/);
+  assert.throws(() => validateInventory(inventory(), withEntry('TOKEN_ISSUE_ROUTE,')),
+    /holds an entry that is not a KeyedRoute literal: TOKEN_ISSUE_ROUTE/);
+  assert.throws(() => validateInventory(inventory(), withEntry('KeyedRoute { method: "POST", route: concat!("/v1", "{ADMIN_PREFIX}/tokens") },')),
+    /KeyedRoute literal the checker cannot read|not a KeyedRoute literal|string literals/);
 });
 
 test("evidence anchors only in the gateway or the compiler it links", () => {
@@ -96,6 +193,56 @@ test("new mutation endpoint in a reviewed admin surface requires inventory revie
   assert.throws(() => validateInventory(inventory(), (path) =>
     source(path) + (path.endsWith("/admin_mutation_approvals.rs") ? "\npub(super) async fn bulk_review_endpoint(" : "")
   ), /unreviewed mutation entrypoint/);
+});
+
+test("a mutation endpoint in the policy draft, policy test and observability handlers must be reviewed", () => {
+  const appending = (file, line) => (path) => source(path) + (path.endsWith(`/${file}`) ? `\n${line}` : "");
+  for (const [file, endpoint] of [
+    ["admin_policy_drafts.rs", "policy_draft_bulk_publish_endpoint"],
+    ["admin_policy_tests.rs", "policy_tests_bulk_put_endpoint"],
+    ["admin_observability.rs", "rule_suggestion_bulk_accept_endpoint"],
+    ["admin_observability.rs", "principal_bulk_revoke_endpoint"],
+    ["admin_policy.rs", "policy_bulk_publish_endpoint"],
+  ]) {
+    assert.throws(() => validateInventory(inventory(), appending(file, `pub(super) async fn ${endpoint}(`)),
+      new RegExp(`unreviewed mutation entrypoint gateway/src/${file}::${endpoint}`), endpoint);
+  }
+  // The wider scan found suggestion acceptance, which both policy rows now
+  // name.
+  for (const id of ["policy_postgres", "policy_standalone"]) {
+    assert.ok(groupOf(inventory(), id).entrypoints.some((ref) => ref.anchor === "async fn rule_suggestion_accept_endpoint("), id);
+  }
+  const unnamed = inventory();
+  for (const id of ["policy_postgres", "policy_standalone"]) {
+    groupOf(unnamed, id).entrypoints = groupOf(unnamed, id).entrypoints.filter((ref) => !ref.anchor.includes("rule_suggestion_accept_endpoint"));
+  }
+  assert.throws(() => validateInventory(unnamed), /unreviewed mutation entrypoint gateway\/src\/admin_observability\.rs::rule_suggestion_accept_endpoint/);
+  // What it found that is not an authority change is excluded by a reviewed
+  // table, each entry with a reason; an exclusion must still exist, and an
+  // endpoint cannot be both excluded and an inventory entry point.
+  assert.deepEqual(Object.keys(NOT_AUTHORITY_CHANGES).sort(), [
+    "gateway/src/admin_observability.rs::principal_delegated_tokens_revoke_endpoint",
+    "gateway/src/admin_policy_drafts.rs::policy_draft_create_endpoint",
+    "gateway/src/admin_policy_drafts.rs::policy_draft_delete_endpoint",
+    "gateway/src/admin_policy_drafts.rs::policy_draft_patch_endpoint",
+  ]);
+  for (const reason of Object.values(NOT_AUTHORITY_CHANGES)) assert.ok(reason.length >= 20, reason);
+  const removed = (path) => path.endsWith("/admin_policy_drafts.rs")
+    ? source(path).replace("pub(super) async fn policy_draft_patch_endpoint(", "pub(super) async fn policy_draft_amend_endpoint(")
+    : source(path);
+  assert.throws(() => validateInventory(inventory(), removed), /stale exclusion gateway\/src\/admin_policy_drafts\.rs::policy_draft_patch_endpoint/);
+  const both = inventory();
+  groupOf(both, "policy_postgres").entrypoints.push({ path: "gateway/src/admin_policy_drafts.rs", anchor: "pub(super) async fn policy_draft_create_endpoint(" });
+  assert.throws(() => validateInventory(both), /gateway\/src\/admin_policy_drafts\.rs::policy_draft_create_endpoint is both excluded and an inventory entry point/);
+});
+
+test("the summary line is computed from the inventory", () => {
+  const line = summary(validateInventory(inventory()));
+  assert.match(line, new RegExp(`^Authority evidence inventory valid: ${inventory().groups.length} groups, ${OPERATIONS.length * 2} operation/mode pairs, \\d+ source references\\.`));
+  assert.match(line, / Qualified in required mode: mutation_approval\.prepare\/postgres\./);
+  assert.match(line, / Admitted withdrawals with a reviewed keyed path: service_token\.revoke\/postgres\./);
+  assert.equal(summary({ groups: 1, operationModePairs: 2, sourceReferences: 3, qualifiedPairs: [], keyedWithdrawalPairs: [] }),
+    "Authority evidence inventory valid: 1 groups, 2 operation/mode pairs, 3 source references. Qualified in required mode: none. Admitted withdrawals with a reviewed keyed path: none.");
 });
 
 test("resource creation and replacement retain distinct revision histories", () => {

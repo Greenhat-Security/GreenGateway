@@ -53,7 +53,7 @@
 //!
 //! Schema presence alone never enables an operation.
 //!
-//! The registry ([`OPERATION_REQUIREMENTS`]) holds six operations. The
+//! The registry ([`OPERATION_REQUIREMENTS`]) holds ten operations. The
 //! first (issue #426, PR 2) is committing a policy document in which a role
 //! carries a `description` ([`POLICY_ROLE_DESCRIPTIONS`]). A gateway built
 //! before the field refuses such a document outright -- the role's fields
@@ -88,6 +88,9 @@
 //! with repeated query mappings also needs [`OPENAPI_REPEATED_QUERY`].
 //! Enrolling a managed HTTP mutation raises a durable fence. A returning
 //! replica must support the approval requirement before it may serve traffic.
+//! Honouring a caller's `Idempotency-Key` on an admin authority change
+//! ([`CALLER_OPERATION_KEYS`], issue #425) raises it too: a returning build
+//! that predates [`Capability::CallerOperationKeys`] would ignore the key.
 
 use std::collections::BTreeSet;
 
@@ -112,6 +115,13 @@ const SEPARATOR: char = ',';
 /// these, and recognizes only these.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Capability {
+    /// The member honours or refuses every `Idempotency-Key` on an admin
+    /// mutation route -- it never ignores one -- and projects caller-bound
+    /// principal changes as `authority_event.v1` under the negotiated format
+    /// (issue #425). A member without it would apply a keyed retry a second
+    /// time and, as the dispatcher's lease holder, deliver a caller-bound row
+    /// in the legacy format, so [`CALLER_OPERATION_KEYS`] waits for it.
+    CallerOperationKeys,
     /// The member applies every delegated-token purge recorded at the
     /// authority before it serves another protected request (issue #441). A
     /// member without it ignores the record and keeps serving the purged
@@ -164,7 +174,8 @@ pub(crate) enum Capability {
 
 impl Capability {
     /// Every capability, in name order.
-    pub(crate) const KNOWN: [Self; 10] = [
+    pub(crate) const KNOWN: [Self; 11] = [
+        Self::CallerOperationKeys,
         Self::DelegatedTokenPurges,
         Self::ManagedHttpMutationV1,
         Self::OpenApiDiscoveryCatalogs,
@@ -179,6 +190,7 @@ impl Capability {
 
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::CallerOperationKeys => "caller_operation_keys",
             Self::DelegatedTokenPurges => "delegated_token_purges",
             Self::ManagedHttpMutationV1 => "managed_http_mutation_v1",
             Self::OpenApiDiscoveryCatalogs => "openapi_discovery_catalogs",
@@ -201,6 +213,7 @@ impl Capability {
 
 /// What this binary advertises: every capability it implements.
 pub(crate) const BINARY_CAPABILITIES: &[Capability] = &[
+    Capability::CallerOperationKeys,
     Capability::DelegatedTokenPurges,
     Capability::ManagedHttpMutationV1,
     Capability::OpenApiDiscoveryCatalogs,
@@ -288,9 +301,9 @@ impl RecognizedCapabilities {
 pub(crate) use gate::{
     evaluate, evaluate_without_own_row, fence_target, Activation, Backfill, BackfillState,
     BinaryContract, ContractFence, FenceExclusion, FenceTarget, MemberAdvertisement,
-    OperationAdmission, OperationRefusal, OperationRequirement, DELEGATED_TOKEN_PURGES,
-    MANAGED_HTTP_MUTATION_V1, OPENAPI_DISCOVERY_CATALOGS, OPENAPI_REPEATED_QUERY,
-    OPENAPI_SWAGGER2_CATALOGS, OPERATION_REQUIREMENTS, POLICY_DOCUMENT_V1,
+    OperationAdmission, OperationRefusal, OperationRequirement, CALLER_OPERATION_KEYS,
+    DELEGATED_TOKEN_PURGES, MANAGED_HTTP_MUTATION_V1, OPENAPI_DISCOVERY_CATALOGS,
+    OPENAPI_REPEATED_QUERY, OPENAPI_SWAGGER2_CATALOGS, OPERATION_REQUIREMENTS, POLICY_DOCUMENT_V1,
     POLICY_ROLE_DESCRIPTIONS, POLICY_RULE_CONDITIONS, POLICY_TOOL_ARGUMENT_CONDITIONS,
 };
 
@@ -554,6 +567,35 @@ mod gate {
         activation: Activation::DurableFence,
     };
 
+    /// Honouring a caller's `Idempotency-Key` on an admin authority change
+    /// (issue #425): the first commit of a keyed change, through any route
+    /// in `routing::KEYED_ROUTES` that asks
+    /// (`admin_responses::admit_keyed_authority_change`). The keyed
+    /// service-token revoke and the keyed approval preparation predate the
+    /// capability and do not ask.
+    ///
+    /// From schema 36 every build serves the same schema, so builds of
+    /// different changes of issue #425 can share one database. A build that
+    /// predates the capability would ignore the key -- applying a keyed retry
+    /// a second time -- and, holding the dispatcher's lease, would deliver a
+    /// caller-bound row as `authority_event_delivery.v1`. Neither fails
+    /// closed on the data, which is what [`Activation::LiveMembers`] needs
+    /// of a lacking member that returns, so the operation raises the durable
+    /// contract fence ([`Activation::DurableFence`]): from the first admitted
+    /// keyed change, a build without the capability cannot start, rejoin or
+    /// take the dispatcher's lease. That first admission is the rollback
+    /// cutoff for builds before it. `minimum_schema` is 36, the schema whose
+    /// reservation table binds every keyed action to its request; no
+    /// document format is involved.
+    pub(crate) const CALLER_OPERATION_KEYS: OperationRequirement = OperationRequirement {
+        operation: "authority.caller_operation_keys",
+        minimum_schema: 36,
+        document_format: None,
+        capability: Capability::CallerOperationKeys,
+        backfill: Backfill::NotRequired,
+        activation: Activation::DurableFence,
+    };
+
     /// Every operation this binary gates. An operation added later
     /// registers here, advertises a new capability, and calls the gate
     /// before its write.
@@ -567,6 +609,7 @@ mod gate {
         POLICY_RULE_CONDITIONS,
         POLICY_TOOL_ARGUMENT_CONDITIONS,
         MANAGED_HTTP_MUTATION_V1,
+        CALLER_OPERATION_KEYS,
     ];
 
     /// What this binary serves and advertises: the left-hand side of every

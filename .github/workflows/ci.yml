@@ -764,6 +764,8 @@ jobs:
             storage::contract_tests::postgres_audit_tests::postgres_caller_operation_reservation_contract
             storage::contract_tests::postgres_audit_tests::postgres_a_rolled_back_transaction_leaves_no_reservation
             storage::contract_tests::postgres_audit_tests::postgres_two_transactions_racing_one_key_reserve_it_once
+            storage::contract_tests::postgres_audit_tests::a_bound_reservation_below_the_fence_is_refused
+            storage::contract_tests::postgres_audit_tests::the_caller_key_gate_raises_the_fence_once_and_then_admits_concurrent_keyed_changes
             connections::pg_store::tests::
             tests::issue_757_mutation_approvals::postgres::
             storage::postgres_documents::tests::

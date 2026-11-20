@@ -133,8 +133,10 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
         let why = match operation {
             AuthorityOperation::PolicyFileReload => "does not perform it",
             AuthorityOperation::ConfigurationImport => "records evidence for only part of it",
+            // The ordinary preparation POST refuses a key: the message names
+            // the keyed route instead.
             AuthorityOperation::MutationApprovalPrepare => {
-                "requires a caller-bound preparation with qualified_v1"
+                "admits it only as a keyed preparation, PUT .../tools/{id}/mutation-approvals with an Idempotency-Key"
             }
             _ => "records no durable evidence of it",
         };
@@ -184,6 +186,232 @@ fn required_refuses_the_offline_import_in_cluster_mode() {
         .refusal(operation),
         None,
         "best_effort imports as before"
+    );
+}
+
+/// A required gate in cluster mode, where preparation is the one
+/// `caller_key_required` operation, with every delivery criterion met unless
+/// a case changes it.
+fn keyed_cluster_gate() -> AuthorityEvidenceGate {
+    AuthorityEvidenceGate::new(
+        AuthorityEvidenceDurability::Required,
+        StateBackend::Postgres,
+    )
+    .with_delivery(crate::config::AuthorityEventFormat::QualifiedV1, true, true)
+}
+
+fn issuer_bound_principal() -> crate::auth::change_actor::ChangeActor {
+    crate::auth::change_actor::ChangeActor::for_test_with_issuer(
+        "operator@example.test",
+        "https://issuer.example.test",
+    )
+}
+
+/// The general gate (issue #425, plan section 3.3): a `caller_key_required`
+/// change is admitted only keyed, by a provider-authenticated principal with
+/// a canonical issuer, under `qualified_v1`, with the file sink, on a build
+/// that syncs the file and its directory. One case per criterion: each
+/// refusal names exactly the criterion that failed, the first in that order.
+#[test]
+fn caller_key_required_admits_only_a_keyed_issuer_bound_principal_under_qualified_v1_with_the_file_sink(
+) {
+    use crate::auth::change_actor::ChangeActor;
+    use crate::config::AuthorityEventFormat;
+
+    let operation = AuthorityOperation::MutationApprovalPrepare;
+    assert_eq!(
+        operation.required_mode(StateBackend::Postgres),
+        RequiredMode::CallerKeyRequired
+    );
+    let principal = issuer_bound_principal();
+    let keyed = RequestForm::of(true, &principal);
+    assert_eq!(
+        keyed,
+        RequestForm {
+            keyed: true,
+            issuer_bound_principal: true
+        }
+    );
+    assert_eq!(keyed_cluster_gate().refusal_for(operation, keyed), None);
+
+    let unmet = |gate: AuthorityEvidenceGate, form: RequestForm| {
+        gate.refusal_for(operation, form)
+            .map(|refusal| refusal.unmet())
+            .expect("refused")
+    };
+    let cases = [
+        (
+            keyed_cluster_gate(),
+            RequestForm::of(false, &principal),
+            KeyedAdmission::CallerKey,
+        ),
+        (
+            keyed_cluster_gate(),
+            RequestForm::UNKEYED,
+            KeyedAdmission::CallerKey,
+        ),
+        (
+            keyed_cluster_gate(),
+            RequestForm::of(
+                true,
+                &ChangeActor::service_token_for_test("service-token:1"),
+            ),
+            KeyedAdmission::IssuerBoundPrincipal,
+        ),
+        (
+            keyed_cluster_gate(),
+            RequestForm::of(true, &ChangeActor::for_test("no-issuer")),
+            KeyedAdmission::IssuerBoundPrincipal,
+        ),
+        (
+            keyed_cluster_gate(),
+            RequestForm::of(true, &ChangeActor::system("operator:revoke-jwt")),
+            KeyedAdmission::IssuerBoundPrincipal,
+        ),
+        (
+            keyed_cluster_gate().with_delivery(AuthorityEventFormat::DeliveryV1, true, true),
+            keyed,
+            KeyedAdmission::QualifiedFormat,
+        ),
+        (
+            keyed_cluster_gate().with_delivery(AuthorityEventFormat::QualifiedV1, false, true),
+            keyed,
+            KeyedAdmission::FileSink,
+        ),
+        (
+            keyed_cluster_gate().with_delivery(AuthorityEventFormat::QualifiedV1, true, false),
+            keyed,
+            KeyedAdmission::SyncedFilesystem,
+        ),
+        // Two unmet criteria: the earlier one is named.
+        (
+            keyed_cluster_gate().with_delivery(AuthorityEventFormat::DeliveryV1, false, false),
+            RequestForm::of(true, &ChangeActor::for_test("no-issuer")),
+            KeyedAdmission::IssuerBoundPrincipal,
+        ),
+    ];
+    for (gate, form, expected) in cases {
+        assert_eq!(unmet(gate, form), Some(expected), "{form:?} {gate:?}");
+    }
+
+    // The form never changes what the mode decides for any other operation:
+    // an admitted operation stays admitted unkeyed, and a refused one stays
+    // refused keyed by an issuer-bound principal with every criterion met.
+    let gate = keyed_cluster_gate();
+    assert_eq!(
+        gate.refusal_for(AuthorityOperation::PolicyPublish, RequestForm::UNKEYED),
+        None
+    );
+    let refused = gate
+        .refusal_for(AuthorityOperation::MutationApprovalReview, keyed)
+        .expect("review is refused in every form");
+    assert_eq!(refused.unmet(), None);
+    // And best_effort admits every form.
+    let best_effort = AuthorityEvidenceGate::new(
+        AuthorityEvidenceDurability::BestEffort,
+        StateBackend::Postgres,
+    );
+    assert_eq!(
+        best_effort.refusal_for(operation, RequestForm::UNKEYED),
+        None
+    );
+    // `refusal` is the unkeyed form.
+    assert_eq!(
+        gate.refusal(operation),
+        gate.refusal_for(operation, RequestForm::UNKEYED)
+    );
+}
+
+/// The log sink only hands an event to the log writer, which is not a
+/// durable store, while every qualified path records the synced file sink.
+/// So a keyed, issuer-bound preparation under `qualified_v1` is refused with
+/// the log sink, and the refusal says the sink is why. This tightens keyed
+/// preparation, which before this change was admitted with any sink.
+#[test]
+fn a_keyed_request_with_the_log_sink_is_refused_and_the_refusal_names_the_sink() {
+    let (audit, capture) = capture_log();
+    let gate = keyed_cluster_gate().with_delivery(
+        crate::config::AuthorityEventFormat::QualifiedV1,
+        false,
+        true,
+    );
+    let refusal = gate
+        .admit_for(
+            AuthorityOperation::MutationApprovalPrepare,
+            RequestForm::of(true, &issuer_bound_principal()),
+            &audit,
+            RefusalOrigin::Background("signal"),
+        )
+        .expect_err("the log sink is not durable");
+    assert_eq!(refusal.unmet(), Some(KeyedAdmission::FileSink));
+    assert_eq!(
+        refusal.message(),
+        "AUTHORITY_EVIDENCE_DURABILITY=required refuses mutation_approval.prepare: cluster mode admits it only with AUTHORITY_EVENT_SINK=file; nothing was changed"
+    );
+    let events = delivered_events(&audit, &capture);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        events[0].payload["operation"], "mutation_approval.prepare",
+        "the refusal is audited like every other"
+    );
+    assert_eq!(events[0].payload["reason"], REFUSAL_REASON);
+}
+
+/// A change that only removes authority and that a remote caller starts --
+/// token revocation, Connection deletion, local-secret deletion -- never
+/// asks the evidence gate: refusing one fails open (owner ruling 4 on issue
+/// #425). None is an operation the gate knows, and the inventory admits
+/// every form of each in every mode that performs it.
+#[test]
+fn withdrawals_never_ask_the_evidence_gate() {
+    let withdrawals = Withdrawal::ALL.map(Withdrawal::code);
+    assert_eq!(
+        withdrawals,
+        ["service_token.revoke", "connection.delete", "secret.delete"]
+    );
+    for code in withdrawals {
+        assert!(gated_operation(code).is_none(), "{code} is not gated");
+        assert_eq!(
+            Withdrawal::from_code(code).map(Withdrawal::code),
+            Some(code)
+        );
+    }
+    for operation in EVERY_OPERATION {
+        assert_eq!(
+            Withdrawal::from_code(operation.code()),
+            None,
+            "{operation:?}"
+        );
+    }
+    let inventory = inventory();
+    let mut admitted = BTreeSet::new();
+    for group in inventory["groups"].as_array().expect("groups") {
+        for operation in group["operations"].as_array().expect("operations") {
+            let code = operation.as_str().expect("code");
+            if !withdrawals.contains(&code) {
+                continue;
+            }
+            for mode in group["modes"].as_array().expect("modes") {
+                let required_mode = group["required_mode"].as_str().expect("required mode");
+                assert!(
+                    matches!(required_mode, "admitted" | "unavailable"),
+                    "{code} in {mode} is {required_mode}"
+                );
+                if required_mode == "admitted" {
+                    admitted.insert((code, mode.as_str().expect("mode")));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        admitted,
+        BTreeSet::from([
+            ("connection.delete", "postgres"),
+            ("connection.delete", "standalone"),
+            ("secret.delete", "standalone"),
+            ("service_token.revoke", "postgres"),
+            ("service_token.revoke", "standalone"),
+        ])
     );
 }
 

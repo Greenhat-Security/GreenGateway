@@ -39,7 +39,7 @@ fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
     let rendered = advertisement(BINARY_CAPABILITIES).expect("the shipped set fits the column");
     assert_eq!(
         rendered,
-        "delegated_token_purges,managed_http_mutation_v1,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
+        "caller_operation_keys,delegated_token_purges,managed_http_mutation_v1,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
          operation_requirements,policy_document_v1,policy_role_descriptions,\
          policy_rule_conditions,policy_tool_argument_conditions"
     );
@@ -51,6 +51,7 @@ fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
     assert_eq!(
         recognized.names(),
         vec![
+            "caller_operation_keys",
             "delegated_token_purges",
             "managed_http_mutation_v1",
             "openapi_discovery_catalogs",
@@ -322,10 +323,22 @@ mod gate_tests {
                 POLICY_DOCUMENT_V1,
                 POLICY_RULE_CONDITIONS,
                 POLICY_TOOL_ARGUMENT_CONDITIONS,
-                MANAGED_HTTP_MUTATION_V1
+                MANAGED_HTTP_MUTATION_V1,
+                CALLER_OPERATION_KEYS
             ],
             "registering an operation is a protocol change: review its requirement, its new \
              capability and the docs in ha-state-model.md section 7 before updating this test"
+        );
+        assert_eq!(
+            CALLER_OPERATION_KEYS,
+            OperationRequirement {
+                operation: "authority.caller_operation_keys",
+                minimum_schema: 36,
+                document_format: None,
+                capability: Capability::CallerOperationKeys,
+                backfill: Backfill::NotRequired,
+                activation: Activation::DurableFence,
+            }
         );
         assert_eq!(
             POLICY_TOOL_ARGUMENT_CONDITIONS,
@@ -1082,6 +1095,121 @@ mod gate_tests {
             ..binary
         };
         assert!(old_binary.fenced_by(&fence).is_some());
+    }
+
+    /// Honouring a caller key (issue #425) waits for every live member to
+    /// advertise `caller_operation_keys`, draining members included, and its
+    /// first admission raises the durable contract fence: a build without
+    /// the capability -- one that would ignore the key and deliver a
+    /// caller-bound row in the legacy format -- is then excluded at the door,
+    /// whether it was live before the raise or starts afterwards. A build
+    /// that serves only schema 35 is excluded too.
+    #[test]
+    fn caller_operation_keys_waits_for_every_live_member_and_raises_the_fence() {
+        let requirement = &CALLER_OPERATION_KEYS;
+        assert_eq!(requirement.activation, Activation::DurableFence);
+        assert_eq!(requirement.minimum_schema, 36);
+        let binary = BinaryContract::shipped();
+        assert!(binary
+            .capabilities
+            .contains(&Capability::CallerOperationKeys));
+        let own = MemberAdvertisement {
+            schema_version: binary.schema,
+            document_version: binary.document,
+            ..member(
+                OWN,
+                true,
+                &advertisement(binary.capabilities).expect("the shipped set fits"),
+            )
+        };
+        // A live member of the build before the capability: the same schema,
+        // every other capability.
+        let earlier_capabilities: Vec<Capability> = binary
+            .capabilities
+            .iter()
+            .copied()
+            .filter(|capability| *capability != Capability::CallerOperationKeys)
+            .collect();
+        let earlier_advertisement =
+            advertisement(&earlier_capabilities).expect("the earlier set fits");
+        let mut earlier = MemberAdvertisement {
+            schema_version: binary.schema,
+            document_version: binary.document,
+            ..member(PEER, true, &earlier_advertisement)
+        };
+        match gate(requirement, &binary, OWN, &[own.clone(), earlier.clone()]) {
+            Err(OperationRefusal::MembersLackRequirement { lacking, live }) => {
+                assert_eq!((lacking, live), (vec![PEER], 2));
+            }
+            other => panic!("a live member without the capability refuses: {other:?}"),
+        }
+        // Draining members still answer what was routed to them, so they
+        // count while their heartbeat is live; once stale they do not.
+        earlier.live = false;
+        assert_eq!(
+            gate(requirement, &binary, OWN, &[own.clone(), earlier]),
+            Ok(OperationAdmission { live_members: 1 })
+        );
+
+        // The first admission raises the open fence to the requirement; a
+        // second admission over the raised fence writes nothing.
+        let target = fence_target(&ContractFence::open(), requirement)
+            .expect("the open fence can be raised")
+            .expect("the first admission raises it");
+        assert_eq!(target.minimum_schema, 36);
+        assert_eq!(target.capabilities, "caller_operation_keys");
+        let raised = fence(1, target.minimum_schema, &target.capabilities);
+        assert_eq!(fence_target(&raised, requirement), Ok(None));
+        // Raised over an enrollment fence, it keeps what was there.
+        let enrolled = fence(1, 34, "managed_http_mutation_v1");
+        let both = fence_target(&enrolled, requirement)
+            .expect("raised")
+            .expect("the capability is added");
+        assert_eq!(both.minimum_schema, 36);
+        assert_eq!(
+            both.capabilities,
+            "caller_operation_keys,managed_http_mutation_v1"
+        );
+
+        // From then on this build is admitted, and the build without the
+        // capability is excluded at its boot, its heartbeat and every gated
+        // write, as is a build that serves only schema 35.
+        assert!(binary.fenced_by(&raised).is_none());
+        let earlier_binary = BinaryContract {
+            capabilities: &[
+                Capability::DelegatedTokenPurges,
+                Capability::ManagedHttpMutationV1,
+                Capability::OperationRequirements,
+            ],
+            ..binary
+        };
+        let exclusion = earlier_binary
+            .fenced_by(&raised)
+            .expect("a build without the capability is excluded");
+        assert_eq!(exclusion.missing_capabilities, 1);
+        let schema_35 = BinaryContract {
+            schema: (35, 35),
+            ..binary
+        };
+        assert!(schema_35.fenced_by(&raised).is_some());
+        // And a live roster row of the earlier build, from before the raise,
+        // still refuses a later gated write instead of counting as met.
+        let stale_view = MemberAdvertisement {
+            schema_version: binary.schema,
+            document_version: binary.document,
+            ..member(PEER, true, &earlier_advertisement)
+        };
+        assert!(matches!(
+            evaluate(
+                &DELEGATED_TOKEN_PURGES,
+                &binary,
+                OWN,
+                &[own, stale_view],
+                &raised,
+                None,
+            ),
+            Err(OperationRefusal::MembersLackRequirement { .. })
+        ));
     }
 
     /// The pure gate judges a durable-fence operation exactly as it judges

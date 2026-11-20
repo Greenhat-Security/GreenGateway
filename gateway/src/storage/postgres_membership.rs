@@ -38,10 +38,12 @@
 //!   boot into the roster nor rejoin it after its row went stale or was
 //!   swept, and the heartbeat reports [`HeartbeatOutcome::Fenced`] instead.
 //!   [`PostgresMembershipStore::raise_contract_fence`] is the only writer: one
-//!   transaction that takes the migrator's advisory lock as a try-lock,
-//!   locks the fence row `FOR UPDATE`, reads the ledger, the named backfill
-//!   and the roster under that lock, and raises the fence only if the
-//!   caller's decision admits it. A heartbeat therefore lands either before
+//!   transaction that takes the migrator's advisory lock as a shared
+//!   try-lock, locks the fence row `FOR UPDATE`, reads the ledger, the named
+//!   backfill and the roster under that lock, and raises the fence only if
+//!   the caller's decision admits it. A repeat admission that would raise
+//!   nothing is answered by an unlocked read pass first, so it holds up no
+//!   heartbeat and no other admission. A heartbeat therefore lands either before
 //!   the raise reads the roster, where it is counted, or after the raise
 //!   commits, where it is refused; there is no instant at which a member the
 //!   raise did not see can join behind it. The ready and draining stamps,
@@ -615,21 +617,35 @@ impl PostgresMembershipStore {
         .await
     }
 
-    /// Raise the durable contract fence, or decide not to, in one
-    /// transaction (issue #426, PR 3).
+    /// Raise the durable contract fence, or decide not to (issue #426, PR 3).
     ///
-    /// The migrator's advisory lock is taken first, as a transaction-level
-    /// try-lock: a migrator holding it means the schema may be changing
+    /// Each pass is one transaction that first takes the migrator's advisory
+    /// lock as a *shared* transaction-level try-lock: a migrator holding it
+    /// (exclusively, for its whole run) means the schema may be changing
     /// under the decision, so nothing is read and the raise answers
     /// [`FenceRaise::MigrationInProgress`]; a migrator that starts later
-    /// waits for this transaction. Then the fence row is locked
-    /// `FOR UPDATE`, which every heartbeat's `FOR SHARE` waits behind, and
-    /// the ledger, the named backfill and the roster are read under it.
-    /// `decide` sees all of it and either refuses or names where the fence
-    /// must end up; the raise is written only when that differs from the
-    /// fence as read, and the trigger refuses anything that would lower it.
+    /// waits for this transaction. Shared, so two admissions never take each
+    /// other for a migrator (issue #425): concurrent raises are serialized by
+    /// the fence row's lock instead, and the later one finds the fence
+    /// already raised.
+    ///
+    /// The first pass reads the fence, the ledger, the named backfill and
+    /// the roster without locking the fence row. When `decide` admits and
+    /// the fence already demands everything it asks for, that is the answer
+    /// ([`FenceRaise::Unchanged`]) and no row lock was taken: the fence only
+    /// moves forward, and a member it excludes can neither boot nor
+    /// heartbeat, so a repeat admission -- every keyed admin change once
+    /// `caller_operation_keys` is fenced -- neither queues behind nor holds
+    /// up a heartbeat or another admission. Anything else (a raise to make,
+    /// or a refusal) is decided again by the second pass, which locks the
+    /// fence row `FOR UPDATE`, which every heartbeat's `FOR SHARE` waits
+    /// behind, and reads everything again under it. The raise is written
+    /// only when `decide` names a target that differs from the fence as
+    /// read, and the trigger refuses anything that would lower it. So every
+    /// refusal and every raise is decided under the row lock.
+    ///
     /// Every statement runs under the pooled session's statement and lock
-    /// timeouts, and the transaction rolls back if the future is dropped
+    /// timeouts, and a transaction rolls back if the future is dropped
     /// mid-way, so an abandoned raise never leaves the fence row locked.
     pub(crate) async fn raise_contract_fence<T, E, F>(
         &self,
@@ -641,120 +657,145 @@ impl PostgresMembershipStore {
     where
         T: Send,
         E: Send,
-        F: FnOnce(FenceDecision<'_>) -> Result<(T, Option<FenceTarget>), E> + Send,
+        F: Fn(FenceDecision<'_>) -> Result<(T, Option<FenceTarget>), E> + Send + Sync,
     {
         timed_operation(OPERATION_FENCE_RAISE, async {
             let mut client = self.pool.get().await.map_err(classify_pool_error)?;
-            // `Transaction`'s drop queues a ROLLBACK the moment the future
-            // is abandoned (a cancelled request), as the audit store's
-            // batch does: a bare BEGIN would go back to the pool still
-            // holding the fence row, and every heartbeat in the deployment
-            // would queue behind it.
-            let transaction = client
-                .transaction()
-                .await
-                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?;
-            let migration_lock_free: bool = transaction
-                .query_one(
-                    "SELECT pg_try_advisory_xact_lock($1) AS free",
-                    &[&super::migrations::migration_lock_key()],
-                )
-                .await
-                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))
-                .and_then(|row| column(&row, "free", OPERATION_FENCE_RAISE))?;
-            if !migration_lock_free {
-                return Ok(FenceRaise::MigrationInProgress);
-            }
-            let fence = transaction
-                .query_opt(&format!("{FENCE_COLUMNS} FOR UPDATE"), &[])
-                .await
-                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?
-                .ok_or_else(|| invalid_data(OPERATION_FENCE_RAISE))
-                .and_then(|row| fence_from_row(&row, OPERATION_FENCE_RAISE))?;
-            let ledger_limit =
-                i64::try_from(super::migrations::runtime_ledger_row_limit()).unwrap_or(i64::MAX);
-            let ledger = transaction
-                .query(
-                    &format!(
-                        "SELECT version, left(checksum, 65) AS checksum FROM {}
-                         ORDER BY version LIMIT $1",
-                        super::migrations::LEDGER_TABLE
-                    ),
-                    &[&ledger_limit],
-                )
-                .await
-                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?
-                .iter()
-                .map(|row| {
-                    Ok((
-                        column(row, "version", OPERATION_FENCE_RAISE)?,
-                        column(row, "checksum", OPERATION_FENCE_RAISE)?,
-                    ))
-                })
-                .collect::<Result<Vec<(i64, String)>, RepositoryError>>()?;
-            let backfill = match backfill {
-                Some(name) => {
-                    let state: Option<String> = transaction
-                        .query_opt(
-                            "SELECT state FROM greengateway.schema_backfills WHERE name = $1",
-                            &[&name],
-                        )
-                        .await
-                        .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?
-                        .map(|row| column(&row, "state", OPERATION_FENCE_RAISE))
-                        .transpose()?;
-                    BackfillState::from_column(state.as_deref())
+            for locked in [false, true] {
+                // `Transaction`'s drop queues a ROLLBACK the moment the
+                // future is abandoned (a cancelled request), as the audit
+                // store's batch does: a bare BEGIN would go back to the pool
+                // still holding the fence row, and every heartbeat in the
+                // deployment would queue behind it.
+                let transaction = client
+                    .transaction()
+                    .await
+                    .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?;
+                let migration_lock_free: bool = transaction
+                    .query_one(
+                        "SELECT pg_try_advisory_xact_lock_shared($1) AS free",
+                        &[&super::migrations::migration_lock_key()],
+                    )
+                    .await
+                    .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))
+                    .and_then(|row| column(&row, "free", OPERATION_FENCE_RAISE))?;
+                if !migration_lock_free {
+                    return Ok(FenceRaise::MigrationInProgress);
                 }
-                None => None,
-            };
-            let window_secs = stale_window.as_secs_f64();
-            let members = transaction
-                .query(&members_statement(), &[&self.deployment_id, &window_secs])
-                .await
-                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?
-                .iter()
-                .map(member_from_row)
-                .collect::<Result<Vec<_>, _>>()?;
-            let (decided, target) = match decide(FenceDecision {
-                fence: &fence,
-                ledger: &ledger,
-                backfill,
-                members: &members,
-            }) {
-                Ok(decided) => decided,
-                Err(refusal) => return Ok(FenceRaise::Refused(refusal)),
-            };
-            let Some(target) = target else {
+                let fence_statement = if locked {
+                    format!("{FENCE_COLUMNS} FOR UPDATE")
+                } else {
+                    FENCE_COLUMNS.to_owned()
+                };
+                let fence = transaction
+                    .query_opt(&fence_statement, &[])
+                    .await
+                    .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?
+                    .ok_or_else(|| invalid_data(OPERATION_FENCE_RAISE))
+                    .and_then(|row| fence_from_row(&row, OPERATION_FENCE_RAISE))?;
+                let ledger_limit = i64::try_from(super::migrations::runtime_ledger_row_limit())
+                    .unwrap_or(i64::MAX);
+                let ledger = transaction
+                    .query(
+                        &format!(
+                            "SELECT version, left(checksum, 65) AS checksum FROM {}
+                             ORDER BY version LIMIT $1",
+                            super::migrations::LEDGER_TABLE
+                        ),
+                        &[&ledger_limit],
+                    )
+                    .await
+                    .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?
+                    .iter()
+                    .map(|row| {
+                        Ok((
+                            column(row, "version", OPERATION_FENCE_RAISE)?,
+                            column(row, "checksum", OPERATION_FENCE_RAISE)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<(i64, String)>, RepositoryError>>()?;
+                let backfill_state = match backfill {
+                    Some(name) => {
+                        let state: Option<String> = transaction
+                            .query_opt(
+                                "SELECT state FROM greengateway.schema_backfills WHERE name = $1",
+                                &[&name],
+                            )
+                            .await
+                            .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?
+                            .map(|row| column(&row, "state", OPERATION_FENCE_RAISE))
+                            .transpose()?;
+                        BackfillState::from_column(state.as_deref())
+                    }
+                    None => None,
+                };
+                let window_secs = stale_window.as_secs_f64();
+                let members = transaction
+                    .query(&members_statement(), &[&self.deployment_id, &window_secs])
+                    .await
+                    .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?
+                    .iter()
+                    .map(member_from_row)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let decision = decide(FenceDecision {
+                    fence: &fence,
+                    ledger: &ledger,
+                    backfill: backfill_state,
+                    members: &members,
+                });
+                if !locked {
+                    // Only an admission that raises nothing is answered
+                    // without the row lock.
+                    if let Ok((decided, None)) = decision {
+                        transaction
+                            .commit()
+                            .await
+                            .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?;
+                        return Ok(FenceRaise::Unchanged { decided });
+                    }
+                    transaction
+                        .rollback()
+                        .await
+                        .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?;
+                    continue;
+                }
+                let (decided, target) = match decision {
+                    Ok(decided) => decided,
+                    Err(refusal) => return Ok(FenceRaise::Refused(refusal)),
+                };
+                let Some(target) = target else {
+                    transaction
+                        .commit()
+                        .await
+                        .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?;
+                    return Ok(FenceRaise::Unchanged { decided });
+                };
+                let after = transaction
+                    .query_one(
+                        "UPDATE greengateway.contract_fence
+                         SET generation = generation + 1,
+                             minimum_schema = $1,
+                             capabilities = $2,
+                             raised_at = now(),
+                             raised_by = $3
+                         WHERE singleton
+                         RETURNING generation, minimum_schema, capabilities",
+                        &[&target.minimum_schema, &target.capabilities, &raised_by],
+                    )
+                    .await
+                    .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))
+                    .and_then(|row| fence_from_row(&row, OPERATION_FENCE_RAISE))?;
                 transaction
                     .commit()
                     .await
                     .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?;
-                return Ok(FenceRaise::Unchanged { decided });
-            };
-            let after = transaction
-                .query_one(
-                    "UPDATE greengateway.contract_fence
-                     SET generation = generation + 1,
-                         minimum_schema = $1,
-                         capabilities = $2,
-                         raised_at = now(),
-                         raised_by = $3
-                     WHERE singleton
-                     RETURNING generation, minimum_schema, capabilities",
-                    &[&target.minimum_schema, &target.capabilities, &raised_by],
-                )
-                .await
-                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))
-                .and_then(|row| fence_from_row(&row, OPERATION_FENCE_RAISE))?;
-            transaction
-                .commit()
-                .await
-                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?;
-            Ok(FenceRaise::Raised {
-                decided,
-                before: fence,
-                after,
-            })
+                return Ok(FenceRaise::Raised {
+                    decided,
+                    before: fence,
+                    after,
+                });
+            }
+            Err(invalid_data(OPERATION_FENCE_RAISE))
         })
         .await
     }
