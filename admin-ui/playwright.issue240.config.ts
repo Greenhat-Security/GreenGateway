@@ -11,6 +11,14 @@ const liveServer = path.join(
   'issue-240-live-server.mjs',
 );
 const fixtureCommand = `"${process.execPath}" "${liveServer}"`;
+// A real standalone gateway serving its own embedded admin UI, for the
+// Policy Studio workbench (#243 item 18).
+const policyStudioServer = path.join(
+  adminUiRoot,
+  'tests',
+  'fixtures',
+  'policy-studio-live-server.mjs',
+);
 // Real HTTPS gateways with admin sessions behind a disposable OIDC provider.
 const adminSessionServer = path.join(
   adminUiRoot,
@@ -25,7 +33,11 @@ const viteEnvironment = stringEnvironment({
 
 export default defineConfig({
   testDir: 'tests',
-  testMatch: ['issue-240-live.spec.ts', 'admin-session-live.spec.ts'],
+  testMatch: [
+    'issue-240-live.spec.ts',
+    'admin-session-live.spec.ts',
+    'policy-studio-live.spec.ts',
+  ],
   fullyParallel: false,
   workers: 1,
   timeout: 90_000,
@@ -56,6 +68,19 @@ export default defineConfig({
       url: 'http://127.0.0.1:43211/__fixture/ready',
       // SIGTERM lets the fixture stop its gateways and delete the run's keys
       // and state; Playwright would otherwise SIGKILL it. Ignored on Windows.
+      gracefulShutdown: { signal: 'SIGTERM', timeout: 10_000 },
+      reuseExistingServer: false,
+      timeout: 300_000,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+    {
+      name: 'policy-studio-real-gateway',
+      command: `"${process.execPath}" "${policyStudioServer}"`,
+      cwd: adminUiRoot,
+      url: 'http://127.0.0.1:43222/readyz',
+      // SIGTERM lets the fixture stop its gateway and delete the run's
+      // state; Playwright would otherwise SIGKILL it. Ignored on Windows.
       gracefulShutdown: { signal: 'SIGTERM', timeout: 10_000 },
       reuseExistingServer: false,
       timeout: 300_000,

@@ -6,6 +6,7 @@ import {
   adminFetchJsonResponse,
   adminFetchResource,
 } from './api';
+import { subscribeAdminSession, type AdminSessionEvent } from './adminSession';
 import { clearMemoryToken, setMemoryToken } from './auth';
 
 afterEach(() => {
@@ -43,6 +44,78 @@ describe('admin API transport', () => {
       etag: '"connection:v2"',
       collectionEtag: '"connections:v4"',
     });
+  });
+
+  it('storing the policy test suite does not re-read the live policy', async () => {
+    const events: AdminSessionEvent[] = [];
+    const unsubscribe = subscribeAdminSession((event) => events.push(event));
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(jsonResponse(200, {}))));
+    await adminFetchJson('/v1/admin/policy/tests', { method: 'PUT', body: '{}' });
+    expect(events.filter((event) => event.kind === 'policy')).toEqual([]);
+    await adminFetchJson('/v1/admin/policy', { method: 'PUT', body: '{}' });
+    unsubscribe();
+    expect(events.filter((event) => event.kind === 'policy')).toHaveLength(1);
+  });
+
+  it('projects a required-suite publication refusal’s status, suite version and counts, and nothing unbounded', async () => {
+    const answers = [
+      jsonResponse(422, {
+        error: 'the stored policy test suite this deployment requires did not pass against this policy; nothing was written',
+        reason: 'policy_tests_required_failed',
+        required_tests: {
+          status: 'failed',
+          suite_version: 3,
+          suite_etag: '"sha256:suite-3"',
+          summary: { total: 4, passed: 3, failed: 1, incomplete: 0, errors: 0 },
+          cases: [{ id: 'private-case' }],
+        },
+      }),
+      jsonResponse(503, {
+        error: 'unavailable',
+        reason: 'policy_tests_unavailable',
+        required_tests: { status: 'suite_unavailable', suite_version: null, suite_etag: null, summary: null },
+      }),
+      jsonResponse(422, {
+        error: 'refused',
+        reason: 'policy_tests_required_failed',
+        required_tests: {
+          status: 'failed',
+          suite_version: -1,
+          suite_etag: 'x'.repeat(2000),
+          summary: { total: 'four' },
+        },
+      }),
+      jsonResponse(422, {
+        error: 'refused',
+        reason: 'policy_tests_required_failed',
+        required_tests: { status: 'Not A Code' },
+      }),
+    ];
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(answers.shift() as Response)));
+    const details = async () => {
+      try {
+        await adminFetchJson('/v1/admin/policy/drafts/pd_x/publish', { method: 'POST', body: '{}' });
+      } catch (error) {
+        return (error as AdminApiError).details;
+      }
+      throw new Error('expected a refusal');
+    };
+
+    await expect(details()).resolves.toEqual({
+      required_tests: {
+        status: 'failed',
+        suite_version: 3,
+        suite_etag: '"sha256:suite-3"',
+        summary: { total: 4, passed: 3, failed: 1, incomplete: 0, errors: 0 },
+      },
+    });
+    await expect(details()).resolves.toEqual({
+      required_tests: { status: 'suite_unavailable', suite_version: null, suite_etag: null, summary: null },
+    });
+    await expect(details()).resolves.toEqual({
+      required_tests: { status: 'failed', suite_version: null, suite_etag: null, summary: null },
+    });
+    await expect(details()).resolves.toEqual({});
   });
 
   it('uses the secret collection ETag header for conditional secret workflows', async () => {

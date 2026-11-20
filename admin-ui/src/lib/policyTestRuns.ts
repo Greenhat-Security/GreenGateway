@@ -65,6 +65,9 @@ export type PolicyTestSummary = Readonly<{
 export type PolicyTestReport = Readonly<{
   status: PolicyTestRunStatus;
   suite_digest: string;
+  // The stored version a run of the stored suite decided; null for a suite
+  // sent with the run.
+  suite_stored: Readonly<{ version: number; etag: string }> | null;
   policy: Readonly<{
     source: 'active' | 'inline_candidate';
     etag: string;
@@ -80,15 +83,28 @@ export type PolicyTestRunAnswer =
   | Readonly<{ kind: 'report'; report: PolicyTestReport }>
   | Readonly<{ kind: 'refused'; refusal: PolicyRunRefusal }>;
 
-export type PolicyTestRunRequest = Readonly<{
-  // The exact text of a `policy-tests.v1` suite.
-  suiteSource: string;
+// The suite a run decides: one sent with the run as its exact text, or the
+// stored suite, pinned to the strong ETag the operator reviewed.
+export type PolicyTestRunSuite =
+  | Readonly<{ kind: 'inline'; source: string }>
+  | Readonly<{ kind: 'stored'; etag: string }>;
+
+export type PolicyTestRunRequest = Readonly<
+  (
+    | {
+        // The exact text of a `policy-tests.v1` suite.
+        suiteSource: string;
+        suite?: undefined;
+      }
+    | { suite: PolicyTestRunSuite; suiteSource?: undefined }
+  ) & {
   candidate: PolicyRunCandidate;
   // The live policy ETag reviewed, pinned with If-Match when the run judges
   // the live policy itself.
   liveEtag: string;
   signal?: AbortSignal;
-}>;
+}
+>;
 
 // Run a suite against the live policy or a candidate, in the JSON format.
 // Nothing is written or stored. A run that completed is a report whatever its
@@ -96,7 +112,12 @@ export type PolicyTestRunRequest = Readonly<{
 export async function runPolicyTests(
   request: PolicyTestRunRequest,
 ): Promise<PolicyTestRunAnswer> {
-  const suite = jsonObjectText(request.suiteSource);
+  const named: PolicyTestRunSuite =
+    request.suite ?? { kind: 'inline', source: request.suiteSource };
+  const suite =
+    named.kind === 'stored'
+      ? JSON.stringify({ source: 'stored', etag: named.etag })
+      : jsonObjectText(named.source);
   const policy =
     request.candidate.kind === 'inline'
       ? `,"policy":${jsonObjectText(request.candidate.source)}`
@@ -167,9 +188,22 @@ export function projectTestReport(body: unknown): PolicyTestReport | null {
     }
     cases.push(projected);
   }
+  const stored = body.suite.stored;
+  let suiteStored: PolicyTestReport['suite_stored'] = null;
+  if (stored !== undefined) {
+    if (
+      !isJsonObject(stored) ||
+      !isCount(stored.version) ||
+      !isBoundedText(stored.etag, MAX_DIGEST_LENGTH)
+    ) {
+      return null;
+    }
+    suiteStored = { version: stored.version, etag: stored.etag };
+  }
   return {
     status: body.status,
     suite_digest: body.suite.digest,
+    suite_stored: suiteStored,
     policy: {
       source: body.policy.source,
       etag: body.policy.etag,

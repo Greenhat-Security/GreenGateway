@@ -6,7 +6,7 @@ import {
   type PolicyDiagnosticSeverity,
   type PolicyInspection,
 } from '../../../lib/policyDrafts';
-import { blockedUses, severityBadge, severityLabel } from '../model';
+import { blockedUses, severityBadge, severityLabel, type JsonObject } from '../model';
 import { StudioAlertPanel, type StudioAlert } from '../StudioAlert';
 import { AnalyzerFindings } from './AnalyzerFindings';
 import { isAbort, plural, runAlert, type WorkbenchCandidate } from './common';
@@ -55,6 +55,9 @@ export function OptimizePanel({
   canReplay,
   canWritePolicy,
   onShowInEditor,
+  startDraftBlocker,
+  onApplyPatch,
+  onStartDraft,
 }: {
   candidate: WorkbenchCandidate | null;
   candidateProblem: string | null;
@@ -69,6 +72,13 @@ export function OptimizePanel({
   // admin:policy:write: creating and expiring suppressions.
   canWritePolicy: boolean;
   onShowInEditor: (diagnostic: PolicyDiagnostic) => void;
+  // Why a new draft cannot be started now (the Studio's own create
+  // conditions); null when it can.
+  startDraftBlocker: string | null;
+  // An analyzer patch applied to the open draft's text, as an unsaved edit.
+  onApplyPatch: (document: JsonObject) => void;
+  // A new draft from the live policy with an analyzer patch applied.
+  onStartDraft: (source: string) => void;
 }) {
   const headingId = useId();
   const liveCandidate = candidate?.kind === 'live';
@@ -134,7 +144,8 @@ export function OptimizePanel({
       </div>
       <p className="rule-hint">
         Nothing here changes the policy. A remediation is an edit you make in a draft,
-        validate, test and publish through the ordinary review.
+        validate, test and publish through the ordinary review; an analyzer’s advisory change
+        can be opened in a draft for that review, and is never saved or published here.
       </p>
 
       {candidate === null ? (
@@ -185,6 +196,11 @@ export function OptimizePanel({
             canAnalyze={canAnalyze}
             canReplay={canReplay}
             canWritePolicy={canWritePolicy}
+            canEditDraft={canEditDraft && candidate.kind === 'draft'}
+            liveSource={liveSource}
+            startDraftBlocker={startDraftBlocker}
+            onApplyPatch={onApplyPatch}
+            onStartDraft={onStartDraft}
           />
         </>
       )}

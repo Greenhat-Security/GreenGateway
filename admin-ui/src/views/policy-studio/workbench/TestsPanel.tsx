@@ -7,10 +7,18 @@ import {
   type PolicyTestCaseResult,
   type PolicyTestReport,
   type PolicyTestRunStatus,
+  type PolicyTestRunSuite,
 } from '../../../lib/policyTestRuns';
+import { POLICY_TESTS_ETAG_MISMATCH_REASON } from '../../../lib/policyTests';
 import { shortEtag, type JsonObject } from '../model';
 import { StudioAlertPanel, type StudioAlert } from '../StudioAlert';
 import { CasesEditor } from './CasesEditor';
+import {
+  StoredSuite,
+  type StoredRunOutcome,
+  type StoredRunRequest,
+  type StoredRunTarget,
+} from './StoredSuite';
 import {
   CheckboxOption,
   CountList,
@@ -39,32 +47,47 @@ import {
 const PERMISSIONS = `admin:policy:read and ${POLICY_SIMULATE_PERMISSION}`;
 const LISTED_MISSING_EXPECTATIONS = 8;
 
+// A run is stale once what it ran is no longer on screen: the candidate and
+// the cases for a run of the cases on screen (`key`), the candidate and the
+// stored version for a run of the stored suite (`key` is then the candidate
+// alone, and the report names the stored ETag it ran).
 type TestRun = { key: string; subject: string; report: PolicyTestReport };
 type TestRefusal = { refusal: PolicyRunRefusal; cases: readonly JsonObject[] };
 
-// The Test view: run the shared cases as a policy-tests.v1 suite against
-// the live policy or the candidate. A run never passes by default, changes
-// nothing, and gates nothing yet.
+// The Test view: run the shared cases as a policy-tests.v1 suite, or the
+// suite stored beside the policy, against the live policy or the candidate.
+// A run never passes by default and changes nothing; storing the cases as
+// the stored suite is a separate, confirmed write.
 export function TestsPanel({
+  active,
   candidate,
   candidateProblem,
   canSimulate,
+  canWritePolicy,
   validationBlocker,
   suiteSource,
   onSuiteChange,
   onReloadLive,
+  storedRunRequest,
 }: {
+  active: boolean;
   candidate: WorkbenchCandidate | null;
   candidateProblem: string | null;
   canSimulate: boolean;
+  canWritePolicy: boolean;
   validationBlocker: string | null;
   suiteSource: string;
   onSuiteChange: (source: string) => void;
   onReloadLive: () => void;
+  storedRunRequest: StoredRunRequest;
 }) {
   const headingId = useId();
   const blockersId = useId();
   const [busy, setBusy] = useState(false);
+  // What the run in progress runs, for the status line.
+  const [runningText, setRunningText] = useState('');
+  // The ETag of the stored suite as last read here; null for none.
+  const [storedEtag, setStoredEtag] = useState<string | null>(null);
   const [rejected, setRejected] = useState(false);
   const [run, setRun] = useState<TestRun | null>(null);
   const [refusal, setRefusal] = useState<TestRefusal | null>(null);
@@ -79,11 +102,20 @@ export function TestsPanel({
   const cases = parsed.ok ? parsed.cases : [];
   const missing = casesWithoutExpectation(cases);
   const key = candidate === null ? null : `${candidateKey(candidate)}\n${suiteSource}`;
-  const stale = run !== null && run.key !== key;
+  const storedKey = candidate === null ? null : candidateKey(candidate);
+  const stale =
+    run !== null &&
+    (run.report.suite_stored !== null
+      ? run.key !== storedKey || run.report.suite_stored.etag !== storedEtag
+      : run.key !== key);
 
-  const blockers: string[] = [];
-  if (!canSimulate || rejected) blockers.push(`Running policy tests needs ${PERMISSIONS}.`);
-  if (candidate === null) blockers.push(candidateProblem ?? 'There is no candidate to test.');
+  // What any run needs; a run of the cases on screen also needs the cases.
+  const common: string[] = [];
+  if (!canSimulate || rejected) common.push(`Running policy tests needs ${PERMISSIONS}.`);
+  if (candidate === null) common.push(candidateProblem ?? 'There is no candidate to test.');
+  const storedRunBlockers =
+    validationBlocker === null ? common : [...common, validationBlocker];
+  const blockers: string[] = [...common];
   if (!parsed.ok) blockers.push('Fix the suite source first.');
   else if (cases.length === 0) blockers.push('Add a case first.');
   else if (cases.length > MAX_SUITE_CASES) {
@@ -96,21 +128,32 @@ export function TestsPanel({
   }
   if (validationBlocker !== null) blockers.push(validationBlocker);
 
-  async function runTests() {
-    if (candidate === null || key === null || !parsed.ok || busy || blockers.length > 0) {
-      return;
+  // Run the cases on screen, or the stored suite pinned to `target`.
+  // Resolves to whether the gateway answered that the stored suite is no
+  // longer that version.
+  async function execute(suite: PolicyTestRunSuite, target?: StoredRunTarget): Promise<boolean> {
+    const runKey = suite.kind === 'stored' ? storedKey : key;
+    if (candidate === null || runKey === null || busy) {
+      return false;
     }
     controller.current?.abort();
     const current = new AbortController();
     controller.current = current;
     setBusy(true);
+    setRunningText(
+      suite.kind === 'stored'
+        ? target !== undefined && target.version !== null
+          ? `Running stored suite version ${target.version}.`
+          : 'Running the stored suite.'
+        : `Running ${plural(cases.length, 'case')}.`,
+    );
     setAlert(null);
     setBaseStale(false);
     setRefusal(null);
-    const sentCases = parsed.cases;
+    const sentCases = suite.kind === 'inline' && parsed.ok ? parsed.cases : [];
     try {
       const answer = await runPolicyTests({
-        suiteSource,
+        suite,
         candidate: runCandidate(candidate),
         liveEtag: candidate.liveEtag,
         signal: current.signal,
@@ -118,19 +161,53 @@ export function TestsPanel({
       if (answer.kind === 'refused') {
         setRefusal({ refusal: answer.refusal, cases: sentCases });
       } else {
-        setRun({ key, subject: candidateLabel(candidate), report: answer.report });
+        setRun({ key: runKey, subject: candidateLabel(candidate), report: answer.report });
       }
+      return false;
     } catch (error) {
-      if (isAbort(error)) return;
+      if (isAbort(error)) return false;
       if (error instanceof AdminApiError && error.status === 403) setRejected(true);
-      setBaseStale(error instanceof AdminApiError && error.status === 412);
-      setAlert(runAlert(error, 'Policy tests did not run', PERMISSIONS));
+      const suiteChanged =
+        error instanceof AdminApiError && error.code === POLICY_TESTS_ETAG_MISMATCH_REASON;
+      setBaseStale(error instanceof AdminApiError && error.status === 412 && !suiteChanged);
+      setAlert(
+        suiteChanged && target?.fromRefusal === true
+          ? {
+              title: 'Stored suite changed',
+              message: `The stored suite is no longer ${target.version !== null ? `version ${target.version}, ` : 'the version '}which refused the publication, so nothing ran. Run the stored suite to see how this draft fares against the version stored now.`,
+              tone: 'warning',
+            }
+          : runAlert(error, 'Policy tests did not run', PERMISSIONS),
+      );
+      return suiteChanged;
     } finally {
       if (controller.current === current) {
         controller.current = null;
         setBusy(false);
       }
     }
+  }
+
+  async function runTests() {
+    if (!parsed.ok || blockers.length > 0) {
+      return;
+    }
+    await execute({ kind: 'inline', source: suiteSource });
+  }
+
+  async function runStored(target: StoredRunTarget): Promise<StoredRunOutcome> {
+    if (storedRunBlockers.length > 0) {
+      // Only a run asked from elsewhere gets here: the button is disabled.
+      setRefusal(null);
+      setAlert({
+        title: 'The stored suite did not run',
+        message: 'It cannot run against this candidate now:',
+        details: storedRunBlockers,
+        tone: 'warning',
+      });
+      return 'blocked';
+    }
+    return (await execute({ kind: 'stored', etag: target.etag }, target)) ? 'changed' : 'ran';
   }
 
   const problems = new Map<number, string[]>();
@@ -152,9 +229,23 @@ export function TestsPanel({
       <p className="rule-hint">
         Runs the cases as a policy-tests.v1 suite through the gateway’s own evaluator. A
         case passes only when the policy gives the answer it expects; an undecided or
-        refused case never passes. Nothing is written or stored, and no publication is
-        gated on a suite yet.
+        refused case never passes. A run writes and stores nothing. Where the gateway
+        requires the stored suite (POLICY_TESTS_REQUIRED), every policy publication must pass
+        the stored suite; running it here shows whether this candidate would.
       </p>
+
+      <StoredSuite
+        active={active}
+        canRead={canSimulate}
+        canWrite={canWritePolicy}
+        suiteSource={suiteSource}
+        onSuiteChange={onSuiteChange}
+        runBlockers={storedRunBlockers}
+        running={busy}
+        onRunStored={runStored}
+        onStoredEtag={setStoredEtag}
+        runRequest={storedRunRequest}
+      />
 
       <CasesEditor
         suiteSource={suiteSource}
@@ -177,7 +268,7 @@ export function TestsPanel({
       <RunBlockers id={blockersId} blockers={blockers} />
 
       <div className="policy-studio-status" role="status" aria-live="polite">
-        {busy ? <p className="rule-hint">Running {plural(cases.length, 'case')}.</p> : null}
+        {busy ? <p className="rule-hint">{runningText}</p> : null}
       </div>
       {alert ? (
         <>
@@ -266,6 +357,9 @@ function TestReportView({
         <strong>{status.label}.</strong> {statusSentence(report)}
       </p>
       <p>
+        {report.suite_stored !== null
+          ? `Ran the stored suite, version ${report.suite_stored.version}. `
+          : 'Ran the cases on screen. '}
         Tested {run.subject}
         {report.policy.source === 'inline_candidate' ? ', as a candidate that was not stored' : ''}
         : revision <code title={report.policy.etag}>{shortEtag(report.policy.etag)}</code>.

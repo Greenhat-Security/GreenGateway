@@ -17,6 +17,12 @@ import {
 } from '../../../lib/policyReplays';
 import { POLICY_SIMULATION_DEADLINE_REASON } from '../../../lib/policySimulations';
 import { POLICY_TESTS_DEADLINE_REASON } from '../../../lib/policyTestRuns';
+import {
+  POLICY_TESTS_ETAG_MISMATCH_REASON,
+  POLICY_TESTS_EXIST_REASON,
+  POLICY_TESTS_NOT_FOUND_REASON,
+  POLICY_TESTS_UNAVAILABLE_REASON,
+} from '../../../lib/policyTests';
 import { shortEtag, type JsonObject } from '../model';
 import type { StudioAlert } from '../StudioAlert';
 import { caseId, caseIndexForPointer } from './suite';
@@ -82,6 +88,12 @@ export function runAlert(
     };
   }
   switch (error.status) {
+    case 400:
+      return {
+        title,
+        message: `The gateway refused the request as malformed${error.code !== 'request_failed' ? ` (${error.code})` : ''}, so nothing ran and nothing was stored.`,
+        tone: 'error',
+      };
     case 401:
       return {
         title: 'Sign in required',
@@ -102,11 +114,13 @@ export function runAlert(
               'The gateway no longer holds this job. Jobs live in the memory of the replica that ran them, and an expired or restarted job is forgotten.',
             tone: 'warning',
           }
-        : { title, message: 'No policy is configured on this gateway.', tone: 'warning' };
+        : error.code === POLICY_TESTS_NOT_FOUND_REASON
+          ? { title, message: 'No suite is stored beside the policy.', tone: 'warning' }
+          : { title, message: 'No policy is configured on this gateway.', tone: 'warning' };
     case 408:
       return {
         title,
-        message: 'The request did not reach the gateway in time, so nothing ran. Try again.',
+        message: 'The request did not reach the gateway in time, so nothing ran and nothing was stored. Try again.',
         tone: 'warning',
       };
     case 409:
@@ -119,6 +133,14 @@ export function runAlert(
         tone: 'warning',
       };
     case 412:
+      if (error.code === POLICY_TESTS_ETAG_MISMATCH_REASON || error.code === POLICY_TESTS_EXIST_REASON) {
+        return {
+          title: 'Stored suite changed',
+          message:
+            'The stored suite is no longer the version this was pinned to, so nothing ran and nothing was stored. Read the stored suite again and review it.',
+          tone: 'warning',
+        };
+      }
       return {
         title: 'Live policy changed',
         message:
@@ -128,7 +150,7 @@ export function runAlert(
     case 413:
       return {
         title,
-        message: 'The request is larger than the gateway accepts. Use fewer cases or a smaller candidate.',
+        message: 'The request is larger than the gateway accepts, so nothing ran and nothing was stored. Use fewer cases or a smaller candidate.',
         tone: 'error',
       };
     case 428:
@@ -170,6 +192,8 @@ function unavailableMessage(error: AdminApiError): string {
       return 'Historical replay is not available in cluster mode on this gateway version.';
     case POLICY_REPLAY_STORE_UNAVAILABLE_REASON:
       return 'The cluster replay job store could not be reached, so there is no result.';
+    case POLICY_TESTS_UNAVAILABLE_REASON:
+      return 'The gateway has no suite store configured, or could not read it.';
     default:
       return 'The gateway could not read what this run needs. There is no result.';
   }

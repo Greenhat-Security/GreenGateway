@@ -54,8 +54,25 @@ export type AdminCompositeOrphan = Readonly<{
   upstream_status?: number;
 }>;
 
+// What the required stored suite answered for a refused publication: its
+// status code, the suite version and ETag it read (null when none was read),
+// and the counts of a completed run (null otherwise). Never a case.
+export type AdminRequiredTests = Readonly<{
+  status: string;
+  suite_version: number | null;
+  suite_etag: string | null;
+  summary: Readonly<{
+    total: number;
+    passed: number;
+    failed: number;
+    incomplete: number;
+    errors: number;
+  }> | null;
+}>;
+
 export type AdminApiErrorDetails = Readonly<{
   dependency_count?: number;
+  required_tests?: AdminRequiredTests;
   request_id?: string;
   reason?:
     | 'composite_failed'
@@ -232,8 +249,10 @@ export async function adminFetchResponse<T>(
 // Whether a successful write to this path can have changed the live policy.
 // Previews, validation, conversion, simulations, analyses and test runs read
 // only their request, and a replay job only reads retained records; a
-// suppression only labels an analyzer finding; saving, editing or deleting a
-// draft changes no enforcement, and only a draft's publication does.
+// suppression only labels an analyzer finding; storing the policy test suite
+// changes no enforcement (it gates later publications, not the live policy);
+// saving, editing or deleting a draft changes no enforcement, and only a
+// draft's publication does.
 // (Opening a suggestion in a draft or dismissing one is not under `/policy`
 // and changes no policy either.)
 function changesLivePolicy(path: string): boolean {
@@ -248,6 +267,7 @@ function changesLivePolicy(path: string): boolean {
     path === adminApiUrl('/policy/simulations') ||
     path === adminApiUrl('/policy/analyses') ||
     path === adminApiUrl('/policy/evidence') ||
+    path === adminApiUrl('/policy/tests') ||
     path === adminApiUrl('/policy/tests/runs')
   ) {
     return false;
@@ -417,10 +437,54 @@ function errorDetails(body: unknown): AdminApiErrorDetails {
   ) {
     details.dependency_count = dependencyCount;
   }
+  const requiredTests = projectRequiredTests(source.required_tests);
 
   return {
     ...details,
+    ...(requiredTests === null ? {} : { required_tests: requiredTests }),
     ...compositeErrorDetails(source),
+  };
+}
+
+const MAX_REQUIRED_TESTS_ETAG_BYTES = 1_024;
+
+// The bounded `required_tests` member of a publication the required stored
+// suite refused: a status code, and only counts beside it. A member that is
+// not one of those shapes is dropped, never passed on.
+function projectRequiredTests(value: unknown): AdminRequiredTests | null {
+  if (
+    !isJsonObject(value) ||
+    typeof value.status !== 'string' ||
+    !/^[a-z][a-z0-9_]{0,63}$/.test(value.status)
+  ) {
+    return null;
+  }
+  const count = (member: unknown): member is number =>
+    typeof member === 'number' && Number.isSafeInteger(member) && member >= 0;
+  const summary = value.summary;
+  return {
+    status: value.status,
+    suite_version: count(value.suite_version) ? value.suite_version : null,
+    suite_etag:
+      isBoundedNonEmptyString(value.suite_etag, MAX_REQUIRED_TESTS_ETAG_BYTES) &&
+      /^"[!#-~]+"$/.test(value.suite_etag)
+        ? value.suite_etag
+        : null,
+    summary:
+      isJsonObject(summary) &&
+      count(summary.total) &&
+      count(summary.passed) &&
+      count(summary.failed) &&
+      count(summary.incomplete) &&
+      count(summary.errors)
+        ? {
+            total: summary.total,
+            passed: summary.passed,
+            failed: summary.failed,
+            incomplete: summary.incomplete,
+            errors: summary.errors,
+          }
+        : null,
   };
 }
 
