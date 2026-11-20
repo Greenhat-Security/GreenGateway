@@ -147,6 +147,14 @@ export function buildGreenGatewayContainerEnv(
       throw new Error(`source.selector_without_mode: ${locator}`);
     }
   }
+  // The gateway refuses to start under required authority evidence until a
+  // configuration activation can be evidenced (issue #242). Refuse it here,
+  // where the operator sees it, rather than start a container that exits.
+  if (bindings.AUTHORITY_EVIDENCE_DURABILITY === "required") {
+    throw new Error(
+      "authority_evidence.activation_unevidenced: AUTHORITY_EVIDENCE_DURABILITY",
+    );
+  }
 
   for (const key of GREEN_GATEWAY_ENV_KEYS) {
     const value = bindings[key];

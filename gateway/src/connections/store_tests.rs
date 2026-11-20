@@ -304,7 +304,7 @@ fn migrations_are_ordered_idempotent_and_restart_safe() {
         .expect("migration rows should read");
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
 }
 
@@ -635,7 +635,7 @@ fn migration_five_preserves_populated_v4_catalog_state() {
         .expect("migration rows should read");
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
 }
 
@@ -740,7 +740,7 @@ fn migration_six_preserves_populated_v5_mcp_catalog_state() {
         .expect("migration rows should read");
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
 }
 
@@ -1085,7 +1085,7 @@ fn migrations_eight_and_nine_preserve_bindings_and_openapi_catalogs() {
         .expect("migration rows should read");
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
     assert!(connection
         .prepare("SELECT source_digest, values_json FROM connection_enum_source_values LIMIT 0")
@@ -5089,6 +5089,8 @@ fn migration_twelve_adds_empty_evidence_tables_to_an_existing_database() {
         .expect("database should open")
         .execute_batch(
             r#"
+            DROP TABLE authority_caller_operation_ids;
+            DELETE FROM connection_schema_migrations WHERE version = 16;
             DROP TABLE connection_mutation_approvals;
             DELETE FROM connection_schema_migrations WHERE version = 15;
             DROP TABLE authority_event_cursors;
@@ -6304,6 +6306,8 @@ fn migration_thirteen_adds_an_empty_catalog_evidence_table_to_an_existing_databa
     assert_eq!(overlay_author, "overlay-author");
     file.execute_batch(
         r#"
+            DROP TABLE authority_caller_operation_ids;
+            DELETE FROM connection_schema_migrations WHERE version = 16;
             DROP TABLE connection_mutation_approvals;
             DELETE FROM connection_schema_migrations WHERE version = 15;
             DROP TABLE authority_event_cursors;
@@ -6357,6 +6361,115 @@ fn migration_thirteen_adds_an_empty_catalog_evidence_table_to_an_existing_databa
         ("upgrading-admin", None, "principal", "bearer_token")
     );
     assert_eq!((rows[0].prior_version, rows[0].new_version), (Some(1), 2));
+}
+
+/// The reservation table's definition as SQLite stored it in `path`.
+fn reservation_table_definition(path: &Path) -> String {
+    Connection::open(path)
+        .expect("database should open")
+        .query_row(
+            "SELECT sql FROM sqlite_master \
+             WHERE type = 'table' AND name = 'authority_caller_operation_ids'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the reservation table should exist")
+}
+
+/// Migration 16 adds the standalone caller-key reservation table, empty,
+/// from the definition the token store also creates, to a database at
+/// migration 15. No evidence row is changed, copied or fabricated, and the
+/// evidence a later change writes is unaffected.
+#[test]
+fn migration_sixteen_adds_the_reservation_table_and_changes_no_evidence() {
+    let (_directory, path, store) = temporary_store("migration-sixteen");
+    let admin = ChangeActor::for_test("creating-admin");
+    let created = store
+        .create(candidate(), &admin)
+        .expect("create should commit");
+    drop(store);
+    let evidence_before = change_evidence(&path);
+    assert_eq!(evidence_before.len(), 1);
+    Connection::open(&path)
+        .expect("database should open")
+        .execute_batch(
+            r#"
+            DROP TABLE authority_caller_operation_ids;
+            DELETE FROM connection_schema_migrations WHERE version = 16;
+            "#,
+        )
+        .expect("the database should roll back to migration 15");
+
+    let reopened = SqliteConnectionStore::open(&path).expect("the store should migrate and open");
+    let versions: Vec<u32> = reopened
+        .connection_guard()
+        .prepare("SELECT version FROM connection_schema_migrations ORDER BY version")
+        .expect("migration query should prepare")
+        .query_map([], |row| row.get(0))
+        .expect("migration query should run")
+        .collect::<Result<_, _>>()
+        .expect("migration rows should read");
+    assert_eq!(versions, (1..=16).collect::<Vec<_>>());
+    let reserved: i64 = reopened
+        .connection_guard()
+        .query_row(
+            "SELECT COUNT(*) FROM authority_caller_operation_ids",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the reservation table should exist");
+    assert_eq!(reserved, 0, "migration 16 reserves nothing");
+    assert_eq!(change_evidence(&path), evidence_before);
+
+    let fresh = Connection::open_in_memory().expect("an in-memory database opens");
+    fresh
+        .execute_batch(crate::storage::standalone_authority_events::CALLER_OPERATION_TABLE_SQL)
+        .expect("the shared definition creates");
+    let shared: String = fresh
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'authority_caller_operation_ids'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the table exists");
+    assert_eq!(reservation_table_definition(&path), shared);
+
+    reopened
+        .delete(&created.id, &created.etag(), &admin)
+        .expect("delete should commit");
+    assert_eq!(change_evidence(&path).len(), 2);
+}
+
+/// A token store and a Connections store pointed at one file share one
+/// reservation table, with the same definition whichever store opens the
+/// file first, so either store's keys conflict with the other's.
+#[test]
+fn a_shared_file_gets_one_reservation_table_whichever_store_opens_first() {
+    let tokens_first = TemporaryDatabase::new("shared-tokens-first");
+    drop(crate::auth::SqliteTokenStore::open(&tokens_first.path).expect("token store opens"));
+    drop(SqliteConnectionStore::open(&tokens_first.path).expect("Connections store opens"));
+    drop(crate::auth::SqliteTokenStore::open(&tokens_first.path).expect("token store reopens"));
+
+    let connections_first = TemporaryDatabase::new("shared-connections-first");
+    drop(SqliteConnectionStore::open(&connections_first.path).expect("Connections store opens"));
+    drop(crate::auth::SqliteTokenStore::open(&connections_first.path).expect("token store opens"));
+    drop(SqliteConnectionStore::open(&connections_first.path).expect("Connections store reopens"));
+
+    assert_eq!(
+        reservation_table_definition(&tokens_first.path),
+        reservation_table_definition(&connections_first.path)
+    );
+    for path in [&tokens_first.path, &connections_first.path] {
+        let tables: i64 = Connection::open(path)
+            .expect("database should open")
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'authority_caller_operation_ids'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the schema reads");
+        assert_eq!(tables, 1);
+    }
 }
 
 /// Migration 13's row CHECKs are the backstop behind the store, and the

@@ -41,7 +41,7 @@ same goldens (`gateway-config/src/compiler/parity_tests.rs`).
 
 | Caller | Reader | What it does with the result |
 | --- | --- | --- |
-| `gateway` with no arguments: `bootstrap::start_serving` | `config::process_environment`, the process environment | Converts the plan with `config::into_config` and runs the startup stages on it (see [Startup](#startup)). A refused configuration is printed and the process exits with status 1 before any stage runs. |
+| `gateway` with no arguments: `bootstrap::start_serving` | `config::process_environment`, the process environment | Converts the plan with `config::into_config` and runs the startup stages on it (see [Startup](#startup)). A refused configuration is printed and the process exits with status 1 before any stage runs. So is an accepted one under `AUTHORITY_EVIDENCE_DURABILITY=required` (`authority_evidence_activation_unevidenced`). |
 | The one-shot commands: `migrate`, `connection-secret`, `revoke-jwt`, `jwt-revocations-cleanup`, `rate-limit-buckets-cleanup`, `cluster-members`, `maintenance-run`, and `import-standalone`'s own configuration | `Config::from_env`, the same reader | Uses the converted `Config`. A refusal is returned as the command's error, in the same operator-facing form. |
 | `gateway import-standalone --from FILE`, for the source deployment | The variables `gateway_config::env_file` parses from `FILE`, as a map | Refuses the import with `ImportError::StandaloneConfigInvalid`, naming only the settings that failed, never their values. |
 | `ggctl validate`, `ggctl doctor` and `ggctl diff` with `--env FILE` (and `--against-env FILE`) | `gateway_config::env_file::EnvFile::var`: the variables the file sets, parsed with the same grammar as the import's, every other input unset | Reports each diagnostic as a `config` code with the rule's stable name, located by the line of its setting ([docs/ggctl.md](../ggctl.md#environment-files)); the doctor evaluates an accepted plan against the production profile as advice, and the diff compares two plans with `semantic_diff::plans`. |
@@ -292,7 +292,7 @@ holds this table to `diagnostic::ConfigRule`.
 | `AuthorityEventMaterialUnused` | Authority-event material the configured sink never reads. |
 | `AuthorityPseudonymKeysDistinct` | The current and previous pseudonym key aliases naming the same alias. |
 | `AuthorityEvidenceDeliveryRequired` | `AUTHORITY_EVIDENCE_DURABILITY=required` with `AUTHORITY_EVENT_SINK=none`, in either mode: a cluster replica would journal evidence that is never delivered, and a standalone gateway's stores would record evidence that is never delivered. |
-| `AuthorityEvidenceUnsupportedConfiguration` | `AUTHORITY_EVIDENCE_DURABILITY=required` with a setting that enables an authority change the evidence inventory marks unsupported in this mode: `ADMIN_SESSION_MODE=standalone_memory`. |
+| `AuthorityEvidenceUnsupportedConfiguration` | `AUTHORITY_EVIDENCE_DURABILITY=required` with a setting that enables an authority change the evidence inventory marks unsupported in this mode: `ADMIN_SESSION_MODE=standalone_memory`. A configuration these two rules accept is still refused by serving startup, after the compiler and before preflight, until #242 evidences configuration activation (`authority_evidence_activation_unevidenced`). That refusal is an I/O question, not a rule: the compiler accepts the configuration, and so does `ggctl`. |
 | `SourceSelection` | The selected source is unavailable, its selectors are invalid or missing, or an ordinary environment setting would create a competing authority. |
 
 Codes and rules are Rust enums. `ConfigRule::as_str` gives every rule
@@ -430,7 +430,13 @@ plan once with `config::into_config`, and then runs the stages of
    routers. It binds nothing.
 3. **Serving** binds the listeners and serves until shutdown.
 
-A refused configuration reaches no stage. When a stage fails before any
+A refused configuration reaches no stage. Under
+`AUTHORITY_EVIDENCE_DURABILITY=required` startup also stops after the
+conversion and before preflight, with
+`authority_evidence_activation_unevidenced`, so no stage runs: nothing
+records the activation of the configuration until #242
+([required-durability mode](../authority-evidence.md#required-durability-mode)).
+When a stage fails before any
 listener served, what preflight published (the membership row) is withdrawn,
 and background work activation started is stopped within
 `SHUTDOWN_TIMEOUT_MS`, before the error is returned. The stages run the startup

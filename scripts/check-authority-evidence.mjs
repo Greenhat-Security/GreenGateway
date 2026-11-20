@@ -179,9 +179,24 @@ export function validateEvent(event) {
 // `caller_key_required` admits the PostgreSQL qualified prepare only.
 // `refused` and `refused_at_startup` refuse it when asked or when the
 // configuration enables it; `unavailable` rows cannot run in the mode at
-// all; `outside_gateway` is a provider's write the gateway cannot refuse;
-// `not_refused` is the activation that starts the gateway.
-const REQUIRED_MODES = new Set(["admitted", "caller_key_required", "refused", "refused_at_startup", "unavailable", "outside_gateway", "not_refused"]);
+// all; `outside_gateway` is a provider's write the gateway cannot refuse.
+// No row is run unrefused: the activation that starts the gateway is refused
+// at startup (owner decision 2 of #425, 2026-11-19).
+const REQUIRED_MODES = new Set(["admitted", "caller_key_required", "refused", "refused_at_startup", "unavailable", "outside_gateway"]);
+
+// Serving startup refuses required mode until a configuration activation can
+// be proven durably recorded. The proof type has no value until #242 gives it
+// one; while it has none, every row holding configuration.activate stays
+// refused at startup and anchors on the type and on the place serving startup
+// asks, so making it inhabited, or moving the check, breaks an anchor and the
+// row changes in the same reviewed change. The type is recognised by its
+// shape, not one spelling: a visibility change keeps the rule on, and a
+// rename or removal fails outright instead of switching it off.
+const ACTIVATION_PROOF_PATH = "gateway/src/authority_events/required.rs";
+const ACTIVATION_PROOF_DECLARED = /\b(?:enum|struct|union|type)\s+ActivationProof\b/;
+const ACTIVATION_PROOF_UNINHABITED = /\benum\s+ActivationProof\s*\{\s*\}/;
+const ACTIVATION_CHECK = { path: "gateway/src/bootstrap/stages.rs", anchor: "crate::authority_events::required::startup_refusal(&config)" };
+const withoutLineComments = (text) => text.replace(/\/\/.*$/gm, "");
 
 // The gateway's source, and the configuration compiler it links from the
 // shared gateway-config library (issue #242), which refuses the settings the
@@ -227,10 +242,28 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
     references += 1;
   };
   check(Array.isArray(inventory.groups) && inventory.groups.length > 0, "empty inventory");
+  let activationProofState;
+  const activationUnproven = () => {
+    if (activationProofState === undefined) {
+      const proofSource = withoutLineComments(source(ACTIVATION_PROOF_PATH));
+      check(ACTIVATION_PROOF_DECLARED.test(proofSource),
+        `${ACTIVATION_PROOF_PATH} declares no ActivationProof: the configuration activation rule cannot be switched off by a rename`);
+      activationProofState = ACTIVATION_PROOF_UNINHABITED.test(proofSource);
+    }
+    return activationProofState;
+  };
   for (const group of inventory.groups) {
     check(!ids.has(group.id), `duplicate group ${group.id}`); ids.add(group.id);
     for (const field of ["boundary", "record", "actor", "identity", "follow_up", "test_claim"]) {
       check(typeof group[field] === "string" && group[field].trim().length >= 4, `${group.id}: missing ${field}`);
+    }
+    if (group.operations.includes("configuration.activate") && activationUnproven()) {
+      check(group.required_mode === "refused_at_startup" && group.required_durability_supported === false,
+        `${group.id}: configuration activation stays refused at startup while the activation proof is uninhabited`);
+      check((group.sources ?? []).some((ref) => ref.path === ACTIVATION_PROOF_PATH && ACTIVATION_PROOF_UNINHABITED.test(ref.anchor)),
+        `${group.id}: configuration activation must anchor on the uninhabited activation proof`);
+      check((group.sources ?? []).some((ref) => ref.path === ACTIVATION_CHECK.path && ref.anchor === ACTIVATION_CHECK.anchor),
+        `${group.id}: configuration activation must anchor on the startup check in ${ACTIVATION_CHECK.path}`);
     }
     const pgPrepare = group.modes.includes("postgres") && group.operations.includes("mutation_approval.prepare");
     const pgRevoke = group.modes.includes("postgres") && group.operations.includes("service_token.revoke");
@@ -263,7 +296,7 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
     // An unsupported operation is never run as if it had evidence, and a
     // row with an entry point a request reaches cannot be waved through.
     check(!(group.required_mode === "admitted" && group.disposition.includes("unsupported_future_operation")), `${group.id}: required mode admits an unsupported operation`);
-    check(!["outside_gateway", "not_refused"].includes(group.required_mode) || group.entrypoints.length === 0, `${group.id}: a reachable entry point must be admitted or refused`);
+    check(group.required_mode !== "outside_gateway" || group.entrypoints.length === 0, `${group.id}: a reachable entry point must be admitted or refused`);
     check(group.disposition.length > 0 && new Set(group.disposition).size === group.disposition.length, `${group.id}: missing/duplicate disposition`);
     for (const disposition of group.disposition) check(DISPOSITIONS.has(disposition), `${group.id}: unknown disposition`);
     check(!group.disposition.includes("already_sufficient") || group.disposition.length === 1, "sufficient contradicts a gap");
@@ -298,6 +331,8 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
     }
   }
   assert.deepEqual([...schema.properties.operation.enum].sort(), [...OPERATIONS].sort(), "event schema and coverage operations diverged");
+  // Asked even when no row holds the activation, so a rename never passes.
+  activationUnproven();
   return { groups: inventory.groups.length, operationModePairs: seen.size, sourceReferences: references };
 }
 

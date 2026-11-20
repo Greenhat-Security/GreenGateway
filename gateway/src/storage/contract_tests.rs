@@ -34,6 +34,9 @@ use crate::auth::{
     },
     ServiceTokenValidator, SessionCredential, SessionValidator,
 };
+use crate::authority_events::caller_operation::{
+    test_caller_key, CallerKeyReservation, CallerKeyState, CallerOperation, CallerOperationBinding,
+};
 use crate::rbac::{
     policy_history::{PolicyHistoryListFilters, PolicyHistoryStore},
     Policy,
@@ -1217,6 +1220,493 @@ async fn sqlite_service_token_change_evidence_satisfies_the_contract() {
         },
     )
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Caller operation keys bound to one request (issue #425; PostgreSQL
+// migration 36, the standalone reservation table)
+// ---------------------------------------------------------------------------
+
+/// One store's reservation table, driven the way a keyed change drives it:
+/// a read-only look before any work, and a reservation inside a
+/// transaction that commits or rolls back.
+#[async_trait::async_trait]
+trait CallerOperationHarness: Send + Sync {
+    /// The read-only look, outside any transaction.
+    async fn read(&self, operation: &CallerOperation) -> Result<CallerKeyState, RepositoryError>;
+
+    /// Reserve in one transaction, then commit it, or roll it back.
+    async fn reserve(
+        &self,
+        operation: &CallerOperation,
+        commit: bool,
+    ) -> Result<CallerKeyReservation, RepositoryError>;
+
+    /// Reserve `id` the way a keyed service-token revoke does, with no
+    /// binding digest, and commit.
+    async fn reserve_for_a_keyed_revoke(&self, id: uuid::Uuid);
+
+    /// Reserve `first` in one transaction and hold it open while a second
+    /// transaction tries to reserve `second`; commit the first, then let the
+    /// second finish and commit. Both answers, in that order.
+    async fn race(
+        &self,
+        first: &CallerOperation,
+        second: &CallerOperation,
+    ) -> (CallerKeyReservation, CallerKeyReservation);
+
+    /// Every reservation, as `(operation_id, action, binding_digest)`.
+    async fn reservations(&self) -> Vec<(String, String, Option<String>)>;
+}
+
+fn bound_operation(
+    key: uuid::Uuid,
+    action: &'static str,
+    actor: &ChangeActor,
+    request: &[u8],
+) -> CallerOperation {
+    CallerOperation::bind(
+        key,
+        &CallerOperationBinding {
+            action,
+            actor,
+            target: "",
+            precondition: "",
+            request,
+        },
+    )
+    .expect("the key binds")
+}
+
+/// Reserve, exact replay, a different digest and a different action. A key
+/// is reserved once; its request's exact retry is recognized before and
+/// inside the transaction and writes nothing; every other use of the key --
+/// another request body, another actor, another action, or a key a keyed
+/// revoke holds without a digest -- is a conflict and writes nothing. An
+/// action the store keys no digest for is refused before anything is read.
+async fn caller_operation_reservation_contract(harness: &dyn CallerOperationHarness) {
+    let owner = ChangeActor::for_test_with_issuer("operator", "https://one.example.test");
+    let other = ChangeActor::for_test_with_issuer("operator", "https://two.example.test");
+    let key = test_caller_key(11);
+    let issue = bound_operation(
+        key,
+        "service_token.issue",
+        &owner,
+        br#"{"scopes":["read"]}"#,
+    );
+
+    assert_eq!(harness.read(&issue).await.unwrap(), CallerKeyState::Unused);
+    assert_eq!(
+        harness.reserve(&issue, true).await.unwrap(),
+        CallerKeyReservation::Reserved
+    );
+    assert_eq!(
+        harness.read(&issue).await.unwrap(),
+        CallerKeyState::SameBinding
+    );
+    assert_eq!(
+        harness.reserve(&issue, true).await.unwrap(),
+        CallerKeyReservation::SameBinding,
+        "an exact retry is recognized inside the transaction too"
+    );
+    for conflicting in [
+        bound_operation(
+            key,
+            "service_token.issue",
+            &owner,
+            br#"{"scopes":["write"]}"#,
+        ),
+        bound_operation(
+            key,
+            "service_token.issue",
+            &other,
+            br#"{"scopes":["read"]}"#,
+        ),
+        bound_operation(
+            key,
+            "service_token.rotate",
+            &owner,
+            br#"{"scopes":["read"]}"#,
+        ),
+        bound_operation(key, "connection.create", &owner, br#"{"scopes":["read"]}"#),
+    ] {
+        assert_eq!(
+            harness.read(&conflicting).await.unwrap(),
+            CallerKeyState::OtherBinding
+        );
+        assert_eq!(
+            harness.reserve(&conflicting, true).await.unwrap(),
+            CallerKeyReservation::OtherBinding
+        );
+    }
+    assert_eq!(
+        harness.reservations().await,
+        [(
+            key.to_string(),
+            "service_token.issue".to_owned(),
+            Some(issue.binding_digest().to_owned())
+        )],
+        "one reservation, as the first request made it"
+    );
+
+    // A keyed revoke's key has no digest, so no digest-bound request owns it.
+    let revoked = test_caller_key(12);
+    harness.reserve_for_a_keyed_revoke(revoked).await;
+    for action in ["service_token.issue", "connection.create"] {
+        let reuse = bound_operation(revoked, action, &owner, b"{}");
+        assert_eq!(
+            harness.read(&reuse).await.unwrap(),
+            CallerKeyState::OtherBinding
+        );
+        assert_eq!(
+            harness.reserve(&reuse, true).await.unwrap(),
+            CallerKeyReservation::OtherBinding
+        );
+    }
+
+    // The keyed revoke keeps its own path, and an action no key is bound
+    // to is refused before anything is read or written.
+    for action in ["service_token.revoke", "jwt.revoke", "admin_session.grant"] {
+        let refused = bound_operation(test_caller_key(13), action, &owner, b"{}");
+        for error in [
+            harness.read(&refused).await.unwrap_err(),
+            harness.reserve(&refused, true).await.unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), RepositoryErrorKind::InvalidData, "{action}");
+            assert_eq!(error.invalid_parameter_name(), Some("action"), "{action}");
+        }
+    }
+    assert_eq!(harness.reservations().await.len(), 2);
+}
+
+/// I1 for the reservation alone: a reservation made inside a transaction
+/// that rolls back leaves nothing, so the key is still unused and the next
+/// attempt reserves it.
+async fn caller_operation_rolled_back_reservation_contract(harness: &dyn CallerOperationHarness) {
+    let owner = ChangeActor::for_test_with_issuer("operator", "https://one.example.test");
+    let operation = bound_operation(test_caller_key(21), "connection.replace", &owner, b"{}");
+    assert_eq!(
+        harness.reserve(&operation, false).await.unwrap(),
+        CallerKeyReservation::Reserved
+    );
+    assert!(harness.reservations().await.is_empty());
+    assert_eq!(
+        harness.read(&operation).await.unwrap(),
+        CallerKeyState::Unused
+    );
+    assert_eq!(
+        harness.reserve(&operation, true).await.unwrap(),
+        CallerKeyReservation::Reserved
+    );
+    assert_eq!(harness.reservations().await.len(), 1);
+}
+
+/// Competing writers: two transactions reserving one key commit one
+/// reservation. The loser waits for the winner and then reads its
+/// committed row: the same request is an exact retry, another request a
+/// conflict.
+async fn caller_operation_race_contract(harness: &dyn CallerOperationHarness) {
+    let owner = ChangeActor::for_test_with_issuer("operator", "https://one.example.test");
+    let same = bound_operation(test_caller_key(31), "catalog.mcp.publish", &owner, b"{}");
+    assert_eq!(
+        harness.race(&same, &same).await,
+        (
+            CallerKeyReservation::Reserved,
+            CallerKeyReservation::SameBinding
+        )
+    );
+    let first = bound_operation(test_caller_key(32), "connection.delete", &owner, b"{}");
+    let second = bound_operation(
+        test_caller_key(32),
+        "connection.delete",
+        &owner,
+        b"{\"x\":1}",
+    );
+    assert_eq!(
+        harness.race(&first, &second).await,
+        (
+            CallerKeyReservation::Reserved,
+            CallerKeyReservation::OtherBinding
+        )
+    );
+    let reservations = harness.reservations().await;
+    assert_eq!(reservations.len(), 2);
+    assert!(reservations.contains(&(
+        test_caller_key(32).to_string(),
+        "connection.delete".to_owned(),
+        Some(first.binding_digest().to_owned())
+    )));
+}
+
+/// The standalone reservation table in a token database, as the token store
+/// creates it on open. Each call opens its own connection, as another store
+/// on the same file would.
+struct SqliteCallerOperations {
+    path: PathBuf,
+}
+
+impl SqliteCallerOperations {
+    fn new(db: &TempDb) -> Self {
+        drop(SqliteTokenStore::open(&db.path).expect("token store should open"));
+        Self {
+            path: db.path.clone(),
+        }
+    }
+
+    fn connection(path: &std::path::Path) -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open(path).expect("the file opens");
+        connection
+            .busy_timeout(Duration::from_secs(10))
+            .expect("the busy budget sets");
+        connection
+    }
+
+    fn reserve_on(
+        path: &std::path::Path,
+        operation: &CallerOperation,
+        commit: bool,
+    ) -> Result<CallerKeyReservation, RepositoryError> {
+        Self::reserve_with(&Self::connection(path), operation, commit)
+    }
+
+    fn reserve_with(
+        connection: &rusqlite::Connection,
+        operation: &CallerOperation,
+        commit: bool,
+    ) -> Result<CallerKeyReservation, RepositoryError> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .expect("the write lock is taken");
+        let reserved =
+            super::standalone_authority_events::reserve_bound_operation(&transaction, operation);
+        if commit {
+            transaction.commit().expect("the reservation commits");
+        } else {
+            transaction.rollback().expect("the reservation rolls back");
+        }
+        reserved
+    }
+}
+
+#[async_trait::async_trait]
+impl CallerOperationHarness for SqliteCallerOperations {
+    async fn read(&self, operation: &CallerOperation) -> Result<CallerKeyState, RepositoryError> {
+        super::standalone_authority_events::read_caller_operation(
+            &Self::connection(&self.path),
+            operation,
+        )
+    }
+
+    async fn reserve(
+        &self,
+        operation: &CallerOperation,
+        commit: bool,
+    ) -> Result<CallerKeyReservation, RepositoryError> {
+        Self::reserve_on(&self.path, operation, commit)
+    }
+
+    async fn reserve_for_a_keyed_revoke(&self, id: uuid::Uuid) {
+        assert!(
+            super::standalone_authority_events::reserve_unbound_operation(
+                &Self::connection(&self.path),
+                id,
+                crate::auth::tokens::TOKEN_CHANGE_ACTION_REVOKE,
+            )
+            .expect("the reservation inserts")
+        );
+    }
+
+    async fn race(
+        &self,
+        first: &CallerOperation,
+        second: &CallerOperation,
+    ) -> (CallerKeyReservation, CallerKeyReservation) {
+        let holder = Self::connection(&self.path);
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&holder, rusqlite::TransactionBehavior::Immediate)
+                .expect("the write lock is taken");
+        let won = super::standalone_authority_events::reserve_bound_operation(&transaction, first)
+            .expect("the first reservation succeeds");
+        let (path, second) = (self.path.clone(), second.clone());
+        let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let noted = Arc::clone(&blocked);
+        let loser = std::thread::spawn(move || {
+            let mut contender = rusqlite::Connection::open(&path).expect("the file opens");
+            // SQLite calls this each time the contender finds the write lock
+            // taken: the proof that it waited for the first transaction. It
+            // retries for a budget of about ten seconds.
+            contender
+                .busy_handler(Some(move |attempts: i32| {
+                    noted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(5));
+                    attempts < 2_000
+                }))
+                .expect("the busy handler installs");
+            Self::reserve_with(&contender, &second, true)
+        });
+        // Commit only once the second writer is blocked on the write lock,
+        // so the two genuinely overlap on every passing run.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !blocked.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            blocked.load(std::sync::atomic::Ordering::SeqCst),
+            "the second writer waits for the first"
+        );
+        assert!(
+            !loser.is_finished(),
+            "the second writer cannot finish while the first holds the lock"
+        );
+        transaction.commit().expect("the first reservation commits");
+        let lost = loser
+            .join()
+            .expect("the second writer finishes")
+            .expect("the second reservation answers");
+        (won, lost)
+    }
+
+    async fn reservations(&self) -> Vec<(String, String, Option<String>)> {
+        let connection = Self::connection(&self.path);
+        let mut statement = connection
+            .prepare(
+                "SELECT operation_id, action, binding_digest FROM authority_caller_operation_ids \
+                 ORDER BY operation_id",
+            )
+            .expect("the reservations query prepares");
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("the reservations query runs")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("the reservations read");
+        rows
+    }
+}
+
+#[tokio::test]
+async fn sqlite_caller_operation_reservation_contract() {
+    let db = TempDb::new("caller-operation-contract");
+    caller_operation_reservation_contract(&SqliteCallerOperations::new(&db)).await;
+}
+
+#[tokio::test]
+async fn sqlite_a_rolled_back_transaction_leaves_no_reservation() {
+    let db = TempDb::new("caller-operation-rollback");
+    caller_operation_rolled_back_reservation_contract(&SqliteCallerOperations::new(&db)).await;
+}
+
+#[tokio::test]
+async fn sqlite_two_transactions_racing_one_key_reserve_it_once() {
+    let db = TempDb::new("caller-operation-race");
+    caller_operation_race_contract(&SqliteCallerOperations::new(&db)).await;
+}
+
+/// One key, one action, per file: once a keyed revoke used a key, no
+/// issue, rotation or (through the Connections store on the same file)
+/// Connection create can reserve it, and a key an issue or a Connection
+/// create reserved cannot be used by a keyed revoke. Every refusal writes
+/// nothing.
+#[test]
+fn sqlite_a_key_used_by_a_revoke_cannot_be_reserved_by_another_action() {
+    use crate::auth::tokens::{TokenStore, TokenStoreError};
+    use crate::storage::standalone_authority_events::{
+        reserve_bound_operation, StandaloneEvidenceAuthority,
+    };
+
+    let db = TempDb::new("caller-operation-cross-action");
+    let tokens = SqliteTokenStore::open(&db.path).expect("token store should open");
+    let connections = crate::connections::store::SqliteConnectionStore::open(&db.path)
+        .expect("the Connections store opens on the same file");
+    let owner = ChangeActor::for_test_with_issuer("operator", "https://one.example.test");
+    let issue = || {
+        TokenStore::create(
+            &tokens,
+            CreateTokenRequest {
+                scopes: vec!["read".to_owned()],
+                created_by: "operator".to_owned(),
+                expires_at: None,
+            },
+            &owner,
+        )
+        .expect("token should issue")
+        .record
+        .id
+    };
+    let reserve_in = |connection: &rusqlite::Connection, operation: &CallerOperation| {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .expect("the write lock is taken");
+        let reserved = reserve_bound_operation(&transaction, operation).expect("answers");
+        transaction.commit().expect("commits");
+        reserved
+    };
+    let reservations = || {
+        rusqlite::Connection::open(&db.path)
+            .expect("the file opens")
+            .query_row(
+                "SELECT COUNT(*) FROM authority_caller_operation_ids",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("the reservations count")
+    };
+
+    let revoked = issue();
+    let key = test_caller_key(41);
+    TokenStore::revoke_with_operation(&tokens, &revoked, &owner, Some(key))
+        .expect("the keyed revoke commits")
+        .expect("token should exist");
+    assert_eq!(reservations(), 1);
+    let file = SqliteCallerOperations::connection(&db.path);
+    for action in ["service_token.issue", "service_token.rotate"] {
+        assert_eq!(
+            reserve_in(&file, &bound_operation(key, action, &owner, b"{}")),
+            CallerKeyReservation::OtherBinding,
+            "{action}"
+        );
+    }
+    assert_eq!(
+        reserve_in(
+            &connections.evidence_connection(),
+            &bound_operation(key, "connection.create", &owner, b"{}")
+        ),
+        CallerKeyReservation::OtherBinding
+    );
+    assert_eq!(reservations(), 1);
+
+    // The reverse order: a key another action reserved refuses the revoke.
+    let live = issue();
+    for (seed, action) in [(42, "service_token.issue"), (43, "connection.create")] {
+        let key = test_caller_key(seed);
+        let operation = bound_operation(key, action, &owner, b"{}");
+        let reserved = if action == "connection.create" {
+            reserve_in(&connections.evidence_connection(), &operation)
+        } else {
+            reserve_in(&file, &operation)
+        };
+        assert_eq!(reserved, CallerKeyReservation::Reserved);
+        assert!(matches!(
+            TokenStore::revoke_with_operation(&tokens, &live, &owner, Some(key)),
+            Err(TokenStoreError::RevokeOperationConflict)
+        ));
+    }
+    assert!(TokenStore::get_by_id(&tokens, &live)
+        .expect("token should load")
+        .expect("token should exist")
+        .revoked_at
+        .is_none());
+    assert_eq!(reservations(), 3);
+    assert_eq!(
+        sqlite_token_evidence(&db.path).len(),
+        3,
+        "two issues and one revoke: the refused revokes recorded nothing"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -6899,6 +7389,170 @@ pub(crate) mod postgres_audit_tests {
         let (store, pool) = migrated_service_token_store(&database).await;
         super::service_token_change_evidence_contract(&*store, &PostgresTokenEvidence { pool })
             .await;
+    }
+
+    /// `greengateway.authority_caller_operation_ids` at schema 36, through
+    /// the pooled sessions a keyed change would use.
+    struct PostgresCallerOperations {
+        pool: deadpool_postgres::Pool,
+    }
+
+    impl PostgresCallerOperations {
+        async fn reserve_on(
+            client: &deadpool_postgres::Object,
+            operation: &CallerOperation,
+            commit: bool,
+        ) -> Result<CallerKeyReservation, RepositoryError> {
+            client.batch_execute("BEGIN").await.expect("BEGIN");
+            let reserved = crate::storage::postgres_authority_events::reserve_bound_operation(
+                client, operation,
+            )
+            .await;
+            let end = if commit && reserved.is_ok() {
+                "COMMIT"
+            } else {
+                "ROLLBACK"
+            };
+            client
+                .batch_execute(end)
+                .await
+                .expect("the transaction ends");
+            reserved
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::CallerOperationHarness for PostgresCallerOperations {
+        async fn read(
+            &self,
+            operation: &CallerOperation,
+        ) -> Result<CallerKeyState, RepositoryError> {
+            let client = self.pool.get().await.expect("checkout");
+            crate::storage::postgres_authority_events::read_caller_operation(&client, operation)
+                .await
+        }
+
+        async fn reserve(
+            &self,
+            operation: &CallerOperation,
+            commit: bool,
+        ) -> Result<CallerKeyReservation, RepositoryError> {
+            let client = self.pool.get().await.expect("checkout");
+            Self::reserve_on(&client, operation, commit).await
+        }
+
+        async fn reserve_for_a_keyed_revoke(&self, id: uuid::Uuid) {
+            let client = self.pool.get().await.expect("checkout");
+            assert!(
+                crate::storage::postgres_authority_events::reserve_caller_operation(
+                    &client,
+                    id,
+                    crate::auth::tokens::TOKEN_CHANGE_ACTION_REVOKE,
+                )
+                .await
+                .expect("the reservation inserts")
+            );
+        }
+
+        async fn race(
+            &self,
+            first: &CallerOperation,
+            second: &CallerOperation,
+        ) -> (CallerKeyReservation, CallerKeyReservation) {
+            let holder = self.pool.get().await.expect("checkout");
+            holder.batch_execute("BEGIN").await.expect("BEGIN");
+            let won =
+                crate::storage::postgres_authority_events::reserve_bound_operation(&holder, first)
+                    .await
+                    .expect("the first reservation succeeds");
+            let contender = self.pool.get().await.expect("checkout");
+            let second = second.clone();
+            let loser = tokio::spawn(async move {
+                // Waits on the first transaction's uncommitted key.
+                Self::reserve_on(&contender, &second, true).await
+            });
+            // Commit only once the second writer is blocked on the key, so
+            // the two genuinely overlap.
+            let observer = self.pool.get().await.expect("checkout");
+            let mut blocked = false;
+            for _ in 0..500 {
+                let waiting: i64 = observer
+                    .query_one(
+                        "SELECT count(*) FROM pg_stat_activity \
+                         WHERE datname = current_database() AND wait_event_type = 'Lock'",
+                        &[],
+                    )
+                    .await
+                    .expect("the activity reads")
+                    .get(0);
+                if waiting > 0 {
+                    blocked = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(blocked, "the second writer waits for the first");
+            holder.batch_execute("COMMIT").await.expect("COMMIT");
+            let lost = loser
+                .await
+                .expect("the second writer finishes")
+                .expect("the second reservation answers");
+            (won, lost)
+        }
+
+        async fn reservations(&self) -> Vec<(String, String, Option<String>)> {
+            let client = self.pool.get().await.expect("checkout");
+            client
+                .query(
+                    "SELECT operation_id::text, action, binding_digest \
+                     FROM greengateway.authority_caller_operation_ids ORDER BY operation_id",
+                    &[],
+                )
+                .await
+                .expect("the reservations read")
+                .iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_caller_operation_reservation_contract() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_store, pool) = migrated_service_token_store(&database).await;
+        super::caller_operation_reservation_contract(&PostgresCallerOperations { pool }).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_a_rolled_back_transaction_leaves_no_reservation() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_store, pool) = migrated_service_token_store(&database).await;
+        super::caller_operation_rolled_back_reservation_contract(&PostgresCallerOperations {
+            pool,
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_two_transactions_racing_one_key_reserve_it_once() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_store, pool) = migrated_service_token_store(&database).await;
+        super::caller_operation_race_contract(&PostgresCallerOperations { pool }).await;
     }
 
     struct PostgresTokenIssueHarness<'a> {

@@ -9,7 +9,8 @@
 //! one task delivers every source:
 //!
 //! 1. Read at most `batch_size` rows after the source's committed cursor.
-//! 2. Project them all under the store's keyring ([`project_standalone`]).
+//! 2. Project them all under the store's keyring ([`project_standalone`]),
+//!    in the format the sink negotiated.
 //!    A row that cannot be projected faithfully refuses the batch, so
 //!    nothing after it is offered ahead of it.
 //! 3. Offer the batch to the sink.
@@ -61,7 +62,7 @@ use super::{
 };
 use crate::{
     audit,
-    config::AuthorityEventSettings,
+    config::{AuthorityEventFormat, AuthorityEventSettings},
     connections::secret::SecretResolver,
     lifecycle::GatewayLifecycle,
     storage::{
@@ -248,7 +249,7 @@ impl SourceLane {
             None => self.reopen().await?,
         };
         if self.accepted.is_none() {
-            if self.pending.is_empty() && !self.fill(committed, batch_size).await? {
+            if self.pending.is_empty() && !self.fill(committed, batch_size, sink.format()).await? {
                 return Ok(StepOutcome::Idle);
             }
             if stop.is_cancelled() {
@@ -272,7 +273,12 @@ impl SourceLane {
 
     /// Read and project the next batch. `false` when there is none. A row
     /// that cannot be projected refuses the whole batch.
-    async fn fill(&mut self, committed: i64, batch_size: usize) -> Result<bool, StepError> {
+    async fn fill(
+        &mut self,
+        committed: i64,
+        batch_size: usize,
+        format: AuthorityEventFormat,
+    ) -> Result<bool, StepError> {
         let limit = batch_size.clamp(1, MAX_READ_BATCH);
         let authority = Arc::clone(&self.authority);
         let source = self.source;
@@ -285,12 +291,14 @@ impl SourceLane {
         let through = last.sequence;
         let mut projected = Vec::with_capacity(rows.len());
         for row in &rows {
-            projected.push(project_standalone(row, &self.keyring).map_err(|error| {
-                StepError::Projection {
-                    sequence: row.sequence,
-                    error,
-                }
-            })?);
+            projected.push(
+                project_standalone(row, &self.keyring, format).map_err(|error| {
+                    StepError::Projection {
+                        sequence: row.sequence,
+                        error,
+                    }
+                })?,
+            );
         }
         self.pending = projected;
         self.pending_through = through;

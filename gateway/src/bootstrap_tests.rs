@@ -8,7 +8,8 @@
 //! compiler runs first and alone, that every stage receives its one result,
 //! that a refused configuration reaches no stage at all, and that a stage
 //! that fails stops the ones after it -- with a failure before the gateway
-//! served withdrawing what preflight had published.
+//! served withdrawing what preflight had published. Under required
+//! authority evidence no stage runs at all (issue #425).
 
 use std::{cell::RefCell, env::VarError, rc::Rc};
 
@@ -604,4 +605,153 @@ fn compiling_touches_nothing_the_configuration_names() {
         );
     }
     assert!(!root.exists());
+}
+
+/// A cluster configuration the compiler accepts. Like every fixture here it
+/// names a database it never reaches: the double stands in for preflight.
+const CLUSTER: &[(&str, &str)] = &[
+    ("STATE_BACKEND", "postgres"),
+    ("DEPLOYMENT_ID", "deploy-prod-eu"),
+    (
+        "DATABASE_URL_FILE",
+        "/run/secrets/greengateway/database-url",
+    ),
+    ("CONNECTION_SECRETS_ROOT", "/run/secrets/greengateway"),
+    (
+        "RATE_LIMIT_KEYRING",
+        r#"[{"id":"rl-primary","file":"rate-limit-key","role":"primary"}]"#,
+    ),
+    ("UPSTREAM_URL", "https://upstream.invalid"),
+];
+
+/// What `AUTHORITY_EVIDENCE_DURABILITY=required` needs to pass the
+/// compiler: a sink to deliver the evidence and a key to pseudonymize it.
+const REQUIRED_EVIDENCE: &[(&str, &str)] = &[
+    ("AUTHORITY_EVIDENCE_DURABILITY", "required"),
+    ("AUTHORITY_EVENT_SINK", "log"),
+    ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-2026-11"),
+];
+
+/// Each deployment mode's fixture, under its mode name in refusals.
+fn deployment_modes() -> [(&'static str, &'static [(&'static str, &'static str)]); 2] {
+    [("standalone", STANDALONE), ("cluster", CLUSTER)]
+}
+
+/// Owner decision 2 of issue #425 (2026-11-19): under required authority
+/// evidence the gateway refuses to start, because nothing records the
+/// activation of its configuration. The refusal comes after the compiler
+/// accepted the environment and before preflight, so no stage runs: no
+/// database connection, migration, membership row, tools seed or listener.
+#[test]
+fn required_authority_evidence_refuses_to_start_before_any_stage_runs() {
+    for (mode, fixture) in deployment_modes() {
+        let fixture = [fixture, REQUIRED_EVIDENCE].concat();
+        let (result, stages) = start(&fixture, None, nothing_to_check());
+        let Err(StartupFailure::AuthorityEvidence(refusal)) = result else {
+            panic!("{mode}: expected the activation refusal, got {result:?}");
+        };
+        assert_eq!(refusal.code(), "authority_evidence_activation_unevidenced");
+        assert!(refusal.message().contains(mode), "{mode}: {refusal}");
+        // The compiler accepted the environment, and nothing else read it.
+        let accepted = config::Config::from_env_vars(|name| fixture_value(&fixture, name))
+            .unwrap_or_else(|error| panic!("{mode}: the fixture compiles: {error}"));
+        assert_eq!(
+            accepted.authority_events.durability,
+            config::AuthorityEvidenceDurability::Required
+        );
+        assert_eq!(*stages.calls.borrow(), legacy_reads(&fixture), "{mode}");
+        assert!(stage_calls(&stages).is_empty(), "{mode}");
+        assert_eq!(stages.preflighted, None, "{mode}");
+        assert_eq!(stages.activated, None, "{mode}");
+        assert_eq!(stages.withdrawn, None, "{mode}");
+    }
+}
+
+#[test]
+fn best_effort_runs_every_stage_as_before() {
+    for (mode, fixture) in deployment_modes() {
+        let explicit = [fixture, &[("AUTHORITY_EVIDENCE_DURABILITY", "best_effort")]].concat();
+        for fixture in [fixture, &explicit[..]] {
+            let (result, stages) = start(fixture, None, nothing_to_check());
+            assert!(result.is_ok(), "{mode}: {result:?}");
+            assert_eq!(
+                stage_calls(&stages),
+                [Call::Preflight, Call::Activate, Call::Serve],
+                "{mode}"
+            );
+            let expected = config::Config::from_env_vars(|name| fixture_value(fixture, name))
+                .expect("the fixture is valid");
+            assert_eq!(
+                expected.authority_events.durability,
+                config::AuthorityEvidenceDurability::BestEffort
+            );
+            assert_eq!(stages.preflighted.as_ref(), Some(&expected), "{mode}");
+            assert_eq!(stages.activated.as_ref(), Some(&expected), "{mode}");
+            assert_eq!(stages.withdrawn, None, "{mode}");
+        }
+    }
+}
+
+#[test]
+fn a_compiler_refusal_is_reported_before_the_activation_refusal() {
+    for (mode, fixture) in deployment_modes() {
+        let fixture = [fixture, &[("AUTHORITY_EVIDENCE_DURABILITY", "required")]].concat();
+        let (result, stages) = start(&fixture, None, nothing_to_check());
+        let Err(StartupFailure::Configuration(error)) = result else {
+            panic!("{mode}: expected the compiler's refusal, got {result:?}");
+        };
+        let rules: Vec<_> = error
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.rule)
+            .collect();
+        assert_eq!(
+            rules,
+            [config::diagnostic::ConfigRule::AuthorityEvidenceDeliveryRequired],
+            "{mode}"
+        );
+        assert!(stage_calls(&stages).is_empty(), "{mode}");
+    }
+}
+
+#[test]
+fn the_activation_refusal_names_the_setting_and_no_configured_value() {
+    let markers = [
+        ("UPSTREAM_URL", "https://refusal-marker-upstream.invalid"),
+        ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "refusal-marker-alias"),
+        ("AUDIT_SQLITE_PATH", "refusal-marker-store/audit.sqlite"),
+    ];
+    for (mode, fixture) in deployment_modes() {
+        let mut fixture = [&markers[..], REQUIRED_EVIDENCE, fixture].concat();
+        if mode == "cluster" {
+            // A cluster gateway keeps its audit in the shared database.
+            fixture.retain(|(name, _)| *name != "AUDIT_SQLITE_PATH");
+            fixture.insert(0, ("DEPLOYMENT_ID", "refusal-marker-deployment"));
+        }
+        let (result, _) = start(&fixture, None, nothing_to_check());
+        let Err(StartupFailure::AuthorityEvidence(refusal)) = result else {
+            panic!("{mode}: expected the activation refusal, got {result:?}");
+        };
+        let message = refusal.to_string();
+        assert_eq!(message, refusal.message());
+        for expected in [
+            "authority_evidence_activation_unevidenced",
+            "AUTHORITY_EVIDENCE_DURABILITY=required",
+            "configuration.activate",
+            mode,
+        ] {
+            assert!(message.contains(expected), "{mode}: {message}");
+        }
+        // Every value the environment holds is withheld, the markers and
+        // the fixture's own alike.
+        let debug = format!("{refusal:?}");
+        for shown in [&message, &debug] {
+            for (_, value) in &fixture {
+                if !matches!(*value, "required" | "log" | "postgres") {
+                    assert!(!shown.contains(value), "{mode}: {shown} shows {value}");
+                }
+            }
+            assert!(!shown.contains("refusal-marker"), "{mode}: {shown}");
+        }
+    }
 }

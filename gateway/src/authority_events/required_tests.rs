@@ -250,7 +250,8 @@ fn backend_of(mode: &str) -> StateBackend {
 /// enforces it: every operation a row refuses has a gate that refuses it in
 /// that mode, every operation a gate covers agrees with its row, and the
 /// only operations required mode refuses at startup are the ones the
-/// configuration compiler refuses.
+/// configuration compiler refuses and the activation that starts the
+/// gateway, which [`startup_refusal`] refuses.
 #[test]
 fn the_gate_enforces_exactly_what_the_evidence_inventory_says() {
     let inventory = inventory();
@@ -293,7 +294,6 @@ fn the_gate_enforces_exactly_what_the_evidence_inventory_says() {
                                     | "refused_at_startup"
                                     | "unavailable"
                                     | "outside_gateway"
-                                    | "not_refused"
                             ),
                             "{id}: {code} in {mode} is {required_mode} and no gate asks about it"
                         );
@@ -319,8 +319,10 @@ fn the_gate_enforces_exactly_what_the_evidence_inventory_says() {
         BTreeSet::from([
             ("admin_session.grant", "standalone"),
             ("admin_session.withdraw", "standalone"),
+            ("configuration.activate", "postgres"),
+            ("configuration.activate", "standalone"),
         ]),
-        "config_tests covers each refusal at startup"
+        "config_tests covers the session refusal and bootstrap_tests the activation refusal"
     );
     // The standalone Connections database records these in the change's own
     // transaction, so required mode admits them and no gate asks: Connection
@@ -347,18 +349,28 @@ fn the_gate_enforces_exactly_what_the_evidence_inventory_says() {
         );
         assert!(gated_operation(code).is_none(), "{code} is not gated");
     }
-    // The one unsupported operation required mode runs is the activation
-    // that starts it.
-    let not_refused: Vec<_> = by_mode
-        .iter()
-        .filter(|(_, required_mode)| **required_mode == "not_refused")
-        .map(|((code, mode), _)| (*code, *mode))
-        .collect();
-    assert_eq!(
-        not_refused,
-        [
-            ("configuration.activate", "postgres"),
-            ("configuration.activate", "standalone"),
-        ]
-    );
+}
+
+/// No proof of a configuration activation exists, so required mode refuses
+/// every start in both modes (owner decision 2 of issue #425, 2026-11-19).
+/// This asserts a constant on purpose: the evidence inventory's checker is
+/// what stops the proof type from gaining a value without the inventory row
+/// and this hook changing with it (issue #242).
+#[test]
+fn no_activation_proof_exists_for_any_candidate() {
+    for backend in [StateBackend::Sqlite, StateBackend::Postgres] {
+        assert!(
+            activation_proof(&ActivationCandidate { backend }).is_none(),
+            "{backend:?}"
+        );
+        let refusal = StartupEvidenceRefusal { backend };
+        assert_eq!(refusal.code(), "authority_evidence_activation_unevidenced");
+        assert_eq!(
+            refusal.message(),
+            format!(
+                "authority_evidence_activation_unevidenced: AUTHORITY_EVIDENCE_DURABILITY=required refuses configuration.activate: {} mode records no durable evidence of the configuration it would activate (issue #242); nothing was activated",
+                mode_name(backend)
+            )
+        );
+    }
 }

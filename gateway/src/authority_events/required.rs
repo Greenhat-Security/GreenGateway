@@ -15,6 +15,10 @@
 //!   own (`ADMIN_SESSION_MODE=standalone_memory`), or a gateway of either mode
 //!   that would record evidence without a sink to deliver it, is refused by the
 //!   configuration compiler (`config::authority_events`, `config::storage`).
+//!   A configuration the compiler accepts is then refused by serving startup
+//!   before preflight ([`startup_refusal`]): nothing records the activation
+//!   of the configuration itself until issue #242, so required mode refuses
+//!   to start in either deployment mode.
 //! - **Requests.** Every admin endpoint that makes one of the changes below
 //!   asks [`AuthorityEvidenceGate::admit`] once the caller is authorized and
 //!   before anything is written, and answers a refusal `409` with reason
@@ -363,6 +367,90 @@ impl AuthorityEvidenceGate {
         };
         audit.emit(event);
         Err(refusal)
+    }
+}
+
+/// What serving startup is about to activate. Today this is the
+/// environment-compiled configuration, which has no revision identity.
+/// Issue #242 adds the ledger revision and the safe manifest digest of the
+/// plan or bundle.
+pub(crate) struct ActivationCandidate {
+    pub(crate) backend: StateBackend,
+}
+
+/// Proof that the activation of exactly this candidate is durably recorded.
+///
+/// Uninhabited on purpose: no value can exist until issue #242 adds a
+/// constructor that reads a ledger or activation record matching this
+/// candidate (same digest, same revision), inside the activation stage and
+/// atomically with it. A value granted to a whole backend, or one computed
+/// before a store is open, is not a proof. Because a ledger record can only
+/// be read once preflight has opened a store, that change also moves the
+/// decision out of [`startup_refusal`]'s place before preflight and into
+/// the activation stage, keeping its rule: nothing is published or served
+/// before the proof exists. The evidence inventory's checker holds the
+/// `configuration_activation` row at `refused_at_startup` while this type
+/// is uninhabited, so the type, the check and the row change together.
+pub(crate) enum ActivationProof {}
+
+/// The proof that `candidate`'s activation is durably recorded, if one
+/// exists. None can exist yet (see [`ActivationProof`]).
+pub(crate) fn activation_proof(_candidate: &ActivationCandidate) -> Option<ActivationProof> {
+    None
+}
+
+/// Serving startup refused under `AUTHORITY_EVIDENCE_DURABILITY=required`
+/// because nothing records the activation of the configuration it would
+/// serve (owner decision 2 of issue #425, 2026-11-19). No stage ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StartupEvidenceRefusal {
+    backend: StateBackend,
+}
+
+impl StartupEvidenceRefusal {
+    /// The stable code the refusal carries.
+    pub(crate) const fn code(&self) -> &'static str {
+        "authority_evidence_activation_unevidenced"
+    }
+
+    /// The operator-facing explanation. It names the setting, the operation
+    /// and the deployment mode, and nothing read from the environment.
+    pub(crate) fn message(&self) -> String {
+        format!(
+            "{}: AUTHORITY_EVIDENCE_DURABILITY=required refuses configuration.activate: {} mode records no durable evidence of the configuration it would activate (issue #242); nothing was activated",
+            self.code(),
+            mode_name(self.backend),
+        )
+    }
+}
+
+impl std::fmt::Display for StartupEvidenceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for StartupEvidenceRefusal {}
+
+/// Whether serving startup must stop before preflight because required
+/// mode cannot evidence the configuration's activation. `best_effort`, the
+/// default, never refuses. Pure: reads configuration only. Offline commands
+/// do not ask: they activate nothing, and those that change authority
+/// (`revoke-jwt`) record their own evidence.
+pub(crate) fn startup_refusal(config: &Config) -> Option<StartupEvidenceRefusal> {
+    match config.authority_events.durability {
+        AuthorityEvidenceDurability::BestEffort => None,
+        AuthorityEvidenceDurability::Required => {
+            let candidate = ActivationCandidate {
+                backend: config.state_backend,
+            };
+            match activation_proof(&candidate) {
+                Some(proof) => match proof {},
+                None => Some(StartupEvidenceRefusal {
+                    backend: candidate.backend,
+                }),
+            }
+        }
     }
 }
 

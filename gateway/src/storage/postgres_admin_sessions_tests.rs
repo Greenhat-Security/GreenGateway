@@ -1037,7 +1037,7 @@ async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
     // Retention frees the delivered rows -- never a held unit -- and the
     // refused grant completes.
     assert_eq!(
-        PostgresAuthorityEventStore::prune_with(&client, Duration::ZERO, 1_000)
+        PostgresAuthorityEventStore::prune_with(&client, Duration::ZERO, 1_000, false)
             .await
             .expect("retention runs"),
         8

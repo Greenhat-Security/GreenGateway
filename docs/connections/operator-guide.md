@@ -886,7 +886,7 @@ cascades to its approvals. The gateway emits `connection.mutation_approval`
 with the actor, operation and outcome. It records successful consumption
 before attempting transport. It excludes token material, request and response
 bodies, raw URLs and signing keys from approval events. A consumption event
-does not establish that the upstream applied the mutation. With `AUTHORITY_EVIDENCE_DURABILITY=required`, PostgreSQL admits this keyed prepare route when the configured consumer accepts `qualified_v1`. Both modes refuse unkeyed preparation, review, revocation and consumption with `409 authority_evidence_unsupported`. Standalone also refuses keyed preparation in required mode and returns `501` for that route in best-effort mode. Authorized reads remain available.
+does not establish that the upstream applied the mutation. With `AUTHORITY_EVIDENCE_DURABILITY=required`, PostgreSQL admits this keyed prepare route when the configured consumer accepts `qualified_v1`. Both modes refuse unkeyed preparation, review, revocation and consumption with `409 authority_evidence_unsupported`. Standalone also refuses keyed preparation in required mode and returns `501` for that route in best-effort mode. Authorized reads remain available. Until #242 evidences configuration activation, a gateway with `AUTHORITY_EVIDENCE_DURABILITY=required` refuses to start in either mode, so these answers are what the mode will give once it can start ([required-durability mode](../authority-evidence.md#required-durability-mode)).
 
 #### Signing keys
 

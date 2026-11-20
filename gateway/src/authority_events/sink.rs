@@ -287,7 +287,7 @@ mod tests {
 
     fn record(sequence: &str) -> DeliveryRecord {
         DeliveryRecord {
-            qualified_actor: None,
+            qualified: None,
             schema_version: crate::authority_events::delivery::DELIVERY_SCHEMA_VERSION.to_owned(),
             authority_id: uuid::Uuid::new_v4().to_string(),
             event_id: uuid::Uuid::new_v4().to_string(),

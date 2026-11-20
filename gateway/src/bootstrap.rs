@@ -50,6 +50,7 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(StartupFailure::Configuration(err)) => {
             eprintln!("{err}");
         }
+        Err(StartupFailure::AuthorityEvidence(refusal)) => eprintln!("{refusal}"),
         Err(StartupFailure::Bundle(diagnostics)) => {
             for diagnostic in diagnostics {
                 eprintln!("{diagnostic}");
