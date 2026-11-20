@@ -349,6 +349,141 @@ describe('PolicyStudioView', () => {
     expect(gateway.live.etag).toBe(LIVE_ETAG);
   });
 
+  it('a publication refused by the required stored suite names its status and counts and offers running the stored suite', async () => {
+    const gateway = fakeGateway({ permissions: [READ, WRITE, 'admin:policy:simulate'] });
+    renderStudio(gateway);
+    await openDraft();
+    fireEvent.change(screen.getByLabelText('Policy id'), { target: { value: 'next' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+    await screen.findByText('Revision 2 saved. The live policy is unchanged.', undefined, WAIT);
+    const publish = screen.getByRole('button', { name: 'Publish draft' }) as HTMLButtonElement;
+    await waitFor(() => expect(publish.disabled).toBe(false), WAIT);
+    fireEvent.click(publish);
+    gateway.publishRefusal = jsonResponse(422, {
+      error: 'the stored policy test suite this deployment requires did not pass against this policy; nothing was written',
+      reason: 'policy_tests_required_failed',
+      required_tests: {
+        status: 'failed',
+        suite_version: 3,
+        suite_etag: '"sha256:suite-3"',
+        summary: { total: 4, passed: 3, failed: 1, incomplete: 0, errors: 0 },
+      },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm publish' }));
+
+    const refused = await screen.findByText('Not published: the required test suite did not pass', undefined, WAIT);
+    const panel = refused.closest('.policy-studio-problem') as HTMLElement;
+    expect(within(panel).getByText(/At least one case did not give the expected answer/)).toBeTruthy();
+    expect(within(panel).getByText(/stored suite version 3/)).toBeTruthy();
+    expect(within(panel).getByText(/4 cases: 3 passed, 1 failed, 0 incomplete, 0 errors/)).toBeTruthy();
+    expect(within(panel).getByText(/Nothing was published and the live policy is unchanged/)).toBeTruthy();
+    expect(gateway.live.etag).toBe(LIVE_ETAG);
+
+    fireEvent.click(within(panel).getByRole('button', { name: 'Run the stored suite against this draft' }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Test' }).getAttribute('aria-selected')).toBe('true'),
+    );
+    expect((screen.getByRole('radio', { name: /The open draft/ }) as HTMLInputElement).checked).toBe(true);
+    // The run is pinned to the version that refused the publication.
+    await waitFor(
+      () => expect(gateway.requests('POST', '/v1/admin/policy/tests/runs')).toHaveLength(1),
+      WAIT,
+    );
+    const [run] = gateway.requests('POST', '/v1/admin/policy/tests/runs');
+    expect(JSON.parse(run.body ?? '{}').suite).toEqual({ source: 'stored', etag: '"sha256:suite-3"' });
+  });
+
+  it('a publication refused because the required suite could not be read is a definite refusal with nothing to run', async () => {
+    const gateway = fakeGateway({ permissions: [READ, WRITE, 'admin:policy:simulate'] });
+    renderStudio(gateway);
+    await publishRefusedWith(
+      gateway,
+      jsonResponse(503, {
+        error: 'the policy test suite store is unavailable; nothing was written',
+        reason: 'policy_tests_unavailable',
+        required_tests: { status: 'suite_unavailable', suite_version: null, suite_etag: null, summary: null },
+      }),
+    );
+    const refused = await screen.findByText(
+      'Not published: the required test suite could not be read',
+      undefined,
+      WAIT,
+    );
+    const panel = refused.closest('.policy-studio-problem') as HTMLElement;
+    expect(within(panel).getByText(/Nothing was published and the live policy is unchanged/)).toBeTruthy();
+    expect(within(panel).getByText(/Check that the gateway has a suite store configured/)).toBeTruthy();
+    expect(within(panel).queryByRole('button', { name: 'Run the stored suite against this draft' })).toBeNull();
+    expect(screen.queryByText(/did not confirm the publication/)).toBeNull();
+  });
+
+  it('a stored run asked from a refused publication that cannot start says why', async () => {
+    const gateway = fakeGateway({ permissions: [READ, WRITE, 'admin:policy:simulate'] });
+    gateway.validate = () =>
+      jsonResponse(200, {
+        ...validInspection(),
+        diagnostics: [
+          diagnostic({
+            severity: 'warning',
+            blocks: { simulation: true, tests: true, publication: false, evidence: false },
+          }),
+        ],
+      });
+    renderStudio(gateway);
+    await publishRefusedWith(
+      gateway,
+      jsonResponse(422, {
+        error: 'the stored policy test suite this deployment requires did not pass against this policy; nothing was written',
+        reason: 'policy_tests_required_failed',
+        required_tests: {
+          status: 'failed',
+          suite_version: 3,
+          suite_etag: '"sha256:suite-3"',
+          summary: { total: 1, passed: 0, failed: 1, incomplete: 0, errors: 0 },
+        },
+      }),
+    );
+    const refused = await screen.findByText('Not published: the required test suite did not pass', undefined, WAIT);
+    const panel = refused.closest('.policy-studio-problem') as HTMLElement;
+    fireEvent.click(within(panel).getByRole('button', { name: 'Run the stored suite against this draft' }));
+    const tests = screen.getByRole('tabpanel', { name: 'Test' });
+    expect(await within(tests).findByText('The stored suite did not run', undefined, WAIT)).toBeTruthy();
+    expect(within(tests).getAllByText(/rule out a test run/).length).toBeGreaterThan(0);
+    expect(gateway.requests('POST', '/v1/admin/policy/tests/runs')).toEqual([]);
+  });
+
+  it('a publication refused because no suite is stored offers no run of it', async () => {
+    const gateway = fakeGateway({ permissions: [READ, WRITE, 'admin:policy:simulate'] });
+    renderStudio(gateway);
+    await publishRefusedWith(
+      gateway,
+      jsonResponse(422, {
+        error: 'the stored policy test suite this deployment requires did not pass against this policy; nothing was written',
+        reason: 'policy_tests_required_failed',
+        required_tests: { status: 'suite_missing', suite_version: null, suite_etag: null, summary: null },
+      }),
+    );
+    const refused = await screen.findByText('Not published: the required test suite did not pass', undefined, WAIT);
+    const panel = refused.closest('.policy-studio-problem') as HTMLElement;
+    expect(within(panel).getByText(/There is no suite to run/)).toBeTruthy();
+    expect(within(panel).queryByRole('button', { name: 'Run the stored suite against this draft' })).toBeNull();
+  });
+
+  it('a 503 without required_tests, or a plain 500, still leaves a publication unknown', async () => {
+    const answers = [
+      jsonResponse(503, { error: 'unavailable', reason: 'policy_tests_unavailable' }),
+      jsonResponse(500, { error: 'internal error' }),
+    ];
+    for (const answer of answers) {
+      const gateway = fakeGateway({ permissions: [READ, WRITE, 'admin:policy:simulate'] });
+      renderStudio(gateway);
+      await publishRefusedWith(gateway, answer);
+      expect(await screen.findByText(/did not confirm the publication/, undefined, WAIT)).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Check the draft on the gateway' })).toBeTruthy();
+      expect(screen.queryByText(/Not published: the required test suite/)).toBeNull();
+      cleanup();
+    }
+  });
+
   it('withdraws a publish confirmation when the draft changes and publishes only what was reviewed', async () => {
     const gateway = fakeGateway();
     gateway.drafts.get(DRAFT_ID)!.policy = { ...draftPolicy(), default_action: 'allow' };
@@ -990,4 +1125,18 @@ async function openDraft() {
     await screen.findByRole('button', { name: `Open draft ${DRAFT_ID}` }, WAIT),
   );
   await screen.findByRole('tablist', { name: 'Policy sections' }, WAIT);
+}
+
+// Save an edit to the open draft and confirm its publication, which the
+// gateway answers with `answer`.
+async function publishRefusedWith(gateway: ReturnType<typeof fakeGateway>, answer: Response) {
+  await openDraft();
+  fireEvent.change(screen.getByLabelText('Policy id'), { target: { value: 'next' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+  await screen.findByText('Revision 2 saved. The live policy is unchanged.', undefined, WAIT);
+  const publish = screen.getByRole('button', { name: 'Publish draft' }) as HTMLButtonElement;
+  await waitFor(() => expect(publish.disabled).toBe(false), WAIT);
+  fireEvent.click(publish);
+  gateway.publishRefusal = answer;
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm publish' }));
 }
