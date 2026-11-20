@@ -2417,7 +2417,7 @@
       ],
       "required_durability_supported": false,
       "required_mode": "refused_at_startup",
-      "test_claim": "The bootstrap tests prove that required mode refuses to start in both modes before any stage runs, after a compiler refusal and with a value-free message, and that best_effort startup is unchanged; the rest are existing behavior regression anchors. No test certifies activation evidence, because none exists."
+      "test_claim": "The bootstrap tests prove that required mode refuses to start in both modes before any stage runs, with a value-free message; that the compiler's refusals are reported instead when they apply; and that best_effort startup is unchanged. gateway/tests/audit_durability_startup.rs runs the real binary under required in both modes and proves it exits with status 1 and writes nothing. The rest are existing behavior regression anchors. No test certifies activation evidence, because none exists."
     },
     {
       "id": "configuration_export",

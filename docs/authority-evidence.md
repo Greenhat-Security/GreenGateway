@@ -1194,7 +1194,9 @@ What required mode does not do:
 
 Tests: `gateway/src/authority_events/required_tests.rs` holds the gate's table to the
 inventory (every `refused` row has a gate that refuses it in that mode, every gate
-agrees with its row, and the only startup refusals are the three above), checks both
+agrees with its row, and the only operations refused at startup are standalone admin
+sessions and configuration activation in both modes; the compiler also refuses
+`required` with no sink), checks both
 modes and the refusal's audit event, and holds the evidenced standalone Connection,
 local-secret and catalog rows `admitted` and ungated; `authority_evidence_app_tests.rs`
 drives every refused standalone admin endpoint through the real handlers and asserts
@@ -1205,9 +1207,12 @@ reload helpers in `middleware/rbac_tests.rs` and `tools/definitions.rs` refuse a
 reload and keep the active document; `config_tests.rs`,
 `gateway-config/src/compiler/stage_tests.rs` and `ha.rs` cover the startup rules,
 their diagnostics and the fingerprint; `bootstrap_tests.rs` shows that serving
-startup refuses required mode in both modes before any stage runs, after the
-compiler's refusals and with a value-free message, and that `best_effort` startup
-runs every stage as before.
+startup refuses required mode in both modes before any stage runs, with a
+value-free message, that the compiler's refusals are reported instead when they
+apply, and that `best_effort` startup runs every stage as before;
+`gateway/tests/audit_durability_startup.rs` runs the real binary under `required`
+in both modes and shows that it exits with status 1, prints the refusal and writes
+nothing.
 
 ## Verified-TLS storage tests
 

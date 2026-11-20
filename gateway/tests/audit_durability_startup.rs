@@ -4,7 +4,8 @@
 //! refused at startup rather than served in a mode that would quietly
 //! downgrade to best effort -- or refuse every request. These rows run the
 //! real binary with a cleared environment, so what they observe is what an
-//! operator who sets nothing gets.
+//! operator who sets nothing gets. The last row runs it under
+//! `AUTHORITY_EVIDENCE_DURABILITY=required`, which refuses to start at all.
 
 use std::{
     io::{Read, Write},
@@ -229,4 +230,85 @@ fn the_default_serves_over_sqlite_and_the_opt_out_serves_without_a_store() {
     command.env("AUDIT_DURABILITY", "best_effort");
     let (running, _) = start_serving(command);
     drop(running);
+}
+
+/// A fresh, empty directory for one row, removed when the row ends.
+struct EmptyDirectory(PathBuf);
+
+impl EmptyDirectory {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "greengateway-startup-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("the temporary directory should be created");
+        Self(path)
+    }
+
+    fn entries(&self) -> Vec<PathBuf> {
+        std::fs::read_dir(&self.0)
+            .expect("the temporary directory should be readable")
+            .map(|entry| entry.expect("the entry should be readable").path())
+            .collect()
+    }
+}
+
+impl Drop for EmptyDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `AUTHORITY_EVIDENCE_DURABILITY=required` refuses to start in either
+/// deployment mode, because nothing records the activation of the
+/// configuration the gateway would serve (issue #425, owner decision of
+/// 2026-11-19). The real binary prints the value-free refusal, exits with
+/// status 1, and writes nothing: every store path, and the working
+/// directory any default path would resolve against, is inside one empty
+/// directory that stays empty. The cluster row names a database URL file
+/// that does not exist, so the refusal can only come before preflight.
+#[test]
+fn required_authority_evidence_exits_before_writing_anything() {
+    const MARKER: &str = "startup-refusal-marker";
+    let mut modes = vec!["standalone"];
+    if cfg!(feature = "postgres") {
+        modes.push("cluster");
+    }
+    for mode in modes {
+        let directory = EmptyDirectory::new(&format!("authority-evidence-{mode}"));
+        let inside = |name: &str| directory.0.join(format!("{MARKER}-{name}"));
+        let mut command = gateway();
+        command
+            .current_dir(&directory.0)
+            .env("AUTHORITY_EVIDENCE_DURABILITY", "required")
+            .env("AUTHORITY_EVENT_SINK", "log")
+            .env("AUTHORITY_PSEUDONYM_KEY_ALIAS", format!("{MARKER}-alias"))
+            .env("UPSTREAM_URL", format!("https://{MARKER}.invalid"));
+        if mode == "standalone" {
+            command.env("AUDIT_SQLITE_PATH", inside("audit.sqlite"));
+        } else {
+            command
+                .env("STATE_BACKEND", "postgres")
+                .env("DEPLOYMENT_ID", format!("{MARKER}-deployment"))
+                .env("DATABASE_URL_FILE", inside("database-url"))
+                .env("CONNECTION_SECRETS_ROOT", inside("secrets"))
+                .env(
+                    "RATE_LIMIT_KEYRING",
+                    r#"[{"id":"rl-primary","file":"rate-limit-key","role":"primary"}]"#,
+                );
+        }
+        let output = run_to_refusal(command);
+        let message = stderr(&output);
+        assert_eq!(output.status.code(), Some(1), "{mode}: {message}");
+        let expected = format!(
+            "authority_evidence_activation_unevidenced: AUTHORITY_EVIDENCE_DURABILITY=required refuses configuration.activate: {mode} mode "
+        );
+        assert!(
+            message.lines().any(|line| line.starts_with(&expected)),
+            "{mode}: {message}"
+        );
+        assert!(!message.contains(MARKER), "{mode}: {message}");
+        assert_eq!(directory.entries(), Vec::<PathBuf>::new(), "{mode}");
+    }
 }

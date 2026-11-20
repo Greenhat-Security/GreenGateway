@@ -314,6 +314,50 @@ test("configuration activation stays refused at startup while the activation pro
   assert.throws(() => validateInventory(inventory(), inhabited), /stale source anchor: gateway\/src\/authority_events\/required\.rs :: pub\(crate\) enum ActivationProof \{\}/);
 });
 
+test("the activation rule follows the proof type's shape and the place serving startup asks", () => {
+  const PROOF = { path: "gateway/src/authority_events/required.rs", anchor: "pub(crate) enum ActivationProof {}" };
+  const CHECK = { path: "gateway/src/bootstrap/stages.rs", anchor: "crate::authority_events::required::startup_refusal(&config)" };
+  const activation = (value) => value.groups.find((group) => group.id === "configuration_activation");
+  const rewriting = (path, from, to) => (read) => read === path ? source(read).replace(from, to) : source(read);
+  assert.ok(activation(inventory()).sources.some((ref) => ref.path === CHECK.path && ref.anchor === CHECK.anchor));
+  assert.ok(source(CHECK.path).includes(CHECK.anchor), "serving startup asks on this branch");
+
+  // A visibility change keeps the type uninhabited, so the rule stays on even
+  // when the row is re-anchored on the new spelling and admitted.
+  for (const spelling of ["pub enum ActivationProof {}", "pub(crate) enum ActivationProof{ }", "enum ActivationProof {\n}"]) {
+    const widened = inventory();
+    activation(widened).sources = activation(widened).sources.map((ref) => ref.anchor === PROOF.anchor ? { ...ref, anchor: spelling } : ref);
+    activation(widened).required_mode = "admitted";
+    activation(widened).disposition = ["missing_metadata"];
+    assert.throws(() => validateInventory(widened, rewriting(PROOF.path, PROOF.anchor, spelling)),
+      /configuration_activation: configuration activation stays refused at startup/, spelling);
+    // Re-anchored but still refused at startup, the new spelling is accepted.
+    const kept = inventory();
+    activation(kept).sources = activation(kept).sources.map((ref) => ref.anchor === PROOF.anchor ? { ...ref, anchor: spelling } : ref);
+    validateInventory(kept, rewriting(PROOF.path, PROOF.anchor, spelling));
+  }
+
+  // Renaming or removing the type cannot switch the rule off, and a
+  // declaration left in a comment does not count.
+  for (const replacement of ["pub(crate) enum ActivationEvidence {}", "", `// ${PROOF.anchor}\npub(crate) enum ActivationEvidence {}`]) {
+    const renamed = inventory();
+    activation(renamed).sources = activation(renamed).sources.filter((ref) => ref.anchor !== PROOF.anchor);
+    activation(renamed).required_mode = "admitted";
+    activation(renamed).disposition = ["missing_metadata"];
+    assert.throws(() => validateInventory(renamed, rewriting(PROOF.path, PROOF.anchor, replacement)),
+      /declares no ActivationProof/, JSON.stringify(replacement));
+  }
+
+  // The row must name the place serving startup asks: dropping that anchor
+  // fails, and so does removing the call while the row keeps it.
+  const dropped = inventory();
+  activation(dropped).sources = activation(dropped).sources.filter((ref) => ref.anchor !== CHECK.anchor);
+  assert.throws(() => validateInventory(dropped), /configuration_activation: configuration activation must anchor on the startup check in gateway\/src\/bootstrap\/stages\.rs/);
+  const uncalled = rewriting(CHECK.path, CHECK.anchor, "None::<()>");
+  assert.throws(() => validateInventory(dropped, uncalled), /must anchor on the startup check/);
+  assert.throws(() => validateInventory(inventory(), uncalled), /stale source anchor: gateway\/src\/bootstrap\/stages\.rs :: crate::authority_events::required::startup_refusal\(&config\)/);
+});
+
 test("export evidence binds an existing configuration revision without inventing a mutation", () => {
   const value = fixture();
   value.operation = "configuration.export";
