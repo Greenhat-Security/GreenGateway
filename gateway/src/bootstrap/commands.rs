@@ -507,7 +507,10 @@ pub(crate) async fn run_one_shot_command() -> Result<bool, Box<dyn std::error::E
     // configuration is the file `--from` names, because `Config` refuses
     // to hold both at once. `--dry-run` is the default and writes
     // nothing. The report goes to stdout as JSON: counts, checksums,
-    // revisions and durations, never a token, secret or DSN.
+    // revisions and durations, never a token, secret or DSN. Under
+    // AUTHORITY_EVIDENCE_DURABILITY=required, `import::run` refuses the
+    // writing forms first thing, before the source is read or the target
+    // opened (issue #425); the dry run still runs.
     #[cfg(feature = "postgres")]
     if std::env::args_os()
         .nth(1)

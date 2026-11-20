@@ -756,6 +756,8 @@ jobs:
             storage::contract_tests::postgres_audit_tests::a_failed_token_evidence_insert_rolls_back_the_rotate_and_the_revoke
             storage::contract_tests::postgres_audit_tests::jwt_revocation_evidence_survives_extension_reactivation_and_cleanup
             storage::contract_tests::postgres_audit_tests::a_failed_jwt_evidence_insert_rolls_back_the_revoke
+            storage::contract_tests::postgres_audit_tests::repeating_an_effective_jwt_revoke_records_no_second_evidence_row
+            storage::contract_tests::postgres_audit_tests::extending_a_jwt_revocation_records_exactly_one_more_evidence_row
             storage::contract_tests::postgres_audit_tests::revoke_and_rotate_race_never_leaves_a_live_plaintext
             storage::contract_tests::postgres_audit_tests::an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction
             storage::contract_tests::postgres_audit_tests::a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity

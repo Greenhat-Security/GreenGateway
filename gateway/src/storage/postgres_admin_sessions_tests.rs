@@ -713,6 +713,54 @@ async fn every_grant_and_withdrawal_leaves_one_evidence_row() {
     );
 }
 
+/// A session withdrawal has no caller key: it is reconciled by its natural
+/// key, the session ID (issue #425). Characterizes behaviour that predates
+/// this test: however often, and on whichever replica, a logout is
+/// repeated, the session has exactly one withdrawal row and one journal
+/// entry for it, and a repeat spends no journal unit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeated_withdrawal_records_one_withdrawal() {
+    let Some((_guard, _database, pool)) = database().await else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let authority = Arc::new(Authority::default());
+    let a = replica(&authority, &pool, cluster_config(8), login_keyring());
+    let b = replica(&authority, &pool, cluster_config(8), login_keyring());
+
+    let headers = cookie_headers(&issue_across(&a, &b, &HeaderMap::new()).await.unwrap());
+    let session_id = read(&a, &headers).await.unwrap().session_id;
+    a.revoke(&headers, None).await.unwrap();
+    let after_first = journal_state(&pool).await;
+    for sessions in [&a, &b, &a] {
+        sessions.revoke(&headers, None).await.unwrap();
+    }
+    assert_eq!(
+        journal_state(&pool).await,
+        after_first,
+        "a repeated withdrawal journals nothing"
+    );
+    let withdrawals = format!(
+        "SELECT count(*) FROM greengateway.admin_session_evidence \
+         WHERE session_id = '{session_id}'::uuid AND action = 'admin_session.withdraw'"
+    );
+    assert_eq!(count(&pool, &withdrawals).await, 1);
+    assert_eq!(
+        count(
+            &pool,
+            &format!(
+                "SELECT count(*) FROM greengateway.admin_session_evidence e \
+                 JOIN greengateway.authority_event_journal j \
+                   ON j.event_id = e.event_id AND j.source = 'admin_session_evidence' \
+                 WHERE e.session_id = '{session_id}'::uuid"
+            )
+        )
+        .await,
+        2,
+        "the grant and the one withdrawal"
+    );
+}
+
 /// The journal's state row as the tests read it: the last position, the
 /// units in use, the units held for withdrawals, and the rows retained.
 #[derive(Debug, PartialEq, Eq)]

@@ -1007,7 +1007,15 @@ issuer as the principal carried it, are delivered in this vocabulary without bei
 rewritten. Both tables are journal sources since then. The inventory's
 `policy_postgres`, `tools_postgres`, `policy_tests_postgres`, `configuration_import`
 and `catalog_postgres` rows keep `missing_metadata` for their caller-bound operation
-identity and issuer-scoped subject reference.
+identity and issuer-scoped subject reference; required mode refuses the
+`configuration_import` row's writing form.
+
+A `system` actor never authenticated anybody, so it can never bind a caller key.
+The rows whose changes are started only by a command under a fixed system label or
+by a browser completing or ending a session (`revoke-jwt`, master-key
+re-encryption, and admin session grant and withdrawal) are `no_caller_key` rather
+than `missing_metadata`: they stay unqualified and are reconciled by their natural
+key ([Rows admitted without qualification](#rows-admitted-without-qualification)).
 
 ## Standalone evidence
 
@@ -1231,9 +1239,9 @@ the operation key and negotiated format before admission.
 
 | `required_mode` | Rows | What required mode does |
 | --- | --- | --- |
-| `admitted` | Cluster policy, tools, Connection create, replace and delete, catalogs, token issue and change, JWT revocation, admin sessions and import, and standalone Connection create, replace and delete, local-secret create, rotate, delete and re-encryption, catalog publication and overlays, and token issue and rotate/revoke | Runs it. Its evidence is the row's `record` |
+| `admitted` | Cluster policy, tools, Connection create, replace and delete, catalogs, token issue, rotation and revocation, JWT revocation, and admin session grant and withdrawal, and standalone Connection create, replace and delete, local-secret create, rotate, delete and re-encryption, catalog publication and overlays, and token issue, rotation and revocation | Runs it. Its evidence is the row's `record`. Nine of these pairs stay admitted without qualification on purpose ([below](#rows-admitted-without-qualification)) |
 | `caller_key_required` | PostgreSQL mutation approval preparation | Admits only the issuer-bound keyed PUT with `qualified_v1`. Required mode refuses ordinary POST. |
-| `refused` | Standalone mutation approval preparation and mutation approval review, revocation and consumption in both modes. Standalone policy mutations, policy file reloads, and tools publication (admin API and file reloads) | Refuses it when asked, before anything is written |
+| `refused` | Standalone mutation approval preparation and mutation approval review, revocation and consumption in both modes. Standalone policy mutations, policy file reloads, and tools publication (admin API and file reloads). The writing form of the offline import (`import-standalone --apply`, with or without `--resume`) in cluster mode | Refuses it when asked, before anything is written |
 | `refused_at_startup` | Standalone admin sessions (`ADMIN_SESSION_MODE=standalone_memory`), and configuration activation in both modes | Refuses to start |
 | `unavailable` | Cluster policy file reload and local secrets, standalone JWT revocation and import, configuration export | Nothing to refuse: the mode or the build has no such operation. A gate that is asked anyway refuses it |
 | `outside_gateway` | External secret-provider rotation | Not covered: the provider owns the write and the gateway cannot refuse it |
@@ -1260,8 +1268,9 @@ Enforcement:
   activation stage and atomically with it, that a ledger or activation record
   matches the exact configuration being activated (same digest, same revision),
   and the inventory checker holds the `configuration_activation` row at
-  `refused_at_startup` until then. Offline commands do not ask: `revoke-jwt` still
-  runs and records its own evidence. Bundle mode stops before this point with
+  `refused_at_startup` until then. Offline commands do not ask this startup
+  check: `revoke-jwt` still runs and records its own evidence, and the offline
+  import asks its own question (below). Bundle mode stops before this point with
   `source.mode_unavailable`; bundle serving must pass the same check when it
   ships. `ggctl validate` and `ggctl doctor` accept a configuration the gateway
   then refuses to serve, and the Cloudflare Worker refuses the setting before
@@ -1283,7 +1292,20 @@ Enforcement:
 - **Background activations.** A watched or `SIGHUP` reload of `POLICY_FILE` or
   `TOOLS_FILE` asks the gate first; a refused reload keeps the active policy or
   registry, MCP proxy tools included, until a restart activates the file.
-- **Audit.** Every refusal is logged and audited as
+- **Offline import.** `gateway import-standalone --apply` (and `--apply --resume`)
+  asks the gate as `configuration.import` first thing, before it reads the
+  `--from` file or opens the target, and under `required` stops with
+  `authority_evidence_unsupported: AUTHORITY_EVIDENCE_DURABILITY=required refuses
+  configuration.import: cluster mode records evidence for only part of it; nothing
+  was changed` and a non-zero exit. Only its policy and tools activations record
+  evidence; its Connections, audit, discovery and token sections commit none, and
+  the owner ruled (2026-11-20) that the writing form is refused rather than given
+  per-section evidence. The default `--dry-run` writes nothing and still runs. Only
+  a cluster target asks: one that is not cluster mode still gets `target_not_postgres`. An
+  offline command's gate follows that command's own environment: the import is
+  refused when the environment it runs with sets `required`, and not because the
+  fleet's replicas run with it.
+- **Audit.** Every refusal of a request or a background activation is logged and audited as
   `authority_evidence.operation_refused` with `operation`, `deployment_mode`,
   `trigger` (`admin_api`, `file_watch`, `signal`) and `reason`; an admin API
   refusal also carries the request ID, source address and caller.
@@ -1310,6 +1332,9 @@ What required mode does not do:
 - It does not refuse external provider rotation or
   anything outside the inventory's matrix (status observations, verification and
   last-use updates, cleanup).
+- It does not qualify every row it admits. The nine pairs in
+  [Rows admitted without qualification](#rows-admitted-without-qualification) are
+  atomic and delivered, but carry no caller key.
 - A standalone gateway in required mode therefore changes its policy and tools only
   through its startup files. Connections, local secrets, master-key re-encryption,
   managed catalogs and overlays, and service tokens are changed as usual. The
@@ -1321,7 +1346,8 @@ inventory (every `refused` row has a gate that refuses it in that mode, every ga
 agrees with its row, and the only operations refused at startup are standalone admin
 sessions and configuration activation in both modes; the compiler also refuses
 `required` with no sink), checks both
-modes and the refusal's audit event, and holds the evidenced standalone Connection,
+modes and the refusal's audit event, refuses the offline import in cluster mode with
+its own reason (`required_refuses_the_offline_import_in_cluster_mode`), and holds the evidenced standalone Connection,
 local-secret and catalog rows `admitted` and ungated; `authority_evidence_app_tests.rs`
 drives every refused standalone admin endpoint through the real handlers and asserts
 the `409`, the audit event and that nothing changed, and that Connection,
@@ -1336,7 +1362,71 @@ value-free message, that the compiler's refusals are reported instead when they
 apply, and that `best_effort` startup runs every stage as before;
 `gateway/tests/audit_durability_startup.rs` runs the real binary under `required`
 in both modes and shows that it exits with status 1, prints the refusal and writes
-nothing.
+nothing; and `gateway/src/import/tests.rs` shows that the import's writing forms are
+refused under `required` before the `--from` file is read or the target opened
+(`a_writing_import_under_required_exits_before_opening_the_target_store`), that the
+dry run still runs (`a_dry_run_import_under_required_still_runs`), and, against a
+real PostgreSQL target, that the dry run plans every section and the refused apply
+writes nothing (`a_dry_run_under_required_plans_every_section_and_writes_nothing`);
+`the_import_writes_nothing_under_required_and_its_dry_run_still_runs` in
+`gateway/tests/audit_durability_startup.rs` shows the same through the real binary:
+the refusal line, status 1 and nothing written.
+
+### Rows admitted without qualification
+
+Two kinds of inventory row stay `admitted` in required mode with
+`required_durability_supported: false`, by owner ruling (2026-11-20). Each has its
+own disposition, and `scripts/check-authority-evidence.mjs` allows each only alone,
+only on the pairs below, and only on an admitted, unqualified row, so neither can
+relabel a gap.
+
+`no_caller_key`: no authenticated remote caller starts the change, so nothing
+outside the gateway holds a request to retry and no key can be bound to it. Each is
+atomic, delivered at least once as `authority_event_delivery.v1`, and reconciled by
+its natural key:
+
+| Row | Pair | Natural key |
+| --- | --- | --- |
+| `jwt_postgres` | `jwt.revoke`, cluster (`gateway revoke-jwt`, fixed system actor) | The deployment- and issuer-scoped JTI digest. An exact repeat of an effective revoke (the same or an earlier expiry, or any repeat over an entry with no expiry) reports `already revoked`, writes nothing and spends no revision. A repeat that extends the entry (a later expiry, no expiry, or an entry already past its expiry and the retention leeway) updates the denylist in place and records exactly one more evidence row |
+| `admin_session_withdraw_postgres` | `admin_session.withdraw`, cluster (logout, rejection, replacement, expiry) | The session ID: one withdrawal per session (`UNIQUE (session_id, action)`); a repeated logout, on any replica, writes nothing |
+| `local_secret_reencrypt` | `secret.reencrypt`, standalone (`connection-secrets reencrypt`, fixed system actor) | The maintenance batch: a repeat re-encrypts nothing already under the active key, and an empty batch writes no row |
+| `admin_session_grant_postgres` | `admin_session.grant`, cluster (a browser completing OIDC login) | The session ID: one grant per session (`UNIQUE (session_id, action)`) |
+
+The first three withdraw authority or are maintenance; refusing them would fail
+open. A grant gives authority, so that argument does not cover it. It stays
+admitted by its own ruling: the grant, its evidence and its journal entry are one
+SQL statement, it is reconciled by session ID, and refusing it would block the OIDC
+login through which the principals that required mode's keyed changes need use the
+admin UI.
+
+`withdrawal_admitted`: a remote caller starts a change that only removes authority.
+Every form stays admitted in required mode, including the unkeyed `DELETE` the admin
+UI sends and service-token callers, because refusing a withdrawal would leave a
+leaked token, a Connection or a secret live. Those forms commit their evidence row in
+the change's transaction and are delivered as `authority_event_delivery.v1`, but are
+not caller-keyed. Only the keyed principal form is qualified, so a
+`withdrawal_admitted` row carries exactly one reviewed `qualified_delivery_paths`
+entry for each of its pairs. The pairs are `service_token.revoke` in both modes,
+`connection.delete` in both modes and standalone `secret.delete`. Today only
+`token_revoke_postgres` has its reviewed path (`POST .../tokens/{id}/revoke`); the
+other four rows keep `missing_metadata` until their keyed paths are reviewed.
+
+`catalog.overlay.delete` is not a withdrawal: removing an overlay publishes a new
+catalog revision. The session withdrawal reason stays in `admin_session_evidence`;
+the delivered record has no field for it, and delivering it needs a new schema
+version.
+
+Tests: the checker's "no_caller_key is limited to its reviewed pairs",
+"withdrawal_admitted is limited to its reviewed pairs and needs a reviewed keyed
+path" and "neither disposition can claim required durability". The natural-key
+behaviour is characterized, not changed, by
+`repeating_an_effective_jwt_revoke_records_no_second_evidence_row` and
+`extending_a_jwt_revocation_records_exactly_one_more_evidence_row` in
+`storage::contract_tests` (with
+`jwt_revocation_evidence_survives_extension_reactivation_and_cleanup` for the
+reactivation of an expired entry), `a_repeated_withdrawal_records_one_withdrawal` in
+`storage::postgres_admin_sessions`, and the re-encryption batch tests in
+`connections::local_secret` and `connection_secret_maintenance`.
 
 ## Verified-TLS storage tests
 
@@ -1356,7 +1446,9 @@ disposable PostgreSQL 16, the same pinned image, that accepts TLS and nothing el
   `a_failed_token_evidence_insert_rolls_back_the_rotate_and_the_revoke`,
   `revoke_and_rotate_race_never_leaves_a_live_plaintext`,
   `jwt_revocation_evidence_survives_extension_reactivation_and_cleanup`,
-  `a_failed_jwt_evidence_insert_rolls_back_the_revoke`), the suggestion acceptance's
+  `a_failed_jwt_evidence_insert_rolls_back_the_revoke`,
+  `repeating_an_effective_jwt_revoke_records_no_second_evidence_row`,
+  `extending_a_jwt_revocation_records_exactly_one_more_evidence_row`), the suggestion acceptance's
   document evidence (`an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction`)
   and `a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity`;
 - the whole PostgreSQL Connection store suite (`connections::pg_store`), its create,
