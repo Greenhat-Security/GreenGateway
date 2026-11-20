@@ -172,6 +172,28 @@ fn a_system_actor_or_a_non_v7_id_cannot_bind() {
     }
 }
 
+/// The binding digest never appears in a `{:?}` rendering, so a `tracing`
+/// field or an error message cannot leak it. The key and action still do.
+#[test]
+fn debug_output_redacts_the_binding_digest() {
+    let actor = operator();
+    let operation = bind(&CallerOperationBinding {
+        action: "connection.create",
+        actor: &actor,
+        target: "",
+        precondition: "",
+        request: br#"{"secret_id":"alias-a"}"#,
+    });
+    for rendered in [format!("{operation:?}"), format!("{operation:#?}")] {
+        assert!(!rendered.contains(operation.binding_digest()), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains(&operation.id().to_string()), "{rendered}");
+        assert!(rendered.contains("connection.create"), "{rendered}");
+    }
+    let wrapped: Result<CallerOperation, BindingRefusal> = Ok(operation.clone());
+    assert!(!format!("{wrapped:?}").contains(operation.binding_digest()));
+}
+
 /// Only the same action with the same digest is the same request. A
 /// reservation without a digest -- a keyed revoke's or prepare's -- never is.
 #[test]

@@ -1466,9 +1466,16 @@ impl SqliteCallerOperations {
         operation: &CallerOperation,
         commit: bool,
     ) -> Result<CallerKeyReservation, RepositoryError> {
-        let connection = Self::connection(path);
+        Self::reserve_with(&Self::connection(path), operation, commit)
+    }
+
+    fn reserve_with(
+        connection: &rusqlite::Connection,
+        operation: &CallerOperation,
+        commit: bool,
+    ) -> Result<CallerKeyReservation, RepositoryError> {
         let transaction = rusqlite::Transaction::new_unchecked(
-            &connection,
+            connection,
             rusqlite::TransactionBehavior::Immediate,
         )
         .expect("the write lock is taken");
@@ -1523,14 +1530,38 @@ impl CallerOperationHarness for SqliteCallerOperations {
         let won = super::standalone_authority_events::reserve_bound_operation(&transaction, first)
             .expect("the first reservation succeeds");
         let (path, second) = (self.path.clone(), second.clone());
-        let (started, waiting) = mpsc::channel();
+        let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let noted = Arc::clone(&blocked);
         let loser = std::thread::spawn(move || {
-            started.send(()).expect("the main thread listens");
-            // Waits for the first transaction's write lock.
-            Self::reserve_on(&path, &second, true)
+            let mut contender = rusqlite::Connection::open(&path).expect("the file opens");
+            // SQLite calls this each time the contender finds the write lock
+            // taken: the proof that it waited for the first transaction. It
+            // retries for a budget of about ten seconds.
+            contender
+                .busy_handler(Some(move |attempts: i32| {
+                    noted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(5));
+                    attempts < 2_000
+                }))
+                .expect("the busy handler installs");
+            Self::reserve_with(&contender, &second, true)
         });
-        waiting.recv().expect("the second writer starts");
-        std::thread::sleep(Duration::from_millis(200));
+        // Commit only once the second writer is blocked on the write lock,
+        // so the two genuinely overlap on every passing run.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !blocked.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            blocked.load(std::sync::atomic::Ordering::SeqCst),
+            "the second writer waits for the first"
+        );
+        assert!(
+            !loser.is_finished(),
+            "the second writer cannot finish while the first holds the lock"
+        );
         transaction.commit().expect("the first reservation commits");
         let lost = loser
             .join()

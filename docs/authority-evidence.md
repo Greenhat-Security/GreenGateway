@@ -392,15 +392,34 @@ log line or a metric.
   reserves any keyed revoke an older build committed without a reservation; the
   older build itself never reads the table, so it can still serve the file, but
   it does not enforce reservations the newer build made.
+- Standalone upgrades: the Connections database upgrade is one-way. An older
+  build refuses a version-16 Connections file, and there is no downgrade: recover
+  forward with a build that knows Connections version 16. Restoring the
+  pre-upgrade file copy brings back every Connection and secret deleted since and
+  undoes every rotation, so it is disaster recovery, not rollback. The token
+  database needs no restore to run an older build, at the cost above.
 - Each SQLite file is its own authority, so a key is unique within one file, as
   consumers deduplicate events on `(authority_id, event_id)`: the token database
   and a separate Connections database each accept a key once.
 
 Rows are never removed. A reservation exists exactly when a keyed evidence row
-with that operation ID and action exists, in both stores, except for a keyed
-revoke an older build committed to a token database since this build last opened
-it (`a_keyed_revoke_reserves_its_key_with_its_evidence` and
-`reopening_reserves_keyed_revocations_an_older_build_wrote` assert both halves).
+with that operation ID and action exists, in both stores, with two exceptions,
+both written by an older build serving a token database:
+
+- a keyed revoke it committed since this build last opened the file, which the
+  next open reserves;
+- a keyed revoke whose key this file had already reserved for another action
+  (the older build checks only the evidence table). That cannot be repaired: the
+  key stays with the action that reserved it and the revoke keeps no
+  reservation. Every open counts such revokes and logs the count with a fixed
+  message, never the key, token or actor. It cannot happen before an operation
+  family reserves keys for another action in the token database or the
+  Connections database on a shared file.
+
+`a_keyed_revoke_reserves_its_key_with_its_evidence`,
+`reopening_reserves_keyed_revocations_an_older_build_wrote` and
+`reopening_counts_a_keyed_revocation_whose_key_another_action_holds` assert
+these cases.
 
 ## Keyed safe references
 

@@ -54,6 +54,21 @@
 //! capacity update each lock at most the state row or the cursor row and
 //! nothing a producer holds, so no cycle can form.
 //!
+//! A keyed producer also reserves its caller key
+//! ([`reserve_caller_operation`], [`reserve_bound_operation`]), and a second
+//! writer of the same key waits on the first writer's uncommitted
+//! primary-key entry until that transaction ends. That wait has one place in
+//! the order: after the producer's own store locks and before
+//! `security_revision_state` and the journal state row. The full order is
+//! therefore own rows, caller key, `security_revision_state`, journal state
+//! row. A producer that reserved its key after `security_revision_state`
+//! could deadlock against another holder of the key (one holds the key and
+//! waits for `security_revision_state`, the other holds
+//! `security_revision_state` and waits for the key) and would be answered
+//! only by PostgreSQL's deadlock detector, as a `503`. The keyed revoke
+//! (`storage::postgres_service_tokens`) and the keyed prepare
+//! (`connections::pg_mutation_approvals`) follow this order.
+//!
 //! Errors carry a classification and a static operation label only.
 
 use std::time::Duration;
@@ -300,7 +315,19 @@ pub(crate) async fn read_caller_operation(
 /// second writer waits for the first to end, and when the first committed
 /// it reads the committed row (the transaction runs at READ COMMITTED, so
 /// the statement after the insert sees it); when the first rolled back, the
-/// second's insert takes the key.
+/// second's insert takes the key. Under REPEATABLE READ or SERIALIZABLE the
+/// waiting insert would instead fail with a serialization error (SQLSTATE
+/// 40001), which is returned as a classified `Conflict` error and fails
+/// closed: the transaction rolls back and nothing is reserved or changed.
+///
+/// Where the caller calls this, in lock order: after its own store's locks
+/// and before `security_revision_state` and the journal state row (see the
+/// module's lock order; reserving later can deadlock against another holder
+/// of the key). The caller's own in-transaction lookup of the key (step 1 of
+/// the keyed contract) also runs after its store's serializing lock, so a
+/// concurrent exact duplicate that committed first is answered as a replay
+/// from its evidence before this request reads its target, and this insert
+/// only meets a writer that is still in flight.
 #[cfg_attr(not(test), allow(dead_code))] // Called by the operation families that bind keys.
 pub(crate) async fn reserve_bound_operation(
     client: &tokio_postgres::Client,

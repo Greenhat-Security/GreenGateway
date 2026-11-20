@@ -731,14 +731,22 @@ impl TokenStore for SqliteTokenStore {
         // transaction, so no later keyed issue, rotation or Connection change
         // in this file can claim it. The look above found it free, and the
         // write lock is held, so a taken key here means the file disagrees
-        // with itself: nothing commits.
+        // with itself: nothing commits. A reservation insert that fails is
+        // part of the change's evidence failing (I2): it is counted on the
+        // standalone evidence-failure counter, as a failed evidence insert
+        // is, and nothing commits.
         if let Some(operation_id) = operation_id {
             let reserved = crate::storage::standalone_authority_events::reserve_unbound_operation(
                 &transaction,
                 operation_id,
                 TOKEN_CHANGE_ACTION_REVOKE,
             )
-            .map_err(|source| self.sqlite_error(source))?;
+            .map_err(|source| {
+                crate::storage::record_standalone_evidence_failure(
+                    crate::storage::StandaloneEvidenceStore::ServiceTokens,
+                );
+                self.sqlite_error(source)
+            })?;
             if !reserved {
                 return Err(TokenStoreError::RevokeOperationConflict);
             }
@@ -1161,43 +1169,68 @@ pub fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     // older binary never reads the table, so it can still serve this file.
     connection
         .execute_batch(crate::storage::standalone_authority_events::CALLER_OPERATION_TABLE_SQL)?;
-    reserve_keyed_revocations(connection)
+    let collisions = reserve_keyed_revocations(connection)?;
+    if collisions > 0 {
+        tracing::warn!(
+            collisions,
+            "keyed service-token revocations use a caller key this file reserved for another \
+             action; the key stays with that action and the revocations stay unreserved"
+        );
+    }
+    Ok(())
 }
+
+/// Every keyed revoke evidence row -- one whose operation ID is
+/// caller-assigned (canonical UUIDv7 text) -- beside the reservation of its
+/// key, if there is one. Gateway-assigned v4 operation IDs are never keys.
+const KEYED_REVOCATIONS_SQL: &str = r#"
+FROM service_token_change_evidence e
+LEFT JOIN authority_caller_operation_ids k ON k.operation_id = e.operation_id
+WHERE e.action = 'service_token.revoke'
+  AND e.operation_id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-7[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+"#;
 
 /// Reserve the key of every keyed revoke whose evidence has none, on every
 /// open, not once. The token database has no version fence, so an older
 /// build can serve this file after the upgrade and commit keyed revokes
 /// that check only the evidence table; the next open by this build reserves
 /// their keys, so a reservation exists for every keyed revoke's evidence row
-/// again. Only caller-assigned IDs (canonical UUIDv7 text) are keys:
-/// gateway-assigned v4 operation IDs are never reserved. A key already
-/// reserved is left as it is. The common case -- nothing to reserve -- reads
-/// and writes nothing.
-const UNRESERVED_KEYED_REVOCATIONS_SQL: &str = r#"
-FROM service_token_change_evidence e
-WHERE e.action = 'service_token.revoke'
-  AND e.operation_id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-7[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
-  AND NOT EXISTS (
-      SELECT 1 FROM authority_caller_operation_ids k WHERE k.operation_id = e.operation_id
-  )
-"#;
-
-fn reserve_keyed_revocations(connection: &Connection) -> rusqlite::Result<()> {
-    let unreserved: bool = connection.query_row(
-        &format!("SELECT EXISTS (SELECT 1 {UNRESERVED_KEYED_REVOCATIONS_SQL})"),
+/// again. A key already reserved is left as it is.
+///
+/// One exception cannot be repaired: an older build checks only the
+/// evidence table, so it can commit a keyed revoke whose key this file
+/// already reserved for another action (by the token store or a Connections
+/// store on a shared file). That key stays with the action that reserved it,
+/// and the revoke keeps no reservation. Such rows are counted and returned,
+/// and the caller logs the count under a static message, so the collision is
+/// visible; no key, token or actor is logged.
+///
+/// Cost: one read of the revoke evidence per open (the evidence table has no
+/// index on `action`, so it is a scan, paid once per process start and per
+/// offline command). When nothing needs reserving it writes nothing and takes
+/// no write lock. The insert is one statement with the same predicate, so
+/// two processes opening the file together cannot reserve a key twice.
+fn reserve_keyed_revocations(connection: &Connection) -> rusqlite::Result<i64> {
+    let (unreserved, collisions): (i64, i64) = connection.query_row(
+        &format!(
+            "SELECT COALESCE(SUM(k.operation_id IS NULL), 0), \
+                    COALESCE(SUM(k.action IS NOT NULL AND k.action <> e.action), 0) \
+             {KEYED_REVOCATIONS_SQL}"
+        ),
         [],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if unreserved {
+    if unreserved > 0 {
         connection.execute(
             &format!(
                 "INSERT OR IGNORE INTO authority_caller_operation_ids (operation_id, action) \
-                 SELECT e.operation_id, e.action {UNRESERVED_KEYED_REVOCATIONS_SQL}"
+                 SELECT e.operation_id, e.action {KEYED_REVOCATIONS_SQL} \
+                 AND k.operation_id IS NULL"
             ),
             [],
         )?;
     }
-    Ok(())
+    Ok(collisions)
 }
 
 /// Widen an evidence table created before token issue evidence existed, so it
@@ -2282,8 +2315,26 @@ mod tests {
                 .record
                 .id
         };
-        let (first, second, unkeyed, faulted) = (issue(), issue(), issue(), issue());
+        let (first, second, unkeyed, faulted, unreservable) =
+            (issue(), issue(), issue(), issue(), issue());
         let key = test_revoke_operation_id(1);
+        // The recorder is this thread's, and the store runs on this thread.
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        let _recording = ::metrics::set_default_local_recorder(&recorder);
+        let evidence_failures = || {
+            recorder.count(
+                crate::metrics::STANDALONE_EVIDENCE_FAILURES_TOTAL,
+                &[("store", "service_tokens")],
+            )
+        };
+        let live = |id: &str| {
+            store
+                .get_by_id(id)
+                .expect("token should load")
+                .expect("token should exist")
+                .revoked_at
+                .is_none()
+        };
 
         store
             .revoke_with_operation(&first, &owner, Some(key))
@@ -2317,6 +2368,41 @@ mod tests {
             .revoke(&unkeyed, &owner)
             .expect("the unkeyed revoke commits")
             .expect("token should exist");
+        assert_eq!(evidence_failures(), 0, "a recorded change counts nothing");
+        let evidence_rows = || {
+            Connection::open(&db.path)
+                .expect("token database should open")
+                .query_row(
+                    "SELECT COUNT(*) FROM service_token_change_evidence",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("the evidence counts")
+        };
+        let evidence_before = evidence_rows();
+
+        // I2: a reservation insert that fails refuses the revoke before the
+        // update, counts one evidence failure, and leaves the token live
+        // with no evidence row and no reservation.
+        Connection::open(&db.path)
+            .expect("token database should open")
+            .execute_batch(
+                "CREATE TRIGGER fail_caller_operation_reservation \
+                 BEFORE INSERT ON authority_caller_operation_ids \
+                 BEGIN SELECT RAISE(ABORT, 'injected reservation failure'); END;",
+            )
+            .expect("failure trigger should install");
+        assert!(matches!(
+            store.revoke_with_operation(&unreservable, &owner, Some(test_revoke_operation_id(3))),
+            Err(TokenStoreError::Sqlite { .. })
+        ));
+        assert_eq!(evidence_failures(), 1);
+        assert!(live(&unreservable));
+        assert_eq!(evidence_rows(), evidence_before);
+        Connection::open(&db.path)
+            .expect("token database should open")
+            .execute_batch("DROP TRIGGER fail_caller_operation_reservation;")
+            .expect("failure trigger should drop");
 
         Connection::open(&db.path)
             .expect("token database should open")
@@ -2330,15 +2416,12 @@ mod tests {
             store.revoke_with_operation(&faulted, &owner, Some(test_revoke_operation_id(2))),
             Err(TokenStoreError::ChangeEvidence { .. })
         ));
+        assert_eq!(evidence_failures(), 2);
         let (after, keyed_after) = reservations_and_keyed_evidence(&db.path);
         assert_eq!(after, reservations, "nothing else was reserved");
         assert_eq!(after, keyed_after);
-        assert!(store
-            .get_by_id(&faulted)
-            .expect("token should load")
-            .expect("token should exist")
-            .revoked_at
-            .is_none());
+        assert!(live(&faulted));
+        assert_eq!(evidence_rows(), evidence_before);
     }
 
     /// The token database has no version fence: an older build can open the
@@ -2421,6 +2504,82 @@ mod tests {
             reservations,
             "a later open changes nothing"
         );
+    }
+
+    /// The one exception the backfill cannot repair: an older build checks
+    /// only the evidence table, so it can commit a keyed revoke whose key
+    /// this file already reserved for another action. Opening leaves the
+    /// key with that action, reserves nothing for the revoke, and counts
+    /// the collision so it is visible; a revoke with a free key beside it is
+    /// still reserved.
+    #[test]
+    fn reopening_counts_a_keyed_revocation_whose_key_another_action_holds() {
+        let db = TempDb::new("reservation-collision");
+        let store = SqliteTokenStore::open(&db.path).expect("token store should open");
+        let owner = ChangeActor::for_test_with_issuer("operator", "https://issuer.example.test");
+        let token = store
+            .create(create_request(&["admin"], "operator", None), &owner)
+            .expect("token should create")
+            .record
+            .id;
+        drop(store);
+
+        let held = test_revoke_operation_id(5);
+        let free = test_revoke_operation_id(6);
+        let digest = "a".repeat(64);
+        {
+            let connection = Connection::open(&db.path).expect("token database should open");
+            connection
+                .execute(
+                    "INSERT INTO authority_caller_operation_ids \
+                     (operation_id, action, binding_digest) \
+                     VALUES (?1, 'service_token.issue', ?2)",
+                    params![held.to_string(), digest],
+                )
+                .expect("another action reserves the key");
+            for key in [held, free] {
+                connection
+                    .execute(
+                        "INSERT INTO service_token_change_evidence (event_id, operation_id, \
+                         actor_user_id, actor_issuer, actor_kind, actor_auth_mode, action, \
+                         token_id, committed_at) \
+                         VALUES (?1, ?2, 'operator', 'https://issuer.example.test', \
+                         'principal', 'bearer_token', 'service_token.revoke', ?3, \
+                         '2026-11-19T00:00:00Z')",
+                        params![uuid::Uuid::new_v4().to_string(), key.to_string(), token],
+                    )
+                    .expect("an older build's evidence row inserts");
+            }
+        }
+
+        let expected = {
+            let mut rows = vec![
+                (held.to_string(), "service_token.issue".to_owned()),
+                (free.to_string(), TOKEN_CHANGE_ACTION_REVOKE.to_owned()),
+            ];
+            rows.sort();
+            rows
+        };
+        for _ in 0..2 {
+            drop(SqliteTokenStore::open(&db.path).expect("token store should reopen"));
+            let (reservations, _) = reservations_and_keyed_evidence(&db.path);
+            assert_eq!(reservations, expected);
+            let connection = Connection::open(&db.path).expect("token database should open");
+            assert_eq!(
+                reserve_keyed_revocations(&connection).expect("the backfill runs"),
+                1,
+                "the collision is counted on every open"
+            );
+            let kept: Option<String> = connection
+                .query_row(
+                    "SELECT binding_digest FROM authority_caller_operation_ids \
+                     WHERE operation_id = ?1",
+                    params![held.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("the held key reads");
+            assert_eq!(kept.as_deref(), Some(digest.as_str()));
+        }
     }
 
     fn create_request(

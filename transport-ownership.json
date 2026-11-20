@@ -16214,7 +16214,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::storage::postgres_authority_events::reserve_bound_operation#1",
-      "sha256": "1236d85192bac4b483f8a9f56365b328a22f35f002f11f93b8005fb612e3fb09",
+      "sha256": "5f87f38d5a6ca05c6b2823abd1441323752fe1f50dece3b4f71ab5b58a1a3948",
       "owner": "GreenGateway authority evidence maintainers",
       "purpose": "Inserts a caller UUID, operation family and binding digest on the existing PostgreSQL transaction, serializing reuse across authority writers; no caller-selected HTTP authority. Allowed dead outside tests until an operation family binds a key."
     },

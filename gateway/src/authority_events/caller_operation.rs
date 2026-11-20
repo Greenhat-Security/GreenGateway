@@ -76,11 +76,27 @@ pub(crate) enum BindingRefusal {
 
 /// A caller key bound to one request: the key, the action it is reserved
 /// for and the binding digest that makes it this request's.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Debug` is written by hand and redacts the digest. The digest is a
+/// SHA-256 over low-entropy inputs (credential aliases, provider locators),
+/// so it could be confirmed offline; it must never reach a log line, and a
+/// derived `Debug` would put it one `{:?}` away from one.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct CallerOperation {
     id: uuid::Uuid,
     action: &'static str,
     binding_digest: String,
+}
+
+impl std::fmt::Debug for CallerOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CallerOperation")
+            .field("id", &self.id)
+            .field("action", &self.action)
+            .field("binding_digest", &"<redacted>")
+            .finish()
+    }
 }
 
 impl CallerOperation {
