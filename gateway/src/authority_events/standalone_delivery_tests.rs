@@ -627,4 +627,35 @@ fn a_keyed_principal_row_of_a_revised_source_is_qualified_under_the_negotiated_f
             StandaloneEvidenceSource::CatalogChange,
         ]
     );
+
+    // A re-encryption batch records no revision, so even a caller UUIDv7 on
+    // it (which no writer binds: the batch runs as a fixed system actor)
+    // keeps its delivery record under the negotiated format, whatever the
+    // actor, byte for byte.
+    let reencrypt = STANDALONE_SHAPES
+        .iter()
+        .find(|shape| shape.action == "secret.reencrypt")
+        .expect("the re-encryption shape exists");
+    for (kind, auth_mode, issuer) in [
+        ("system", "system", None),
+        ("principal", "bearer_token", Some(ACTOR_ISSUER_MARKER)),
+    ] {
+        let mut batch = evidence(reencrypt);
+        batch.operation_id = caller_key(14);
+        batch.actor_kind = Some(kind.to_owned());
+        batch.actor_auth_mode = Some(auth_mode.to_owned());
+        batch.actor_issuer = issuer.map(str::to_owned);
+        let negotiated = project_standalone(&batch, &keyring, AuthorityEventFormat::QualifiedV1)
+            .unwrap_or_else(|error| panic!("{kind}: the batch projects: {error}"));
+        assert!(negotiated.qualified.is_none(), "{kind}");
+        let expected = project_standalone(&batch, &keyring, AuthorityEventFormat::DeliveryV1)
+            .expect("the batch projects");
+        assert_eq!(
+            negotiated
+                .wire_json(AuthorityEventFormat::QualifiedV1)
+                .unwrap(),
+            serde_json::to_string(&expected).unwrap(),
+            "{kind}"
+        );
+    }
 }

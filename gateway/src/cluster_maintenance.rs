@@ -405,8 +405,13 @@ pub(crate) struct AuthorityEventRetention {
 /// mode always configures a sink, so the hold lasts only while delivery has
 /// not established its cursor. Under `best_effort` it does not, so a
 /// deployment with no sink keeps pruning by age whatever its callers send.
-/// The durability value is part of the cluster fingerprint when `required`,
-/// so every replica that can lead the maintenance job agrees on it.
+///
+/// The hold follows the configuration of whichever process runs the pass:
+/// the replica holding the maintenance lease, or `gateway maintenance-run`.
+/// Neither asks the membership gate before taking the lease, so a replica
+/// held at the fingerprint door, or a one-shot run with a different
+/// `AUTHORITY_EVIDENCE_DURABILITY`, applies its own value. Every process that
+/// can take the lease must carry the fleet's durability.
 pub(crate) fn holds_a_journal_without_a_cursor(settings: &AuthorityEventSettings) -> bool {
     settings.durability == AuthorityEvidenceDurability::Required
 }

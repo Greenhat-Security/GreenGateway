@@ -624,8 +624,10 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
   receipt protects the entire journal until the dispatcher checkpoints it. The
   hold does not depend on whether a keyed row exists, so a best-effort
   deployment with no sink does not start filling its journal when one client
-  sends a key. Retention preserves all evidence rows, including the
-  preparation receipt.
+  sends a key. The hold follows the durability of the process that runs the
+  maintenance pass, including `gateway maintenance-run`, which is not checked
+  against the cluster fingerprint: run it with the replicas' environment.
+  Retention preserves all evidence rows, including the preparation receipt.
 - **Default delivery format.** Each legacy record carries the persisted `authority_id`, the
   evidence row's `event_id` and `operation_id`, the journal position as
   `sequence`, the operation, `result: committed`, the evidence row's
@@ -1260,8 +1262,9 @@ disposable PostgreSQL 16, the same pinned image, that accepts TLS and nothing el
 - `storage::postgres_documents` and `storage::postgres_admin_sessions`;
 - the dispatcher (`authority_events::dispatcher`);
 - journal retention without a cursor, in `storage::postgres_authority_events`:
-  `retention_under_required_never_prunes_a_journal_with_no_cursor` and
-  `best_effort_without_a_cursor_still_prunes_by_age`;
+  `retention_under_required_never_prunes_a_journal_with_no_cursor`,
+  `best_effort_without_a_cursor_still_prunes_by_age` and
+  `the_maintenance_retention_job_takes_its_cursorless_hold_from_durability`;
 - `storage::migrations`' evidence and journal migrations: 12 through 16, 18, 21 and
   24 through 28;
 - the app-level `admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_postgres`.

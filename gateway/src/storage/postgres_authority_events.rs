@@ -932,4 +932,94 @@ mod tests {
             "retention never touches evidence"
         );
     }
+
+    /// The retention job of the production job list, built from
+    /// `settings` the way both `StandardJobSources` construction sites
+    /// build it.
+    fn standard_retention_job(
+        pool: &deadpool_postgres::Pool,
+        settings: &crate::config::AuthorityEventSettings,
+    ) -> std::sync::Arc<dyn crate::cluster_maintenance::MaintenanceJob> {
+        use crate::cluster_maintenance::{
+            holds_a_journal_without_a_cursor, standard_jobs, StandardJobSources,
+            JOB_AUTHORITY_EVENT_RETENTION,
+        };
+        let jobs = standard_jobs(StandardJobSources {
+            pool: pool.clone(),
+            deployment_id: DEPLOYMENT.to_owned(),
+            rate_limit_keyring:
+                crate::connections::local_secret::LocalSecretKeyring::from_material_for_test(
+                    "retention-rate-limit-key",
+                    vec![("retention-rate-limit-key".to_owned(), [7; 32])],
+                ),
+            rate_limit_max_buckets: 16,
+            rate_limit_idle: Duration::from_secs(60),
+            membership: std::sync::Arc::new(crate::storage::PostgresMembershipStore::new(
+                pool.clone(),
+                DEPLOYMENT,
+                crate::ha::InstanceIdentity::generate(),
+            )),
+            stale_window: Duration::from_secs(30),
+            audit: None,
+            audit_retention: None,
+            audit_floor: None,
+            authority_event_retention: settings.retention(),
+            authority_event_hold_without_cursor: holds_a_journal_without_a_cursor(settings),
+            lease_holder: Uuid::new_v4(),
+            tool_lease_ttl: Duration::from_secs(30),
+        });
+        jobs.into_iter()
+            .find(|job| job.name() == JOB_AUTHORITY_EVENT_RETENTION)
+            .expect("the job list holds authority-event retention")
+    }
+
+    /// From configuration to the prune statement: the job the maintenance
+    /// leader runs holds a cursorless journal under required durability and
+    /// prunes the same journal by age under best effort.
+    #[tokio::test]
+    async fn the_maintenance_retention_job_takes_its_cursorless_hold_from_durability() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database).await;
+        journal_revocations(&pool, 3).await;
+        let store = PostgresAuthorityEventStore::new(pool.clone());
+        let client = pool.get().await.expect("maintenance session");
+        let mut settings = crate::config::AuthorityEventSettings {
+            durability: crate::config::AuthorityEvidenceDurability::Required,
+            retention_hours: 0,
+            ..Default::default()
+        };
+
+        let held = standard_retention_job(&pool, &settings);
+        assert_eq!(
+            held.run_step(&client)
+                .await
+                .expect("the retention step runs"),
+            0,
+            "required durability holds a cursorless journal"
+        );
+        let stats = store.stats().await.expect("stats");
+        assert_eq!((stats.retained, stats.cursor), (3, None));
+
+        settings.durability = crate::config::AuthorityEvidenceDurability::BestEffort;
+        let pruning = standard_retention_job(&pool, &settings);
+        assert_eq!(
+            pruning
+                .run_step(&client)
+                .await
+                .expect("the retention step runs"),
+            3,
+            "best effort prunes a cursorless journal by age"
+        );
+        assert_eq!(store.stats().await.expect("stats").retained, 0);
+        assert_eq!(
+            evidence_rows(&pool).await,
+            3,
+            "retention never touches evidence"
+        );
+    }
 }
