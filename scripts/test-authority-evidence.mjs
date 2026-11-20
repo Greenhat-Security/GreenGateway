@@ -30,12 +30,12 @@ test("qualification stays within the negotiated issuer-bound PostgreSQL file del
     format: "delivery_v1", durable_sink: "log", filesystem: "unknown", wire_schema: "authority_event_delivery.v1",
   })) {
     const changed = inventory();
-    const [path] = changed.groups.find(group => group.id === "token_change_postgres").qualified_delivery_paths;
+    const [path] = changed.groups.find(group => group.id === "token_revoke_postgres").qualified_delivery_paths;
     path.criteria[field] = value;
     assert.throws(() => validateInventory(changed), /qualified revoke criteria/);
   }
   const absent = inventory();
-  const renamed = absent.groups.find(group => group.id === "token_change_postgres");
+  const renamed = absent.groups.find(group => group.id === "token_revoke_postgres");
   renamed.id = "renamed_revoke_group";
   delete renamed.qualified_delivery_paths;
   assert.throws(() => validateInventory(absent), /missing qualified revoke path/);
@@ -208,19 +208,124 @@ test("admin session grant and withdrawal project as creation and deletion of a s
 });
 
 test("the in-memory session authority stays unsupported and the shared one records and delivers transactional evidence", () => {
-  const sessions = inventory().groups.filter((group) => group.operations.includes("admin_session.grant"));
-  assert.deepEqual(sessions.flatMap((group) => group.modes).sort(), ["postgres", "standalone"]);
-  for (const group of sessions) {
-    assert.deepEqual(group.operations, ["admin_session.grant", "admin_session.withdraw"]);
-    assert.equal(group.required_durability_supported, false);
+  const sessions = inventory().groups.filter((group) => group.operations.some((operation) => operation.startsWith("admin_session.")));
+  for (const group of sessions) assert.equal(group.required_durability_supported, false, group.id);
+  const standalone = sessions.filter((group) => group.modes.includes("standalone"));
+  assert.deepEqual(standalone.map((group) => group.id), ["admin_session_standalone"]);
+  assert.deepEqual(standalone[0].operations, ["admin_session.grant", "admin_session.withdraw"]);
+  assert.deepEqual(standalone[0].disposition, ["unsupported_future_operation"]);
+  assert.equal(standalone[0].delivery, "post_commit_telemetry");
+  // The shared authority grants and withdraws in separate rows: neither has
+  // a caller key, and the grant is not a withdrawal (owner ruling 5 of #425).
+  const postgres = sessions.filter((group) => group.modes.includes("postgres"));
+  assert.deepEqual(postgres.map((group) => [group.id, group.operations, group.modes]), [
+    ["admin_session_grant_postgres", ["admin_session.grant"], ["postgres"]],
+    ["admin_session_withdraw_postgres", ["admin_session.withdraw"], ["postgres"]],
+  ]);
+  for (const group of postgres) {
+    assert.deepEqual(group.disposition, ["no_caller_key"], group.id);
+    assert.equal(group.required_mode, "admitted", group.id);
+    assert.equal(group.delivery, "journaled_dispatch", group.id);
+    assert.ok(group.sources.some((ref) => ref.anchor.includes("admin_session_evidence")), group.id);
+    assert.ok(group.sources.some((ref) => ref.anchor.includes("reserved_withdrawals")), group.id);
   }
-  const byMode = Object.fromEntries(sessions.map((group) => [group.modes[0], group]));
-  assert.deepEqual(byMode.standalone.disposition, ["unsupported_future_operation"]);
-  assert.deepEqual(byMode.postgres.disposition, ["missing_metadata"]);
-  assert.equal(byMode.postgres.delivery, "journaled_dispatch");
-  assert.equal(byMode.standalone.delivery, "post_commit_telemetry");
-  assert.ok(byMode.postgres.sources.some((ref) => ref.anchor.includes("admin_session_evidence")));
-  assert.ok(byMode.postgres.sources.some((ref) => ref.anchor.includes("reserved_withdrawals")));
+});
+
+// The rows required mode admits without qualification (issue #425, plan
+// section 3.5, owner rulings 3 to 5). Each disposition is a closed list of
+// operation/mode pairs, so neither can be used to relabel a gap.
+const NO_CALLER_KEY = ["admin_session.grant/postgres", "admin_session.withdraw/postgres", "jwt.revoke/postgres", "secret.reencrypt/standalone"];
+const WITHDRAWALS = ["connection.delete/postgres", "connection.delete/standalone", "secret.delete/standalone", "service_token.revoke/postgres", "service_token.revoke/standalone"];
+const pairsOf = (group) => group.operations.flatMap((operation) => group.modes.map((mode) => `${operation}/${mode}`));
+const rowsWith = (value, disposition) => value.groups.filter((group) => group.disposition.includes(disposition));
+const row = (value, id) => value.groups.find((group) => group.id === id);
+
+test("no_caller_key is limited to its reviewed pairs", () => {
+  assert.deepEqual(rowsWith(inventory(), "no_caller_key").flatMap(pairsOf).sort(), NO_CALLER_KEY);
+  for (const group of rowsWith(inventory(), "no_caller_key")) {
+    assert.deepEqual(group.disposition, ["no_caller_key"], group.id);
+    assert.equal(group.qualified_delivery_paths, undefined, group.id);
+  }
+  // A caller-started change that is not a withdrawal cannot be relabelled.
+  for (const id of ["connection_postgres", "token_rotate_postgres", "local_secrets", "token_issue_standalone", "policy_postgres", "connection_delete_standalone"]) {
+    const relabelled = inventory();
+    row(relabelled, id).disposition = ["no_caller_key"];
+    assert.throws(() => validateInventory(relabelled), new RegExp(`${id}: no_caller_key is limited to its reviewed pairs`), id);
+  }
+  // Moving a reviewed pair into a wider row does not widen the label.
+  const widened = inventory();
+  row(widened, "admin_session_grant_postgres").operations = ["admin_session.grant", "connection.create"];
+  row(widened, "connection_postgres").operations = ["connection.replace", "credential.binding_change"];
+  assert.throws(() => validateInventory(widened), /admin_session_grant_postgres: no_caller_key is limited to its reviewed pairs/);
+  // It stands alone, and a row that has it carries no keyed path.
+  const combined = inventory();
+  row(combined, "jwt_postgres").disposition = ["no_caller_key", "missing_metadata"];
+  assert.throws(() => validateInventory(combined), /jwt_postgres: no_caller_key stands alone/);
+  const keyed = inventory();
+  row(keyed, "jwt_postgres").qualified_delivery_paths = structuredClone(row(keyed, "token_revoke_postgres").qualified_delivery_paths);
+  assert.throws(() => validateInventory(keyed), /unreviewed qualified path|jwt_postgres: a no_caller_key row has no keyed path/);
+});
+
+test("withdrawal_admitted is limited to its reviewed pairs and needs a reviewed keyed path", () => {
+  const revoke = (value) => row(value, "token_revoke_postgres");
+  const current = inventory();
+  assert.deepEqual(rowsWith(current, "withdrawal_admitted").map((group) => group.id), ["token_revoke_postgres"]);
+  assert.deepEqual(revoke(current).disposition, ["withdrawal_admitted"]);
+  assert.deepEqual(pairsOf(revoke(current)), ["service_token.revoke/postgres"]);
+  assert.equal(revoke(current).qualified_delivery_paths.length, 1);
+  for (const pair of rowsWith(current, "withdrawal_admitted").flatMap(pairsOf)) assert.ok(WITHDRAWALS.includes(pair), pair);
+  // A change that grants or replaces authority is never a withdrawal.
+  for (const id of ["token_rotate_postgres", "connection_postgres", "local_secrets", "catalog_postgres", "jwt_postgres"]) {
+    const relabelled = inventory();
+    row(relabelled, id).disposition = ["withdrawal_admitted"];
+    assert.throws(() => validateInventory(relabelled), new RegExp(`${id}: withdrawal_admitted is limited to its reviewed pairs`), id);
+  }
+  // Rotation folded back into the revoke row is not a withdrawal either.
+  const folded = inventory();
+  revoke(folded).operations = ["service_token.rotate", "service_token.revoke"];
+  folded.groups = folded.groups.filter((group) => group.id !== "token_rotate_postgres");
+  assert.throws(() => validateInventory(folded), /token_revoke_postgres: withdrawal_admitted is limited to its reviewed pairs/);
+  // A withdrawal with no reviewed keyed path yet keeps its gap label: the
+  // label is earned by the path, one per pair.
+  for (const id of ["connection_delete_postgres", "connection_delete_standalone", "local_secret_delete", "token_revoke_standalone"]) {
+    const unearned = inventory();
+    row(unearned, id).disposition = ["withdrawal_admitted"];
+    assert.throws(() => validateInventory(unearned), new RegExp(`${id}: withdrawal_admitted needs one reviewed keyed path per pair`), id);
+  }
+  const pathless = inventory();
+  delete revoke(pathless).qualified_delivery_paths;
+  assert.throws(() => validateInventory(pathless), /missing qualified revoke path|withdrawal_admitted needs one reviewed keyed path per pair/);
+  const doubled = inventory();
+  revoke(doubled).qualified_delivery_paths.push(structuredClone(revoke(doubled).qualified_delivery_paths[0]));
+  assert.throws(() => validateInventory(doubled), /missing qualified revoke path|withdrawal_admitted needs one reviewed keyed path per pair/);
+  // It stands alone, and the reviewed path belongs to a withdrawal_admitted row.
+  const combined = inventory();
+  revoke(combined).disposition = ["withdrawal_admitted", "missing_metadata"];
+  assert.throws(() => validateInventory(combined), /token_revoke_postgres: withdrawal_admitted stands alone/);
+  const gap = inventory();
+  revoke(gap).disposition = ["missing_metadata"];
+  assert.throws(() => validateInventory(gap), /token_revoke_postgres: a keyed path on an unqualified row needs withdrawal_admitted/);
+});
+
+test("neither disposition can claim required durability", () => {
+  for (const disposition of ["no_caller_key", "withdrawal_admitted"]) {
+    for (const group of rowsWith(inventory(), disposition)) {
+      assert.equal(group.required_mode, "admitted", group.id);
+      assert.equal(group.required_durability_supported, false, group.id);
+      const supported = inventory();
+      row(supported, group.id).required_durability_supported = true;
+      assert.throws(() => validateInventory(supported), /unproven durability claim|is admitted and unqualified/, group.id);
+      for (const mode of ["caller_key_required", "refused", "unavailable", "outside_gateway"]) {
+        const moved = inventory();
+        row(moved, group.id).required_mode = mode;
+        assert.throws(() => validateInventory(moved), /unreviewed caller-key admission|is admitted and unqualified/, `${group.id} ${mode}`);
+      }
+    }
+  }
+  // The refused offline import is not one of them.
+  const imported = inventory();
+  row(imported, "configuration_import").disposition = ["no_caller_key"];
+  assert.throws(() => validateInventory(imported), /configuration_import: no_caller_key is limited to its reviewed pairs/);
 });
 
 test("standalone evidence rows are delivered from their own stores and only they are", () => {
@@ -230,9 +335,12 @@ test("standalone evidence rows are delivered from their own stores and only they
     "catalog_standalone",
     "connection_delete_standalone",
     "connection_standalone",
+    "local_secret_delete",
+    "local_secret_reencrypt",
     "local_secrets",
-    "token_change_standalone",
     "token_issue_standalone",
+    "token_revoke_standalone",
+    "token_rotate_standalone",
   ]);
   for (const group of groups.filter((group) => delivered.includes(group.id))) {
     assert.deepEqual(group.modes, ["standalone"], group.id);
@@ -252,11 +360,16 @@ test("required mode never admits an unsupported row or waves through a reachable
   const byId = Object.fromEntries(groups.map((group) => [group.id, group.required_mode]));
   assert.equal(byId.admin_session_standalone, "refused_at_startup");
   assert.equal(byId.policy_standalone, "refused");
-  assert.equal(byId.token_change_standalone, "admitted");
+  assert.equal(byId.token_rotate_standalone, "admitted");
+  assert.equal(byId.token_revoke_standalone, "admitted");
   // The standalone Connections database records these in the change's own transaction.
   assert.equal(byId.connection_standalone, "admitted");
   assert.equal(byId.connection_delete_standalone, "admitted");
   assert.equal(byId.local_secrets, "admitted");
+  assert.equal(byId.local_secret_delete, "admitted");
+  assert.equal(byId.local_secret_reencrypt, "admitted");
+  // The offline import records evidence for two of its sections only.
+  assert.equal(byId.configuration_import, "refused");
   assert.equal(byId.catalog_standalone, "admitted");
   assert.equal(byId.configuration_activation, "refused_at_startup");
 

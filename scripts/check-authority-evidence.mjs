@@ -57,7 +57,20 @@ const REVISION_OPERATIONS = {
   maintenance: ["secret.reencrypt"],
 };
 assert.deepEqual(Object.values(REVISION_OPERATIONS).flat().sort(), [...OPERATIONS].sort(), "every operation needs exactly one revision contract");
-const DISPOSITIONS = new Set(["already_sufficient", "missing_metadata", "missing_delivery", "unsupported_future_operation"]);
+const DISPOSITIONS = new Set(["already_sufficient", "missing_metadata", "missing_delivery", "unsupported_future_operation", "no_caller_key", "withdrawal_admitted"]);
+// Rows required mode admits without qualification (issue #425, owner rulings
+// of 2026-11-20). Each disposition stands alone, holds only its reviewed
+// operation/mode pairs, and is admitted and unqualified, so neither can
+// relabel a gap. `no_caller_key`: no authenticated remote caller starts the
+// change, so no key can be bound to it; it is reconciled by its natural key
+// (the issuer-scoped JTI digest, the session ID, the maintenance batch). The
+// grant is not a withdrawal and is listed by its own ruling.
+// `withdrawal_admitted`: a remote caller starts a change that only removes
+// authority, so refusing its unkeyed or service-token form would fail open;
+// the row is earned by a reviewed keyed path for every pair it holds.
+const NO_CALLER_KEY_PAIRS = new Set(["jwt.revoke/postgres", "admin_session.withdraw/postgres", "secret.reencrypt/standalone", "admin_session.grant/postgres"]);
+const WITHDRAWAL_PAIRS = new Set(["service_token.revoke/postgres", "service_token.revoke/standalone", "connection.delete/postgres", "connection.delete/standalone", "secret.delete/standalone"]);
+const ADMITTED_UNQUALIFIED = { no_caller_key: NO_CALLER_KEY_PAIRS, withdrawal_admitted: WITHDRAWAL_PAIRS };
 const ADMIN_FILES = ["admin_policy.rs", "admin_tools.rs", "admin_mutation_approvals.rs", "admin_connections.rs", "admin_tokens.rs"];
 const SCHEMA_KEYWORDS = new Set(["$schema", "title", "description", "type", "const", "enum", "anyOf", "pattern", "maxLength", "additionalProperties", "required", "properties"]);
 export const readJson = (path) => JSON.parse(readFileSync(resolve(ROOT, path), "utf8"));
@@ -291,6 +304,29 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
       for (const ref of path.tests) check(/(?:async )?fn [a-z0-9_]+\(/.test(ref.anchor), "qualified test anchor must name a function");
     } else {
       check(group.qualified_delivery_paths === undefined, "unreviewed qualified path");
+    }
+    const pairs = group.operations.flatMap((operation) => group.modes.map((mode) => `${operation}/${mode}`));
+    for (const [disposition, reviewed] of Object.entries(ADMITTED_UNQUALIFIED)) {
+      if (!group.disposition.includes(disposition)) continue;
+      check(group.disposition.length === 1, `${group.id}: ${disposition} stands alone`);
+      for (const pair of pairs) check(reviewed.has(pair), `${group.id}: ${disposition} is limited to its reviewed pairs (${pair} is not one)`);
+      check(group.required_mode === "admitted" && group.required_durability_supported === false, `${group.id}: ${disposition} is admitted and unqualified`);
+    }
+    if (group.disposition.includes("no_caller_key")) {
+      check(group.qualified_delivery_paths === undefined, `${group.id}: a no_caller_key row has no keyed path`);
+    }
+    if (group.disposition.includes("withdrawal_admitted")) {
+      // The paths themselves are held to the reviewed criteria above; here
+      // every pair must have exactly one.
+      const paths = Array.isArray(group.qualified_delivery_paths) ? group.qualified_delivery_paths : [];
+      const covered = paths.map((path) => `${path.criteria?.operation}/${path.criteria?.storage_mode}`);
+      check(paths.length === pairs.length && pairs.every((pair) => covered.filter((key) => key === pair).length === 1),
+        `${group.id}: withdrawal_admitted needs one reviewed keyed path per pair`);
+    } else {
+      // A reviewed path on a row that is not itself qualified exists only
+      // because the row also admits an unqualified withdrawal.
+      check(group.qualified_delivery_paths === undefined || group.required_durability_supported === true,
+        `${group.id}: a keyed path on an unqualified row needs withdrawal_admitted`);
     }
     check(REQUIRED_MODES.has(group.required_mode), `${group.id}: unknown required mode`);
     // An unsupported operation is never run as if it had evidence, and a

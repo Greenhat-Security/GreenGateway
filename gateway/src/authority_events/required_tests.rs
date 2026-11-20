@@ -121,6 +121,7 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
         refused_in_cluster,
         [
             AuthorityOperation::PolicyFileReload,
+            AuthorityOperation::ConfigurationImport,
             AuthorityOperation::MutationApprovalPrepare,
             AuthorityOperation::MutationApprovalConsume,
             AuthorityOperation::MutationApprovalReview,
@@ -129,12 +130,13 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
         "cluster mode refuses operations without durable authority evidence"
     );
     for operation in refused_in_cluster {
-        let why = if operation == AuthorityOperation::PolicyFileReload {
-            "does not perform it"
-        } else if operation == AuthorityOperation::MutationApprovalPrepare {
-            "requires a caller-bound preparation with qualified_v1"
-        } else {
-            "records no durable evidence of it"
+        let why = match operation {
+            AuthorityOperation::PolicyFileReload => "does not perform it",
+            AuthorityOperation::ConfigurationImport => "records evidence for only part of it",
+            AuthorityOperation::MutationApprovalPrepare => {
+                "requires a caller-bound preparation with qualified_v1"
+            }
+            _ => "records no durable evidence of it",
         };
         assert_eq!(
             cluster.refusal(operation).map(|refusal| refusal.message()),
@@ -144,6 +146,45 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
             ))
         );
     }
+}
+
+/// The offline import's writing form records evidence for its policy and
+/// tools activations only; its Connections, audit, discovery and token
+/// sections commit without any. Required mode therefore refuses it in
+/// cluster mode (owner ruling 7 on issue #425, 2026-11-20), with a reason
+/// that says so rather than claiming no evidence at all. Standalone mode
+/// still has no import to refuse, and `best_effort` admits it as before.
+#[test]
+fn required_refuses_the_offline_import_in_cluster_mode() {
+    let operation = AuthorityOperation::ConfigurationImport;
+    assert_eq!(
+        operation.required_mode(StateBackend::Postgres),
+        RequiredMode::Refused
+    );
+    assert_eq!(
+        operation.required_mode(StateBackend::Sqlite),
+        RequiredMode::Unavailable
+    );
+    let refusal = AuthorityEvidenceGate::new(
+        AuthorityEvidenceDurability::Required,
+        StateBackend::Postgres,
+    )
+    .refusal(operation)
+    .expect("required mode refuses the import in cluster mode");
+    assert_eq!(refusal.operation(), operation);
+    assert_eq!(
+        refusal.message(),
+        "AUTHORITY_EVIDENCE_DURABILITY=required refuses configuration.import: cluster mode records evidence for only part of it; nothing was changed"
+    );
+    assert_eq!(
+        AuthorityEvidenceGate::new(
+            AuthorityEvidenceDurability::BestEffort,
+            StateBackend::Postgres,
+        )
+        .refusal(operation),
+        None,
+        "best_effort imports as before"
+    );
 }
 
 #[test]
