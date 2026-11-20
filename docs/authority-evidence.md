@@ -347,7 +347,9 @@ SELECT pg_total_relation_size('greengateway.authority_caller_operation_ids') AS 
        pg_total_relation_size('greengateway.mutation_approval_prepare_evidence') AS receipt_bytes;
 ```
 
-Provision more database capacity before the volume fills. A full journal has a
+Provision more database capacity before the volume fills. From schema 36 the
+reservation table holds the keys of every keyed action, not only these two, and
+the same query measures it. A full journal has a
 separate limit, `AUTHORITY_EVENT_JOURNAL_CAPACITY` (default 1,000,000
 units, range 1 to 1,000,000,000). Monitor
 `greengateway_authority_event_journal_retained` against
@@ -355,6 +357,71 @@ units, range 1 to 1,000,000,000). Monitor
 `qualified_v1` consumer, allow delivered entries to age out, shorten journal
 retention, or raise the capacity across the cluster. Removing a cursor cannot
 reclaim space after the first keyed preparation.
+
+### Caller operation keys bound to a request
+
+Schema 36 (PostgreSQL migration 36) and the standalone reservation table prepare
+caller operation IDs for every admin change that will take an `Idempotency-Key`.
+No admin route binds a key through them yet; each operation family does so in its
+own change. A key belongs to exactly one request: its binding digest is a
+domain-separated, length-prefixed SHA-256 over the action, the recorded actor
+(kind, canonical issuer, subject and auth mode), the target, the `If-Match` value
+and the request with secret values removed
+(`gateway/src/authority_events/caller_operation.rs`). Only an issuer-bound
+principal or a service token can own a key; a system actor cannot, and a
+gateway-assigned v4 ID is never a key. The digest is stored only in the key's
+reservation row, beside the key and its action, in the transaction that commits
+the change and its evidence. It never appears in a receipt, a delivered record, a
+log line or a metric.
+
+- PostgreSQL: migration 36 widens `greengateway.authority_caller_operation_ids`
+  to every action a key will be reserved for (`CALLER_OPERATION_ACTIONS` in
+  `storage::postgres_authority_events`) and adds a nullable `binding_digest`.
+  Every new action must store one. The keyed revoke and keyed prepare keep their
+  reservations with no digest, and their own replay checks, unchanged.
+  `read_caller_operation` looks a key up without a transaction, so a handler can
+  answer an exact retry before any external work; `reserve_bound_operation`
+  reserves it in the change's own transaction, where a second writer competing
+  for the key waits on it and then reads the winner's row.
+- Standalone: each SQLite file that owns authority evidence keeps the same table,
+  created from one definition by both owners (the token database on open, the
+  Connections database in its migration 16), so a token store and a Connections
+  store on one file share one table. Its action list is fixed for every keyable
+  standalone action now, because SQLite cannot widen a CHECK in place. A keyed
+  service-token revoke now reserves its key with its evidence, so no later keyed
+  issue, rotation or Connection change in that file can reuse it, and a key
+  another action reserved refuses the revoke. Every open of the token database
+  reserves any keyed revoke an older build committed without a reservation; the
+  older build itself never reads the table, so it can still serve the file, but
+  it does not enforce reservations the newer build made.
+- Standalone upgrades: the Connections database upgrade is one-way. An older
+  build refuses a version-16 Connections file, and there is no downgrade: recover
+  forward with a build that knows Connections version 16. Restoring the
+  pre-upgrade file copy brings back every Connection and secret deleted since and
+  undoes every rotation, so it is disaster recovery, not rollback. The token
+  database needs no restore to run an older build, at the cost above.
+- Each SQLite file is its own authority, so a key is unique within one file, as
+  consumers deduplicate events on `(authority_id, event_id)`: the token database
+  and a separate Connections database each accept a key once.
+
+Rows are never removed. A reservation exists exactly when a keyed evidence row
+with that operation ID and action exists, in both stores, with two exceptions,
+both written by an older build serving a token database:
+
+- a keyed revoke it committed since this build last opened the file, which the
+  next open reserves;
+- a keyed revoke whose key this file had already reserved for another action
+  (the older build checks only the evidence table). That cannot be repaired: the
+  key stays with the action that reserved it and the revoke keeps no
+  reservation. Every open counts such revokes and logs the count with a fixed
+  message, never the key, token or actor. It cannot happen before an operation
+  family reserves keys for another action in the token database or the
+  Connections database on a shared file.
+
+`a_keyed_revoke_reserves_its_key_with_its_evidence`,
+`reopening_reserves_keyed_revocations_an_older_build_wrote` and
+`reopening_counts_a_keyed_revocation_whose_key_another_action_holds` assert
+these cases.
 
 ## Keyed safe references
 
@@ -1222,7 +1289,11 @@ against a service container over loopback plaintext, under the documented
 `loopback-dev` exception. `postgres-foundation-tls` runs these suites again against a
 disposable PostgreSQL 16, the same pinned image, that accepts TLS and nothing else:
 
-- in `storage::contract_tests`, the service-token and JWT revocation evidence tests
+- in `storage::contract_tests`, the caller operation key contract
+  (`postgres_caller_operation_reservation_contract`,
+  `postgres_a_rolled_back_transaction_leaves_no_reservation`,
+  `postgres_two_transactions_racing_one_key_reserve_it_once`), the service-token
+  and JWT revocation evidence tests
   (`postgres_service_token_change_evidence_satisfies_the_contract`,
   `service_token_change_evidence_matches_the_outbox_and_survives_deletion_and_restart`,
   `a_failed_token_evidence_insert_rolls_back_the_rotate_and_the_revoke`,
@@ -1235,8 +1306,8 @@ disposable PostgreSQL 16, the same pinned image, that accepts TLS and nothing el
   replace, credential binding change, deletion and catalog evidence included;
 - `storage::postgres_documents` and `storage::postgres_admin_sessions`;
 - the dispatcher (`authority_events::dispatcher`);
-- `storage::migrations`' evidence and journal migrations: 12 through 16, 18, 21 and
-  24 through 28;
+- `storage::migrations`' evidence and journal migrations: 12 through 16, 18, 21,
+  24 through 29, 32, 33, 35 and 36;
 - the app-level `admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_postgres`.
 
 Each run generates a throwaway CA and a server certificate for `127.0.0.1` and

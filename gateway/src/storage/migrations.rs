@@ -412,6 +412,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("f8c7c10d1d4fe92e36debb396daafb300805d597a3e4f429b30e72e2710efc32"),
+        Migration::new(
+            36,
+            "caller_operation_bindings",
+            include_str!("migrations/0036_caller_operation_bindings.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("9a2965fceb62b36abea9c58841df092b1c97db24259d20a0301ffc0d3a523a31"),
     ]
 });
 
@@ -444,7 +451,15 @@ impl SchemaCompatibility {
     }
 }
 
-// This build serves exactly schema 35. Drain schema-34 replicas before
+// This build serves exactly schema 36. The move from 35 to 36 (caller
+// operation IDs bound to a request digest, #425) is coordinated for one
+// reason: no release approved migration 36's checksum before a build applied
+// it, so no schema-35 build has an overlap window across it
+// (`an_unapproved_migration_has_no_overlap_window_so_it_cannot_roll`). It is
+// not that a schema-35 writer would write something migration 36 refuses: it
+// reserves only keyed revokes and keyed prepares, with no digest, which
+// migration 36 still admits.
+// Migration 35 was coordinated too: drain schema-34 replicas before
 // migration 35 reserves existing caller IDs. Later writes by an old keyed
 // revoke endpoint would bypass the shared namespace.
 // Schema 34 introduced mutation approvals in the
@@ -492,7 +507,7 @@ impl SchemaCompatibility {
 // the same explicit column list (`connections::pg_store::
 // record_catalog_change_evidence`). This build is not that successor: it
 // carries migration 25 byte for byte, so its migrator records the approved
-// checksum, but it serves only schema 35, so from a prepared fleet it is a
+// checksum, but it serves only schema 36, so from a prepared fleet it is a
 // coordinated drain/migrate/restart like every other step.
 // That shared column list left out the three columns; this build's catalog
 // writer records all three.
@@ -523,8 +538,8 @@ impl SchemaCompatibility {
 // covering every binary that can serve this database: none that predates it
 // accepts this ledger either.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (35, 35),
-    write: (35, 35),
+    read: (36, 36),
+    write: (36, 36),
     approved_extensions: &[],
 };
 
@@ -559,7 +574,7 @@ const APPROVED_EXTENSION_SOURCES: &[ExtensionSource] = &[];
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 35.
+/// contract the schema. The shipped contract accepts only schema 36.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1479,18 +1494,18 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            35,
+            36,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (35, 35));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (35, 35));
-        assert_eq!(schema_version_range(), (35, 35));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (36, 36));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (36, 36));
+        assert_eq!(schema_version_range(), (36, 36));
         assert!(
             BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty(),
             "this build approves no migration above its manifest"
         );
         // Readiness samples the manifest and one row more.
-        assert_eq!(runtime_ledger_row_limit(), 36);
+        assert_eq!(runtime_ledger_row_limit(), 37);
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
             Ok(SchemaStatus::Current)
@@ -1498,7 +1513,7 @@ mod tests {
         // The next migration is refused whatever it is: nothing prepared this
         // build for one.
         let mut beyond = ledger_for(&MANIFEST, MANIFEST.len(), "");
-        beyond.push((36, hex_checksum("-- migration 36")));
+        beyond.push((37, hex_checksum("-- migration 37")));
         assert_eq!(
             validate_runtime_ledger(&beyond),
             Err(LedgerProblem::UnknownVersion)
@@ -4887,6 +4902,198 @@ mod tests {
         clean_database(foundation.pool()).await;
     }
 
+    /// Migration 36 upgrades a populated schema-35 reservation table: the
+    /// keyed revoke and keyed prepare reservations stay exactly as they were,
+    /// with no binding digest. The widened action CHECK, the digest's shape
+    /// and the rule that every new action stores a digest are present as
+    /// three `NOT VALID` constraints, the old inline CHECK is gone, and all
+    /// three are enforced on every new row.
+    #[tokio::test]
+    async fn migration_thirty_six_keeps_existing_reservations_and_requires_a_binding_for_new_actions(
+    ) {
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let config = migration_config(&dsn_file);
+        let foundation = establish(&config).await;
+        clean_database(foundation.pool()).await;
+        let client = foundation.pool().get().await.expect("checkout");
+        bootstrap_ledger(&client).await.expect("ledger");
+        for migration in MANIFEST.iter().take_while(|m| m.version <= 35) {
+            apply_one(&client, migration, &test_settings())
+                .await
+                .expect("apply schema 35");
+        }
+        client
+            .batch_execute(
+                "INSERT INTO greengateway.authority_caller_operation_ids (operation_id, action)
+                 VALUES ('00000000-0000-7000-8000-000000000001', 'service_token.revoke'),
+                        ('00000000-0000-7000-8000-000000000002', 'mutation_approval.prepare')",
+            )
+            .await
+            .expect("populate schema 35");
+        const RESERVATIONS: &str = "SELECT operation_id::text, action, binding_digest \
+             FROM greengateway.authority_caller_operation_ids ORDER BY operation_id";
+        let read = |rows: Vec<tokio_postgres::Row>| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.get::<_, String>(0),
+                        row.get::<_, String>(1),
+                        row.get::<_, Option<String>>(2),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let before: Vec<(String, String)> = client
+            .query(
+                "SELECT operation_id::text, action \
+                 FROM greengateway.authority_caller_operation_ids ORDER BY operation_id",
+                &[],
+            )
+            .await
+            .expect("schema-35 reservations")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        apply_one(&client, &MANIFEST[35], &test_settings())
+            .await
+            .expect("apply schema 36");
+        let after = read(
+            client
+                .query(RESERVATIONS, &[])
+                .await
+                .expect("schema-36 reservations"),
+        );
+        assert_eq!(
+            after,
+            before
+                .into_iter()
+                .map(|(id, action)| (id, action, None))
+                .collect::<Vec<_>>(),
+            "existing reservations are kept and gain no digest"
+        );
+
+        let constraints: Vec<(String, bool)> = client
+            .query(
+                "SELECT conname::text, convalidated FROM pg_constraint \
+                 WHERE conrelid = 'greengateway.authority_caller_operation_ids'::regclass \
+                   AND contype = 'c' AND conname::text LIKE 'authority_caller_operation_ids_%' \
+                   AND conname::text <> 'authority_caller_operation_ids_operation_id_check' \
+                 ORDER BY conname",
+                &[],
+            )
+            .await
+            .expect("constraints")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(
+            constraints,
+            [
+                (
+                    "authority_caller_operation_ids_action_check".to_owned(),
+                    false
+                ),
+                (
+                    "authority_caller_operation_ids_binding_check".to_owned(),
+                    false
+                ),
+                (
+                    "authority_caller_operation_ids_binding_digest_check".to_owned(),
+                    false
+                ),
+            ],
+            "three NOT VALID constraints, and the old action CHECK is replaced"
+        );
+
+        const INSERT: &str = "INSERT INTO greengateway.authority_caller_operation_ids \
+             (operation_id, action, binding_digest) VALUES ($1::text::uuid, $2, $3)";
+        let digest = "a".repeat(64);
+        for (index, action) in super::super::postgres_authority_events::CALLER_OPERATION_ACTIONS
+            .iter()
+            .enumerate()
+        {
+            let id = format!("00000000-0000-7000-8000-{:012x}", 0x100 + index);
+            client
+                .execute(INSERT, &[&id, action, &Some(digest.as_str())])
+                .await
+                .unwrap_or_else(|error| panic!("{action} with a digest: {error}"));
+        }
+        client
+            .execute(
+                INSERT,
+                &[
+                    &"00000000-0000-7000-8000-000000000003",
+                    &"service_token.revoke",
+                    &None::<&str>,
+                ],
+            )
+            .await
+            .expect("a keyed revoke still reserves without a digest");
+        for (id, action, stored) in [
+            // A new action without its digest.
+            (
+                "00000000-0000-7000-8000-000000000201",
+                "connection.create",
+                None,
+            ),
+            (
+                "00000000-0000-7000-8000-000000000202",
+                "tools.publish",
+                None,
+            ),
+            // A digest that is not lowercase SHA-256 hex.
+            (
+                "00000000-0000-7000-8000-000000000203",
+                "connection.create",
+                Some("A".repeat(64)),
+            ),
+            (
+                "00000000-0000-7000-8000-000000000204",
+                "connection.create",
+                Some("a".repeat(63)),
+            ),
+            // Actions no key is reserved for in PostgreSQL.
+            (
+                "00000000-0000-7000-8000-000000000205",
+                "secret.create",
+                Some(digest.clone()),
+            ),
+            (
+                "00000000-0000-7000-8000-000000000206",
+                "credential.binding_change",
+                Some(digest.clone()),
+            ),
+            (
+                "00000000-0000-7000-8000-000000000207",
+                "jwt.revoke",
+                Some(digest.clone()),
+            ),
+            // A gateway-assigned v4 ID, refused by migration 35's own CHECK.
+            (
+                "00000000-0000-4000-8000-000000000208",
+                "connection.create",
+                Some(digest.clone()),
+            ),
+        ] {
+            let refused = client
+                .execute(INSERT, &[&id, &action, &stored.as_deref()])
+                .await
+                .expect_err("the row does not fit");
+            assert_eq!(
+                refused.code(),
+                Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION),
+                "{action} {stored:?}"
+            );
+        }
+        drop(client);
+        clean_database(foundation.pool()).await;
+    }
+
     #[tokio::test]
     async fn migration_thirty_three_preserves_existing_session_evidence_and_checks_new_rows() {
         let Some(dsn) = real_dsn() else {
@@ -5297,7 +5504,7 @@ mod tests {
     /// refuses naming the missing migrations and readiness reports the schema
     /// incompatible, so a replica of it started before the migration stalls
     /// the rollout rather than serving. Its `migrate check` reports exactly
-    /// migrations 25 through 35 unapplied, and its `migrate up` applies them
+    /// migrations 25 through 36 unapplied, and its `migrate up` applies them
     /// and nothing else, recording for migration 25 exactly the checksum the
     /// prepared release approved. From then on it serves, with and without
     /// development auto-migration, and its migrator has nothing left to do.
@@ -5354,7 +5561,7 @@ mod tests {
 
         // The prepared release's schema: not served here.
         let missing = MANIFEST.len() - through_v24;
-        assert_eq!(missing, 11, "migrations 25 through 35");
+        assert_eq!(missing, 12, "migrations 25 through 36");
         let authority = PostgresReadinessAuthority::new(pool.clone());
         assert_eq!(
             read_and_validate_runtime(pool).await,
@@ -5387,7 +5594,7 @@ mod tests {
             })
         );
 
-        // The migration role's `migrate up`: migrations 25 through 35 and
+        // The migration role's `migrate up`: migrations 25 through 36 and
         // nothing else, migration 25 under the approved checksum.
         assert_eq!(
             execute(&strict, false).await,
@@ -5417,7 +5624,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 35 }
+            AuthorityObservation::Writable { schema_version: 36 }
         );
         assert_eq!(
             execute(&strict, true).await,
@@ -5457,7 +5664,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 35 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 36 }
         );
         drop(client);
         clean_database(pool).await;

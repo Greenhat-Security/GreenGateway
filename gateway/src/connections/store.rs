@@ -1015,6 +1015,19 @@ ON catalog_change_evidence(connection_id, sequence);
 const MIGRATION_14_SQL: &str =
     crate::storage::standalone_authority_events::AUTHORITY_EVENT_TABLES_SQL;
 
+// Migration 16: the caller keys used in this file (issue #425). One row per
+// caller-assigned operation ID, the action it is reserved for and the
+// binding digest of the one request it belongs to, committed with the change
+// and its evidence row. The token database creates the same table on open,
+// from the same definition
+// (`storage::standalone_authority_events::CALLER_OPERATION_TABLE_SQL`), so
+// a token store and a Connections store on one file share one table and
+// each refuses a key the other used; `IF NOT EXISTS` for the same reason as
+// migration 14. It starts empty: no Connection change was keyed before it.
+// An older build refuses a version-16 file; there is no downgrade.
+const MIGRATION_16_SQL: &str =
+    crate::storage::standalone_authority_events::CALLER_OPERATION_TABLE_SQL;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -1075,6 +1088,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 15,
         sql: mutation_approvals::MIGRATION_SQL,
+    },
+    Migration {
+        version: 16,
+        sql: MIGRATION_16_SQL,
     },
 ];
 
@@ -4375,6 +4392,7 @@ fn validate_schema(connection: &Connection, path: &Path) -> Result<(), Connectio
         "SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode, action, connection_id, prior_version, new_version, overlay_revision, committed_at FROM catalog_change_evidence LIMIT 0",
         "SELECT singleton, authority_id, created_at FROM authority_event_state LIMIT 0",
         "SELECT source, position, delivered_events, advanced_at FROM authority_event_cursors LIMIT 0",
+        "SELECT operation_id, action, binding_digest FROM authority_caller_operation_ids LIMIT 0",
         mutation_approvals::SCHEMA_QUERY,
     ] {
         connection

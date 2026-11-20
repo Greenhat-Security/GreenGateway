@@ -20,6 +20,9 @@
 
 /// The poll interval, batch size and retry backoff both dispatchers share.
 pub(crate) mod cadence;
+/// Caller operation IDs bound to one request, and what an exact retry gets
+/// back.
+pub(crate) mod caller_operation;
 pub(crate) mod delivery;
 #[cfg(feature = "postgres")]
 pub(crate) mod dispatcher;

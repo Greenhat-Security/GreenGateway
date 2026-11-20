@@ -54,11 +54,30 @@
 //! capacity update each lock at most the state row or the cursor row and
 //! nothing a producer holds, so no cycle can form.
 //!
+//! A keyed producer also reserves its caller key
+//! ([`reserve_caller_operation`], [`reserve_bound_operation`]), and a second
+//! writer of the same key waits on the first writer's uncommitted
+//! primary-key entry until that transaction ends. That wait has one place in
+//! the order: after the producer's own store locks and before
+//! `security_revision_state` and the journal state row. The full order is
+//! therefore own rows, caller key, `security_revision_state`, journal state
+//! row. A producer that reserved its key after `security_revision_state`
+//! could deadlock against another holder of the key (one holds the key and
+//! waits for `security_revision_state`, the other holds
+//! `security_revision_state` and waits for the key) and would be answered
+//! only by PostgreSQL's deadlock detector, as a `503`. The keyed revoke
+//! (`storage::postgres_service_tokens`) and the keyed prepare
+//! (`connections::pg_mutation_approvals`) follow this order.
+//!
 //! Errors carry a classification and a static operation label only.
 
 use std::time::Duration;
 
 use uuid::Uuid;
+
+use crate::authority_events::caller_operation::{
+    CallerKeyReservation, CallerKeyState, CallerOperation,
+};
 
 use super::{
     log_classified,
@@ -211,6 +230,143 @@ pub(crate) async fn reserve_caller_operation(
         )
         .await
         .map(|count| count == 1)
+}
+
+/// Every action a caller key can be reserved for: migration 36's CHECK on
+/// `greengateway.authority_caller_operation_ids.action`, value for value.
+/// `credential.binding_change` rides on its Connection operation's key, and
+/// local secrets do not exist in PostgreSQL, so neither is here.
+pub(crate) const CALLER_OPERATION_ACTIONS: [&str; 20] = [
+    "service_token.revoke",
+    "mutation_approval.prepare",
+    "service_token.issue",
+    "service_token.rotate",
+    "connection.create",
+    "connection.replace",
+    "connection.delete",
+    "catalog.mcp.publish",
+    "catalog.openapi.publish",
+    "catalog.overlay.replace",
+    "catalog.overlay.delete",
+    "policy.publish",
+    "policy.rollback",
+    "policy.rule.create",
+    "policy.rule.update",
+    "policy.rule.delete",
+    "policy.rule.reorder",
+    "policy.suggestion.accept",
+    "tools.publish",
+    "policy_tests.publish",
+];
+
+/// The two actions keyed before migration 36: their reservations have no
+/// binding digest ([`reserve_caller_operation`]), and their own stores'
+/// replay checks decide an exact retry. Every other action must store one.
+pub(crate) const UNBOUND_CALLER_OPERATION_ACTIONS: [&str; 2] =
+    ["service_token.revoke", "mutation_approval.prepare"];
+
+const OPERATION_CALLER_KEY_READ: &str = "authority_caller_operation_read";
+const OPERATION_CALLER_KEY_RESERVE: &str = "authority_caller_operation_reserve";
+
+/// Whether `action` is one a key is bound to by digest.
+fn is_bound_action(action: &str) -> bool {
+    CALLER_OPERATION_ACTIONS.contains(&action)
+        && !UNBOUND_CALLER_OPERATION_ACTIONS.contains(&action)
+}
+
+const READ_CALLER_OPERATION_SQL: &str = "SELECT action, binding_digest \
+     FROM greengateway.authority_caller_operation_ids WHERE operation_id = $1::text::uuid";
+
+/// What the reservation table says about `operation`'s key. Read only and
+/// usable outside a transaction, so a handler can ask before any external
+/// I/O and answer an exact retry without repeating it. The answer is
+/// advisory: the change's own transaction decides, with
+/// [`reserve_bound_operation`].
+#[cfg_attr(not(test), allow(dead_code))] // Asked by the operation families that bind keys.
+pub(crate) async fn read_caller_operation(
+    client: &tokio_postgres::Client,
+    operation: &CallerOperation,
+) -> Result<CallerKeyState, RepositoryError> {
+    if !is_bound_action(operation.action()) {
+        return Err(RepositoryError::invalid_parameter(
+            OPERATION_CALLER_KEY_READ,
+            "action",
+        ));
+    }
+    let row = client
+        .query_opt(READ_CALLER_OPERATION_SQL, &[&operation.id().to_string()])
+        .await
+        .map_err(|error| classify_query(error, OPERATION_CALLER_KEY_READ))?;
+    Ok(match row {
+        None => CallerKeyState::Unused,
+        Some(row) => {
+            let action: String = column(&row, 0, OPERATION_CALLER_KEY_READ)?;
+            let digest: Option<String> = column(&row, 1, OPERATION_CALLER_KEY_READ)?;
+            operation.judge(&action, digest.as_deref())
+        }
+    })
+}
+
+/// Reserve `operation`'s key with its binding digest in the caller's
+/// transaction, which also commits the change, its evidence row and its
+/// journal entry. A key already reserved is judged instead, and nothing is
+/// written: the same action and digest is an exact retry, anything else a
+/// conflict. The primary key serializes writers competing for one key: a
+/// second writer waits for the first to end, and when the first committed
+/// it reads the committed row (the transaction runs at READ COMMITTED, so
+/// the statement after the insert sees it); when the first rolled back, the
+/// second's insert takes the key. Under REPEATABLE READ or SERIALIZABLE the
+/// waiting insert would instead fail with a serialization error (SQLSTATE
+/// 40001), which is returned as a classified `Conflict` error and fails
+/// closed: the transaction rolls back and nothing is reserved or changed.
+///
+/// Where the caller calls this, in lock order: after its own store's locks
+/// and before `security_revision_state` and the journal state row (see the
+/// module's lock order; reserving later can deadlock against another holder
+/// of the key). The caller's own in-transaction lookup of the key (step 1 of
+/// the keyed contract) also runs after its store's serializing lock, so a
+/// concurrent exact duplicate that committed first is answered as a replay
+/// from its evidence before this request reads its target, and this insert
+/// only meets a writer that is still in flight.
+#[cfg_attr(not(test), allow(dead_code))] // Called by the operation families that bind keys.
+pub(crate) async fn reserve_bound_operation(
+    client: &tokio_postgres::Client,
+    operation: &CallerOperation,
+) -> Result<CallerKeyReservation, RepositoryError> {
+    if !is_bound_action(operation.action()) {
+        return Err(RepositoryError::invalid_parameter(
+            OPERATION_CALLER_KEY_RESERVE,
+            "action",
+        ));
+    }
+    let id = operation.id().to_string();
+    let inserted = client
+        .execute(
+            "INSERT INTO greengateway.authority_caller_operation_ids \
+                 (operation_id, action, binding_digest) \
+             VALUES ($1::text::uuid, $2, $3) ON CONFLICT (operation_id) DO NOTHING",
+            &[&id, &operation.action(), &operation.binding_digest()],
+        )
+        .await
+        .map_err(|error| classify_query(error, OPERATION_CALLER_KEY_RESERVE))?;
+    if inserted == 1 {
+        return Ok(CallerKeyReservation::Reserved);
+    }
+    let row = client
+        .query_opt(READ_CALLER_OPERATION_SQL, &[&id])
+        .await
+        .map_err(|error| classify_query(error, OPERATION_CALLER_KEY_RESERVE))?;
+    let Some(row) = row else {
+        // The key refused the insert and then read as absent: not this
+        // request's either.
+        return Ok(CallerKeyReservation::OtherBinding);
+    };
+    let action: String = column(&row, 0, OPERATION_CALLER_KEY_RESERVE)?;
+    let digest: Option<String> = column(&row, 1, OPERATION_CALLER_KEY_RESERVE)?;
+    Ok(match operation.judge(&action, digest.as_deref()) {
+        CallerKeyState::SameBinding => CallerKeyReservation::SameBinding,
+        CallerKeyState::Unused | CallerKeyState::OtherBinding => CallerKeyReservation::OtherBinding,
+    })
 }
 
 /// Count and log one mutation refused because the journal was full. Every
@@ -700,6 +856,56 @@ mod tests {
         }
         assert_eq!(JournalSource::from_table("security_outbox"), None);
         assert!(journal.contains(&format!("consumer IN ('{DISPATCHER_CONSUMER}')")));
+    }
+
+    /// The quoted values between `opening` and the next `)` of `sql`.
+    fn quoted_list(sql: &str, opening: &str) -> Vec<String> {
+        let (_, rest) = sql
+            .split_once(opening)
+            .unwrap_or_else(|| panic!("migration 36 states {opening}"));
+        let (list, _) = rest.split_once(')').expect("the list closes");
+        list.split('\'')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The reservable actions are migration 36's action CHECK, value for
+    /// value; only the two actions keyed before it may go without a binding
+    /// digest; every standalone action but the local-secret ones is
+    /// reservable here too; and each is an `authority_event.v1` operation.
+    #[test]
+    fn the_caller_operation_actions_are_the_migrations_closed_vocabulary() {
+        let migration = include_str!("migrations/0036_caller_operation_bindings.sql");
+        assert_eq!(
+            quoted_list(
+                migration,
+                "ADD CONSTRAINT authority_caller_operation_ids_action_check CHECK (action IN ("
+            ),
+            CALLER_OPERATION_ACTIONS
+        );
+        assert_eq!(
+            quoted_list(migration, "OR action IN ("),
+            UNBOUND_CALLER_OPERATION_ACTIONS
+        );
+        assert!(migration.contains("DROP CONSTRAINT authority_caller_operation_ids_action_check"));
+        let schema = include_str!("../../../docs/schemas/authority_event.v1.schema.json");
+        for action in CALLER_OPERATION_ACTIONS {
+            assert!(
+                schema.contains(&format!("\"{action}\"")),
+                "{action} is an authority_event.v1 operation"
+            );
+        }
+        for action in
+            crate::storage::standalone_authority_events::STANDALONE_CALLER_OPERATION_ACTIONS
+        {
+            assert_eq!(
+                CALLER_OPERATION_ACTIONS.contains(&action),
+                !action.starts_with("secret."),
+                "{action}"
+            );
+        }
     }
 
     /// Undelivered is the distance from the cursor (or, before the first
