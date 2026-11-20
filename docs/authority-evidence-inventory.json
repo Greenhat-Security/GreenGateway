@@ -2346,16 +2346,32 @@
         "standalone"
       ],
       "entrypoints": [],
-      "boundary": "The configuration compiler validates the environment and selects authorities without I/O; serving bootstrap's preflight, activation and serving stages then assemble runtime state from that one compiled result. PostgreSQL document seeding uses normal document commits but does not establish a revisioned whole-configuration authority.",
-      "record": "No common configuration activation manifest/event transaction. File/environment configuration remains operator-owned; revisioned policy/tools records cover only their own resources.",
+      "boundary": "The configuration compiler validates the environment and selects authorities without I/O; serving bootstrap's preflight, activation and serving stages then assemble runtime state from that one compiled result. PostgreSQL document seeding uses normal document commits but does not establish a revisioned whole-configuration authority. Under AUTHORITY_EVIDENCE_DURABILITY=required, start_serving asks authority_events::required::startup_refusal after the compiler accepts the environment and before preflight, and stops: no stage runs, so nothing is connected, migrated, published, seeded, activated or served. Bundle mode stops earlier with source.mode_unavailable and must pass the same check when bundle serving ships. Offline commands do not ask.",
+      "record": "No common configuration activation manifest/event transaction. File/environment configuration remains operator-owned; revisioned policy/tools records cover only their own resources. Because nothing records an activation, required mode refuses to start in both modes.",
       "actor": "Startup system process; no authenticated changing operator.",
       "identity": "No authoritative whole-configuration operation/revision identity.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "unsupported_future_operation"
       ],
-      "follow_up": "#242 configuration ledger/activation contract first; bind validated safe manifest digest, parent revision, activation intent/result and required evidence before enabling required-durability configuration activation. Never hash/export raw secrets as a substitute for redaction.",
+      "follow_up": "Not part of #425 by owner decision, recorded 2026-11-19; tracked in #242. Required mode keeps this row refused at startup until #242 demonstrates, with tests: a ledger-owned safe manifest and digest; parent revision and compare-and-swap; actor and operation intent; activation and evidence that are atomic or recoverably staged; authoritative replay after interruption; and export intent accepted before an artifact is released. Raw secrets are never hashed or exported as a substitute for redaction. Owner decision of 2026-11-19: with AUTHORITY_EVIDENCE_DURABILITY=required the gateway refuses to start in both modes, because configuration activation has no durable evidence. `ActivationProof` in `authority_events/required.rs` has no value. #242 enables a mode only by adding a constructor that verifies, inside the activation stage and atomically with it, that a ledger or activation record matches this exact configuration (same digest, same revision), and by changing this row in the same reviewed change. A value granted to a whole backend, or computed before a store is open, is not evidence.",
       "sources": [
+        {
+          "path": "gateway/src/bootstrap/stages.rs",
+          "anchor": "pub(crate) async fn start_serving<"
+        },
+        {
+          "path": "gateway/src/bootstrap/stages.rs",
+          "anchor": "crate::authority_events::required::startup_refusal(&config)"
+        },
+        {
+          "path": "gateway/src/authority_events/required.rs",
+          "anchor": "pub(crate) enum ActivationProof {}"
+        },
+        {
+          "path": "gateway/src/authority_events/required.rs",
+          "anchor": "pub(crate) fn startup_refusal("
+        },
         {
           "path": "gateway/src/bootstrap.rs",
           "anchor": "pub(super) async fn run("
@@ -2363,13 +2379,29 @@
         {
           "path": "gateway/src/config.rs",
           "anchor": "pub fn from_env("
-        },
-        {
-          "path": "gateway/src/bootstrap/stages.rs",
-          "anchor": "pub(crate) async fn start_serving<"
         }
       ],
       "tests": [
+        {
+          "path": "gateway/src/bootstrap_tests.rs",
+          "anchor": "fn required_authority_evidence_refuses_to_start_before_any_stage_runs("
+        },
+        {
+          "path": "gateway/src/bootstrap_tests.rs",
+          "anchor": "fn best_effort_runs_every_stage_as_before("
+        },
+        {
+          "path": "gateway/src/bootstrap_tests.rs",
+          "anchor": "fn a_compiler_refusal_is_reported_before_the_activation_refusal("
+        },
+        {
+          "path": "gateway/src/bootstrap_tests.rs",
+          "anchor": "fn the_activation_refusal_names_the_setting_and_no_configured_value("
+        },
+        {
+          "path": "gateway/src/authority_events/required_tests.rs",
+          "anchor": "fn no_activation_proof_exists_for_any_candidate("
+        },
         {
           "path": "gateway/src/config_tests.rs",
           "anchor": "fn a_valid_postgres_mode_configuration_parses("
@@ -2384,8 +2416,8 @@
         }
       ],
       "required_durability_supported": false,
-      "required_mode": "not_refused",
-      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+      "required_mode": "refused_at_startup",
+      "test_claim": "The bootstrap tests prove that required mode refuses to start in both modes before any stage runs, with a value-free message; that the compiler's refusals are reported instead when they apply; and that best_effort startup is unchanged. gateway/tests/audit_durability_startup.rs runs the real binary under required in both modes and proves it exits with status 1 and writes nothing. The rest are existing behavior regression anchors. No test certifies activation evidence, because none exists."
     },
     {
       "id": "configuration_export",

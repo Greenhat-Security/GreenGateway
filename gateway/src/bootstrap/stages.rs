@@ -8,6 +8,9 @@ use super::*;
 pub(crate) enum StartupFailure {
     /// The configuration compiler refused the environment. No stage ran.
     Configuration(config::ConfigError),
+    /// `AUTHORITY_EVIDENCE_DURABILITY=required` with nothing to record the
+    /// configuration's activation (issue #425). No stage ran.
+    AuthorityEvidence(crate::authority_events::required::StartupEvidenceRefusal),
     /// The pinned bundle failed the same reader as the offline tools.
     Bundle(Vec<gateway_config::bundle::BundleDiagnostic>),
     StateDirectory(gateway_config::state_dir::StateDirError),
@@ -105,6 +108,10 @@ impl ServingFailure {
 /// passes its result to every stage. Bundle mode reads one pinned generation,
 /// checks its standalone state requirements and stops before activation.
 ///
+/// Under `AUTHORITY_EVIDENCE_DURABILITY=required` startup stops after the
+/// compiler and before preflight: nothing evidences the activation of the
+/// configuration it would serve (issue #425).
+///
 /// Serving starts only with a gateway activation built in full. When
 /// preflight or activation fails, or serving fails before any listener
 /// served, what preflight published is withdrawn before the error is
@@ -155,6 +162,15 @@ pub(crate) async fn start_serving<S: StartupStages>(
         }
     };
     let config = config::into_config(plan);
+    // Required authority evidence refuses to start until the activation of
+    // this configuration can be proven durably recorded (issue #425, owner
+    // decision 2 of 2026-11-19; the proof is issue #242's). The check comes
+    // after the compiler, so its refusals are reported first, and before
+    // preflight, so nothing is connected, migrated, published or seeded.
+    // Bundle mode stops above; bundle serving must pass this check too.
+    if let Some(refusal) = crate::authority_events::required::startup_refusal(&config) {
+        return Err(StartupFailure::AuthorityEvidence(refusal));
+    }
     // Each stage's future is boxed: an unoptimized build would otherwise
     // hold all of them inline, and the main thread's stack on Windows is
     // 1 MiB.

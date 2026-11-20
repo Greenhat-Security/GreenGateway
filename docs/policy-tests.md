@@ -302,7 +302,7 @@ If-Match: "sha256:..."            (replacing the stored one)
 | `404` | -- | No policy is configured. |
 | `404` | `policy_tests_not_found` | No suite is stored (`GET`). |
 | `408` | `policy_tests_request_timeout` | The body did not arrive within five seconds. |
-| `409` | `authority_evidence_unsupported` | `AUTHORITY_EVIDENCE_DURABILITY=required` in standalone mode, which records no evidence of the write beyond the version row ([authority evidence](authority-evidence.md)). Nothing was written. |
+| `409` | `authority_evidence_unsupported` | `AUTHORITY_EVIDENCE_DURABILITY=required` in standalone mode, which records no evidence of the write beyond the version row ([authority evidence](authority-evidence.md)). Nothing was written. Until #242 evidences configuration activation, a gateway in that mode refuses to start, so it answers nothing. |
 | `412` | `policy_tests_etag_mismatch` | `If-Match` does not name the stored suite (or none is stored). |
 | `412` | `policy_tests_exist` | `If-None-Match: *`, and a suite is already stored. |
 | `413` | -- | The body exceeds `MAX_BODY_SIZE` or 2 MiB, whichever is lower. |

@@ -834,9 +834,11 @@ The `rule` of a `config` diagnostic: the compiler check that refused it (`gatewa
 | `authority_event_sink_requirements` | An authority-event sink without its pseudonym key alias or, for the file sink, its file. |
 | `authority_event_material_unused` | Authority-event material the configured sink never reads. |
 | `authority_pseudonym_keys_distinct` | The current and previous pseudonym key aliases naming the same alias. |
-| `authority_evidence_delivery_required` | `AUTHORITY_EVIDENCE_DURABILITY=required` in cluster mode with no authority-event sink to deliver it. |
+| `authority_evidence_delivery_required` | `AUTHORITY_EVIDENCE_DURABILITY=required` in either mode with no authority-event sink to deliver it. |
 | `authority_evidence_unsupported_configuration` | `AUTHORITY_EVIDENCE_DURABILITY=required` with a setting that enables an authority change the evidence inventory marks unsupported in this mode. |
 | `source_selection` | A source selector is invalid or missing, the selected authority conflicts with an environment setting, or this build cannot load that authority. |
+
+These rules are the compiler's, so `ggctl` accepts a configuration the gateway then refuses to serve: with `AUTHORITY_EVIDENCE_DURABILITY=required`, a configuration that passes every rule above is refused at serving startup with `authority_evidence_activation_unevidenced`, in either mode, because nothing records the activation of the configuration itself until #242 ([required-durability mode](authority-evidence.md#required-durability-mode)). That refusal is not a compiler rule and `ggctl` does not report it.
 
 ### Source diagnostics
 

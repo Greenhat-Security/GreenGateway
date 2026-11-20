@@ -6788,9 +6788,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::run#1",
-      "sha256": "05d6a8ea38b7acb71094fa93e1b00a2cb63c49adf81b83f6aed1aa2a00783d06",
+      "sha256": "d86790fe44a16814575faa6f95e1c5c30a68a957200c96e9d5eba106b28582f3",
       "owner": "GreenGateway maintainers",
-      "purpose": "The native entry point reports value-free configuration, bundle and state-directory failures to the operator and exits before activation. It opens no listener or client."
+      "purpose": "The native entry point reports value-free configuration, required authority evidence, bundle and state-directory failures to the operator and exits before activation. It opens no listener or client."
     },
     {
       "file": "gateway/src/bootstrap/commands.rs",
