@@ -720,3 +720,228 @@ async fn required_evidence_admits_standalone_service_token_changes() {
         .iter()
         .all(|event| event.event_type != audit::event::AUTHORITY_EVIDENCE_OPERATION_REFUSED));
 }
+
+// --- the keyed-change helpers every operation family uses (issue #425) -----
+
+fn keyed_parts(keys: &[&str]) -> http::request::Parts {
+    let mut request = Request::builder()
+        .method(Method::PUT)
+        .uri("/v1/admin/fixture/fixture-id")
+        .body(())
+        .expect("request builds");
+    for key in keys {
+        request
+            .headers_mut()
+            .append("idempotency-key", key.parse().unwrap());
+    }
+    request.into_parts().0
+}
+
+fn issuer_bound_owner() -> auth::Principal {
+    let mut owner = test_principal(&["superadmin"]);
+    owner.issuer = Some("https://issuer.example.test".to_owned());
+    owner
+}
+
+/// `caller_operation` binds the header to its request: no header is no key;
+/// a malformed or repeated header is `400`; a principal without a canonical
+/// issuer cannot own a key (`403`, as for the keyed revoke); an issuer-bound
+/// principal or a service token can. The same key over two different
+/// requests gives two different bindings.
+#[test]
+fn a_caller_key_is_bound_to_its_request_or_refused_before_anything_is_read() {
+    let key = crate::auth::tokens::test_revoke_operation_id(3).to_string();
+    let owner = issuer_bound_owner();
+    let actor = auth::change_actor::ChangeActor::from_principal(&owner);
+    let bind = |keys: &[&str], actor: &auth::change_actor::ChangeActor, body: &[u8]| {
+        caller_operation(
+            &keyed_parts(keys).headers,
+            actor,
+            "connection.replace",
+            "fixture-id",
+            "\"etag\"",
+            body,
+        )
+    };
+    assert_eq!(bind(&[], &actor, b"{}").expect("no key"), None);
+    let first = bind(&[&key], &actor, b"{}").expect("binds").expect("a key");
+    assert_eq!(first.id().to_string(), key);
+    assert_eq!(first.action(), "connection.replace");
+    let other = bind(&[&key], &actor, br#"{"name":"other"}"#)
+        .expect("binds")
+        .expect("a key");
+    assert_ne!(first.binding_digest(), other.binding_digest());
+
+    for keys in [
+        vec!["not-a-uuid"],
+        vec![key.as_str(), key.as_str()],
+        vec!["AAAAAAAA-AAAA-7AAA-8AAA-AAAAAAAAAAAA"],
+        vec!["00000000-0000-4000-8000-000000000000"],
+    ] {
+        let refused = bind(&keys, &actor, b"{}").expect_err("refused");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{keys:?}");
+    }
+    let unbound = auth::change_actor::ChangeActor::from_principal(&test_principal(&["superadmin"]));
+    let refused = bind(&[&key], &unbound, b"{}").expect_err("no canonical issuer");
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let mut service = test_principal(&["superadmin"]);
+    service.auth_method = auth::AuthMethod::ServiceToken;
+    let service = auth::change_actor::ChangeActor::from_principal(&service);
+    assert!(bind(&[&key], &service, b"{}").expect("binds").is_some());
+}
+
+/// Ask `admit_keyed_authority_change` as a handler would, with no cluster
+/// membership.
+async fn admit_keyed(
+    evidence: authority_events::required::AuthorityEvidenceGate,
+    operation: Option<authority_events::required::AuthorityOperation>,
+    caller: Option<&authority_events::caller_operation::CallerOperation>,
+    request: (&audit::AuditLog, &http::request::Parts, &auth::Principal),
+) -> ResponseResult<()> {
+    let (audit_log, parts, principal) = request;
+    let policy = client_ip::ClientIpPolicy::default();
+    let gates = KeyedChangeGates {
+        evidence: &evidence,
+        #[cfg(feature = "postgres")]
+        membership: None,
+        audit: audit_log,
+        client_ip_policy: &policy,
+    };
+    let actor = auth::change_actor::ChangeActor::from_principal(principal);
+    admit_keyed_authority_change(&gates, operation, caller, &actor, parts, principal).await
+}
+
+/// `admit_keyed_authority_change` asks the evidence gate with the request's
+/// form, and a withdrawal never asks it. In standalone mode there is no
+/// operation gate to ask; in cluster mode a keyed request with no
+/// membership to ask is refused (`503 roster_unavailable`), never admitted,
+/// and an unkeyed one does not ask.
+#[tokio::test]
+async fn a_keyed_change_is_admitted_through_the_evidence_gate_then_the_operation_gate() {
+    use authority_events::required::{AuthorityEvidenceGate, AuthorityOperation};
+
+    let (audit_log, _capture) = captured_audit();
+    let owner = issuer_bound_owner();
+    let actor = auth::change_actor::ChangeActor::from_principal(&owner);
+    let key = crate::auth::tokens::test_revoke_operation_id(4).to_string();
+    let parts = keyed_parts(&[&key]);
+    let caller = caller_operation(&parts.headers, &actor, "connection.create", "", "", b"{}")
+        .expect("binds")
+        .expect("keyed");
+    let request = (&audit_log, &parts, &owner);
+    let required = |backend| {
+        AuthorityEvidenceGate::new(config::AuthorityEvidenceDurability::Required, backend)
+    };
+
+    // Standalone: the gate decides, and nothing else is asked.
+    let standalone = required(config::StateBackend::Sqlite);
+    let refused = admit_keyed(
+        standalone,
+        Some(AuthorityOperation::PolicyPublish),
+        Some(&caller),
+        request,
+    )
+    .await
+    .expect_err("standalone mode records no policy evidence");
+    assert_refused(*refused, "policy.publish").await;
+    admit_keyed(standalone, None, Some(&caller), request)
+        .await
+        .expect("a withdrawal never asks the evidence gate");
+    admit_keyed(
+        AuthorityEvidenceGate::best_effort(),
+        Some(AuthorityOperation::PolicyPublish),
+        Some(&caller),
+        request,
+    )
+    .await
+    .expect("best_effort admits");
+
+    // Cluster mode: an unkeyed change does not ask the operation gate; a
+    // keyed one with no membership to ask is refused.
+    let cluster = required(config::StateBackend::Postgres);
+    admit_keyed(
+        cluster,
+        Some(AuthorityOperation::PolicyPublish),
+        None,
+        request,
+    )
+    .await
+    .expect("cluster mode admits an unkeyed policy publication");
+    let refused = admit_keyed(cluster, None, Some(&caller), request)
+        .await
+        .expect_err("a keyed change with no membership to ask is refused");
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    #[cfg(feature = "postgres")]
+    assert_eq!(
+        json_body(*refused).await["reason"],
+        json!("roster_unavailable")
+    );
+}
+
+/// `replayed_receipt` is the read-only pre-check: an unused key goes on; an
+/// exact retry is answered with the receipt read from the committed evidence
+/// (and only then is the evidence read); a key bound to anything else is
+/// `409`; a failed read, or a reservation with no evidence row, is `503`.
+#[tokio::test]
+async fn the_pre_check_answers_an_exact_retry_with_its_receipt_and_any_other_use_with_a_conflict() {
+    use authority_events::caller_operation::{CallerKeyState, OperationReceipt};
+    use std::future::ready;
+
+    let receipt = OperationReceipt {
+        operation_id: crate::auth::tokens::test_revoke_operation_id(5).to_string(),
+        operation: "connection.replace".to_owned(),
+        resource_id: "fixture-id".to_owned(),
+        revision: Some(2),
+        committed_at: "2026-11-20T12:00:00Z".to_owned(),
+    };
+    let unread = || async { panic!("the evidence is read only for an exact retry") };
+    replayed_receipt(ready(Ok(CallerKeyState::Unused)), unread())
+        .await
+        .expect("an unused key goes on");
+
+    let replayed = replayed_receipt(
+        ready(Ok(CallerKeyState::SameBinding)),
+        ready(Ok(Some(receipt.clone()))),
+    )
+    .await
+    .expect_err("an exact retry is answered");
+    assert_eq!(replayed.status(), StatusCode::OK);
+    assert_eq!(
+        replayed.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    assert_eq!(
+        json_body(*replayed).await,
+        json!({
+            "operation_id": receipt.operation_id,
+            "operation": "connection.replace",
+            "resource_id": "fixture-id",
+            "revision": 2,
+            "committed_at": "2026-11-20T12:00:00Z",
+        })
+    );
+
+    let conflict = replayed_receipt(ready(Ok(CallerKeyState::OtherBinding)), unread())
+        .await
+        .expect_err("another binding conflicts");
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(*conflict).await["reason"],
+        json!(CALLER_OPERATION_CONFLICT_REASON)
+    );
+
+    let failed = replayed_receipt(
+        ready(Err(storage::RepositoryError::new(
+            storage::RepositoryErrorKind::Unavailable,
+            "fixture",
+        ))),
+        unread(),
+    )
+    .await
+    .expect_err("an unreadable key refuses");
+    assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let orphan = replayed_receipt(ready(Ok(CallerKeyState::SameBinding)), ready(Ok(None)))
+        .await
+        .expect_err("a reservation without its evidence refuses");
+    assert_eq!(orphan.status(), StatusCode::SERVICE_UNAVAILABLE);
+}

@@ -244,14 +244,9 @@ pub(super) async fn prepare_binding_or_receipt(
             Err(error),
         ))
     };
-    let binding = PrepareBinding::new(
-        id,
-        auth::change_actor::ChangeActor::from_principal(principal),
-        tool_id,
-        etag,
-        body,
-    )
-    .map_err(receipt_error)?;
+    let actor = auth::change_actor::ChangeActor::from_principal(principal);
+    let form = authority_events::required::RequestForm::of(true, &actor);
+    let binding = PrepareBinding::new(id, actor, tool_id, etag, body).map_err(receipt_error)?;
     if state.authority_evidence.has_prepare_receipts() {
         let store = state
             .connections
@@ -270,15 +265,19 @@ pub(super) async fn prepare_binding_or_receipt(
             )));
         }
     }
+    // Required mode admits the keyed preparation only when every keyed
+    // criterion holds, the file sink and a Unix build included, and names
+    // the first that does not (issue #425).
+    admit_authority_change_for(
+        &state.authority_evidence,
+        authority_events::required::AuthorityOperation::MutationApprovalPrepare,
+        form,
+        &state.audit,
+        parts,
+        principal,
+        &state.client_ip_policy,
+    )?;
     if !state.authority_evidence.supports_keyed_prepare() {
-        admit_authority_change(
-            &state.authority_evidence,
-            authority_events::required::AuthorityOperation::MutationApprovalPrepare,
-            &state.audit,
-            parts,
-            principal,
-            &state.client_ip_policy,
-        )?;
         return Err(Box::new(
             (
                 StatusCode::NOT_IMPLEMENTED,

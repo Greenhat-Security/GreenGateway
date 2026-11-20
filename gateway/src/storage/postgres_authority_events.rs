@@ -278,6 +278,12 @@ fn is_bound_action(action: &str) -> bool {
 const READ_CALLER_OPERATION_SQL: &str = "SELECT action, binding_digest \
      FROM greengateway.authority_caller_operation_ids WHERE operation_id = $1::text::uuid";
 
+/// Whether the durable contract fence carries a capability at a minimum
+/// schema: `$1` the schema, `$2` the capability name.
+const CALLER_OPERATION_KEYS_FENCE_SQL: &str = "SELECT EXISTS (SELECT 1 \
+     FROM greengateway.contract_fence WHERE singleton AND minimum_schema >= $1 \
+     AND $2 = ANY (string_to_array(capabilities, ',')))";
+
 /// What the reservation table says about `operation`'s key. Read only and
 /// usable outside a transaction, so a handler can ask before any external
 /// I/O and answer an exact retry without repeating it. The answer is
@@ -329,6 +335,16 @@ pub(crate) async fn read_caller_operation(
 /// concurrent exact duplicate that committed first is answered as a replay
 /// from its evidence before this request reads its target, and this insert
 /// only meets a writer that is still in flight.
+///
+/// Before it reserves anything it confirms, in the same transaction, that the
+/// durable contract fence carries `caller_operation_keys` at schema 36 or
+/// above (`storage::compatibility::CALLER_OPERATION_KEYS`), the way a
+/// Connection enrollment confirms its own fence. The handler's operation
+/// gate raised it when it admitted the first keyed change, and the fence is
+/// forward-only, so a fence below it means the gate was not asked: the key is
+/// refused (`Unavailable`), and nothing is reserved or changed. Every build
+/// that could still be serving beside this one then honours or refuses the
+/// key; none ignores it.
 #[cfg_attr(not(test), allow(dead_code))] // Called by the operation families that bind keys.
 pub(crate) async fn reserve_bound_operation(
     client: &tokio_postgres::Client,
@@ -338,6 +354,28 @@ pub(crate) async fn reserve_bound_operation(
         return Err(RepositoryError::invalid_parameter(
             OPERATION_CALLER_KEY_RESERVE,
             "action",
+        ));
+    }
+    let requirement = &crate::storage::compatibility::CALLER_OPERATION_KEYS;
+    let fenced = client
+        .query_one(
+            CALLER_OPERATION_KEYS_FENCE_SQL,
+            &[
+                &requirement.minimum_schema,
+                &requirement.capability.as_str(),
+            ],
+        )
+        .await
+        .map_err(|error| classify_query(error, OPERATION_CALLER_KEY_RESERVE))?;
+    let fenced: bool = column(&fenced, 0, OPERATION_CALLER_KEY_RESERVE)?;
+    if !fenced {
+        tracing::warn!(
+            action = operation.action(),
+            "a caller key was not reserved: the contract fence does not carry caller_operation_keys, so the operation gate did not admit keyed changes; nothing was changed"
+        );
+        return Err(RepositoryError::new(
+            RepositoryErrorKind::Unavailable,
+            OPERATION_CALLER_KEY_RESERVE,
         ));
     }
     let id = operation.id().to_string();

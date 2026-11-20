@@ -339,7 +339,8 @@ records, logs and metrics.
 Creating an occurrence with `PUT /v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals` requires PostgreSQL,
 `AUTHORITY_EVENT_FORMAT=qualified_v1`, an authorized principal with a canonical
 issuer, one strong `If-Match` ETag and one caller-supplied RFC UUIDv7
-`Idempotency-Key`. Schema 35 reserves that key across this operation and keyed
+`Idempotency-Key`. Under `AUTHORITY_EVIDENCE_DURABILITY=required` it also needs
+`AUTHORITY_EVENT_SINK=file` and a Unix build ([Keyed authority changes](#keyed-authority-changes)). Schema 35 reserves that key across this operation and keyed
 service-token revocations. The transaction writes the pending occurrence, its
 immutable receipt and a journal entry. A journal capacity or evidence-write
 failure rolls back all three and the key reservation. The receipt survives
@@ -396,7 +397,8 @@ reclaim space after the first keyed preparation.
 Schema 36 (PostgreSQL migration 36) and the standalone reservation table prepare
 caller operation IDs for every admin change that will take an `Idempotency-Key`.
 No admin route binds a key through them yet; each operation family does so in its
-own change. A key belongs to exactly one request: its binding digest is a
+own change, through the contract in [Keyed authority changes](#keyed-authority-changes).
+A key belongs to exactly one request: its binding digest is a
 domain-separated, length-prefixed SHA-256 over the action, the recorded actor
 (kind, canonical issuer, subject and auth mode), the target, the `If-Match` value
 and the request with secret values removed
@@ -455,6 +457,99 @@ both written by an older build serving a token database:
 `reopening_reserves_keyed_revocations_an_older_build_wrote` and
 `reopening_counts_a_keyed_revocation_whose_key_another_action_holds` assert
 these cases.
+
+### Keyed authority changes
+
+Every admin change that takes an `Idempotency-Key` follows one contract. Today
+the keyed service-token revoke and the keyed approval preparation take one; each
+other operation family adopts the contract in its own change, and the inventory
+qualifies its rows when it does.
+
+**A key is honoured or refused, never ignored.** The router keeps a reviewed table
+of the routes that honour a key, `KEYED_ROUTES` in `gateway/src/routing.rs`
+(today `POST /v1{ADMIN_PREFIX}/tokens/{id}/revoke` and
+`PUT /v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals`). Any other admin request
+that carries the header with a method other than `GET`, `HEAD` or `OPTIONS` is
+answered `400 {"error":"...","reason":"idempotency_key_unsupported"}` before its
+handler runs, so nothing is read or written. That includes the unkeyed
+`DELETE /v1{ADMIN_PREFIX}/tokens/{id}` and the ordinary preparation `POST`, which
+before this change ignored the header. The checker holds `KEYED_ROUTES` and its
+table of reviewed qualified paths (`QUALIFIED_PATHS`) to the same methods and
+routes.
+
+**A key is honoured only once the whole cluster honours it.** In cluster mode a
+keyed request asks the operation gate for `authority.caller_operation_keys`
+(capability `caller_operation_keys`, schema 36, durable fence; see
+[Gated operations](deployment/postgres.md#gated-operations)) before the store is
+called. It is refused, `409 capability_not_advertised` or `503` when the gate
+cannot answer, while any live member lacks the capability. The first admission
+raises the durable contract fence, so a build that would ignore the key, or
+deliver a caller-bound change as `authority_event_delivery.v1` from the
+dispatcher's lease, can no longer start or rejoin. That admission is the
+[rollback cutoff](deployment/postgres.md#the-rollback-cutoff) for such builds.
+The store confirms the same fence inside the change's transaction before it
+reserves the key (`reserve_bound_operation`). The keyed revoke and keyed
+preparation predate the capability and do not ask the gate.
+
+**The request.** The method and route are the route's own, plus one
+`Idempotency-Key` holding a canonical lowercase RFC UUIDv7. Under `best_effort`
+the header is optional, and a request without it behaves exactly as before. A
+malformed or repeated header is `400`. A principal without a canonical issuer
+cannot own a key (`403`, as for the keyed revoke), and a system actor never
+can. The key is bound to the action, the recorded actor, the target, the
+`If-Match` value and the request with secret values removed
+([above](#caller-operation-keys-bound-to-a-request)).
+
+**The answers.** The first commit answers as the route does today. An exact retry
+is answered `200` with the receipt read from the committed evidence row,
+`{operation_id, operation, resource_id, revision, committed_at}`, which never
+carries a secret or the binding digest. The same key with any other binding,
+action or actor is `409 caller_operation_conflict`, and nothing changes. A
+keyed request that would change nothing writes no evidence and reserves
+nothing, so it cannot be reconciled by its key: if its response is lost and the
+resource then changes, the retry gets `412`, and the caller reads the resource
+again.
+
+**The order of work.** The handler binds the key (`caller_operation`), asks
+the gates (`admit_keyed_authority_change`), and answers an exact retry from a
+read-only pre-check (`replayed_receipt`, from `read_caller_operation`) before any
+external I/O or post-commit side effect. Inside the one transaction the store
+then looks the key up, reads the target (a stale ETag is `412`, a no-op rolls
+back), confirms the fence and reserves the key, makes the change, inserts the
+evidence rows under the caller's operation ID, appends to the journal last
+(PostgreSQL), and commits. These helpers are in `gateway/src/admin_responses.rs`;
+`operation_receipt` and `caller_operation_conflict` build the two answers above.
+
+**Required mode.** Under `AUTHORITY_EVIDENCE_DURABILITY=required` a
+`caller_key_required` change is admitted only when all of these hold, checked in
+this order, and its `409 authority_evidence_unsupported` names the first that
+does not (`KeyedAdmission` in `gateway/src/authority_events/required.rs`):
+
+1. the request is keyed;
+2. the actor is a provider-authenticated principal with a canonical issuer;
+3. `AUTHORITY_EVENT_FORMAT=qualified_v1`;
+4. `AUTHORITY_EVENT_SINK=file`: the log sink only hands an event to the log
+   writer, which is not a durable store;
+5. the build is a Unix build, where the file sink syncs the file and its
+   directory.
+
+The last three are the criteria every qualified path in the inventory records
+(`format`, `durable_sink`, `filesystem`), so the gate now enforces what the
+qualified rows claim. This tightens the keyed preparation: under `required` with
+the log sink, or on a Windows build, it is refused. A change that only removes
+authority and that a remote caller starts (token revocation, Connection
+deletion, local-secret deletion) never asks the evidence gate: every form of it
+stays admitted ([Rows admitted without qualification](#rows-admitted-without-qualification)).
+
+`required_tests::caller_key_required_admits_only_a_keyed_issuer_bound_principal_under_qualified_v1_with_the_file_sink`,
+`a_keyed_request_with_the_log_sink_is_refused_and_the_refusal_names_the_sink` and
+`withdrawals_never_ask_the_evidence_gate` prove the gate;
+`routing_app_tests::an_idempotency_key_on_a_route_that_does_not_honour_it_is_refused_and_changes_nothing`
+sends a key to every mutating method of every admin API route;
+`compatibility_tests::caller_operation_keys_waits_for_every_live_member_and_raises_the_fence`
+and `contract_tests::postgres_audit_tests::a_bound_reservation_below_the_fence_is_refused`
+prove the capability, the fence and the store's check; and
+`authority_evidence_app_tests` proves the helpers.
 
 ## Keyed safe references
 
@@ -1234,13 +1329,15 @@ The contract is the inventory's `required_mode` for each row, and
 `gateway/src/authority_events/required.rs` enforces it. A change is `admitted` only
 where the row's record shows that the change's own transaction durably names who
 made it, beside the change; the evidence may still lack metadata or delivery, and
-the row's other dispositions identify the gaps. A `caller_key_required` row checks
-the operation key and negotiated format before admission.
+the row's other dispositions identify the gaps. A `caller_key_required` row admits
+only a keyed request by an issuer-bound principal with `qualified_v1`, the file
+sink and a Unix build, and names the first of these that fails
+([Keyed authority changes](#keyed-authority-changes)).
 
 | `required_mode` | Rows | What required mode does |
 | --- | --- | --- |
 | `admitted` | Cluster policy, tools, Connection create, replace and delete, catalogs, token issue, rotation and revocation, JWT revocation, and admin session grant and withdrawal, and standalone Connection create, replace and delete, local-secret create, rotate, delete and re-encryption, catalog publication and overlays, and token issue, rotation and revocation | Runs it. Its evidence is the row's `record`. Nine of these pairs stay admitted without qualification on purpose ([below](#rows-admitted-without-qualification)) |
-| `caller_key_required` | PostgreSQL mutation approval preparation | Admits only the issuer-bound keyed PUT with `qualified_v1`. Required mode refuses ordinary POST. |
+| `caller_key_required` | PostgreSQL mutation approval preparation | Admits only the issuer-bound keyed PUT with `qualified_v1`, `AUTHORITY_EVENT_SINK=file` and a Unix build. Required mode refuses ordinary POST. |
 | `refused` | Standalone mutation approval preparation and mutation approval review, revocation and consumption in both modes. Standalone policy mutations, policy file reloads, and tools publication (admin API and file reloads). The writing form of the offline import (`import-standalone --apply`, with or without `--resume`) in cluster mode | Refuses it when asked, before anything is written |
 | `refused_at_startup` | Standalone admin sessions (`ADMIN_SESSION_MODE=standalone_memory`), and configuration activation in both modes | Refuses to start |
 | `unavailable` | Cluster policy file reload and local secrets, standalone JWT revocation and import, configuration export | Nothing to refuse: the mode or the build has no such operation. A gate that is asked anyway refuses it |
@@ -1310,7 +1407,9 @@ Enforcement:
   `trigger` (`admin_api`, `file_watch`, `signal`) and `reason`; an admin API
   refusal also carries the request ID, source address and caller.
 
-The gate reads two configuration values and nothing else. It never waits on a
+The gate reads configuration and nothing else: the durability, the deployment
+mode, and for a keyed change the event format, whether the sink is the file sink,
+and whether this is a Unix build. It never waits on a
 store, the dispatcher or a sink, so proxy admission and every admin change still
 wait only on their own local commits, never on a downstream acknowledgement. In
 either mode the dispatcher delivers after the commit, outside every authority
@@ -1439,7 +1538,8 @@ disposable PostgreSQL 16, the same pinned image, that accepts TLS and nothing el
 - in `storage::contract_tests`, the caller operation key contract
   (`postgres_caller_operation_reservation_contract`,
   `postgres_a_rolled_back_transaction_leaves_no_reservation`,
-  `postgres_two_transactions_racing_one_key_reserve_it_once`), the service-token
+  `postgres_two_transactions_racing_one_key_reserve_it_once`) and its contract
+  fence check (`a_bound_reservation_below_the_fence_is_refused`), the service-token
   and JWT revocation evidence tests
   (`postgres_service_token_change_evidence_satisfies_the_contract`,
   `service_token_change_evidence_matches_the_outbox_and_survives_deletion_and_restart`,

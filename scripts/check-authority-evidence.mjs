@@ -71,7 +71,19 @@ const DISPOSITIONS = new Set(["already_sufficient", "missing_metadata", "missing
 const NO_CALLER_KEY_PAIRS = new Set(["jwt.revoke/postgres", "admin_session.withdraw/postgres", "secret.reencrypt/standalone", "admin_session.grant/postgres"]);
 const WITHDRAWAL_PAIRS = new Set(["service_token.revoke/postgres", "service_token.revoke/standalone", "connection.delete/postgres", "connection.delete/standalone", "secret.delete/standalone"]);
 const ADMITTED_UNQUALIFIED = { no_caller_key: NO_CALLER_KEY_PAIRS, withdrawal_admitted: WITHDRAWAL_PAIRS };
-const ADMIN_FILES = ["admin_policy.rs", "admin_tools.rs", "admin_mutation_approvals.rs", "admin_connections.rs", "admin_tokens.rs"];
+// The admin handler files whose mutation endpoints must each be an inventory
+// entry point or a reviewed exclusion.
+const ADMIN_FILES = ["admin_policy.rs", "admin_policy_drafts.rs", "admin_policy_tests.rs", "admin_observability.rs", "admin_tools.rs", "admin_mutation_approvals.rs", "admin_connections.rs", "admin_tokens.rs"];
+const MUTATION_ENDPOINT = /(?:create|put|post|patch|delete|rollback|register|rotate|revoke|refresh|accept|publish)_endpoint$/;
+// Endpoints the scan finds that are not authority changes, each with the
+// reason it is outside the inventory. An exclusion must name an endpoint
+// that exists and that no row claims.
+export const NOT_AUTHORITY_CHANGES = {
+  "gateway/src/admin_policy_drafts.rs::policy_draft_create_endpoint": "a policy draft is not active policy; only publishing one changes authority, and that is policy.publish",
+  "gateway/src/admin_policy_drafts.rs::policy_draft_patch_endpoint": "a policy draft is not active policy; only publishing one changes authority, and that is policy.publish",
+  "gateway/src/admin_policy_drafts.rs::policy_draft_delete_endpoint": "a policy draft is not active policy; only publishing one changes authority, and that is policy.publish",
+  "gateway/src/admin_observability.rs::principal_delegated_tokens_revoke_endpoint": "the delegated-token purge withdraws cached delegated credentials; it is audited and recorded as a shared security revision through the operation gate, and is outside the authority-change inventory by owner ruling 8 on issue #425 (2026-11-20)",
+};
 const SCHEMA_KEYWORDS = new Set(["$schema", "title", "description", "type", "const", "enum", "anyOf", "pattern", "maxLength", "additionalProperties", "required", "properties"]);
 export const readJson = (path) => JSON.parse(readFileSync(resolve(ROOT, path), "utf8"));
 export const schema = readJson("docs/schemas/authority_event.v1.schema.json");
@@ -216,21 +228,52 @@ const withoutLineComments = (text) => text.replace(/\/\/.*$/gm, "");
 // evidence rows anchor on.
 const SOURCE_ROOTS = ["gateway/src/", "gateway-config/src/"];
 
-// One reviewed route and delivery configuration qualify. The inventory also
-// covers unkeyed DELETE, other actors and rotation in the containing row.
-const qualifiedRevoke = {
-  operation: "service_token.revoke", storage_mode: "postgres", method: "POST",
-  route: "/v1{ADMIN_PREFIX}/tokens/{id}/revoke", operation_id_version: 7,
-  actor_kind: "principal", issuer: "canonical_provider", format: "qualified_v1",
+// The reviewed qualified delivery paths, one per operation/mode pair (issue
+// #425). A path in the inventory must equal its entry here, criterion for
+// criterion, and a row claims required durability exactly when every pair it
+// holds has its path (see the qualification bar below). Adding an entry is
+// the reviewed change that qualifies a pair: copy the method and route from
+// KEYED_ROUTES in gateway/src/routing.rs, which must honour the key there.
+// The criteria shared by every entry are the ones the evidence gate enforces
+// (gateway/src/authority_events/required.rs, KeyedAdmission).
+const KEYED_DELIVERY = {
+  operation_id_version: 7, actor_kind: "principal", issuer: "canonical_provider", format: "qualified_v1",
   durable_sink: "file", filesystem: "unix_file_and_directory_sync", wire_schema: "authority_event.v1",
 };
+export const QUALIFIED_PATHS = Object.freeze({
+  // Admitted withdrawal: the containing row also admits the unkeyed DELETE
+  // and service-token callers, unqualified.
+  "service_token.revoke/postgres": {
+    operation: "service_token.revoke", storage_mode: "postgres", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/tokens/{id}/revoke", ...KEYED_DELIVERY,
+  },
+  "mutation_approval.prepare/postgres": {
+    operation: "mutation_approval.prepare", storage_mode: "postgres", method: "PUT",
+    route: "/v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals", ...KEYED_DELIVERY,
+  },
+});
+// The dispatcher that delivers a qualified pair in each mode.
+const QUALIFIED_DELIVERY = { postgres: "journaled_dispatch", standalone: "standalone_cursor_dispatch" };
 
-const qualifiedPrepare = {
-  ...qualifiedRevoke, operation: "mutation_approval.prepare", method: "PUT",
-  route: "/v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals",
-};
+// The router's table of routes that honour an Idempotency-Key; every other
+// admin mutation route refuses one. Its entries and QUALIFIED_PATHS name the
+// same method and route pairs.
+const ROUTING_PATH = "gateway/src/routing.rs";
+const KEYED_ROUTES_DECLARED = /pub\(super\) const KEYED_ROUTES: &\[KeyedRoute\] = &\[([\s\S]*?)\n\];/;
+const KEYED_ROUTE_ENTRY = /KeyedRoute\s*\{\s*method:\s*"([A-Z]+)",\s*route:\s*"([^"]+)",?\s*\}/g;
 
-export function validateInventory(inventory, readSource = (path) => readFileSync(resolve(ROOT, path), "utf8")) {
+const pathKey = (criteria) => `${criteria?.operation}/${criteria?.storage_mode}`;
+const sameList = (left, right) => left.length === right.length && left.every((value, index) => value === right[index]);
+
+// The checker's summary of a valid inventory, computed from what it checked.
+export function summary(result) {
+  const list = (pairs) => pairs.length > 0 ? pairs.join(", ") : "none";
+  return `Authority evidence inventory valid: ${result.groups} groups, ${result.operationModePairs} operation/mode pairs, ${result.sourceReferences} source references.`
+    + ` Qualified in required mode: ${list(result.qualifiedPairs)}.`
+    + ` Admitted withdrawals with a reviewed keyed path: ${list(result.keyedWithdrawalPairs)}.`;
+}
+
+export function validateInventory(inventory, readSource = (path) => readFileSync(resolve(ROOT, path), "utf8"), qualifiedPaths = QUALIFIED_PATHS) {
   check(inventory.version === 1 && inventory.issue === 425, "unknown inventory contract");
   check(/^[0-9a-f]{40}$/.test(inventory.reviewed_revision), "missing reviewed revision");
   assert.deepEqual(inventory.storage_modes, MODES, "storage modes changed without contract review");
@@ -255,6 +298,8 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
     references += 1;
   };
   check(Array.isArray(inventory.groups) && inventory.groups.length > 0, "empty inventory");
+  const qualifiedPairs = [];
+  const keyedWithdrawalPairs = [];
   let activationProofState;
   const activationUnproven = () => {
     if (activationProofState === undefined) {
@@ -278,42 +323,43 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
       check((group.sources ?? []).some((ref) => ref.path === ACTIVATION_CHECK.path && ref.anchor === ACTIVATION_CHECK.anchor),
         `${group.id}: configuration activation must anchor on the startup check in ${ACTIVATION_CHECK.path}`);
     }
-    const pgPrepare = group.modes.includes("postgres") && group.operations.includes("mutation_approval.prepare");
-    const pgRevoke = group.modes.includes("postgres") && group.operations.includes("service_token.revoke");
-    if (pgPrepare) {
-      assert.deepEqual(group.operations, ["mutation_approval.prepare"], "qualified prepare must be its own operation");
-      assert.deepEqual(group.modes, ["postgres"], "qualified prepare must be its own mode");
-      assert.deepEqual(group.disposition, ["already_sufficient"], "qualified prepare disposition");
-      check(group.required_mode === "caller_key_required" && group.delivery === "journaled_dispatch",
-        "qualified prepare requires keyed admission and journal delivery");
-    } else {
-      check(group.required_mode !== "caller_key_required", "unreviewed caller-key admission");
+    const pairs = group.operations.flatMap((operation) => group.modes.map((mode) => `${operation}/${mode}`));
+    // Every qualified path is a reviewed table entry, exactly, on a pair its
+    // own row holds.
+    const paths = group.qualified_delivery_paths;
+    if (group.disposition.includes("no_caller_key")) {
+      check(paths === undefined, `${group.id}: a no_caller_key row has no keyed path`);
     }
-    check(group.required_durability_supported === pgPrepare, `${group.id}: unproven durability claim`);
-    if (pgPrepare || pgRevoke) {
-      const expected = pgPrepare ? qualifiedPrepare : qualifiedRevoke;
-      const name = pgPrepare ? "prepare" : "revoke";
-      const paths = group.qualified_delivery_paths;
-      check(Array.isArray(paths) && paths.length === 1, `missing qualified ${name} path`);
-      const [path] = paths;
-      assert.deepEqual(path.criteria, expected, `qualified ${name} criteria changed without review`);
-      check(group.operations.includes(path.criteria.operation) && group.modes.includes(path.criteria.storage_mode), "qualified path outside its inventory group");
-      check(typeof path.guarantee === "string" && path.guarantee.length > 0, "missing qualified path guarantee");
-      check(path.sources.length > 0 && path.tests.length > 0, "missing qualified path evidence");
+    check(paths === undefined || (Array.isArray(paths) && paths.length > 0), `${group.id}: an empty qualified path list`);
+    for (const path of paths ?? []) {
+      const key = pathKey(path?.criteria);
+      check(Object.hasOwn(qualifiedPaths, key), `${group.id}: qualified path ${key} is outside the reviewed table`);
+      assert.deepEqual(path.criteria, qualifiedPaths[key], `${group.id}: qualified path ${key} criteria changed without review`);
+      check(pairs.includes(key), `${group.id}: qualified path outside its inventory group`);
+      check(typeof path.guarantee === "string" && path.guarantee.length > 0, `${group.id}: missing qualified path guarantee`);
+      check(Array.isArray(path.sources) && Array.isArray(path.tests) && path.sources.length > 0 && path.tests.length > 0, `${group.id}: missing qualified path evidence`);
       for (const ref of [...path.sources, ...path.tests]) reference(ref);
       for (const ref of path.tests) check(/(?:async )?fn [a-z0-9_]+\(/.test(ref.anchor), "qualified test anchor must name a function");
-    } else {
-      check(group.qualified_delivery_paths === undefined, "unreviewed qualified path");
     }
-    const pairs = group.operations.flatMap((operation) => group.modes.map((mode) => `${operation}/${mode}`));
+    const covered = (paths ?? []).map((path) => pathKey(path.criteria));
+    const onePathPerPair = covered.length === pairs.length && pairs.every((pair) => covered.filter((key) => key === pair).length === 1);
+    // The qualification bar: a row claims required durability exactly when
+    // every pair it holds has its reviewed path, it admits only the keyed
+    // form, it records no remaining gap, and its mode's dispatcher delivers
+    // it. Keyed-only admission and sufficiency are never claimed without it.
+    const meetsBar = onePathPerPair
+      && group.required_mode === "caller_key_required"
+      && sameList(group.disposition, ["already_sufficient"])
+      && group.modes.every((mode) => group.delivery === QUALIFIED_DELIVERY[mode]);
+    check(!group.required_durability_supported || meetsBar, `${group.id}: unproven durability claim`);
+    check(group.required_durability_supported === meetsBar, `${group.id}: a row that meets the qualification bar must claim required durability`);
+    check(group.required_mode !== "caller_key_required" || meetsBar, `${group.id}: unreviewed caller-key admission`);
+    if (meetsBar) qualifiedPairs.push(...pairs);
     for (const [disposition, reviewed] of Object.entries(ADMITTED_UNQUALIFIED)) {
       if (!group.disposition.includes(disposition)) continue;
       check(group.disposition.length === 1, `${group.id}: ${disposition} stands alone`);
       for (const pair of pairs) check(reviewed.has(pair), `${group.id}: ${disposition} is limited to its reviewed pairs (${pair} is not one)`);
       check(group.required_mode === "admitted" && group.required_durability_supported === false, `${group.id}: ${disposition} is admitted and unqualified`);
-    }
-    if (group.disposition.includes("no_caller_key")) {
-      check(group.qualified_delivery_paths === undefined, `${group.id}: a no_caller_key row has no keyed path`);
     }
     if (group.disposition.includes("withdrawal_admitted")) {
       // The paths themselves are held to the reviewed criteria above; here
@@ -322,6 +368,7 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
       const covered = paths.map((path) => `${path.criteria?.operation}/${path.criteria?.storage_mode}`);
       check(paths.length === pairs.length && pairs.every((pair) => covered.filter((key) => key === pair).length === 1),
         `${group.id}: withdrawal_admitted needs one reviewed keyed path per pair`);
+      keyedWithdrawalPairs.push(...pairs);
     } else {
       // A reviewed path on a row that is not itself qualified exists only
       // because the row also admits an unqualified withdrawal.
@@ -336,7 +383,7 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
     check(group.disposition.length > 0 && new Set(group.disposition).size === group.disposition.length, `${group.id}: missing/duplicate disposition`);
     for (const disposition of group.disposition) check(DISPOSITIONS.has(disposition), `${group.id}: unknown disposition`);
     check(!group.disposition.includes("already_sufficient") || group.disposition.length === 1, "sufficient contradicts a gap");
-    check(!group.disposition.includes("already_sufficient") || pgPrepare, "unreviewed sufficient disposition");
+    check(!group.disposition.includes("already_sufficient") || meetsBar, `${group.id}: unreviewed sufficient disposition`);
     check(Object.hasOwn(inventory.delivery_profiles, group.delivery), `${group.id}: missing delivery profile`);
     check(group.operations.length > 0 && group.modes.length > 0, "empty coverage row");
     for (const operation of group.operations) {
@@ -355,27 +402,53 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
   for (const operation of OPERATIONS) for (const mode of MODES) check(seen.has(`${operation}/${mode}`), `missing coverage ${operation}/${mode}`);
   for (const profile of Object.values(inventory.delivery_profiles)) for (const ref of profile.sources) reference(ref);
   // Endpoint discovery catches a newly shipped mutation in the reviewed admin
-  // surfaces even if nobody adds it to OPERATIONS or the JSON matrix.
+  // surfaces even if nobody adds it to OPERATIONS or the JSON matrix. What it
+  // finds is an inventory entry point or a reviewed exclusion, never both.
+  const found = new Set();
   for (const file of ADMIN_FILES) {
     const path = `gateway/src/${file}`;
     for (const match of source(path).matchAll(/pub\(super\) async fn ([a-z0-9_]+_endpoint)\(/g)) {
-      if (/(?:create|put|post|patch|delete|rollback|register|rotate|revoke|refresh|accept)_endpoint$/.test(match[1])
+      const endpoint = `${path}::${match[1]}`;
+      found.add(endpoint);
+      if (MUTATION_ENDPOINT.test(match[1])
           || /_mutation_approval_execute_endpoint$/.test(match[1])
           || file === "admin_mutation_approvals.rs" && /_review_endpoint$/.test(match[1])) {
-        check(coveredEntries.has(`${path}::${match[1]}`), `unreviewed mutation entrypoint ${path}::${match[1]}`);
+        check(coveredEntries.has(endpoint) || Object.hasOwn(NOT_AUTHORITY_CHANGES, endpoint), `unreviewed mutation entrypoint ${endpoint}`);
       }
     }
+  }
+  for (const [endpoint, reason] of Object.entries(NOT_AUTHORITY_CHANGES)) {
+    check(found.has(endpoint), `stale exclusion ${endpoint}: the endpoint no longer exists`);
+    check(!coveredEntries.has(endpoint), `${endpoint} is both excluded and an inventory entry point`);
+    check(typeof reason === "string" && reason.length >= 20, `${endpoint}: an exclusion needs its reason`);
+  }
+  // The router honours a key on exactly the reviewed routes: every reviewed
+  // path's route is in KEYED_ROUTES, and every KEYED_ROUTES entry is named by
+  // a reviewed path. Elsewhere the router refuses the key.
+  const declared = withoutLineComments(source(ROUTING_PATH)).match(KEYED_ROUTES_DECLARED);
+  check(declared !== null, `${ROUTING_PATH} declares no KEYED_ROUTES table`);
+  const honoured = new Set([...declared[1].matchAll(KEYED_ROUTE_ENTRY)].map(([, method, route]) => `${method} ${route}`));
+  const reviewed = new Set(Object.values(qualifiedPaths).map((criteria) => `${criteria.method} ${criteria.route}`));
+  for (const [key, criteria] of Object.entries(qualifiedPaths)) {
+    check(honoured.has(`${criteria.method} ${criteria.route}`),
+      `qualified path ${key} (${criteria.method} ${criteria.route}) is not honoured by KEYED_ROUTES in ${ROUTING_PATH}`);
+  }
+  for (const route of honoured) {
+    check(reviewed.has(route), `KEYED_ROUTES in ${ROUTING_PATH} honours ${route}, which no reviewed qualified path names`);
   }
   assert.deepEqual([...schema.properties.operation.enum].sort(), [...OPERATIONS].sort(), "event schema and coverage operations diverged");
   // Asked even when no row holds the activation, so a rename never passes.
   activationUnproven();
-  return { groups: inventory.groups.length, operationModePairs: seen.size, sourceReferences: references };
+  return {
+    groups: inventory.groups.length, operationModePairs: seen.size, sourceReferences: references,
+    qualifiedPairs: qualifiedPairs.sort(), keyedWithdrawalPairs: keyedWithdrawalPairs.sort(),
+  };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const result = validateInventory(readJson("docs/authority-evidence-inventory.json"));
-    console.log(`Authority evidence inventory valid: ${result.groups} groups, ${result.operationModePairs} operation/mode pairs, ${result.sourceReferences} source references. PostgreSQL keyed preparation qualifies in required mode. PostgreSQL keyed revocation has a qualified delivery path.`);
+    console.log(summary(result));
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;

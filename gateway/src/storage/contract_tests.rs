@@ -7525,6 +7525,7 @@ pub(crate) mod postgres_audit_tests {
         let _guard = DATABASE.lock().await;
         let database = create_test_database(&admin_dsn).await;
         let (_store, pool) = migrated_service_token_store(&database).await;
+        raise_caller_operation_keys_fence(&pool).await;
         super::caller_operation_reservation_contract(&PostgresCallerOperations { pool }).await;
     }
 
@@ -7537,6 +7538,7 @@ pub(crate) mod postgres_audit_tests {
         let _guard = DATABASE.lock().await;
         let database = create_test_database(&admin_dsn).await;
         let (_store, pool) = migrated_service_token_store(&database).await;
+        raise_caller_operation_keys_fence(&pool).await;
         super::caller_operation_rolled_back_reservation_contract(&PostgresCallerOperations {
             pool,
         })
@@ -7552,7 +7554,92 @@ pub(crate) mod postgres_audit_tests {
         let _guard = DATABASE.lock().await;
         let database = create_test_database(&admin_dsn).await;
         let (_store, pool) = migrated_service_token_store(&database).await;
+        raise_caller_operation_keys_fence(&pool).await;
         super::caller_operation_race_contract(&PostgresCallerOperations { pool }).await;
+    }
+
+    /// Raise the contract fence the way the operation gate's first admission
+    /// of a keyed change leaves it (`CALLER_OPERATION_KEYS`), so a bound
+    /// reservation may be made.
+    async fn raise_caller_operation_keys_fence(pool: &deadpool_postgres::Pool) {
+        let requirement = &crate::storage::compatibility::CALLER_OPERATION_KEYS;
+        raise_fence_directly(
+            pool,
+            requirement.minimum_schema,
+            requirement.capability.as_str(),
+        )
+        .await;
+    }
+
+    /// A bound reservation is the store-side half of the operation gate for
+    /// `caller_operation_keys` (issue #425): it is made only in a transaction
+    /// that sees the durable contract fence carry the capability at schema 36
+    /// or above. Below that -- the open fence migration 20 seeds, a fence
+    /// raised only for another operation, or one that names the capability
+    /// at an earlier schema -- the key is refused as unavailable and nothing
+    /// is reserved, so no key is honoured that a build without the capability
+    /// could still be serving beside. Once the gate's first admission has
+    /// raised the fence, the same reservation is made.
+    #[tokio::test]
+    async fn a_bound_reservation_below_the_fence_is_refused() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_store, pool) = migrated_service_token_store(&database).await;
+        let harness = PostgresCallerOperations { pool: pool.clone() };
+        let actor = ChangeActor::for_test_with_issuer("operator", "https://one.example.test");
+        let create = super::bound_operation(
+            test_caller_key(31),
+            "connection.create",
+            &actor,
+            br#"{"name":"fixture"}"#,
+        );
+
+        let refused = |outcome: Result<CallerKeyReservation, RepositoryError>, why: &str| {
+            let error = outcome.expect_err(why);
+            assert_eq!(error.kind(), RepositoryErrorKind::Unavailable, "{why}");
+            assert_eq!(
+                error.operation(),
+                "authority_caller_operation_reserve",
+                "{why}"
+            );
+        };
+        refused(
+            harness.reserve(&create, true).await,
+            "the open fence refuses a bound reservation",
+        );
+        raise_fence_directly(&pool, 34, "managed_http_mutation_v1").await;
+        refused(
+            harness.reserve(&create, true).await,
+            "a fence raised for another operation refuses it",
+        );
+        raise_fence_directly(&pool, 35, "caller_operation_keys,managed_http_mutation_v1").await;
+        refused(
+            harness.reserve(&create, true).await,
+            "the capability below schema 36 refuses it",
+        );
+        assert!(
+            harness.reservations().await.is_empty(),
+            "a refused reservation reserves nothing"
+        );
+        // The read-only pre-check is advisory and asks no fence.
+        assert_eq!(
+            harness.read(&create).await.expect("the key reads"),
+            CallerKeyState::Unused
+        );
+
+        raise_fence_directly(&pool, 36, "caller_operation_keys,managed_http_mutation_v1").await;
+        assert_eq!(
+            harness
+                .reserve(&create, true)
+                .await
+                .expect("the raised fence admits it"),
+            CallerKeyReservation::Reserved
+        );
+        assert_eq!(harness.reservations().await.len(), 1);
     }
 
     struct PostgresTokenIssueHarness<'a> {
@@ -12930,7 +13017,7 @@ pub(crate) mod postgres_audit_tests {
         let members = store.members(window).await.expect("members");
         assert_eq!(
             members[0].capabilities,
-            "delegated_token_purges,managed_http_mutation_v1,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
+            "caller_operation_keys,delegated_token_purges,managed_http_mutation_v1,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
              operation_requirements,policy_document_v1,policy_role_descriptions,\
              policy_rule_conditions,policy_tool_argument_conditions"
         );
@@ -12983,7 +13070,7 @@ pub(crate) mod postgres_audit_tests {
             .expect("refresh");
         assert_eq!(
             store.members(window).await.expect("members")[0].capabilities,
-            "delegated_token_purges,managed_http_mutation_v1,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
+            "caller_operation_keys,delegated_token_purges,managed_http_mutation_v1,openapi_discovery_catalogs,openapi_repeated_query,openapi_swagger2_catalogs,\
              operation_requirements,policy_document_v1,policy_role_descriptions,\
              policy_rule_conditions,policy_tool_argument_conditions"
         );

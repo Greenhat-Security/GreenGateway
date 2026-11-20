@@ -63,6 +63,12 @@ pub(crate) const REFUSAL_REASON: &str = "authority_evidence_unsupported";
 /// service-token issue, rotation and revocation, and JWT revocation. The
 /// inventory test holds that rule too: an operation no gate asks about must
 /// be `admitted` or `unavailable` wherever its row says.
+///
+/// The withdrawals a remote caller starts -- `service_token.revoke`,
+/// `connection.delete` and `secret.delete` -- are never listed, and no
+/// family change adds them: refusing a change that only removes authority
+/// would fail open (owner ruling 4 on issue #425, 2026-11-20), so every form
+/// of them stays admitted and only their keyed principal form is qualified.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AuthorityOperation {
     PolicyPublish,
@@ -115,7 +121,11 @@ impl From<DocumentAction> for AuthorityOperation {
 pub(crate) enum RequiredMode {
     /// The change's own transaction durably records who made it.
     Admitted,
-    /// Only PostgreSQL's caller-keyed prepare persists an immutable receipt and event.
+    /// Only the keyed form is admitted, and only when every
+    /// [`KeyedAdmission`] criterion holds: the change, its evidence, its
+    /// caller key's reservation and its journal entry commit together, and
+    /// the record is a qualified `authority_event.v1` delivered through the
+    /// synced file sink.
     CallerKeyRequired,
     /// The mode records no such evidence; the change is refused.
     Refused,
@@ -210,13 +220,89 @@ const fn mode_name(backend: StateBackend) -> &'static str {
     }
 }
 
+/// How a request asks for an authority change, as far as the gate is
+/// concerned: whether it carries a caller key bound to it
+/// (`Idempotency-Key`), and whether its actor is a provider-authenticated
+/// principal with a canonical issuer. Only a `caller_key_required` change
+/// looks at it; every other required mode decides by the operation alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RequestForm {
+    pub(crate) keyed: bool,
+    pub(crate) issuer_bound_principal: bool,
+}
+
+impl RequestForm {
+    /// A request without a caller key, or a change no request asked for (a
+    /// reload, an offline command).
+    pub(crate) const UNKEYED: Self = Self {
+        keyed: false,
+        issuer_bound_principal: false,
+    };
+
+    /// The form of a request by `actor`, keyed or not. Only a principal
+    /// whose issuer canonicalized, and whose subject and issuer evidence can
+    /// record as they are, is issuer-bound: a service token, a system actor
+    /// and a principal without a canonical issuer are not.
+    pub(crate) fn of(keyed: bool, actor: &crate::auth::change_actor::ChangeActor) -> Self {
+        Self {
+            keyed,
+            issuer_bound_principal: actor.kind() == crate::auth::change_actor::ActorKind::Principal
+                && actor.issuer().is_some()
+                && actor.can_bind_operation(),
+        }
+    }
+}
+
+/// What a `caller_key_required` change needs in required mode, in the order
+/// the gate checks it; a refusal names the first one that does not hold.
+/// The last three are the criteria every qualified path in the evidence
+/// inventory records (`format`, `durable_sink`, `filesystem`), so the gate
+/// enforces what the qualified rows claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyedAdmission {
+    /// The request carries one `Idempotency-Key` bound to it.
+    CallerKey,
+    /// The actor is a provider-authenticated principal with a canonical
+    /// issuer, so its event can carry an issuer-scoped subject.
+    IssuerBoundPrincipal,
+    /// `AUTHORITY_EVENT_FORMAT=qualified_v1`: the change is delivered as
+    /// `authority_event.v1`.
+    QualifiedFormat,
+    /// `AUTHORITY_EVENT_SINK=file`. The log sink only hands an event to the
+    /// log writer, which is not a durable store.
+    FileSink,
+    /// A Unix build: the file sink syncs the file and its directory only
+    /// there.
+    SyncedFilesystem,
+}
+
+impl KeyedAdmission {
+    /// What the refusal says the change needs.
+    const fn requirement(self) -> &'static str {
+        match self {
+            Self::CallerKey => "with an Idempotency-Key",
+            Self::IssuerBoundPrincipal => {
+                "from a provider-authenticated principal with a canonical issuer"
+            }
+            Self::QualifiedFormat => "with AUTHORITY_EVENT_FORMAT=qualified_v1",
+            Self::FileSink => "with AUTHORITY_EVENT_SINK=file",
+            Self::SyncedFilesystem => {
+                "on a Unix build, where the file sink syncs the file and its directory"
+            }
+        }
+    }
+}
+
 /// A change required mode refused. Nothing was written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EvidenceRefusal {
     operation: AuthorityOperation,
     backend: StateBackend,
-    /// `Refused` or `Unavailable`, never `Admitted`.
+    /// `Refused`, `Unavailable` or `CallerKeyRequired`, never `Admitted`.
     mode: RequiredMode,
+    /// For a `caller_key_required` change, the first criterion the request
+    /// or the deployment did not meet.
+    unmet: Option<KeyedAdmission>,
 }
 
 impl EvidenceRefusal {
@@ -224,12 +310,27 @@ impl EvidenceRefusal {
         self.operation
     }
 
+    /// The criterion a `caller_key_required` change did not meet, or `None`
+    /// for a change the mode refuses whatever the request.
+    #[cfg_attr(not(test), allow(dead_code))] // read by the tests and the family changes
+    pub(crate) fn unmet(&self) -> Option<KeyedAdmission> {
+        self.unmet
+    }
+
     /// The operator-facing explanation, naming the operation and the mode
     /// and never anything from the request.
     pub(crate) fn message(&self) -> String {
         let why = match (self.mode, self.operation) {
             (RequiredMode::CallerKeyRequired, _) => {
-                "requires a caller-bound preparation with qualified_v1"
+                let requirement = self
+                    .unmet
+                    .unwrap_or(KeyedAdmission::CallerKey)
+                    .requirement();
+                return format!(
+                    "AUTHORITY_EVIDENCE_DURABILITY=required refuses {}: {} mode admits it only {requirement}; nothing was changed",
+                    self.operation.code(),
+                    mode_name(self.backend),
+                );
             }
             (RequiredMode::Unavailable, _) => "does not perform it",
             (RequiredMode::Refused, AuthorityOperation::ConfigurationImport) => {
@@ -269,13 +370,19 @@ impl RefusalOrigin {
 }
 
 /// Whether this deployment performs an authority change it cannot evidence.
-/// Built once from the configuration, and as cheap to copy as the two
-/// settings it holds.
+/// Built once from the configuration, and as cheap to copy as the settings
+/// it holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AuthorityEvidenceGate {
     format: crate::config::AuthorityEventFormat,
     durability: AuthorityEvidenceDurability,
     backend: StateBackend,
+    /// `AUTHORITY_EVENT_SINK=file`.
+    file_sink: bool,
+    /// Whether this build's file sink syncs the file and its directory: a
+    /// Unix build. A field rather than a `cfg!` at the check so the tests
+    /// reach both answers on every platform.
+    synced_filesystem: bool,
 }
 
 impl AuthorityEvidenceGate {
@@ -287,12 +394,18 @@ impl AuthorityEvidenceGate {
             durability,
             backend,
             format: crate::config::AuthorityEventFormat::DeliveryV1,
+            file_sink: false,
+            synced_filesystem: cfg!(unix),
         }
     }
 
     pub(crate) fn from_config(config: &Config) -> Self {
         Self {
             format: config.authority_events.format,
+            file_sink: matches!(
+                config.authority_events.sink,
+                crate::config::AuthorityEventSinkSetting::File(_)
+            ),
             ..Self::new(config.authority_events.durability, config.state_backend)
         }
     }
@@ -306,23 +419,89 @@ impl AuthorityEvidenceGate {
         )
     }
 
-    /// The refusal of `operation`, or `None` when this deployment performs
-    /// it. Pure: records nothing.
+    /// This gate with the delivery settings a keyed change is judged on:
+    /// the record format, whether the sink is the file sink, and whether
+    /// this build syncs the file sink's file and directory.
+    #[cfg(test)]
+    pub(crate) const fn with_delivery(
+        self,
+        format: crate::config::AuthorityEventFormat,
+        file_sink: bool,
+        synced_filesystem: bool,
+    ) -> Self {
+        Self {
+            format,
+            file_sink,
+            synced_filesystem,
+            ..self
+        }
+    }
+
+    /// The deployment mode this gate decides for.
+    #[cfg_attr(not(test), allow(dead_code))] // Asked by the operation families that bind keys.
+    pub(crate) const fn backend(&self) -> StateBackend {
+        self.backend
+    }
+
+    /// The refusal of `operation` asked without a caller key, or `None` when
+    /// this deployment performs it. Pure: records nothing.
     pub(crate) fn refusal(&self, operation: AuthorityOperation) -> Option<EvidenceRefusal> {
+        self.refusal_for(operation, RequestForm::UNKEYED)
+    }
+
+    /// The refusal of `operation` asked in `form`, or `None` when this
+    /// deployment performs it. Pure: reads configuration only and records
+    /// nothing. A `caller_key_required` change is admitted only when every
+    /// [`KeyedAdmission`] criterion holds, and its refusal names the first
+    /// that does not; every other required mode decides by the operation
+    /// alone.
+    pub(crate) fn refusal_for(
+        &self,
+        operation: AuthorityOperation,
+        form: RequestForm,
+    ) -> Option<EvidenceRefusal> {
         match self.durability {
             AuthorityEvidenceDurability::BestEffort => None,
             AuthorityEvidenceDurability::Required => match operation.required_mode(self.backend) {
                 RequiredMode::Admitted => None,
+                RequiredMode::CallerKeyRequired => {
+                    self.unmet_keyed_admission(form)
+                        .map(|unmet| EvidenceRefusal {
+                            operation,
+                            backend: self.backend,
+                            mode: RequiredMode::CallerKeyRequired,
+                            unmet: Some(unmet),
+                        })
+                }
                 // An operation the mode cannot perform is refused too: the
                 // gate never admits what it cannot vouch for.
-                mode @ (RequiredMode::Refused
-                | RequiredMode::Unavailable
-                | RequiredMode::CallerKeyRequired) => Some(EvidenceRefusal {
-                    operation,
-                    backend: self.backend,
-                    mode,
-                }),
+                mode @ (RequiredMode::Refused | RequiredMode::Unavailable) => {
+                    Some(EvidenceRefusal {
+                        operation,
+                        backend: self.backend,
+                        mode,
+                        unmet: None,
+                    })
+                }
             },
+        }
+    }
+
+    /// The first [`KeyedAdmission`] criterion `form` or this deployment does
+    /// not meet.
+    fn unmet_keyed_admission(&self, form: RequestForm) -> Option<KeyedAdmission> {
+        if !form.keyed {
+            Some(KeyedAdmission::CallerKey)
+        } else if !form.issuer_bound_principal {
+            Some(KeyedAdmission::IssuerBoundPrincipal)
+        } else if self.format != crate::config::AuthorityEventFormat::QualifiedV1 {
+            Some(KeyedAdmission::QualifiedFormat)
+        } else if !self.file_sink {
+            Some(KeyedAdmission::FileSink)
+        } else if !self.synced_filesystem {
+            Some(KeyedAdmission::SyncedFilesystem)
+        } else {
+            None
         }
     }
 
@@ -336,28 +515,55 @@ impl AuthorityEvidenceGate {
             && self.format == crate::config::AuthorityEventFormat::QualifiedV1
     }
 
-    /// Admits `operation`, or records its refusal -- one warning and one
-    /// `authority_evidence.operation_refused` audit event -- and returns it.
+    /// Admits `operation` asked without a caller key, or records its refusal
+    /// -- one warning and one `authority_evidence.operation_refused` audit
+    /// event -- and returns it.
     pub(crate) fn admit(
         &self,
         operation: AuthorityOperation,
         audit: &AuditLog,
         origin: RefusalOrigin,
     ) -> Result<(), EvidenceRefusal> {
-        let Some(refusal) = self.refusal(operation) else {
-            return Ok(());
-        };
+        match self.refusal(operation) {
+            None => Ok(()),
+            Some(refusal) => Err(Self::record(refusal, audit, origin)),
+        }
+    }
+
+    /// Admits `operation` asked in `form`, or records its refusal as
+    /// [`Self::admit`] does and returns it.
+    pub(crate) fn admit_for(
+        &self,
+        operation: AuthorityOperation,
+        form: RequestForm,
+        audit: &AuditLog,
+        origin: RefusalOrigin,
+    ) -> Result<(), EvidenceRefusal> {
+        match self.refusal_for(operation, form) {
+            None => Ok(()),
+            Some(refusal) => Err(Self::record(refusal, audit, origin)),
+        }
+    }
+
+    /// Log and audit `refusal`, and return it.
+    fn record(
+        refusal: EvidenceRefusal,
+        audit: &AuditLog,
+        origin: RefusalOrigin,
+    ) -> EvidenceRefusal {
+        let operation = refusal.operation;
+        let backend = refusal.backend;
         let trigger = origin.trigger();
         tracing::warn!(
             operation = operation.code(),
-            deployment_mode = mode_name(self.backend),
+            deployment_mode = mode_name(backend),
             trigger,
             reason = REFUSAL_REASON,
             "AUTHORITY_EVIDENCE_DURABILITY=required refused an authority change this deployment mode records no evidence of; nothing was changed"
         );
         let payload = json!({
             "operation": operation.code(),
-            "deployment_mode": mode_name(self.backend),
+            "deployment_mode": mode_name(backend),
             "trigger": trigger,
             "reason": REFUSAL_REASON,
         });
@@ -382,7 +588,7 @@ impl AuthorityEvidenceGate {
             ),
         };
         audit.emit(event);
-        Err(refusal)
+        refusal
     }
 }
 

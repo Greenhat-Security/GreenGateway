@@ -141,6 +141,10 @@
         {
           "path": "gateway/src/admin_policy_drafts.rs",
           "anchor": "async fn policy_draft_publish_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_observability.rs",
+          "anchor": "async fn rule_suggestion_accept_endpoint("
         }
       ],
       "boundary": "persist_policy_mutation -> PolicyControlPlane::commit -> commit_policy_in / postgres_documents::commit_in; active row lock and expected ETag guard; document/history, shared revision, active pointer, security_outbox, one document_change_evidence row and its authority_event_journal row commit together. Discovery acceptance invokes commit_policy_in inside its suggestion transaction, so its evidence row shares that transaction. An empty or oversized actor, or an action that cannot describe the resource, is refused before anything is written; an evidence insert or journal append failure rolls the whole commit (and an acceptance's transition) back and is reported as a store failure (503); a full journal refuses the commit with 503 and is counted.",
@@ -282,6 +286,10 @@
         {
           "path": "gateway/src/admin_policy_drafts.rs",
           "anchor": "async fn policy_draft_publish_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_observability.rs",
+          "anchor": "async fn rule_suggestion_accept_endpoint("
         }
       ],
       "boundary": "persist_to_file writes temporary file and renames; reload swaps runtime; append_policy_version_after_commit writes a separately configured SQLite history database afterward.",
