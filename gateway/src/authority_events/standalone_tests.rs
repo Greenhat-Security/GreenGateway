@@ -727,6 +727,73 @@ async fn the_file_sink_holds_the_records_and_no_identifier() {
     }
 }
 
+/// A lane projects in the format its sink negotiated. A Connection row
+/// behind a caller UUIDv7 and an issuer-bound principal reaches a
+/// `qualified_v1` file as `authority_event.v1` and a `delivery_v1` file as
+/// the delivery record. No route writes such a row yet, so the fixture
+/// gives a row the store committed a caller key.
+#[tokio::test]
+async fn a_lane_delivers_a_keyed_connection_row_in_its_sinks_format() {
+    use crate::config::AuthorityEventFormat;
+    let scratch = Scratch::new("format");
+    let operation_id = crate::auth::tokens::test_revoke_operation_id(5).to_string();
+    for (format, schema_version) in [
+        (AuthorityEventFormat::QualifiedV1, "authority_event.v1"),
+        (
+            AuthorityEventFormat::DeliveryV1,
+            "authority_event_delivery.v1",
+        ),
+    ] {
+        let path = scratch.path(&format!("{schema_version}.sqlite"));
+        let connections = SqliteConnectionStore::open(&path).expect("the Connections store opens");
+        let created = connections
+            .create(mcp_candidate(), &actor())
+            .expect("the Connection creates");
+        let keyed = connections
+            .evidence_connection()
+            .execute(
+                "UPDATE connection_change_evidence SET operation_id = ?1 \
+                 WHERE action = 'connection.create'",
+                [operation_id.as_str()],
+            )
+            .expect("the fixture row updates");
+        assert_eq!(keyed, 1);
+        let authority: Arc<dyn StandaloneEvidenceAuthority> = Arc::new(connections);
+        let events = scratch.path(&format!("{schema_version}.jsonl"));
+        let sink = FileSink::new(events.clone(), format);
+        let stop = CancellationToken::new();
+        for mut lane in lanes_for(&authority, &generated_key_hex()).await {
+            lane.deliver_until_caught_up(&sink, test_config(100), &stop)
+                .await
+                .expect("delivery succeeds");
+        }
+        assert_eq!(cursor(&path, StandaloneEvidenceSource::ConnectionChange), 1);
+        let written = std::fs::read_to_string(&events).expect("the event file reads");
+        let lines: Vec<serde_json::Value> = written
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every line is JSON"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{format:?}");
+        assert_eq!(lines[0]["schema_version"], schema_version, "{format:?}");
+        assert_eq!(lines[0]["operation"], "connection.create", "{format:?}");
+        assert_eq!(
+            lines[0]["operation_id"],
+            operation_id.as_str(),
+            "{format:?}"
+        );
+        let created_id = created.id.to_string();
+        for marker in [
+            ACTOR_MARKER,
+            ACTOR_ISSUER_MARKER,
+            CONNECTION_NAME_MARKER,
+            CONNECTION_HOST_MARKER,
+            created_id.as_str(),
+        ] {
+            assert!(!written.contains(marker), "{marker} reached the file");
+        }
+    }
+}
+
 /// Startup resolves a keyring per store under that store's persisted
 /// authority ID, audits each by key ID only, and refuses a key that does
 /// not resolve before anything runs.

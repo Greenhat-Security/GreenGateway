@@ -6808,7 +6808,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::commands::run_one_shot_command#1",
-      "sha256": "7606b550e6d877fbe23747cb751cfffa0f9653ca0ad12be7f1c87004d4baa079",
+      "sha256": "19db8574f6d5c2464e85e2795f9399b1cda8b636d27cd2e0bb2e23194a463a31",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -8143,12 +8143,22 @@
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
+      "file": "gateway/src/authority_events/caller_operation.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::authority_events::caller_operation::file_attributes#1",
+      "sha256": "d08a9f90cf24307d4e309725d64a1f70a944e74efba3aacca6c7bb8d373baed2",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Allows dead code outside tests for the caller operation types (issue #425) until an operation family binds a key; no I/O and no transport authority."
+    },
+    {
       "file": "gateway/src/authority_events/delivery.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
       "scope": "gateway::authority_events::delivery::file_attributes#1",
-      "sha256": "4e67f17b406b983fddfa6428cc61429567ab81243bf58bb7950bf3adcad8b38f",
+      "sha256": "f0301a716b3b1f6c7ae059ebcccd6bd1786a770f17290c61a25a482d94adb6b1",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
     },
@@ -8259,7 +8269,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::cluster_maintenance::StandardJobSources#1",
-      "sha256": "2613cbc6040d3e9a9c98c14b81f1b7057aaea0b680026694b4bbbe4aab9e2285",
+      "sha256": "14e4c5dfa79b47f46b15fcd02387644193cdfd3a98bf0e50705bc241ebc5bb76",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -14895,6 +14905,26 @@
       "reasons": [
         "unexpanded-attribute"
       ],
+      "scope": "gateway::storage::standalone_authority_events::read_caller_operation#1",
+      "sha256": "56296f23fa582cf457d1d25dd6e6d1599ca2c6e268ecb5ab4a3f1ea53d1fe065",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Reads one caller key's reserved action and binding digest from the local SQLite file that owns the evidence; no transport authority. Allowed dead outside tests until an operation family binds a key."
+    },
+    {
+      "file": "gateway/src/storage/standalone_authority_events.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::storage::standalone_authority_events::reserve_bound_operation#1",
+      "sha256": "0f2c4e5355c018907652332ecbf86bd66f841387faae79cd4ea5869540a3fc66",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Inserts a caller UUID, operation family and binding digest in the caller's IMMEDIATE transaction on the local SQLite file; no transport authority. Allowed dead outside tests until an operation family binds a key."
+    },
+    {
+      "file": "gateway/src/storage/standalone_authority_events.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
       "scope": "gateway::storage::standalone_authority_events::impl  StandaloneEvidenceSource::ALL#1",
       "sha256": "c45e771d64a73c58cadfc03eb7e92933988a91d08be77a4943addd458b671e53",
       "owner": "GreenGateway maintainers",
@@ -16092,7 +16122,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::cluster_maintenance::impl MaintenanceJob AuthorityEventRetention::run_step#1",
-      "sha256": "aafd32ef0210b49eff05897f323831285868e60fb0625e85408cb62ca210930b",
+      "sha256": "a0c7d28d9c5c90947b5a215d0308a2ec4ed87f83ce0a256cdb3830c0da09fda7",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -16169,6 +16199,28 @@
     {
       "file": "gateway/src/storage/postgres_authority_events.rs",
       "reasons": [
+        "network-or-process-reference",
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::read_caller_operation#1",
+      "sha256": "72f3e5f062c6bc6ac9181d783588a2ef79c82c0ab2e78b76efdb2ed81c9467e8",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Reads one caller key's reserved action and binding digest on a caller-supplied PostgreSQL session, read only; no caller-selected HTTP authority. Allowed dead outside tests until an operation family binds a key."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "network-or-process-reference",
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::reserve_bound_operation#1",
+      "sha256": "5f87f38d5a6ca05c6b2823abd1441323752fe1f50dece3b4f71ab5b58a1a3948",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Inserts a caller UUID, operation family and binding digest on the existing PostgreSQL transaction, serializing reuse across authority writers; no caller-selected HTTP authority. Allowed dead outside tests until an operation family binds a key."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::classify_query#1",
@@ -16232,7 +16284,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::impl  PostgresAuthorityEventStore::prune_with#1",
-      "sha256": "469aa5bf9bd516c92003f99c8611f750a68b8bb1b41b0c69dbbc9ecfcf251041",
+      "sha256": "e421cb7cd0393a195fd01b06b9768ee4ac955e2ed1793344fa2adbbff13ac5f3",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

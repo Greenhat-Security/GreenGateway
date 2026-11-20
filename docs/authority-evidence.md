@@ -199,16 +199,48 @@ the operation ID lacks caller binding and delivery omits the withdrawal reason.
 
 ## Authority event v1
 
-With `AUTHORITY_EVENT_FORMAT=qualified_v1`, PostgreSQL delivers `authority_event.v1`
-for a caller-bound approval preparation and for a keyed service-token revocation.
-The revocation path is `POST /v1{ADMIN_PREFIX}/tokens/{id}/revoke`, called by
-an authenticated principal with a canonical provider issuer. The UUIDv7 in the request binds the action,
-target and caller. Projection checks that the token revision advanced by one
-and that the row has a shared security revision. The actor's `subject_ref` is
-a keyed reference over the canonical issuer and subject together. The issuer
-and token also have their own domain-separated references. The wire record
-contains those references, the event and operation IDs, authority ID, commit
-time and revision transition. [Event schema](schemas/authority_event.v1.schema.json)
+With `AUTHORITY_EVENT_FORMAT=qualified_v1`, both dispatchers apply one
+qualification rule to every evidence row they deliver: every PostgreSQL
+journal source, and the standalone Connection, local-secret and catalog
+tables.
+
+1. A caller UUIDv7 `operation_id`, an actor that is a provider-authenticated
+   principal with a canonical issuer, and revisions that satisfy the
+   operation's v1 transition: the row is delivered as `authority_event.v1`.
+2. A caller UUIDv7 with a gateway service-token actor, which has no provider
+   issuer to scope its subject: `authority_event_delivery.v1`.
+3. A UUIDv4, which the store minted for an unkeyed change:
+   `authority_event_delivery.v1`.
+4. A caller UUIDv7 with any other actor (a system actor, a principal without
+   a canonical issuer, or no recorded actor), or with revisions outside the
+   operation's transition: delivery stalls at that row. No writer binds a
+   caller key to such a row, so it must not pass as a legacy record.
+
+Two routes bind a caller key today: the keyed service-token revocation
+`POST /v1{ADMIN_PREFIX}/tokens/{id}/revoke` and the keyed approval preparation
+below. Every other store still mints UUIDv4 IDs, so the rule delivers no other
+operation as `authority_event.v1` until its own route is keyed. The UUIDv7 in
+the request binds the action, target and caller. A token row's revision
+advances by exactly one per change, and projection checks that for a keyed
+rotation or revocation, beside the row's shared security revision. The actor's
+`subject_ref` is a keyed reference over the canonical issuer and subject
+together. The issuer and the resource also have their own domain-separated
+references. The wire record contains those references, the event and operation
+IDs, authority ID, commit time and revision transition.
+[Event schema](schemas/authority_event.v1.schema.json)
+
+A `credential.binding_change` is delivered in v1 with resource kind
+`credential_binding`, referenced in the `resource.credential_binding` domain
+from its Connection's ID. It carries the operation ID of the Connection create
+or replace that changed the binding, which is how a consumer joins the two.
+The binding identifier, secret IDs and locators stay out of the record. Its
+`authority_event_delivery.v1` form still names the Connection, as before.
+
+A standalone token row records no revision, and v1 requires one, so it keeps
+`authority_event_delivery.v1` whatever its operation ID. That includes the keyed
+revocations SQLite has recorded since #765, whose delivered bytes do not change.
+A token row that records a revision is out of shape and stalls. A standalone
+re-encryption batch, which no caller starts, also keeps its delivery record.
 
 Both keyed paths support durable delivery through the file sink on a Unix
 filesystem that honors file and directory sync, using shared
@@ -218,12 +250,13 @@ the batch pending. An interrupted cursor update
 can redeliver the event. Consumers deduplicate on the authority and event IDs.
 The opt-in log sink writes the same representation with process-log acceptance.
 
-Consumers select the parser for each record by its `schema_version`. Legacy evidence keeps `authority_event_delivery.v1` under the default format.
-Unkeyed token revocations, gateway service-token actors and every standalone
-row also keep that representation on an opted-in stream. On a PostgreSQL keyed revoke, an impossible
-actor shape, a missing revision or a noncontiguous token revision stalls the
-opted-in stream at that batch. Historical UUIDv4 rows remain eligible for
-delivery in their existing format. No actor or operation identity is backfilled.
+Consumers select the parser for each record by its `schema_version`. Under the
+default format every row keeps `authority_event_delivery.v1`, and a caller key
+never stalls delivery; only a preparation receipt, which has no legacy form,
+holds the cursor (below). Unkeyed changes, gateway service-token actors and
+standalone token rows also keep that representation on an opted-in stream.
+Historical UUIDv4 rows remain eligible for delivery in their existing format.
+No actor or operation identity is backfilled.
 [Format configuration](configuration.md#authority_event_format)
 
 Revision transitions are operation-specific. Resource creation (`connection.create`,
@@ -347,7 +380,9 @@ SELECT pg_total_relation_size('greengateway.authority_caller_operation_ids') AS 
        pg_total_relation_size('greengateway.mutation_approval_prepare_evidence') AS receipt_bytes;
 ```
 
-Provision more database capacity before the volume fills. A full journal has a
+Provision more database capacity before the volume fills. From schema 36 the
+reservation table holds the keys of every keyed action, not only these two, and
+the same query measures it. A full journal has a
 separate limit, `AUTHORITY_EVENT_JOURNAL_CAPACITY` (default 1,000,000
 units, range 1 to 1,000,000,000). Monitor
 `greengateway_authority_event_journal_retained` against
@@ -355,6 +390,71 @@ units, range 1 to 1,000,000,000). Monitor
 `qualified_v1` consumer, allow delivered entries to age out, shorten journal
 retention, or raise the capacity across the cluster. Removing a cursor cannot
 reclaim space after the first keyed preparation.
+
+### Caller operation keys bound to a request
+
+Schema 36 (PostgreSQL migration 36) and the standalone reservation table prepare
+caller operation IDs for every admin change that will take an `Idempotency-Key`.
+No admin route binds a key through them yet; each operation family does so in its
+own change. A key belongs to exactly one request: its binding digest is a
+domain-separated, length-prefixed SHA-256 over the action, the recorded actor
+(kind, canonical issuer, subject and auth mode), the target, the `If-Match` value
+and the request with secret values removed
+(`gateway/src/authority_events/caller_operation.rs`). Only an issuer-bound
+principal or a service token can own a key; a system actor cannot, and a
+gateway-assigned v4 ID is never a key. The digest is stored only in the key's
+reservation row, beside the key and its action, in the transaction that commits
+the change and its evidence. It never appears in a receipt, a delivered record, a
+log line or a metric.
+
+- PostgreSQL: migration 36 widens `greengateway.authority_caller_operation_ids`
+  to every action a key will be reserved for (`CALLER_OPERATION_ACTIONS` in
+  `storage::postgres_authority_events`) and adds a nullable `binding_digest`.
+  Every new action must store one. The keyed revoke and keyed prepare keep their
+  reservations with no digest, and their own replay checks, unchanged.
+  `read_caller_operation` looks a key up without a transaction, so a handler can
+  answer an exact retry before any external work; `reserve_bound_operation`
+  reserves it in the change's own transaction, where a second writer competing
+  for the key waits on it and then reads the winner's row.
+- Standalone: each SQLite file that owns authority evidence keeps the same table,
+  created from one definition by both owners (the token database on open, the
+  Connections database in its migration 16), so a token store and a Connections
+  store on one file share one table. Its action list is fixed for every keyable
+  standalone action now, because SQLite cannot widen a CHECK in place. A keyed
+  service-token revoke now reserves its key with its evidence, so no later keyed
+  issue, rotation or Connection change in that file can reuse it, and a key
+  another action reserved refuses the revoke. Every open of the token database
+  reserves any keyed revoke an older build committed without a reservation; the
+  older build itself never reads the table, so it can still serve the file, but
+  it does not enforce reservations the newer build made.
+- Standalone upgrades: the Connections database upgrade is one-way. An older
+  build refuses a version-16 Connections file, and there is no downgrade: recover
+  forward with a build that knows Connections version 16. Restoring the
+  pre-upgrade file copy brings back every Connection and secret deleted since and
+  undoes every rotation, so it is disaster recovery, not rollback. The token
+  database needs no restore to run an older build, at the cost above.
+- Each SQLite file is its own authority, so a key is unique within one file, as
+  consumers deduplicate events on `(authority_id, event_id)`: the token database
+  and a separate Connections database each accept a key once.
+
+Rows are never removed. A reservation exists exactly when a keyed evidence row
+with that operation ID and action exists, in both stores, with two exceptions,
+both written by an older build serving a token database:
+
+- a keyed revoke it committed since this build last opened the file, which the
+  next open reserves;
+- a keyed revoke whose key this file had already reserved for another action
+  (the older build checks only the evidence table). That cannot be repaired: the
+  key stays with the action that reserved it and the revoke keeps no
+  reservation. Every open counts such revokes and logs the count with a fixed
+  message, never the key, token or actor. It cannot happen before an operation
+  family reserves keys for another action in the token database or the
+  Connections database on a shared file.
+
+`a_keyed_revoke_reserves_its_key_with_its_evidence`,
+`reopening_reserves_keyed_revocations_an_older_build_wrote` and
+`reopening_counts_a_keyed_revocation_whose_key_another_action_holds` assert
+these cases.
 
 ## Keyed safe references
 
@@ -584,9 +684,18 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
   deletes, one bounded step per pass, journal rows at or below the dispatcher's
   cursor and journaled at least `AUTHORITY_EVENT_RETENTION_HOURS` ago (default 168),
   and gives their capacity back. Once a dispatcher has claimed the cursor, no
-  undelivered row is ever pruned, whatever its age. With no cursor, age-only
-  pruning applies until the first keyed approval preparation commits. That
-  receipt protects the entire journal until the dispatcher checkpoints it.
+  undelivered row is ever pruned, whatever its age. With no cursor, retention
+  holds the entire journal under `AUTHORITY_EVIDENCE_DURABILITY=required`: its
+  events have reached no consumer, and required mode always configures a sink,
+  so the hold lasts only while delivery has not established its cursor (or
+  after an operator removed it). Under `best_effort`, age-only pruning applies
+  with no cursor until the first keyed approval preparation commits. That
+  receipt protects the entire journal until the dispatcher checkpoints it. The
+  hold does not depend on whether a keyed row exists, so a best-effort
+  deployment with no sink does not start filling its journal when one client
+  sends a key. The hold follows the durability of the process that runs the
+  maintenance pass, including `gateway maintenance-run`, which is not checked
+  against the cluster fingerprint: run it with the replicas' environment.
   Retention preserves all evidence rows, including the preparation receipt.
 - **Default delivery format.** Each legacy record carries the persisted `authority_id`, the
   evidence row's `event_id` and `operation_id`, the journal position as
@@ -635,9 +744,10 @@ the cursor stays a required consumer when the sink is later turned off: its
 cursor keeps holding undelivered rows. To stop delivering deliberately, remove the
 cursor as the migration role (`DELETE FROM greengateway.authority_event_cursors WHERE
 consumer = 'dispatcher'`) after the sink is off on every replica; retention then
-resumes age-only pruning if the deployment has never committed a keyed approval
-prepare. Once a prepare receipt exists, restore a working dispatcher to free
-capacity. Removing the cursor in that deployment holds the entire journal.
+resumes age-only pruning if the deployment runs `best_effort` and has never
+committed a keyed approval prepare. Under `required`, or once a prepare receipt
+exists, removing the cursor holds the entire journal: restore a working
+dispatcher to free capacity.
 
 A database restore rewinds the journal, the cursor and the evidence together. Events
 committed after the backup are gone with the changes they describe; events delivered
@@ -657,9 +767,12 @@ Not covered by PR 3, and still open:
 - **Standalone mode** has no journal; its evidence is delivered straight from the
   SQLite stores that own it, after a cursor in each
   ([Standalone delivery](#standalone-delivery)).
-- **The v1 contract.** Other operations need caller-bound identities and
-  issuer-scoped subject references before they can qualify for `authority_event.v1`. Kind, auth mode and
-  issuer are recorded since migration 24 ([Actor metadata](#actor-metadata)).
+- **The v1 contract.** The dispatcher qualifies any row with a caller UUIDv7 and
+  an issuer-bound principal ([Authority event v1](#authority-event-v1)), but
+  only token revocation and approval preparation bind a caller key yet. Each
+  other operation needs a keyed route before it delivers `authority_event.v1`.
+  Kind, auth mode and issuer are recorded since migration 24
+  ([Actor metadata](#actor-metadata)).
 - **Service-token issue (migration 27).** A create writes its
   `service_token_change_evidence` row with action `service_token.issue` after the
   token row and the create outbox row, under the outbox row's shared revision, and
@@ -1035,7 +1148,7 @@ secret providers as cluster mode, opens each source's cursor (creating it at 0),
 audits each load as `authority_event.keyring_loaded` with the store's name, its
 authority ID and the key IDs. Any failure refuses startup. Then one task, outside every
 authority transaction, delivers every source in turn: it reads at most 100 rows after
-the cursor, projects them into `authority_event_delivery.v1` records
+the cursor, projects them into records in the sink's format
 (`gateway/src/authority_events/standalone_delivery.rs`), offers them to the sink and
 only after the sink accepted advances the cursor with a compare-and-set in an IMMEDIATE
 transaction. A sink failure is retried with the same 0.5 s to 60 s backoff and the
@@ -1060,6 +1173,17 @@ Catalog publications sit on the `catalog` axis with the catalog revision before 
 for a first catalog) and after, referenced as the Connection's catalog; the compiled
 overlay revision stays in the evidence row. A credential binding change is the
 Connection's, on the `credential` axis, exactly as cluster mode delivers it.
+
+**Format.** Every record is `authority_event_delivery.v1` under the default
+`AUTHORITY_EVENT_FORMAT=delivery_v1`. Under `qualified_v1` a Connection,
+local-secret or catalog row follows the cluster rule in
+[Authority event v1](#authority-event-v1): a caller UUIDv7 with an issuer-bound
+principal is delivered as `authority_event.v1` with `revision.security` `null`,
+and a caller UUIDv7 with any other actor that is not a service token stalls its
+table. No standalone route binds a caller key yet, so these tables hold no such
+row. Token rows record no revision, so they keep `authority_event_delivery.v1`
+whatever their operation ID, including the keyed revocations recorded since
+#765, and so does a re-encryption batch.
 
 **Signals.** `greengateway_standalone_authority_event_undelivered{store}` (rows above
 the cursors, summed per store) and
@@ -1311,7 +1435,11 @@ against a service container over loopback plaintext, under the documented
 `loopback-dev` exception. `postgres-foundation-tls` runs these suites again against a
 disposable PostgreSQL 16, the same pinned image, that accepts TLS and nothing else:
 
-- in `storage::contract_tests`, the service-token and JWT revocation evidence tests
+- in `storage::contract_tests`, the caller operation key contract
+  (`postgres_caller_operation_reservation_contract`,
+  `postgres_a_rolled_back_transaction_leaves_no_reservation`,
+  `postgres_two_transactions_racing_one_key_reserve_it_once`), the service-token
+  and JWT revocation evidence tests
   (`postgres_service_token_change_evidence_satisfies_the_contract`,
   `service_token_change_evidence_matches_the_outbox_and_survives_deletion_and_restart`,
   `a_failed_token_evidence_insert_rolls_back_the_rotate_and_the_revoke`,
@@ -1326,8 +1454,12 @@ disposable PostgreSQL 16, the same pinned image, that accepts TLS and nothing el
   replace, credential binding change, deletion and catalog evidence included;
 - `storage::postgres_documents` and `storage::postgres_admin_sessions`;
 - the dispatcher (`authority_events::dispatcher`);
-- `storage::migrations`' evidence and journal migrations: 12 through 16, 18, 21 and
-  24 through 28;
+- journal retention without a cursor, in `storage::postgres_authority_events`:
+  `retention_under_required_never_prunes_a_journal_with_no_cursor`,
+  `best_effort_without_a_cursor_still_prunes_by_age` and
+  `the_maintenance_retention_job_takes_its_cursorless_hold_from_durability`;
+- `storage::migrations`' evidence and journal migrations: 12 through 16, 18, 21,
+  24 through 29, 32, 33, 35 and 36;
 - the app-level `admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_postgres`.
 
 Each run generates a throwaway CA and a server certificate for `127.0.0.1` and

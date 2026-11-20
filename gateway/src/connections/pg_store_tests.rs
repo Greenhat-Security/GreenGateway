@@ -486,6 +486,129 @@ async fn keyed_prepare_evidence_survives_retries_failures_and_occurrence_cleanup
     );
 }
 
+/// Since migration 36 the reservation table can hold a digest-bound key
+/// (here `connection.create`). Such a key is never a keyed revoke's or a
+/// keyed prepare's: the revoke and the prepare, and the prepare's read-only
+/// receipt lookup, each answer a conflict, the token stays live, and no
+/// occurrence, evidence row, journal entry or second reservation is written.
+#[tokio::test]
+async fn a_key_reserved_for_a_bound_action_refuses_the_keyed_revoke_and_prepare() {
+    use crate::auth::tokens::{test_revoke_operation_id, CreateTokenRequest};
+    use crate::authority_events::caller_operation::{
+        CallerKeyReservation, CallerOperation, CallerOperationBinding,
+    };
+    use crate::connections::mutation_approval::{ApprovalError, PrepareBinding};
+    use crate::storage::{PostgresServiceTokenStore, RepositoryErrorKind, ServiceTokenStore};
+    let Some(dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&dsn).await;
+    let (store, pool) = migrated_store(&database.dsn, 64).await;
+    let (_api, action) = prepare_fixture(&store).await;
+    let actor = ChangeActor::for_test_with_issuer(&action.caller.subject, &action.caller.issuer);
+    let key = test_revoke_operation_id(20);
+    let bound = CallerOperation::bind(
+        key,
+        &CallerOperationBinding {
+            action: "connection.create",
+            actor: &actor,
+            target: "",
+            precondition: "",
+            request: b"{}",
+        },
+    )
+    .expect("the key binds");
+    let client = pool.get().await.unwrap();
+    client.batch_execute("BEGIN").await.unwrap();
+    assert_eq!(
+        crate::storage::postgres_authority_events::reserve_bound_operation(&client, &bound)
+            .await
+            .unwrap(),
+        CallerKeyReservation::Reserved
+    );
+    client.batch_execute("COMMIT").await.unwrap();
+
+    let tokens = PostgresServiceTokenStore::new(pool.clone());
+    let token = tokens
+        .create(
+            CreateTokenRequest {
+                scopes: vec!["admin:tokens:read".into()],
+                created_by: actor.subject().into(),
+                expires_at: None,
+            },
+            &actor,
+        )
+        .await
+        .unwrap()
+        .record
+        .id;
+    let counts = || async {
+        let row = client
+            .query_one(
+                "SELECT
+                  (SELECT count(*) FROM greengateway.authority_caller_operation_ids),
+                  (SELECT count(*) FROM greengateway.connection_mutation_approvals),
+                  (SELECT count(*) FROM greengateway.mutation_approval_prepare_evidence),
+                  (SELECT count(*) FROM greengateway.service_token_change_evidence),
+                  (SELECT count(*) FROM greengateway.authority_event_journal)",
+                &[],
+            )
+            .await
+            .unwrap();
+        [
+            row.get::<_, i64>(0),
+            row.get(1),
+            row.get(2),
+            row.get(3),
+            row.get(4),
+        ]
+    };
+    let before = counts().await;
+    assert_eq!(before[0], 1, "only the bound reservation");
+
+    let refused = tokens
+        .revoke_with_operation(&token, &actor, Some(key))
+        .await
+        .expect_err("a bound key is not a revoke's");
+    assert_eq!(refused.kind(), RepositoryErrorKind::Conflict);
+    let binding =
+        PrepareBinding::new(key, actor.clone(), "opaque-tool", "strong-etag", b"body").unwrap();
+    assert_eq!(
+        store.keyed_prepare_receipt(&binding).await.unwrap_err(),
+        ApprovalError::Conflict
+    );
+    assert_eq!(
+        store
+            .create_keyed_mutation_approval(&action, &binding)
+            .await
+            .unwrap_err(),
+        ApprovalError::Conflict
+    );
+
+    assert_eq!(counts().await, before, "nothing was written");
+    assert!(tokens
+        .get_by_id(&token)
+        .await
+        .unwrap()
+        .expect("token should exist")
+        .revoked_at
+        .is_none());
+    let reservation = client
+        .query_one(
+            "SELECT action, binding_digest FROM greengateway.authority_caller_operation_ids \
+             WHERE operation_id = $1::text::uuid",
+            &[&key.to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(reservation.get::<_, String>(0), "connection.create");
+    assert_eq!(
+        reservation.get::<_, Option<String>>(1).as_deref(),
+        Some(bound.binding_digest())
+    );
+}
+
 #[tokio::test]
 async fn keyed_prepare_file_delivery_resumes_after_format_downgrade_and_cursor_loss() {
     use crate::auth::tokens::test_revoke_operation_id;
@@ -521,7 +644,7 @@ async fn keyed_prepare_file_delivery_resumes_after_format_downgrade_and_cursor_l
     let store = std::sync::Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
     let client = pool.get().await.unwrap();
     assert_eq!(
-        PostgresAuthorityEventStore::prune_with(&client, std::time::Duration::ZERO, 100)
+        PostgresAuthorityEventStore::prune_with(&client, std::time::Duration::ZERO, 100, false)
             .await
             .unwrap(),
         0,
@@ -604,7 +727,7 @@ async fn keyed_prepare_file_delivery_resumes_after_format_downgrade_and_cursor_l
         assert!(!bytes.contains(marker));
     }
     assert_eq!(
-        PostgresAuthorityEventStore::prune_with(&client, std::time::Duration::ZERO, 100)
+        PostgresAuthorityEventStore::prune_with(&client, std::time::Duration::ZERO, 100, false)
             .await
             .unwrap(),
         rows.len() as u64

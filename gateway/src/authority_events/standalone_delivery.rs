@@ -34,6 +34,13 @@
 //! - **A credential binding change** is the Connection's, on the `credential`
 //!   axis, exactly as cluster mode delivers it: no binding or secret ID is
 //!   evidence.
+//! - **The format.** Under the default `delivery_v1` every row is an
+//!   `authority_event_delivery.v1`. Under a negotiated `qualified_v1` a row
+//!   of a table that records revisions (Connection, local secret, catalog)
+//!   follows the cluster rule ([`qualify_caller_bound`]): a caller UUIDv7
+//!   and an issuer-bound principal make an `authority_event.v1`, with no
+//!   shared security revision. A token row records no revision, and v1
+//!   needs one, so it keeps its delivery record whatever its operation ID.
 //!
 //! A row that cannot be projected faithfully -- an action its table may not
 //! hold, a revision out of its transition, a value out of shape -- is refused
@@ -42,13 +49,16 @@
 
 use super::{
     delivery::{
-        canonical_uuid, committed_at_in_shape, non_negative, positive, project_actor, required,
-        DeliveryRecord, DeliveryResource, DeliveryRevision, ProjectionError,
-        DELIVERY_SCHEMA_VERSION, RESULT_COMMITTED,
+        canonical_uuid, committed_at_in_shape, non_negative, positive, project_actor,
+        qualify_caller_bound, required, CallerBoundRow, DeliveryRecord, DeliveryResource,
+        DeliveryRevision, ProjectionError, DELIVERY_SCHEMA_VERSION, RESULT_COMMITTED,
     },
     pseudonym::{PseudonymKeyring, ReferenceDomain},
 };
-use crate::storage::standalone_authority_events::{StandaloneEvidence, StandaloneEvidenceSource};
+use crate::{
+    config::AuthorityEventFormat,
+    storage::standalone_authority_events::{StandaloneEvidence, StandaloneEvidenceSource},
+};
 
 /// The component a re-encryption batch's resource reference is derived
 /// from: the table of envelopes it rewrote. A secret's own reference is
@@ -252,6 +262,7 @@ fn shape_of(source: StandaloneEvidenceSource, action: &str) -> Option<&'static S
 pub(crate) fn project_standalone(
     evidence: &StandaloneEvidence,
     keyring: &PseudonymKeyring,
+    format: AuthorityEventFormat,
 ) -> Result<DeliveryRecord, ProjectionError> {
     let operation_id = required(Some(evidence.operation_id.as_str()))?;
     let subject = required(Some(evidence.actor_user_id.as_str()))?;
@@ -279,9 +290,38 @@ pub(crate) fn project_standalone(
         evidence.actor_issuer.as_deref(),
         keyring,
     )?;
+    let resource = DeliveryResource {
+        kind: shape.resource_kind.to_owned(),
+        reference: resource_reference.as_str().to_owned(),
+    };
+    let qualified = match (format, evidence.resource_id.as_deref()) {
+        // A row that records revisions follows the cluster rule. A row that
+        // records none -- a token row, whose table keeps no token revision,
+        // or a re-encryption batch, which no caller starts -- has no v1
+        // transition and keeps its delivery record whatever its operation
+        // ID: the keyed revocations recorded since #765 are delivered as
+        // they always were.
+        (AuthorityEventFormat::QualifiedV1, Some(resource_id))
+            if shape.transition != Transition::Unrevised =>
+        {
+            qualify_caller_bound(
+                &CallerBoundRow {
+                    operation_id: &operation_id,
+                    subject,
+                    issuer: evidence.actor_issuer.as_deref(),
+                    action,
+                    resource_id,
+                },
+                &actor,
+                &resource,
+                keyring,
+            )?
+        }
+        _ => None,
+    };
 
     Ok(DeliveryRecord {
-        qualified_actor: None,
+        qualified,
         schema_version: DELIVERY_SCHEMA_VERSION.to_owned(),
         authority_id: keyring.authority_id().to_string(),
         event_id,
@@ -291,10 +331,7 @@ pub(crate) fn project_standalone(
         result: RESULT_COMMITTED.to_owned(),
         committed_at: committed_at.to_owned(),
         actor,
-        resource: DeliveryResource {
-            kind: shape.resource_kind.to_owned(),
-            reference: resource_reference.as_str().to_owned(),
-        },
+        resource,
         revision: DeliveryRevision {
             axis: shape.axis.to_owned(),
             before: before.map(|value| value.to_string()),
