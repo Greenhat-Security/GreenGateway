@@ -382,15 +382,16 @@ async fn required_evidence_admits_standalone_catalog_publication_and_records_it(
     let connection_db = TempDb::new("authority-evidence-catalogs");
     let policy = TempPolicyFile::new(&connection_policy_document_string());
     let (audit_log, capture) = captured_audit();
-    let mut config = required(connection_admin_config(
-        &connection_db,
-        &policy,
-        config::DEFAULT_ADMIN_PREFIX,
-    ));
+    let mut config = connection_admin_config(&connection_db, &policy, config::DEFAULT_ADMIN_PREFIX);
     config.rate_limit_write_burst = 1_000;
-    let router = router_with(config, audit_log);
-    let (connection_id, connection_etag) =
-        create_managed_openapi_connection(&router, "Evidence target").await;
+    // Required mode admits a Connection create only in its keyed form (issue
+    // #425), so the target is created before required mode is on.
+    let (connection_id, connection_etag) = create_managed_openapi_connection(
+        &router_with(config.clone(), test_audit_log()),
+        "Evidence target",
+    )
+    .await;
+    let router = router_with(required(config), audit_log);
     let connection_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}");
     let overlay_uri = format!("{connection_uri}/overlay");
 
@@ -535,24 +536,22 @@ async fn required_evidence_admits_standalone_catalog_publication_and_records_it(
 }
 
 /// The Connections database records who changes a Connection or a local
-/// secret in the change's own transaction, so required mode admits them.
+/// secret in the change's own transaction. Required mode admits the local
+/// secret changes and every form of a Connection deletion; a Connection
+/// create is admitted only in its keyed form (issue #425), so an unkeyed one
+/// is refused before anything is written.
 #[tokio::test]
 async fn required_evidence_admits_standalone_connection_and_secret_changes() {
     let connection_db = TempDb::new("authority-evidence-connections");
     let policy = TempPolicyFile::new(&connection_policy_document_string());
     let (audit_log, capture) = captured_audit();
-    let mut config = required(connection_admin_config(
-        &connection_db,
-        &policy,
-        config::DEFAULT_ADMIN_PREFIX,
-    ));
+    let mut config = connection_admin_config(&connection_db, &policy, config::DEFAULT_ADMIN_PREFIX);
     config.rate_limit_write_burst = 1_000;
-    let router = router_with(config, audit_log);
     let superadmin = || Some(test_principal(&["connections-superadmin"]));
-    let (evidence_before, _) =
-        standalone_change_evidence(&connection_db.path, "connection_change_evidence");
-    let collection_etag = connection_collection_etag(&router).await;
-    let admitted = router
+    // The Connection to delete is created before required mode is on.
+    let best_effort = router_with(config.clone(), test_audit_log());
+    let collection_etag = connection_collection_etag(&best_effort).await;
+    let admitted = best_effort
         .clone()
         .oneshot(connection_admin_request(
             Method::POST,
@@ -570,6 +569,27 @@ async fn required_evidence_admits_standalone_connection_and_secret_changes() {
         .as_str()
         .expect("created connection should include ID")
         .to_owned();
+    drop(best_effort);
+    let router = router_with(required(config), audit_log);
+    let (evidence_before, _) =
+        standalone_change_evidence(&connection_db.path, "connection_change_evidence");
+    let collection_etag = connection_collection_etag(&router).await;
+    let refused = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            superadmin(),
+            Some(plain_connection_body("Refused create")),
+            Some(&collection_etag),
+            true,
+        ))
+        .await
+        .expect("connection create should complete");
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    let refused = json_body(refused).await;
+    assert_eq!(refused["reason"], json!("authority_evidence_unsupported"));
+    assert_eq!(refused["operation"], json!("connection.create"));
     let deleted = router
         .clone()
         .oneshot(connection_admin_request(
@@ -590,7 +610,8 @@ async fn required_evidence_admits_standalone_connection_and_secret_changes() {
             .iter()
             .map(|change| change.action.as_str())
             .collect::<Vec<_>>(),
-        ["connection.create", "connection.delete"]
+        ["connection.delete"],
+        "the refused create wrote nothing; the unkeyed delete is admitted"
     );
 
     let secrets = router
@@ -647,10 +668,11 @@ async fn required_evidence_admits_standalone_connection_and_secret_changes() {
             .iter()
             .any(|event| event.event_type == audit::event::CONNECTION_SECRET_CHANGED)
     });
-    assert!(capture
-        .events()
-        .iter()
-        .all(|event| event.event_type != audit::event::AUTHORITY_EVIDENCE_OPERATION_REFUSED));
+    assert_eq!(
+        refused_operations(&capture, 1),
+        ["connection.create"],
+        "only the unkeyed create was refused"
+    );
 }
 
 async fn connection_collection_etag(router: &Router) -> String {
@@ -1020,4 +1042,651 @@ fn the_configured_gate_admits_a_keyed_change_only_with_the_file_sink() {
         )),
         (!cfg!(unix)).then_some(KeyedAdmission::SyncedFilesystem)
     );
+}
+
+// --- keyed Connection create, replace and delete (issue #425) --------------
+
+const KEYED_ISSUER: &str = "https://issuer.example.test";
+
+/// A provider-authenticated principal with a canonical issuer and `roles`.
+fn keyed_admin(roles: &[&str]) -> auth::Principal {
+    let mut principal = test_principal(roles);
+    principal.issuer = Some(KEYED_ISSUER.to_owned());
+    principal
+}
+
+/// A gateway service token holding `roles`.
+fn service_token_admin(roles: &[&str]) -> auth::Principal {
+    let mut principal = test_principal(roles);
+    principal.auth_method = auth::AuthMethod::ServiceToken;
+    principal
+}
+
+/// A Connection admin request, with `key` as its `Idempotency-Key`.
+fn keyed_connection_request(
+    method: Method,
+    uri: &str,
+    principal: auth::Principal,
+    body: Option<String>,
+    if_match: Option<&str>,
+    key: Option<&str>,
+) -> Request<Body> {
+    let mut request = connection_admin_request(method, uri, Some(principal), body, if_match, true);
+    if let Some(key) = key {
+        request
+            .headers_mut()
+            .insert("idempotency-key", key.parse().expect("the key is a header"));
+    }
+    request
+}
+
+/// The status, ETag (if any) and JSON body of one request.
+async fn exchange(router: &Router, request: Request<Body>) -> (StatusCode, Option<String>, Value) {
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("the request completes");
+    let status = response.status();
+    let etag = response
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    (status, etag, json_body(response).await)
+}
+
+/// A disabled HTTP Connection whose credential and proxy header name the
+/// given aliases.
+fn aliased_connection_body(display_name: &str, secret_id: &str, header_secret_id: &str) -> String {
+    json!({
+        "display_name": display_name,
+        "enabled": false,
+        "kind": "http_api",
+        "endpoint": {"base_url": "https://keyed.example.test", "base_path": "/v1"},
+        "authentication": {"type": "static_bearer", "secret_id": secret_id},
+        "additional_headers": [{"header_name": "x-proxy-token", "secret_id": header_secret_id}]
+    })
+    .to_string()
+}
+
+/// Every reservation in a standalone Connections database.
+fn standalone_reservations(path: &FsPath) -> Vec<(String, String, Option<String>)> {
+    let connection = rusqlite::Connection::open(path).expect("the database opens");
+    let mut statement = connection
+        .prepare(
+            "SELECT operation_id, action, binding_digest \
+             FROM authority_caller_operation_ids ORDER BY operation_id",
+        )
+        .expect("the reservation query prepares");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("the reservations read")
+        .collect::<Result<_, _>>()
+        .expect("every reservation reads")
+}
+
+fn caller_key(seed: u8) -> String {
+    crate::authority_events::caller_operation::test_caller_key(seed).to_string()
+}
+
+/// A standalone Connections router with the connection admin policy.
+fn keyed_connection_router(
+    connection_db: &TempDb,
+    policy: &TempPolicyFile,
+    audit_log: audit::AuditLog,
+    configure: impl FnOnce(&mut config::Config),
+) -> Router {
+    let mut config = connection_admin_config(connection_db, policy, config::DEFAULT_ADMIN_PREFIX);
+    config.rate_limit_write_burst = 1_000;
+    configure(&mut config);
+    router_with(config, audit_log)
+}
+
+/// Required mode with every delivery criterion a keyed change needs: the
+/// negotiated format and the file sink at `events`.
+fn qualified_required(config: &mut config::Config, events: &TempDb) {
+    config.authority_events.durability = config::AuthorityEvidenceDurability::Required;
+    config.authority_events.format = config::AuthorityEventFormat::QualifiedV1;
+    config.authority_events.sink =
+        config::AuthorityEventSinkSetting::File(events.path.to_string_lossy().into_owned());
+}
+
+/// An exact retry of a keyed create, replace and delete is answered `200`
+/// with the receipt read from the committed evidence, and repeats no side
+/// effect: no second change, evidence row or audit event. A conflicting use
+/// of a key is `409 caller_operation_conflict` and changes nothing.
+#[tokio::test]
+async fn a_replayed_connection_change_repeats_no_side_effect() {
+    let connection_db = TempDb::new("keyed-connection-replay");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let (audit_log, capture) = captured_audit();
+    let router = keyed_connection_router(&connection_db, &policy, audit_log, |_| {});
+    let admin = keyed_admin(&["connections-superadmin"]);
+    let collection_etag = connection_collection_etag(&router).await;
+    let create_key = caller_key(1);
+    let body = aliased_connection_body("Keyed API", "keyed-alias", "keyed-header-alias");
+    let create = || {
+        keyed_connection_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            admin.clone(),
+            Some(body.clone()),
+            Some(&collection_etag),
+            Some(&create_key),
+        )
+    };
+    let (status, etag, created) = exchange(&router, create()).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("an ID").to_owned();
+    let etag = etag.expect("the create names its ETag");
+    let (status, _, receipt) = exchange(&router, create()).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["operation_id"], json!(create_key));
+    assert_eq!(receipt["operation"], json!("connection.create"));
+    assert_eq!(receipt["resource_id"], json!(id));
+    assert_eq!(receipt["revision"], json!(1));
+    assert_eq!(receipt.as_object().map(|object| object.len()), Some(5));
+
+    let route = format!("{CONNECTIONS_ADMIN_ROUTE}/{id}");
+    let replace_key = caller_key(2);
+    let replacement =
+        aliased_connection_body("Keyed API", "keyed-alias-next", "keyed-header-alias");
+    let replace = |body: &str| {
+        keyed_connection_request(
+            Method::PUT,
+            &route,
+            admin.clone(),
+            Some(body.to_owned()),
+            Some(&etag),
+            Some(&replace_key),
+        )
+    };
+    let (status, replaced_etag, replaced) = exchange(&router, replace(&replacement)).await;
+    assert_eq!(status, StatusCode::OK, "{replaced}");
+    let replaced_etag = replaced_etag.expect("the replace names its ETag");
+    let (status, _, receipt) = exchange(&router, replace(&replacement)).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["operation"], json!("connection.replace"));
+    assert_eq!(receipt["operation_id"], json!(replace_key));
+    // The same key over another body is not this request.
+    let other = aliased_connection_body("Keyed API", "keyed-alias-other", "keyed-header-alias");
+    let (status, _, conflict) = exchange(&router, replace(&other)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["reason"], json!(CALLER_OPERATION_CONFLICT_REASON));
+
+    let delete_key = caller_key(3);
+    let delete = || {
+        keyed_connection_request(
+            Method::DELETE,
+            &route,
+            admin.clone(),
+            None,
+            Some(&replaced_etag),
+            Some(&delete_key),
+        )
+    };
+    let (status, _, deleted) = exchange(&router, delete()).await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    let (status, _, receipt) = exchange(&router, delete()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a committed delete is answered after the record is gone: {receipt}"
+    );
+    assert_eq!(receipt["operation"], json!("connection.delete"));
+    assert_eq!(receipt["resource_id"], json!(id));
+    // Unkeyed, the same delete finds no record.
+    let (status, _, _) = exchange(
+        &router,
+        keyed_connection_request(
+            Method::DELETE,
+            &route,
+            admin.clone(),
+            None,
+            Some(&replaced_etag),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (evidence, _) =
+        standalone_change_evidence(&connection_db.path, "connection_change_evidence");
+    assert_eq!(
+        evidence
+            .iter()
+            .map(|change| change.action.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "connection.create",
+            "connection.replace",
+            "credential.binding_change",
+            "connection.delete"
+        ],
+        "each change committed once"
+    );
+    assert_eq!(standalone_reservations(&connection_db.path).len(), 3);
+    // The audit writer delivers in order: once the delete's event has
+    // arrived, every earlier one has too.
+    let changes = || {
+        capture
+            .events()
+            .into_iter()
+            .filter(|event| event.event_type == audit::event::CONNECTION_CHANGED)
+            .count()
+    };
+    assert_eventually(Duration::from_secs(5), || changes() >= 3);
+    assert_eq!(changes(), 3, "no replay emitted a second change event");
+    // I5: the binding digests stay in the reservation rows, and no alias
+    // reached a receipt or the audit stream.
+    let audited = format!("{:?}", capture.events());
+    let receipts = format!("{receipt}");
+    for (_, _, digest) in standalone_reservations(&connection_db.path) {
+        let digest = digest.expect("every Connection key is bound by digest");
+        assert!(
+            !audited.contains(&digest),
+            "a digest reached the audit stream"
+        );
+        assert!(!receipts.contains(&digest), "a digest reached a receipt");
+    }
+    for alias in ["keyed-alias", "keyed-header-alias"] {
+        assert!(!audited.contains(alias), "{alias} reached the audit stream");
+        assert!(!receipts.contains(alias), "{alias} reached a receipt");
+    }
+}
+
+/// A retry that points the Connection at another credential under the same
+/// key -- another `authentication.secret_id` or another additional header's
+/// `secret_id` -- is `409` and keeps the binding the key committed. The
+/// aliases are in the binding; so is a token exchange's `client_secret_id`.
+#[tokio::test]
+async fn a_different_credential_reference_under_the_same_key_conflicts_and_keeps_the_old_binding() {
+    let connection_db = TempDb::new("keyed-connection-aliases");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let router = keyed_connection_router(&connection_db, &policy, test_audit_log(), |_| {});
+    let admin = keyed_admin(&["connections-superadmin"]);
+    let collection_etag = connection_collection_etag(&router).await;
+    let key = caller_key(10);
+    let original = aliased_connection_body("Aliased API", "alias-original", "header-original");
+    let (status, _, created) = exchange(
+        &router,
+        keyed_connection_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            admin.clone(),
+            Some(original),
+            Some(&collection_etag),
+            Some(&key),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("an ID").to_owned();
+    for changed in [
+        aliased_connection_body("Aliased API", "alias-changed", "header-original"),
+        aliased_connection_body("Aliased API", "alias-original", "header-changed"),
+    ] {
+        let (status, _, conflict) = exchange(
+            &router,
+            keyed_connection_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                admin.clone(),
+                Some(changed),
+                Some(&collection_etag),
+                Some(&key),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+        assert_eq!(conflict["reason"], json!(CALLER_OPERATION_CONFLICT_REASON));
+    }
+    let stored = connections::store::SqliteConnectionStore::open(&connection_db.path)
+        .expect("the store opens");
+    let records = connections::store::ConnectionStore::list(&stored).expect("the store lists");
+    assert_eq!(records.len(), 1, "no second Connection");
+    assert_eq!(records[0].id.as_str(), id);
+    assert_eq!(
+        serde_json::to_value(&records[0].write).expect("the record serializes")["authentication"]
+            ["secret_id"],
+        json!("alias-original")
+    );
+    assert_eq!(
+        records[0].write.additional_headers[0].secret_id.as_deref(),
+        Some("header-original")
+    );
+
+    // A token exchange's client secret alias is bound the same way.
+    let actor = auth::change_actor::ChangeActor::from_principal(&admin);
+    let mut headers = HeaderMap::new();
+    headers.insert("idempotency-key", key.parse().unwrap());
+    headers.insert(header::IF_MATCH, "\"collection\"".parse().unwrap());
+    let digest = |client_secret_id: &str| {
+        let body = json!({"authentication": {"type": "delegated_issuer_token", "client_secret_id": client_secret_id}});
+        caller_operation(
+            &headers,
+            &actor,
+            "connection.create",
+            "",
+            "\"collection\"",
+            &canonical_connection_request(body.to_string().as_bytes()).unwrap(),
+        )
+        .unwrap()
+        .unwrap()
+        .binding_digest()
+        .to_owned()
+    };
+    assert_ne!(digest("exchange-secret-a"), digest("exchange-secret-b"));
+}
+
+/// The request a key is bound to is the body as canonical JSON: key order
+/// and whitespace do not change it, any value does.
+#[test]
+fn the_canonical_connection_request_ignores_key_order_and_whitespace() {
+    let ordered = br#"{"a":1,"b":{"c":[1,{"e":2,"d":3}]}}"#;
+    let reordered = b"{ \"b\" : {\"c\":[1,{\"d\":3,\"e\":2}]},\n \"a\":1}";
+    assert_eq!(
+        canonical_connection_request(ordered).unwrap(),
+        canonical_connection_request(reordered).unwrap()
+    );
+    assert_ne!(
+        canonical_connection_request(ordered).unwrap(),
+        canonical_connection_request(br#"{"a":2,"b":{"c":[1,{"e":2,"d":3}]}}"#).unwrap()
+    );
+    assert!(canonical_connection_request(b"").unwrap().is_empty());
+    assert_eq!(
+        canonical_connection_request(b"not json")
+            .expect_err("invalid JSON")
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+/// I4 end to end: required mode refuses the unkeyed Connection create and
+/// replace before anything is written, and admits the keyed request of an
+/// issuer-bound principal under `qualified_v1` with the file sink.
+#[tokio::test]
+#[cfg_attr(
+    not(unix),
+    ignore = "required mode admits keyed Connection changes only on a Unix build, where the file sink syncs its directory"
+)]
+async fn required_mode_refuses_the_unkeyed_connection_create_and_replace_and_admits_the_keyed_principal(
+) {
+    let connection_db = TempDb::new("keyed-connection-required");
+    let events = TempDb::new("keyed-connection-required-events");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let (audit_log, capture) = captured_audit();
+    let router = keyed_connection_router(&connection_db, &policy, audit_log, |config| {
+        qualified_required(config, &events)
+    });
+    let admin = keyed_admin(&["connections-superadmin"]);
+    let collection_etag = connection_collection_etag(&router).await;
+    let body = aliased_connection_body("Required API", "required-alias", "required-header");
+    let (status, _, refused) = exchange(
+        &router,
+        keyed_connection_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            admin.clone(),
+            Some(body.clone()),
+            Some(&collection_etag),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["reason"], json!("authority_evidence_unsupported"));
+    assert_eq!(
+        refused["error"],
+        json!("AUTHORITY_EVIDENCE_DURABILITY=required refuses connection.create: standalone mode admits it only with an Idempotency-Key, on a route that honours one; nothing was changed")
+    );
+    let (status, etag, created) = exchange(
+        &router,
+        keyed_connection_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            admin.clone(),
+            Some(body),
+            Some(&collection_etag),
+            Some(&caller_key(20)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("an ID").to_owned();
+    let etag = etag.expect("an ETag");
+    let route = format!("{CONNECTIONS_ADMIN_ROUTE}/{id}");
+    let replacement =
+        aliased_connection_body("Required API renamed", "required-alias", "required-header");
+    let (status, _, refused) = exchange(
+        &router,
+        keyed_connection_request(
+            Method::PUT,
+            &route,
+            admin.clone(),
+            Some(replacement.clone()),
+            Some(&etag),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["operation"], json!("connection.replace"));
+    let (status, _, replaced) = exchange(
+        &router,
+        keyed_connection_request(
+            Method::PUT,
+            &route,
+            admin.clone(),
+            Some(replacement),
+            Some(&etag),
+            Some(&caller_key(21)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replaced}");
+    let (evidence, _) =
+        standalone_change_evidence(&connection_db.path, "connection_change_evidence");
+    assert_eq!(
+        evidence
+            .iter()
+            .map(|change| change.action.as_str())
+            .collect::<Vec<_>>(),
+        ["connection.create", "connection.replace"]
+    );
+    assert_eq!(
+        refused_operations(&capture, 2),
+        ["connection.create", "connection.replace"]
+    );
+}
+
+/// The rest of the gate: required mode refuses a keyed Connection create by
+/// a gateway service token, under `delivery_v1`, or with the log sink, and
+/// each refusal names the criterion; nothing is written or reserved.
+#[tokio::test]
+async fn required_mode_refuses_a_keyed_connection_change_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink(
+) {
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let events = TempDb::new("keyed-connection-refused-events");
+    for (case, requirement) in [
+        (
+            "service token",
+            "from a provider-authenticated principal with a canonical issuer",
+        ),
+        ("delivery_v1", "with AUTHORITY_EVENT_FORMAT=qualified_v1"),
+        ("log sink", "with AUTHORITY_EVENT_SINK=file"),
+    ] {
+        let principal = match case {
+            "service token" => service_token_admin(&["connections-superadmin"]),
+            _ => keyed_admin(&["connections-superadmin"]),
+        };
+        let connection_db = TempDb::new("keyed-connection-refused");
+        let router = keyed_connection_router(&connection_db, &policy, test_audit_log(), |config| {
+            qualified_required(config, &events);
+            match case {
+                "delivery_v1" => {
+                    config.authority_events.format = config::AuthorityEventFormat::DeliveryV1;
+                }
+                "log sink" => config.authority_events.sink = config::AuthorityEventSinkSetting::Log,
+                _ => {}
+            }
+        });
+        let collection_etag = connection_collection_etag(&router).await;
+        let (status, _, refused) = exchange(
+            &router,
+            keyed_connection_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                principal,
+                Some(aliased_connection_body(
+                    "Refused API",
+                    "refused-alias",
+                    "refused-header",
+                )),
+                Some(&collection_etag),
+                Some(&caller_key(30)),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{case}: {refused}");
+        assert_eq!(
+            refused["error"],
+            json!(format!(
+                "AUTHORITY_EVIDENCE_DURABILITY=required refuses connection.create: standalone mode admits it only {requirement}; nothing was changed"
+            )),
+            "{case}"
+        );
+        let (evidence, _) =
+            standalone_change_evidence(&connection_db.path, "connection_change_evidence");
+        assert!(evidence.is_empty(), "{case}");
+        assert!(
+            standalone_reservations(&connection_db.path).is_empty(),
+            "{case}"
+        );
+    }
+}
+
+/// Connection deletion is a withdrawal: required mode admits every form of
+/// it -- unkeyed, keyed, and by a gateway service token -- and each records
+/// its evidence (owner ruling 4 on issue #425).
+#[tokio::test]
+async fn required_mode_admits_every_form_of_connection_delete() {
+    let connection_db = TempDb::new("keyed-connection-withdrawal");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let best_effort = keyed_connection_router(&connection_db, &policy, test_audit_log(), |_| {});
+    let admin = keyed_admin(&["connections-superadmin"]);
+    let mut created = Vec::new();
+    for name in ["Unkeyed delete", "Keyed delete", "Service token delete"] {
+        let collection_etag = connection_collection_etag(&best_effort).await;
+        let (status, etag, body) = exchange(
+            &best_effort,
+            keyed_connection_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                admin.clone(),
+                Some(plain_connection_body(name)),
+                Some(&collection_etag),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        created.push((body["id"].as_str().unwrap().to_owned(), etag.unwrap()));
+    }
+    drop(best_effort);
+    let events = TempDb::new("keyed-connection-withdrawal-events");
+    let (audit_log, capture) = captured_audit();
+    let router = keyed_connection_router(&connection_db, &policy, audit_log, |config| {
+        qualified_required(config, &events);
+        // Even where no keyed creation could be admitted, a withdrawal is.
+        config.authority_events.sink = config::AuthorityEventSinkSetting::Log;
+    });
+    let forms = [
+        (admin.clone(), None),
+        (admin.clone(), Some(caller_key(40))),
+        (service_token_admin(&["connections-superadmin"]), None),
+    ];
+    for ((id, etag), (principal, key)) in created.iter().zip(forms) {
+        let (status, _, body) = exchange(
+            &router,
+            keyed_connection_request(
+                Method::DELETE,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{id}"),
+                principal,
+                None,
+                Some(etag),
+                key.as_deref(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (evidence, _) =
+        standalone_change_evidence(&connection_db.path, "connection_change_evidence");
+    let deletes: Vec<_> = evidence
+        .iter()
+        .filter(|change| change.action == "connection.delete")
+        .map(|change| change.kind.as_str())
+        .collect();
+    assert_eq!(deletes, ["principal", "principal", "service_token"]);
+    assert_eq!(standalone_reservations(&connection_db.path).len(), 1);
+    assert_eventually(Duration::from_secs(5), || {
+        capture
+            .events()
+            .iter()
+            .filter(|event| event.event_type == audit::event::CONNECTION_CHANGED)
+            .count()
+            >= 3
+    });
+    assert!(capture
+        .events()
+        .iter()
+        .all(|event| event.event_type != audit::event::AUTHORITY_EVIDENCE_OPERATION_REFUSED));
+}
+
+/// Authorization comes before the key: a keyed request from a caller without
+/// the route's permission is `403` and asks no gate, reads no key and
+/// reserves nothing (in cluster mode it would leave the contract fence
+/// unchanged).
+#[tokio::test]
+async fn a_keyed_connection_change_without_the_routes_permission_is_forbidden_and_reserves_nothing()
+{
+    let connection_db = TempDb::new("keyed-connection-forbidden");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let router = keyed_connection_router(&connection_db, &policy, test_audit_log(), |_| {});
+    let reader = keyed_admin(&["connections-reader"]);
+    let editor = keyed_admin(&["connections-editor"]);
+    let collection_etag = connection_collection_etag(&router).await;
+    let (status, _, body) = exchange(
+        &router,
+        keyed_connection_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            reader,
+            Some(plain_connection_body("Forbidden API")),
+            Some(&collection_etag),
+            Some(&caller_key(50)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    // Binding a credential needs secret authority too.
+    let (status, _, body) = exchange(
+        &router,
+        keyed_connection_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            editor,
+            Some(aliased_connection_body("Forbidden API", "alias", "header")),
+            Some(&collection_etag),
+            Some(&caller_key(51)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(standalone_reservations(&connection_db.path).is_empty());
+    let (evidence, _) =
+        standalone_change_evidence(&connection_db.path, "connection_change_evidence");
+    assert!(evidence.is_empty());
 }

@@ -102,8 +102,8 @@ or unconfigured individual stores.
 | Policy publish, rollback, rule edits and suggestion acceptance | Immutable document/history, actor subject, action/diff, active pointer, shared revision and outbox, plus one non-cascading `document_change_evidence` row (operation code, event/operation UUIDs, actor kind, subject, issuer and auth mode, prior/new version, the outbox row's shared revision, database-clock time) in the same transaction, journaled and delivered since migration 32, its actor in migration 24's vocabulary; suggestion acceptance composes its own state, and so its evidence, in the same transaction | A caller-bound operation identity and an issuer-scoped subject reference; standalone policy writes are refused under `required` |
 | Tools publication | Shared document transaction plus name reservations and the same `document_change_evidence` row, journaled and delivered since migration 32; the first-boot seed and the import's activation are recorded as system actors | Same as policy |
 | Stored policy test suite (`policy_tests.publish`, migration 29) | Shared document transaction over its own versions and active pointer, plus the same `document_change_evidence` row, with resource type `policy_tests` | Same as policy. The proposed event names it as a `policy` resource on its own `policy_tests` revision axis, because its versions are not policy versions. Standalone records only the writer's subject on the version row, so `required` refuses the write there |
-| Connection and credential binding changes | Record, bindings, immutable version, shared revision and outbox, plus since migration 28 a non-cascading `connection_change_evidence` row per committed create (`connection.create`, no prior version and version 1) and replace (`connection.replace`, prior and new specification version), and a `credential.binding_change` row on the credential axis (prior and new credential revision) under the same operation ID and shared revision when a replace advances the credential revision: actor (subject, kind, auth mode, canonical issuer), event/operation UUIDs, the outbox row's shared revision, database-clock time, journaled and delivered in the change's transaction. An identical replace records nothing. No binding, secret ID or locator enters a row. Standalone writes the same rows, without a shared revision, in the Connections database's own transaction ([Standalone evidence](#standalone-evidence)) | A caller-bound operation identity and an issuer-scoped subject reference; Connections created or replaced before migration 28 keep only their cascading version history; standalone records are delivered without a shared security revision |
-| Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) and its journal row in the same transaction; delivered with keyed safe references since PR 3; since migration 24 the actor's kind, auth mode and canonical issuer too. Standalone writes the same deletion evidence, without a shared revision, in the Connections database's own transaction | A caller-bound operation identity and an issuer-scoped subject reference, without which the delivered record cannot be `authority_event.v1`; standalone records are delivered without a shared security revision |
+| Connection and credential binding changes | Record, bindings, immutable version, shared revision and outbox, plus since migration 28 a non-cascading `connection_change_evidence` row per committed create (`connection.create`, no prior version and version 1) and replace (`connection.replace`, prior and new specification version), and a `credential.binding_change` row on the credential axis (prior and new credential revision) under the same operation ID and shared revision when a replace advances the credential revision: actor (subject, kind, auth mode, canonical issuer), event/operation UUIDs, the outbox row's shared revision, database-clock time, journaled and delivered in the change's transaction. An identical replace records nothing. No binding, secret ID or locator enters a row. Standalone writes the same rows, without a shared revision, in the Connections database's own transaction ([Standalone evidence](#standalone-evidence)) | Since #425 a keyed create or replace binds the caller's UUIDv7 in the change's transaction and is delivered as `authority_event.v1` under `qualified_v1` ([Keyed Connection changes](#keyed-connection-create-replace-and-delete)); unkeyed changes keep a generated operation identity. Connections created or replaced before migration 28 keep only their cascading version history; standalone records are delivered without a shared security revision |
+| Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) and its journal row in the same transaction; delivered with keyed safe references since PR 3; since migration 24 the actor's kind, auth mode and canonical issuer too. Standalone writes the same deletion evidence, without a shared revision, in the Connections database's own transaction | Since #425 a keyed delete binds the caller's UUIDv7 in the deletion's transaction and is delivered as `authority_event.v1` under `qualified_v1`; unkeyed and service-token deletions stay admitted and keep a generated operation identity ([Keyed Connection changes](#keyed-connection-create-replace-and-delete)); standalone records are delivered without a shared security revision |
 | Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox, plus one non-cascading `catalog_change_evidence` row (action derived from the write, event/operation UUIDs, the actor's subject, kind, auth mode and canonical issuer, catalog revision transition, compiled overlay revision, shared revision, database-clock time) that outlives the replacement and the Connection's deletion, journaled and delivered since migration 32. Standalone writes the same evidence, without a shared revision, in the Connections database's own transaction (its migration 13) | Caller-bound operation identity and an issuer-scoped subject reference; standalone records are delivered without a shared security revision |
 | Service-token issue | Token row with creator, row/shared revisions and outbox, plus since migration 27 a `service_token_change_evidence` row with action `service_token.issue` (actor, event/operation UUIDs, no prior revision and row revision 1, the create outbox row's shared revision, database-clock time) in the create's transaction, journaled and delivered. Standalone writes the same row in the token database's own create transaction. Neither store records the returned plaintext or its hash | A caller-bound operation identity and an issuer-scoped subject reference; tokens issued before the evidence existed keep only `created_by`; standalone records are delivered without a shared security revision |
 | Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction. In PostgreSQL the change also journals its evidence and is delivered since PR 3. Both stores record the actor's kind, auth mode and canonical issuer (migration 24 and the token database's own columns). The keyed revoke endpoint binds the caller, action and target to the supplied operation UUID in that same transaction | Rotation and unkeyed revocation lack caller-bound operation identities. Issuer-scoped subject references and the qualified event are available for the negotiated PostgreSQL keyed-revoke path only; standalone records are delivered without a shared security revision |
@@ -396,8 +396,10 @@ reclaim space after the first keyed preparation.
 
 Schema 36 (PostgreSQL migration 36) and the standalone reservation table prepare
 caller operation IDs for every admin change that will take an `Idempotency-Key`.
-No admin route binds a key through them yet; each operation family does so in its
-own change, through the contract in [Keyed authority changes](#keyed-authority-changes).
+Connection create, replace and delete bind keys through them
+([Keyed Connection changes](#keyed-connection-create-replace-and-delete)); each other
+operation family does so in its own change, through the contract in
+[Keyed authority changes](#keyed-authority-changes).
 A key belongs to exactly one request: its binding digest is a
 domain-separated, length-prefixed SHA-256 over the action, the recorded actor
 (kind, canonical issuer, subject and auth mode), the target, the `If-Match` value
@@ -461,9 +463,10 @@ these cases.
 ### Keyed authority changes
 
 Every admin change that binds an `Idempotency-Key` through the shared helpers
-in `gateway/src/admin_responses.rs` follows one contract. No route does yet:
-each operation family adopts the contract in its own change, and the inventory
-qualifies its rows when it does. The two routes that take a key today, the
+in `gateway/src/admin_responses.rs` follows one contract. Connection create,
+replace and delete do ([below](#keyed-connection-create-replace-and-delete)); each
+other operation family adopts the contract in its own change, and the inventory
+qualifies its rows when it does. The two routes that took a key first, the
 keyed service-token revoke and the keyed approval preparation, predate the
 contract. They are listed in `KEYED_ROUTES` and follow the first rule below,
 but they keep their own receipts (the preparation answers
@@ -474,8 +477,10 @@ that bind keys through the shared helpers.
 
 **A key is honoured or refused, never ignored.** The router keeps a reviewed table
 of the routes that honour a key, `KEYED_ROUTES` in `gateway/src/routing.rs`
-(today `POST /v1{ADMIN_PREFIX}/tokens/{id}/revoke` and
-`PUT /v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals`). Any other admin request
+(today `POST /v1{ADMIN_PREFIX}/tokens/{id}/revoke`,
+`PUT /v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals`,
+`POST /v1{ADMIN_PREFIX}/connections`, and `PUT` and `DELETE`
+`/v1{ADMIN_PREFIX}/connections/{id}`). Any other admin request
 that carries the header with a method other than `GET`, `HEAD` or `OPTIONS` is
 answered `400 {"error":"...","reason":"idempotency_key_unsupported"}` before its
 handler runs, so nothing is read or written. That includes the unkeyed
@@ -485,8 +490,7 @@ table of reviewed qualified paths (`QUALIFIED_PATHS`) to the same methods and
 routes.
 
 The refusal applies to withdrawals and to the admin session routes too: the
-unkeyed token `DELETE`, Connection and secret deletion, the delegated-token
-purge, `POST .../auth/logout` and `POST .../auth/callback`. A client that
+unkeyed token `DELETE`, secret deletion, the delegated-token purge, `POST .../auth/logout` and `POST .../auth/callback`. A client that
 attaches `Idempotency-Key` to every mutation can therefore not revoke, delete or
 log out until it drops the header from those requests. This is deliberate: a
 key is honoured or refused on every admin mutation, so that once a later change
@@ -597,6 +601,93 @@ lacks the capability, the first admission raises the fence and the store then
 reserves, later admissions write nothing and admit each other while another
 admission holds the fence row); and `authority_evidence_app_tests` proves the
 helpers.
+
+### Keyed Connection create, replace and delete
+
+The first operation family on the contract above (issue #425). Rows
+`connection_postgres` and `connection_standalone` (`connection.create`,
+`connection.replace`, `credential.binding_change`) are qualified, and
+`connection_delete_postgres` and `connection_delete_standalone` are
+`withdrawal_admitted` with their keyed path
+([below](#rows-admitted-without-qualification)).
+
+- **Routes.** `POST /v1{ADMIN_PREFIX}/connections`, and `PUT` and `DELETE`
+  `/v1{ADMIN_PREFIX}/connections/{id}`, each with an optional `Idempotency-Key`.
+  They are in `KEYED_ROUTES`, and the checker's `QUALIFIED_PATHS` names the same
+  methods and routes for both modes (a credential binding change's path is the
+  replacement's `PUT`).
+- **Binding.** The key is bound to the action, the recorded actor, the Connection ID
+  (empty for a create), the `If-Match` value as received, and the body as
+  canonical JSON (object keys sorted, whitespace dropped; empty for a delete). A
+  Connection body holds no secret value, only credential aliases (`secret_id`,
+  `client_secret_id`, an additional header's `secret_id`, TLS and caller-assertion
+  key aliases) and provider locators; they stay in, so a retry that points the
+  Connection at another credential under the same key is `409` and the stored
+  binding stays. The digest is stored only in the key's reservation row.
+- **Order of work.** The handler authorizes the caller (`admin:connections:write`,
+  and `admin:connections:secrets:write` for credential authority) and validates the
+  body, then binds the key, asks the gates (create and replace ask the evidence gate
+  as `connection.create` and `connection.replace`; a delete is a withdrawal and asks
+  only the operation gate when keyed), and answers an exact retry from the
+  read-only pre-check, all before the `If-Match` comparison against the replica's
+  snapshot, which a committed change has since moved, and before any secret
+  provider is consulted. Under the mutation lock the control plane asks the key
+  again before its own checks against the snapshot. Inside the store's one
+  transaction (PostgreSQL after its `connection_state_revision` lock, SQLite under
+  `IMMEDIATE`) the key is looked up first, then the record is read and its ETag,
+  capacity and dependencies checked, then the key is reserved (PostgreSQL confirms
+  the fence carries `caller_operation_keys`), then the change and its evidence rows
+  are written under the caller's key, and the journal entry last.
+- **Answers.** The first commit answers as the route always has (`201` with the
+  detail, `200` with the detail, `200` with the deleted ID). An exact retry is `200`
+  with the receipt `{operation_id, operation, resource_id, revision, committed_at}`
+  and changes nothing: no second evidence row, no audit event, no catalog
+  reconcile or removal. A replacement's receipt is its `connection.replace` row;
+  a deletion's carries the revision it removed, and is answered after the record is
+  gone because its evidence outlives the record. An identical replacement is
+  answered before the key is reserved, so it records and reserves nothing and is not
+  reconcilable by its key.
+- **A replacement that changes credentials** writes the `connection.replace` row and
+  a `credential.binding_change` row under the one caller key; under `qualified_v1`
+  both are delivered as `authority_event.v1` sharing `operation_id`, the second
+  naming a `credential_binding` resource derived from the Connection ID.
+- **Required mode.** Create and replace are `caller_key_required` in both modes:
+  only the keyed request of an issuer-bound principal with `qualified_v1`, the file
+  sink and a Unix build is admitted, and every other form, service-token callers
+  included, is `409 authority_evidence_unsupported` before anything is read or
+  written. Deletion is admitted in every form. The admin UI sends no key, so under
+  `required` it can delete a Connection but not create or replace one (#242 tracks
+  adding keys to it).
+
+Tests. The store contract is written once in
+`gateway/src/connections/caller_operation_contract.rs` and run against both stores
+(`sqlite_*` there, `postgres_*` in `connections::pg_store::tests`); every case ends
+by asserting that a Connection action's reservation exists exactly when its
+evidence row does: `connection_caller_operation_contract` (exact retries answered
+from the receipt with no second change),
+`a_reused_key_with_a_different_binding_conflicts_and_changes_nothing`,
+`a_key_reserved_by_another_action_cannot_take_effect_here` (another Connection
+action and a keyed revoke's key),
+`a_failed_evidence_insert_rolls_back_the_keyed_change_and_its_reservation`,
+`a_stale_etag_under_a_key_writes_no_change_evidence_or_reservation`,
+`an_identical_keyed_replace_records_and_reserves_nothing`,
+`two_writers_racing_one_key_commit_one_change`,
+`two_keys_racing_one_revision_leave_only_the_winners_rows` and
+`the_binding_digest_is_stored_only_in_the_reservation_row`. PostgreSQL adds
+`a_full_journal_refuses_the_keyed_connection_change_and_reserves_nothing` and
+`a_keyed_connection_change_below_the_fence_is_refused_and_changes_nothing`.
+`a_keyed_connection_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit`
+(in both `authority_events::dispatcher::tests` and
+`authority_events::standalone::tests`) delivers a real keyed create, credential
+change and delete as closed v1 events through the file sink and redelivers them
+byte for byte. Through the admin handlers, `authority_evidence_app_tests` proves
+`a_replayed_connection_change_repeats_no_side_effect`,
+`a_different_credential_reference_under_the_same_key_conflicts_and_keeps_the_old_binding`,
+`required_mode_refuses_the_unkeyed_connection_create_and_replace_and_admits_the_keyed_principal`
+(Unix builds),
+`required_mode_refuses_a_keyed_connection_change_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink`,
+`required_mode_admits_every_form_of_connection_delete` and
+`a_keyed_connection_change_without_the_routes_permission_is_forbidden_and_reserves_nothing`.
 
 ## Keyed safe references
 
@@ -1366,8 +1457,9 @@ this mode refuses to start, in both deployment modes** (owner decision of
 2026-11-19); the rest of this section describes what the mode does once a gateway
 can start in it, and what the tests that build the application directly prove.
 Each row states which requests the mode admits. PostgreSQL keyed
-approval preparation has the complete caller-bound event and its tested delivery
-path. Other rows list their remaining gaps. The default is `best_effort`. The setting is separate from
+approval preparation and keyed Connection create and replace in both modes have the
+complete caller-bound event and its tested delivery path. Other rows list their
+remaining gaps. The default is `best_effort`. The setting is separate from
 `AUDIT_DURABILITY`, whose `required` default covers request decisions only: tying
 this contract to that default would have stopped every standalone gateway from
 editing its policy and every cluster replica without a pseudonym key from starting.
@@ -1383,8 +1475,8 @@ sink and a Unix build, and names the first of these that fails
 
 | `required_mode` | Rows | What required mode does |
 | --- | --- | --- |
-| `admitted` | Cluster policy, tools, Connection create, replace and delete, catalogs, token issue, rotation and revocation, JWT revocation, and admin session grant and withdrawal, and standalone Connection create, replace and delete, local-secret create, rotate, delete and re-encryption, catalog publication and overlays, and token issue, rotation and revocation | Runs it. Its evidence is the row's `record`. Nine of these pairs stay admitted without qualification on purpose ([below](#rows-admitted-without-qualification)) |
-| `caller_key_required` | PostgreSQL mutation approval preparation | Admits only the issuer-bound keyed PUT with `qualified_v1`, `AUTHORITY_EVENT_SINK=file` and a Unix build. Required mode refuses ordinary POST. |
+| `admitted` | Cluster policy, tools, Connection delete, catalogs, token issue, rotation and revocation, JWT revocation, and admin session grant and withdrawal, and standalone Connection delete, local-secret create, rotate, delete and re-encryption, catalog publication and overlays, and token issue, rotation and revocation | Runs it. Its evidence is the row's `record`. Nine of these pairs stay admitted without qualification on purpose ([below](#rows-admitted-without-qualification)) |
+| `caller_key_required` | PostgreSQL mutation approval preparation, and Connection create and replace (with the credential binding change a replacement makes) in both modes | Admits only the issuer-bound keyed request with `qualified_v1`, `AUTHORITY_EVENT_SINK=file` and a Unix build. Required mode refuses the ordinary preparation POST and the unkeyed Connection create and replace. |
 | `refused` | Standalone mutation approval preparation and mutation approval review, revocation and consumption in both modes. Standalone policy mutations, policy file reloads, and tools publication (admin API and file reloads). The writing form of the offline import (`import-standalone --apply`, with or without `--resume`) in cluster mode | Refuses it when asked, before anything is written |
 | `refused_at_startup` | Standalone admin sessions (`ADMIN_SESSION_MODE=standalone_memory`), and configuration activation in both modes | Refuses to start |
 | `unavailable` | Cluster policy file reload and local secrets, standalone JWT revocation and import, configuration export | Nothing to refuse: the mode or the build has no such operation. A gate that is asked anyway refuses it |
@@ -1428,7 +1520,10 @@ Enforcement:
   publication bound to a suggestion, asks as `policy.suggestion.accept` before
   its acceptance intent or its rule is written, and a stored policy test suite
   write (`PUT .../policy/tests`) asks as `policy_tests.publish` before its body
-  is read. Connection and local-secret changes, the `connection-secrets
+  is read. Connection create and replace ask as `connection.create` and
+  `connection.replace` once the caller is authorized and the body validated, with
+  the request's form ([Keyed Connection changes](#keyed-connection-create-replace-and-delete)).
+  Connection deletion, local-secret changes, the `connection-secrets
   reencrypt` command, catalog refreshes, OpenAPI catalog registrations and
   overlay writes and removals never ask: the Connections database records each
   of them in the change's own transaction
@@ -1482,7 +1577,8 @@ What required mode does not do:
   [Rows admitted without qualification](#rows-admitted-without-qualification) are
   atomic and delivered, but carry no caller key.
 - A standalone gateway in required mode therefore changes its policy and tools only
-  through its startup files. Connections, local secrets, master-key re-encryption,
+  through its startup files, and creates and replaces Connections only with a
+  caller key. Connection deletion, local secrets, master-key re-encryption,
   managed catalogs and overlays, and service tokens are changed as usual. The
   standalone evidence slices that write policy and tools records in their owning
   stores change those rows to `admitted` as they land.
@@ -1493,12 +1589,14 @@ agrees with its row, and the only operations refused at startup are standalone a
 sessions and configuration activation in both modes; the compiler also refuses
 `required` with no sink), checks both
 modes and the refusal's audit event, refuses the offline import in cluster mode with
-its own reason (`required_refuses_the_offline_import_in_cluster_mode`), and holds the evidenced standalone Connection,
-local-secret and catalog rows `admitted` and ungated; `authority_evidence_app_tests.rs`
+its own reason (`required_refuses_the_offline_import_in_cluster_mode`), holds the evidenced standalone Connection
+deletion, local-secret and catalog rows `admitted` and ungated, and Connection create
+and replace `caller_key_required` in both modes
+(`connection_create_and_replace_admit_only_their_keyed_issuer_bound_form_in_both_modes`); `authority_evidence_app_tests.rs`
 drives every refused standalone admin endpoint through the real handlers and asserts
-the `409`, the audit event and that nothing changed, and that Connection,
-local-secret, catalog, overlay and token changes are admitted and write their
-evidence rows; the
+the `409`, the audit event and that nothing changed, that an unkeyed Connection
+create is refused, and that Connection deletion and local-secret, catalog, overlay
+and token changes are admitted and write their evidence rows; the
 reload helpers in `middleware/rbac_tests.rs` and `tools/definitions.rs` refuse a
 reload and keep the active document; `config_tests.rs`,
 `gateway-config/src/compiler/stage_tests.rs` and `ha.rs` cover the startup rules,
@@ -1553,9 +1651,11 @@ the change's transaction and are delivered as `authority_event_delivery.v1`, but
 not caller-keyed. Only the keyed principal form is qualified, so a
 `withdrawal_admitted` row carries exactly one reviewed `qualified_delivery_paths`
 entry for each of its pairs. The pairs are `service_token.revoke` in both modes,
-`connection.delete` in both modes and standalone `secret.delete`. Today only
-`token_revoke_postgres` has its reviewed path (`POST .../tokens/{id}/revoke`); the
-other four rows keep `missing_metadata` until their keyed paths are reviewed.
+`connection.delete` in both modes and standalone `secret.delete`. Today
+`token_revoke_postgres` (`POST .../tokens/{id}/revoke`) and
+`connection_delete_postgres` and `connection_delete_standalone`
+(`DELETE .../connections/{id}`) have their reviewed paths; the other two rows keep
+`missing_metadata` until their keyed paths are reviewed.
 
 `catalog.overlay.delete` is not a withdrawal: removing an overlay publishes a new
 catalog revision. The session withdrawal reason stays in `admin_session_evidence`;
@@ -1599,7 +1699,8 @@ disposable PostgreSQL 16, the same pinned image, that accepts TLS and nothing el
   document evidence (`an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction`)
   and `a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity`;
 - the whole PostgreSQL Connection store suite (`connections::pg_store`), its create,
-  replace, credential binding change, deletion and catalog evidence included;
+  replace, credential binding change, deletion and catalog evidence and the keyed
+  Connection contract included;
 - `storage::postgres_documents` and `storage::postgres_admin_sessions`;
 - the dispatcher (`authority_events::dispatcher`);
 - journal retention without a cursor, in `storage::postgres_authority_events`:

@@ -9066,6 +9066,56 @@
     {
       "file": "gateway/src/connections/pg_store.rs",
       "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::finish_keyed#1",
+      "sha256": "939630d9b20a40564063d69a16698b2318a60256784ff8af0bda1582777b7444",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Commits or rolls back a keyed Connection change's transaction on the store's pooled PostgreSQL client: an exact retry answered from its receipt rolls back (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::connection_operation_receipt#1",
+      "sha256": "8151cdcdb478666e9810869483f186d7b8fbb9d9464fe809688e625f1e0d8ece",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Reads one committed Connection evidence row by the caller's operation ID and action to build a receipt, through the shared infrastructure pool (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::keyed_receipt#1",
+      "sha256": "6f26a316bd1dc40def3e05677e879e50d7b7e68722462a23d4794bb9399249f2",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Looks a caller key up in authority_caller_operation_ids inside a Connection change's transaction and answers an exact retry from its evidence (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::committed_receipt#1",
+      "sha256": "def02c02708c1ef83680fa561c665543558ced3b872b6f7fc14b5a6798a42dbb",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Reads the committed receipt of an exact retry inside a Connection change's transaction, refusing a reservation without its evidence row (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::reserve_caller_key#1",
+      "sha256": "db36c9e31418269cf2b0216d54a3cb1cec2d18621ce4ead24e5d89024e69efe1",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Reserves a caller key with its binding digest inside a Connection change's transaction after the contract fence is confirmed (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
         "unexpanded-attribute"
       ],
       "scope": "gateway::connections::pg_store::impl  PostgresConnectionStore::exported_statuses#1",

@@ -26,6 +26,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::auth::change_actor::ChangeActor;
+use crate::authority_events::caller_operation::{
+    CallerKeyState, CallerOperation, CallerOutcome, OperationReceipt,
+};
 
 use super::model::ConnectionId;
 use super::model::ConnectionWrite;
@@ -95,6 +98,15 @@ where
             Err(ConnectionStoreError::Unavailable { operation })
         }
     }
+}
+
+/// A caller-key read whose blocking worker did not complete: unavailable,
+/// never an unused key.
+fn caller_operation_unavailable() -> crate::storage::RepositoryError {
+    crate::storage::RepositoryError::new(
+        crate::storage::RepositoryErrorKind::Unavailable,
+        "connection_caller_operation",
+    )
 }
 
 impl ManagedConnectionStore {
@@ -406,18 +418,45 @@ impl ManagedConnectionStore {
         actor: &ChangeActor,
         collection: Option<CollectionCheck<'_>>,
     ) -> Result<StoredConnection, ConnectionStoreError> {
+        super::store::committed(
+            self.create_with_operation(candidate, actor, collection, None)
+                .await,
+        )
+    }
+
+    /// [`Self::create`] under a caller key (issue #425). Both stores look the
+    /// key up first in the creating transaction, answer an exact retry of a
+    /// committed create with its receipt, and otherwise reserve the key with
+    /// the change and record it as the evidence's operation ID.
+    pub async fn create_with_operation(
+        &self,
+        candidate: ConnectionWrite,
+        actor: &ChangeActor,
+        collection: Option<CollectionCheck<'_>>,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<StoredConnection>, ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {
                 let _ = collection;
                 let store = store.clone();
                 let actor = actor.clone();
+                let caller = caller.cloned();
                 blocking("connection create", move || {
-                    ConnectionStore::create(&store, candidate, &actor)
+                    ConnectionStore::create_with_operation(
+                        &store,
+                        candidate,
+                        &actor,
+                        caller.as_ref(),
+                    )
                 })
                 .await
             }
             #[cfg(feature = "postgres")]
-            Self::Postgres { store, .. } => store.create(candidate, actor, collection).await,
+            Self::Postgres { store, .. } => {
+                store
+                    .create_with_operation(candidate, actor, collection, caller)
+                    .await
+            }
         }
     }
 
@@ -432,19 +471,47 @@ impl ManagedConnectionStore {
         candidate: ConnectionWrite,
         actor: &ChangeActor,
     ) -> Result<StoredConnection, ConnectionStoreError> {
+        super::store::committed(
+            self.replace_with_operation(id, expected, candidate, actor, None)
+                .await,
+        )
+    }
+
+    /// [`Self::replace`] under a caller key, as [`Self::create_with_operation`]
+    /// describes. An identical replacement reserves nothing.
+    pub async fn replace_with_operation(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        candidate: ConnectionWrite,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<StoredConnection>, ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {
                 let store = store.clone();
                 let id = id.clone();
                 let expected = expected.clone();
                 let actor = actor.clone();
+                let caller = caller.cloned();
                 blocking("connection replace", move || {
-                    ConnectionStore::replace(&store, &id, &expected, candidate, &actor)
+                    ConnectionStore::replace_with_operation(
+                        &store,
+                        &id,
+                        &expected,
+                        candidate,
+                        &actor,
+                        caller.as_ref(),
+                    )
                 })
                 .await
             }
             #[cfg(feature = "postgres")]
-            Self::Postgres { store, .. } => store.replace(id, expected, candidate, actor).await,
+            Self::Postgres { store, .. } => {
+                store
+                    .replace_with_operation(id, expected, candidate, actor, caller)
+                    .await
+            }
         }
     }
 
@@ -457,19 +524,81 @@ impl ManagedConnectionStore {
         expected: &ConnectionEtag,
         actor: &ChangeActor,
     ) -> Result<(), ConnectionStoreError> {
+        super::store::committed(self.delete_with_operation(id, expected, actor, None).await)
+    }
+
+    /// [`Self::delete`] under a caller key, as [`Self::create_with_operation`]
+    /// describes. A committed keyed delete is answered from its evidence.
+    pub async fn delete_with_operation(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<()>, ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {
                 let store = store.clone();
                 let id = id.clone();
                 let expected = expected.clone();
                 let actor = actor.clone();
+                let caller = caller.cloned();
                 blocking("connection delete", move || {
-                    ConnectionStore::delete(&store, &id, &expected, &actor)
+                    ConnectionStore::delete_with_operation(
+                        &store,
+                        &id,
+                        &expected,
+                        &actor,
+                        caller.as_ref(),
+                    )
                 })
                 .await
             }
             #[cfg(feature = "postgres")]
-            Self::Postgres { store, .. } => store.delete(id, expected, actor).await,
+            Self::Postgres { store, .. } => {
+                store
+                    .delete_with_operation(id, expected, actor, caller)
+                    .await
+            }
+        }
+    }
+
+    /// What the store's reservation table says about `caller`'s key: the
+    /// read-only pre-check a keyed handler asks before any external work
+    /// (issue #425). Advisory: the change's own transaction decides again.
+    pub(crate) async fn caller_operation_state(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<CallerKeyState, crate::storage::RepositoryError> {
+        match self {
+            Self::Sqlite(store) => {
+                let store = store.clone();
+                let caller = caller.clone();
+                tokio::task::spawn_blocking(move || store.caller_operation_state(&caller))
+                    .await
+                    .map_err(|_| caller_operation_unavailable())?
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres { store, .. } => store.caller_operation_state(caller).await,
+        }
+    }
+
+    /// The receipt of the Connection change `caller`'s key committed, read
+    /// from its evidence row, or `None` when there is none.
+    pub(crate) async fn caller_operation_receipt(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<Option<OperationReceipt>, crate::storage::RepositoryError> {
+        match self {
+            Self::Sqlite(store) => {
+                let store = store.clone();
+                let caller = caller.clone();
+                tokio::task::spawn_blocking(move || store.caller_operation_receipt(&caller))
+                    .await
+                    .map_err(|_| caller_operation_unavailable())?
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres { store, .. } => store.caller_operation_receipt(caller).await,
         }
     }
 

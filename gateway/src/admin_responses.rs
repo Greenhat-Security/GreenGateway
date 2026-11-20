@@ -725,8 +725,9 @@ pub(super) fn admit_authority_change_for(
 //
 // The route must also be listed in `routing::KEYED_ROUTES`; everywhere else
 // the router refuses the header with [`idempotency_key_unsupported`] before
-// the handler runs. No route binds a key through these helpers yet: each
-// operation family does so in its own change.
+// the handler runs. Connection create, replace and delete bind keys through
+// these helpers (`admin_connections::admit_keyed_connection_change`); each
+// other operation family does so in its own change.
 
 /// The caller key a request carries, bound to that request: `Ok(None)` when
 /// it carries no `Idempotency-Key`. `action` is the operation code the key is

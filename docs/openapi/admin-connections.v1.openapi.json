@@ -3,7 +3,7 @@
   "info": {
     "title": "GreenGateway Connection and Capability Admin API",
     "version": "1.0.0",
-    "description": "The default paths are shown with ADMIN_PREFIX=/admin. Replace /admin with the configured ADMIN_PREFIX while retaining the /v1 API prefix. Every route requires an authenticated principal and the operation-specific RBAC permission. Safe read responses and projected playground output never expose secret IDs, provider locators, ciphertext, nonces, key/private-key material, raw DNS or transport errors, or upstream response headers. An Idempotency-Key header is honoured only by the routes that document it (here, the keyed preparation PUT); on any other POST, PUT, PATCH or DELETE the gateway answers 400 with reason idempotency_key_unsupported before the handler runs, and nothing changes. In cluster mode a key on a route that later starts honouring one is accepted only once every live replica advertises the caller_operation_keys capability."
+    "description": "The default paths are shown with ADMIN_PREFIX=/admin. Replace /admin with the configured ADMIN_PREFIX while retaining the /v1 API prefix. Every route requires an authenticated principal and the operation-specific RBAC permission. Safe read responses and projected playground output never expose secret IDs, provider locators, ciphertext, nonces, key/private-key material, raw DNS or transport errors, or upstream response headers. An Idempotency-Key header is honoured only by the routes that document it (here, Connection create, replace and delete and the keyed preparation PUT); on any other POST, PUT, PATCH or DELETE the gateway answers 400 with reason idempotency_key_unsupported before the handler runs, and nothing changes. In cluster mode a key on a route that later starts honouring one is accepted only once every live replica advertises the caller_operation_keys capability."
   },
   "servers": [
     {
@@ -111,10 +111,13 @@
           "Connections"
         ],
         "summary": "Create a managed Connection",
-        "description": "Requires admin:connections:write. Configuring credential or TLS authority also requires admin:connections:secrets:write. enabled defaults to false when omitted.",
+        "description": "Requires admin:connections:write. Configuring credential or TLS authority also requires admin:connections:secrets:write. enabled defaults to false when omitted. With an Idempotency-Key the create, its evidence and the key's reservation commit together. An exact retry under the same key is answered 200 with the receipt read from the committed evidence, {operation_id, operation, resource_id, revision, committed_at} with Cache-Control: no-store, and changes nothing, emits no audit event and reloads nothing; the same key with another body, target, If-Match, action or caller is 409 caller_operation_conflict and changes nothing. With AUTHORITY_EVIDENCE_DURABILITY=required only the keyed request of a provider-authenticated principal with a canonical issuer is admitted, and only with AUTHORITY_EVENT_FORMAT=qualified_v1, AUTHORITY_EVENT_SINK=file and a Unix build; any other form is 409 authority_evidence_unsupported naming the first unmet criterion, before anything is read or written.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/ConnectionIdempotencyKey"
           }
         ],
         "requestBody": {
@@ -208,10 +211,13 @@
           "Connections"
         ],
         "summary": "Replace a managed Connection",
-        "description": "Requires admin:connections:write and an exact resource ETag. Explicit binding IDs, credential/TLS authority changes, and credentialed target changes require admin:connections:secrets:write. A caller may round-trip configured redaction markers instead of hidden IDs.",
+        "description": "Requires admin:connections:write and an exact resource ETag. Explicit binding IDs, credential/TLS authority changes, and credentialed target changes require admin:connections:secrets:write. A caller may round-trip configured redaction markers instead of hidden IDs. With an Idempotency-Key the replacement, its evidence (and a credential.binding_change row when the credential revision advances, under the same key) and the key's reservation commit together; an identical replacement changes nothing and reserves nothing, so a retry after a later change gets 412. An exact retry under the same key is answered 200 with the receipt read from the committed evidence, {operation_id, operation, resource_id, revision, committed_at} with Cache-Control: no-store, and changes nothing, emits no audit event and reloads nothing; the same key with another body, target, If-Match, action or caller is 409 caller_operation_conflict and changes nothing. With AUTHORITY_EVIDENCE_DURABILITY=required only the keyed request of a provider-authenticated principal with a canonical issuer is admitted, and only with AUTHORITY_EVENT_FORMAT=qualified_v1, AUTHORITY_EVENT_SINK=file and a Unix build; any other form is 409 authority_evidence_unsupported naming the first unmet criterion, before anything is read or written.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/ConnectionIdempotencyKey"
           }
         ],
         "requestBody": {
@@ -267,10 +273,13 @@
           "Connections"
         ],
         "summary": "Delete an unreferenced managed Connection",
-        "description": "Requires admin:connections:write and an exact resource ETag. Deleting credential/TLS authority also requires admin:connections:secrets:write. There is no force-delete mode.",
+        "description": "Requires admin:connections:write and an exact resource ETag. Deleting credential/TLS authority also requires admin:connections:secrets:write. There is no force-delete mode. With an Idempotency-Key the deletion, its evidence and the key's reservation commit together, and the evidence outlives the record: an exact retry under the same key is answered 200 with the receipt read from the committed evidence, {operation_id, operation, resource_id, revision, committed_at} with Cache-Control: no-store, and changes nothing, emits no audit event and reloads nothing; the same key with another body, target, If-Match, action or caller is 409 caller_operation_conflict and changes nothing. Deletion only removes authority, so AUTHORITY_EVIDENCE_DURABILITY=required admits every form of it, keyed or not and by any caller.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/ConnectionIdempotencyKey"
           }
         ],
         "responses": {
@@ -1555,6 +1564,16 @@
           "minimum": 1,
           "maximum": 100,
           "default": 50
+        }
+      },
+      "ConnectionIdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": false,
+        "description": "Optional caller key (issue #425): one canonical lowercase UUIDv7, bound to the action, the authenticated caller, the Connection ID (none for a create), the If-Match value and the request body as canonical JSON, credential aliases included. A malformed or repeated key is 400; a principal without a canonical issuer cannot own one (403). In cluster mode a key is honoured only once every live replica advertises caller_operation_keys.",
+        "schema": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
         }
       }
     },

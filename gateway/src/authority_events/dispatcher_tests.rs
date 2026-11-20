@@ -2045,3 +2045,223 @@ async fn a_dispatcher_leads_only_while_the_membership_admits_its_replica() {
         "the revoke waits for an admitted leader"
     );
 }
+
+/// A keyed Connection create, a credential-changing keyed replace and a
+/// keyed delete (issue #425) are delivered under the negotiated format as
+/// closed `authority_event.v1` events through the file sink, produced from
+/// real commits: the replacement's two events share its caller key, and the
+/// binding change names a `credential_binding` resource. A crash after the
+/// sink accepted the batch and before the cursor commit redelivers the same
+/// records byte for byte, so consumers deduplicate on
+/// `(authority_id, event_id)`. No identifier, actor, issuer or credential
+/// alias reaches the file.
+#[tokio::test]
+async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit(
+) {
+    use crate::authority_events::caller_operation::{
+        test_caller_key, CallerOperation, CallerOperationBinding, CallerOutcome,
+    };
+    use crate::config::{AuthorityEventFormat, AuthorityEventSinkSetting};
+
+    const ALIAS_MARKER: &str = "keyed-dispatch-alias-marker";
+    let (_guard, database) = database_or_skip!();
+    let pool = migrated_pool(&database).await;
+    let requirement = &crate::storage::compatibility::CALLER_OPERATION_KEYS;
+    pool.get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE greengateway.contract_fence
+             SET generation = generation + 1,
+                 minimum_schema = GREATEST(minimum_schema, $1),
+                 capabilities = $2,
+                 raised_at = now(),
+                 raised_by = 'fixture.caller_operation_keys'
+             WHERE singleton",
+            &[
+                &requirement.minimum_schema,
+                &requirement.capability.as_str(),
+            ],
+        )
+        .await
+        .unwrap();
+    let producers = Producers::new(&pool);
+    let actor = ChangeActor::for_test_with_issuer("keyed-connection-admin", ACTOR_ISSUER);
+    let http = |secret_id: &str| -> ConnectionWrite {
+        serde_json::from_value(serde_json::json!({
+            "display_name": "Keyed dispatch API",
+            "enabled": false,
+            "kind": "http_api",
+            "endpoint": {"base_url": "https://keyed-dispatch.example.test", "base_path": "/v1"},
+            "authentication": {"type": "static_bearer", "secret_id": secret_id},
+            "tls": {}
+        }))
+        .unwrap()
+    };
+    let bind = |seed: u8, action: &'static str, target: &str, precondition: &str, body: &[u8]| {
+        CallerOperation::bind(
+            test_caller_key(seed),
+            &CallerOperationBinding {
+                action,
+                actor: &actor,
+                target,
+                precondition,
+                request: body,
+            },
+        )
+        .unwrap()
+    };
+    let first = http(ALIAS_MARKER);
+    let create = bind(
+        41,
+        "connection.create",
+        "",
+        "",
+        &serde_json::to_vec(&first).unwrap(),
+    );
+    let CallerOutcome::Committed(created) = producers
+        .connections
+        .create_with_operation(first, &actor, None, Some(&create))
+        .await
+        .unwrap()
+    else {
+        panic!("the keyed create commits");
+    };
+    let rebound = http("keyed-dispatch-alias-next");
+    let replace = bind(
+        42,
+        "connection.replace",
+        created.id.as_str(),
+        created.etag().as_str(),
+        &serde_json::to_vec(&rebound).unwrap(),
+    );
+    let CallerOutcome::Committed(updated) = producers
+        .connections
+        .replace_with_operation(
+            &created.id,
+            &created.etag(),
+            rebound,
+            &actor,
+            Some(&replace),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the keyed replace commits");
+    };
+    let delete = bind(
+        43,
+        "connection.delete",
+        updated.id.as_str(),
+        updated.etag().as_str(),
+        b"",
+    );
+    producers
+        .connections
+        .delete_with_operation(&updated.id, &updated.etag(), &actor, Some(&delete))
+        .await
+        .unwrap();
+
+    let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
+    let keyring = keyring_for(&store).await;
+    let path = std::env::temp_dir().join(format!("gg-keyed-connection-{}.jsonl", Uuid::new_v4()));
+    let setting = AuthorityEventSinkSetting::File(path.to_str().unwrap().to_owned());
+    let sink =
+        crate::authority_events::sink::configured_sink(&setting, AuthorityEventFormat::QualifiedV1)
+            .await
+            .unwrap()
+            .unwrap();
+    let mut crashed = DispatcherTerm::begin(
+        store.clone(),
+        sink.clone(),
+        keyring.clone(),
+        test_config(10),
+        1,
+        Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    assert!(crashed.fill().await.unwrap());
+    crashed.offer().await.unwrap();
+    // The process dies here: the sink accepted, the cursor did not move.
+    drop(crashed);
+    assert_eq!(store.stats().await.unwrap().cursor, Some(0));
+    let mut successor = DispatcherTerm::begin(
+        store.clone(),
+        sink,
+        keyring.clone(),
+        test_config(10),
+        2,
+        Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        successor
+            .deliver_until_caught_up(&CancellationToken::new())
+            .await
+            .unwrap(),
+        Some(4)
+    );
+
+    let contents = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let lines: Vec<_> = contents.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), 8);
+    assert_eq!(
+        &lines[..4],
+        &lines[4..],
+        "recovery must redeliver byte-identical records"
+    );
+    let events: Vec<serde_json::Value> = lines[..4]
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/schemas/authority_event.v1.schema.json"
+    ))
+    .unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    for event in &events {
+        assert_eq!(event["schema_version"], "authority_event.v1", "{event}");
+        validator.validate(event).unwrap();
+    }
+    let operations: Vec<_> = events
+        .iter()
+        .map(|event| event["operation"].as_str().unwrap())
+        .collect();
+    assert_eq!(operations[0], "connection.create");
+    assert_eq!(operations[3], "connection.delete");
+    let mut middle = operations[1..3].to_vec();
+    middle.sort_unstable();
+    assert_eq!(middle, ["connection.replace", "credential.binding_change"]);
+    assert_eq!(events[0]["operation_id"], create.id().to_string());
+    assert_eq!(events[1]["operation_id"], replace.id().to_string());
+    assert_eq!(
+        events[1]["operation_id"], events[2]["operation_id"],
+        "a credential-changing replacement delivers two events under one operation"
+    );
+    assert_eq!(events[3]["operation_id"], delete.id().to_string());
+    let binding = events
+        .iter()
+        .find(|event| event["operation"] == "credential.binding_change")
+        .unwrap();
+    assert_eq!(binding["resource"]["kind"], "credential_binding");
+    let connection = events
+        .iter()
+        .find(|event| event["operation"] == "connection.replace")
+        .unwrap();
+    assert_eq!(connection["resource"]["kind"], "connection");
+    assert_ne!(binding["resource"]["ref"], connection["resource"]["ref"]);
+    assert_eq!(events[3]["revision"]["after"], serde_json::Value::Null);
+    let created_id = created.id.to_string();
+    for marker in [
+        created_id.as_str(),
+        actor.subject(),
+        ACTOR_ISSUER,
+        ALIAS_MARKER,
+        create.binding_digest(),
+    ] {
+        assert!(!contents.contains(marker), "{marker} reached the stream");
+    }
+}

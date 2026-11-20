@@ -732,6 +732,25 @@ pub(super) async fn connection_create_endpoint(
         );
     }
 
+    // Authorized and validated: bind the caller key, ask the gates, and
+    // answer an exact retry before the collection precondition, which a
+    // committed create has since moved (issue #425).
+    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
+    let caller = match admit_keyed_connection_change(
+        &state,
+        &parts,
+        &principal,
+        &actor,
+        KeyedConnectionChange::Create,
+        &body,
+        "",
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return *response,
+    };
+
     let snapshot = state.control_plane.runtime_snapshot();
     match if_match_matches(&parts.headers, snapshot.collection_etag()) {
         Ok(true) => {}
@@ -772,14 +791,19 @@ pub(super) async fn connection_create_endpoint(
     }
     let created = match state
         .control_plane
-        .create_managed(
+        .create_managed_with_operation(
             snapshot.collection_etag(),
             candidate,
-            &auth::change_actor::ChangeActor::from_principal(&principal),
+            &actor,
+            caller.as_ref(),
         )
         .await
     {
-        Ok(created) => created,
+        Ok(authority_events::caller_operation::CallerOutcome::Committed(created)) => created,
+        // An exact retry: no change, no audit event, no reload.
+        Ok(authority_events::caller_operation::CallerOutcome::Replayed(receipt)) => {
+            return operation_receipt(&receipt)
+        }
         Err(error) => return connection_mutation_error_response(error),
     };
     let permissions = connection_permissions(rbac_state, &principal);
@@ -885,7 +909,25 @@ pub(super) async fn connection_put_endpoint(
         );
     }
 
+    // Authorized and validated: bind the caller key, ask the gates, and
+    // answer an exact retry before the ETag precondition, which a committed
+    // replacement has since moved (issue #425).
     let current_etag = current.etag();
+    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
+    let caller = match admit_keyed_connection_change(
+        &state,
+        &parts,
+        &principal,
+        &actor,
+        KeyedConnectionChange::Replace,
+        &body,
+        id.as_str(),
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return *response,
+    };
     match if_match_matches(&parts.headers, current_etag.as_str()) {
         Ok(true) => {}
         Ok(false) => {
@@ -923,15 +965,14 @@ pub(super) async fn connection_put_endpoint(
     }
     let updated = match state
         .control_plane
-        .replace_managed(
-            &id,
-            &current_etag,
-            candidate,
-            &auth::change_actor::ChangeActor::from_principal(&principal),
-        )
+        .replace_managed_with_operation(&id, &current_etag, candidate, &actor, caller.as_ref())
         .await
     {
-        Ok(updated) => updated,
+        Ok(authority_events::caller_operation::CallerOutcome::Committed(updated)) => updated,
+        // An exact retry: no change, no audit event, no catalog reconcile.
+        Ok(authority_events::caller_operation::CallerOutcome::Replayed(receipt)) => {
+            return operation_receipt(&receipt)
+        }
         Err(error) => return connection_mutation_error_response(error),
     };
     state.mcp_catalogs.reconcile_connection(&updated);
@@ -1009,6 +1050,7 @@ pub(super) async fn connection_delete_endpoint(
         Ok(id) => id,
         Err(_) => return not_found("connection was not found"),
     };
+    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
     let snapshot = state.control_plane.runtime_snapshot();
     let Some(current) = snapshot.managed().get(&id).cloned() else {
         if snapshot
@@ -1017,6 +1059,22 @@ pub(super) async fn connection_delete_endpoint(
             .any(|projection| projection.id() == &id)
         {
             return conflict("legacy connection projections are read-only");
+        }
+        // A keyed delete that committed is answered from its evidence,
+        // which outlives the record (issue #425); any other request for a
+        // missing record is `404`.
+        if let Err(response) = admit_keyed_connection_change(
+            &state,
+            &parts,
+            &principal,
+            &actor,
+            KeyedConnectionChange::Delete,
+            &body,
+            id.as_str(),
+        )
+        .await
+        {
+            return *response;
         }
         return not_found("connection was not found");
     };
@@ -1034,6 +1092,23 @@ pub(super) async fn connection_delete_endpoint(
         );
     }
     let current_etag = current.etag();
+    // Authorized and validated: bind the caller key, ask the operation gate
+    // (a withdrawal never asks the evidence gate), and answer an exact
+    // retry before the ETag precondition.
+    let caller = match admit_keyed_connection_change(
+        &state,
+        &parts,
+        &principal,
+        &actor,
+        KeyedConnectionChange::Delete,
+        &body,
+        id.as_str(),
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return *response,
+    };
     match if_match_matches(&parts.headers, current_etag.as_str()) {
         Ok(true) => {}
         Ok(false) => {
@@ -1053,16 +1128,17 @@ pub(super) async fn connection_delete_endpoint(
     // principal -- subject, issuer, kind and auth mode -- is the deletion's
     // evidence, committed with it or not at all; the audit event below stays
     // post-commit telemetry.
-    if let Err(error) = state
+    match state
         .control_plane
-        .delete_managed(
-            &id,
-            &current_etag,
-            &auth::change_actor::ChangeActor::from_principal(&principal),
-        )
+        .delete_managed_with_operation(&id, &current_etag, &actor, caller.as_ref())
         .await
     {
-        return connection_mutation_error_response(error);
+        Ok(authority_events::caller_operation::CallerOutcome::Committed(())) => {}
+        // An exact retry: no change, no audit event, no catalog removal.
+        Ok(authority_events::caller_operation::CallerOutcome::Replayed(receipt)) => {
+            return operation_receipt(&receipt)
+        }
+        Err(error) => return connection_mutation_error_response(error),
     }
     state.mcp_catalogs.remove_connection(&id);
     state.openapi_catalogs.remove_connection(&id);
@@ -1087,6 +1163,149 @@ pub(super) async fn connection_delete_endpoint(
             .into_response(),
         new_snapshot.collection_etag(),
     )
+}
+
+/// A Connection change that binds a caller key (issue #425).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum KeyedConnectionChange {
+    Create,
+    Replace,
+    Delete,
+}
+
+impl KeyedConnectionChange {
+    /// The operation code the key is reserved for and the evidence records.
+    pub(super) const fn action(self) -> &'static str {
+        match self {
+            Self::Create => "connection.create",
+            Self::Replace => "connection.replace",
+            Self::Delete => "connection.delete",
+        }
+    }
+
+    /// What the change is to the evidence gate. Its operation's code is
+    /// [`Self::action`], so the key bound here is the one the gate is asked
+    /// about.
+    fn keyed_change(self) -> KeyedChange {
+        match self {
+            Self::Create => {
+                KeyedChange::Gated(authority_events::required::AuthorityOperation::ConnectionCreate)
+            }
+            Self::Replace => KeyedChange::Gated(
+                authority_events::required::AuthorityOperation::ConnectionReplace,
+            ),
+            Self::Delete => {
+                KeyedChange::Withdrawal(authority_events::required::Withdrawal::ConnectionDelete)
+            }
+        }
+    }
+}
+
+/// The request a Connection change's key is bound to: the body as canonical
+/// JSON, object keys sorted, so a retry is the same request whatever its
+/// whitespace or key order. A Connection body holds no secret value -- only
+/// credential aliases and provider locators, which decide which credential
+/// the Connection uses and so stay in -- and a delete has no body.
+pub(super) fn canonical_connection_request(body: &[u8]) -> ResponseResult<Vec<u8>> {
+    fn sorted(value: Value) -> Value {
+        match value {
+            Value::Object(object) => {
+                let mut entries: Vec<(String, Value)> = object.into_iter().collect();
+                entries.sort_by(|left, right| left.0.cmp(&right.0));
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key, sorted(value)))
+                        .collect(),
+                )
+            }
+            Value::Array(values) => Value::Array(values.into_iter().map(sorted).collect()),
+            other => other,
+        }
+    }
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    let value = serde_json::from_slice::<Value>(body)
+        .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
+    serde_json::to_vec(&sorted(value)).map_err(|error| {
+        tracing::error!(error = %error, "a Connection request could not be encoded for its caller key");
+        Box::new(internal_server_error("the caller operation could not be bound"))
+    })
+}
+
+/// The `If-Match` values a request carries, as received, for its key's
+/// binding: missing is `428` and a value that is not ASCII is `400`, as the
+/// precondition check itself answers.
+fn if_match_precondition(headers: &HeaderMap) -> ResponseResult<String> {
+    let mut values = Vec::new();
+    for value in headers.get_all(header::IF_MATCH) {
+        values.push(
+            value
+                .to_str()
+                .map_err(|_| Box::new(if_match_error_response(IfMatchError::InvalidHeader)))?,
+        );
+    }
+    if values.is_empty() {
+        return Err(Box::new(if_match_error_response(IfMatchError::Missing)));
+    }
+    Ok(values.join(", "))
+}
+
+/// Bind a Connection change's caller key and admit it (issue #425). Called
+/// once the handler has authorized the caller and validated the request, and
+/// before the precondition check and any external I/O: the key is bound to
+/// the action, the recorded actor, the target, the `If-Match` value and the
+/// canonical body; the evidence gate (create and replace) and, for a keyed
+/// request in cluster mode, the operation gate are asked; and an exact retry
+/// of a committed change is answered with its receipt, a key bound to
+/// anything else with `409`. `Ok(None)` is an unkeyed request the gates
+/// admitted; `Ok(Some(_))` a keyed one whose key is unused.
+pub(super) async fn admit_keyed_connection_change(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    actor: &auth::change_actor::ChangeActor,
+    change: KeyedConnectionChange,
+    body: &[u8],
+    target: &str,
+) -> ResponseResult<Option<authority_events::caller_operation::CallerOperation>> {
+    let caller = if parts.headers.contains_key("idempotency-key") {
+        caller_operation(
+            &parts.headers,
+            actor,
+            change.action(),
+            target,
+            &if_match_precondition(&parts.headers)?,
+            &canonical_connection_request(body)?,
+        )?
+    } else {
+        None
+    };
+    let gates = KeyedChangeGates {
+        evidence: &state.authority_evidence,
+        #[cfg(feature = "postgres")]
+        membership: state.membership.as_deref(),
+        audit: &state.audit,
+        client_ip_policy: &state.client_ip_policy,
+    };
+    admit_keyed_authority_change(
+        &gates,
+        change.keyed_change(),
+        caller.as_ref(),
+        actor,
+        parts,
+        principal,
+    )
+    .await?;
+    if let Some(caller) = &caller {
+        replayed_receipt(
+            state.control_plane.caller_operation_state(caller),
+            state.control_plane.caller_operation_receipt(caller),
+        )
+        .await?;
+    }
+    Ok(caller)
 }
 
 /// Refresh a managed OpenAPI catalog, asking the operation gate when the
@@ -2902,6 +3121,9 @@ pub(super) fn connection_store_error_response(
         ),
         connections::store::ConnectionStoreError::LimitExceeded { .. } => {
             conflict("managed connection capacity has been reached")
+        }
+        connections::store::ConnectionStoreError::CallerOperationConflict => {
+            caller_operation_conflict()
         }
         other => {
             tracing::error!(error = %other, "managed connection operation failed");

@@ -17,7 +17,13 @@ use uuid::Uuid;
 #[path = "store_mutation_approvals.rs"]
 mod mutation_approvals;
 
-use crate::{auth::change_actor::ChangeActor, tools::definitions::ToolDefinition};
+use crate::{
+    auth::change_actor::ChangeActor,
+    authority_events::caller_operation::{
+        CallerKeyReservation, CallerKeyState, CallerOperation, CallerOutcome, OperationReceipt,
+    },
+    tools::definitions::ToolDefinition,
+};
 
 use super::{
     model::{
@@ -1221,11 +1227,44 @@ pub trait ConnectionStore: Send + Sync {
     fn count(&self) -> Result<usize, ConnectionStoreError>;
     fn list(&self) -> Result<Vec<StoredConnection>, ConnectionStoreError>;
     fn get(&self, id: &ConnectionId) -> Result<Option<StoredConnection>, ConnectionStoreError>;
+    /// Create on behalf of `actor`. With a caller key (issue #425) the key is
+    /// reserved in the creating transaction and recorded as the evidence's
+    /// operation ID; an exact retry of a committed create is answered with
+    /// its receipt and changes nothing, and a key bound to anything else is
+    /// [`ConnectionStoreError::CallerOperationConflict`].
+    fn create_with_operation(
+        &self,
+        candidate: ConnectionWrite,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<StoredConnection>, ConnectionStoreError>;
+    /// Replace under the caller key, as [`Self::create_with_operation`]
+    /// does. An identical replacement changes nothing, records nothing and
+    /// reserves nothing.
+    fn replace_with_operation(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        candidate: ConnectionWrite,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<StoredConnection>, ConnectionStoreError>;
+    /// Delete under the caller key, as [`Self::create_with_operation`] does.
+    fn delete_with_operation(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<()>, ConnectionStoreError>;
+    /// [`Self::create_with_operation`] without a caller key.
     fn create(
         &self,
         candidate: ConnectionWrite,
         actor: &ChangeActor,
-    ) -> Result<StoredConnection, ConnectionStoreError>;
+    ) -> Result<StoredConnection, ConnectionStoreError> {
+        committed(self.create_with_operation(candidate, actor, None))
+    }
     /// An identical replacement changes nothing and records nothing.
     fn replace(
         &self,
@@ -1233,13 +1272,29 @@ pub trait ConnectionStore: Send + Sync {
         expected: &ConnectionEtag,
         candidate: ConnectionWrite,
         actor: &ChangeActor,
-    ) -> Result<StoredConnection, ConnectionStoreError>;
+    ) -> Result<StoredConnection, ConnectionStoreError> {
+        committed(self.replace_with_operation(id, expected, candidate, actor, None))
+    }
     fn delete(
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
         actor: &ChangeActor,
-    ) -> Result<(), ConnectionStoreError>;
+    ) -> Result<(), ConnectionStoreError> {
+        committed(self.delete_with_operation(id, expected, actor, None))
+    }
+}
+
+/// The change an unkeyed store call committed. Only a keyed call is ever
+/// answered from a receipt, so a receipt here is a store defect and is
+/// refused rather than taken for a change.
+pub(crate) fn committed<T>(
+    outcome: Result<CallerOutcome<T>, ConnectionStoreError>,
+) -> Result<T, ConnectionStoreError> {
+    match outcome? {
+        CallerOutcome::Committed(value) => Ok(value),
+        CallerOutcome::Replayed(_) => Err(ConnectionStoreError::CallerOperationConflict),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1818,6 +1873,10 @@ pub enum ConnectionStoreError {
     CollectionConflict {
         current: String,
     },
+    /// The caller key (`Idempotency-Key`, issue #425) is already reserved for
+    /// another action, another binding, or without a binding. The caller
+    /// surfaces `409 caller_operation_conflict`. Nothing was written.
+    CallerOperationConflict,
 }
 
 impl ConnectionStoreError {
@@ -1938,6 +1997,9 @@ impl fmt::Display for ConnectionStoreError {
                 formatter,
                 "connection collection changed at the authority; current ETag is {current}"
             ),
+            Self::CallerOperationConflict => {
+                formatter.write_str("the caller operation key is bound to a different request")
+            }
             Self::OverlayConflict {
                 id,
                 current_connection_revision,
@@ -3831,12 +3893,14 @@ impl ConnectionStore for SqliteConnectionStore {
         Ok(record)
     }
 
-    fn create(
+    fn create_with_operation(
         &self,
         candidate: ConnectionWrite,
         actor: &ChangeActor,
-    ) -> Result<StoredConnection, ConnectionStoreError> {
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<StoredConnection>, ConnectionStoreError> {
         validate_change_actor(actor)?;
+        ensure_caller_action(caller, EVIDENCE_ACTION_CREATE)?;
         let candidate = validate_candidate(candidate)?;
         let spec_json =
             serde_json::to_string(&candidate).map_err(|source| ConnectionStoreError::Json {
@@ -3851,6 +3915,12 @@ impl ConnectionStore for SqliteConnectionStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&self.path, "create transaction", source))?;
+        // The key first, under the file's write lock: an exact retry of a
+        // committed create is answered from its evidence before anything is
+        // checked or written, and the transaction rolls back on return.
+        if let Some(receipt) = keyed_receipt(&transaction, &self.path, caller)? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         let count: i64 = transaction
             .query_row("SELECT COUNT(*) FROM connection_records", [], |row| {
                 row.get(0)
@@ -3864,6 +3934,9 @@ impl ConnectionStore for SqliteConnectionStore {
         }
         ensure_binding_capacity(&transaction, &self.path, None, 0, binding_count(&candidate))?;
         ensure_token_exchange_secret_exclusive_in(&transaction, &self.path, None, &candidate)?;
+        if let Some(receipt) = reserve_caller_key(&transaction, &self.path, caller)? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         transaction
             .execute(
                 r#"
@@ -3892,7 +3965,7 @@ impl ConnectionStore for SqliteConnectionStore {
             &transaction,
             &self.path,
             &ConnectionChangeEvidence {
-                operation_id: &Uuid::new_v4().to_string(),
+                operation_id: &operation_id_for(caller),
                 action: EVIDENCE_ACTION_CREATE,
                 id: &id,
                 prior_version: None,
@@ -3905,23 +3978,25 @@ impl ConnectionStore for SqliteConnectionStore {
             .commit()
             .map_err(|source| sqlite_error(&self.path, "create commit", source))?;
 
-        Ok(StoredConnection {
+        Ok(CallerOutcome::Committed(StoredConnection {
             id,
             write: candidate,
             revisions,
             created_at: now.clone(),
             updated_at: now,
-        })
+        }))
     }
 
-    fn replace(
+    fn replace_with_operation(
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
         candidate: ConnectionWrite,
         actor: &ChangeActor,
-    ) -> Result<StoredConnection, ConnectionStoreError> {
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<StoredConnection>, ConnectionStoreError> {
         validate_change_actor(actor)?;
+        ensure_caller_action(caller, EVIDENCE_ACTION_REPLACE)?;
         let candidate = validate_candidate(candidate)?;
         let spec_json =
             serde_json::to_string(&candidate).map_err(|source| ConnectionStoreError::Json {
@@ -3934,16 +4009,21 @@ impl ConnectionStore for SqliteConnectionStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&self.path, "replace transaction", source))?;
+        if let Some(receipt) = keyed_receipt(&transaction, &self.path, caller)? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         let current = load_raw_by_id(&transaction, &self.path, id)?
             .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?
             .into_stored()?;
         validate_record_bindings(&transaction, &self.path, &current)?;
         ensure_etag(id, expected, &current)?;
+        // An identical replacement changes nothing, so it records nothing and
+        // reserves no caller key: it is answered before the reservation.
         if current.write == candidate {
             transaction
                 .commit()
                 .map_err(|source| sqlite_error(&self.path, "replace no-op commit", source))?;
-            return Ok(current);
+            return Ok(CallerOutcome::Committed(current));
         }
         if managed_catalog_kind(&current.write) != managed_catalog_kind(&candidate) {
             let managed_tool_count: i64 = transaction
@@ -4007,6 +4087,9 @@ impl ConnectionStore for SqliteConnectionStore {
         )?;
         ensure_token_exchange_secret_exclusive_in(&transaction, &self.path, Some(id), &candidate)?;
         let revisions = replacement_revisions(id, &current, &candidate)?;
+        if let Some(receipt) = reserve_caller_key(&transaction, &self.path, caller)? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         transaction
             .execute(
                 r#"
@@ -4039,11 +4122,12 @@ impl ConnectionStore for SqliteConnectionStore {
                 sqlite_error(&self.path, "stale current status invalidation", source)
             })?;
         replace_bindings(&transaction, &self.path, id, &candidate, &revisions, &now)?;
-        // One operation, minted once for this call. A replacement that also
-        // advanced the credential axis records that change too, on its own
-        // axis, so the binding change is attributable without its rows,
-        // which hold secret IDs, entering the evidence.
-        let operation_id = Uuid::new_v4().to_string();
+        // One operation: the caller's key, or one minted once for this call.
+        // A replacement that also advanced the credential axis records that
+        // change too, on its own axis and under the same operation, so the
+        // binding change is attributable without its rows, which hold secret
+        // IDs, entering the evidence.
+        let operation_id = operation_id_for(caller);
         record_change_evidence(
             &transaction,
             &self.path,
@@ -4076,27 +4160,34 @@ impl ConnectionStore for SqliteConnectionStore {
             .commit()
             .map_err(|source| sqlite_error(&self.path, "replace commit", source))?;
 
-        Ok(StoredConnection {
+        Ok(CallerOutcome::Committed(StoredConnection {
             id: id.clone(),
             write: candidate,
             revisions,
             created_at: current.created_at,
             updated_at: now,
-        })
+        }))
     }
 
-    fn delete(
+    fn delete_with_operation(
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
         actor: &ChangeActor,
-    ) -> Result<(), ConnectionStoreError> {
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<()>, ConnectionStoreError> {
         validate_change_actor(actor)?;
+        ensure_caller_action(caller, EVIDENCE_ACTION_DELETE)?;
         let now = utc_timestamp()?;
         let mut connection = self.connection_guard();
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&self.path, "delete transaction", source))?;
+        // A committed keyed delete is answered from its evidence, which
+        // outlives the record, before the missing record is reported.
+        if let Some(receipt) = keyed_receipt(&transaction, &self.path, caller)? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         let current = load_raw_by_id(&transaction, &self.path, id)?
             .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?
             .into_stored()?;
@@ -4115,6 +4206,9 @@ impl ConnectionStore for SqliteConnectionStore {
                 count: usize::try_from(dependency_count).unwrap_or(usize::MAX),
             });
         }
+        if let Some(receipt) = reserve_caller_key(&transaction, &self.path, caller)? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         // The record's bindings, catalogs and status cascade with it; its
         // evidence row has no foreign key and outlives it, which is what
         // lets a lost delete response be reconciled after the record is
@@ -4123,7 +4217,7 @@ impl ConnectionStore for SqliteConnectionStore {
             &transaction,
             &self.path,
             &ConnectionChangeEvidence {
-                operation_id: &Uuid::new_v4().to_string(),
+                operation_id: &operation_id_for(caller),
                 action: EVIDENCE_ACTION_DELETE,
                 id,
                 prior_version: Some(current.revisions.connection),
@@ -4141,7 +4235,161 @@ impl ConnectionStore for SqliteConnectionStore {
         transaction
             .commit()
             .map_err(|source| sqlite_error(&self.path, "delete commit", source))?;
-        Ok(())
+        Ok(CallerOutcome::Committed(()))
+    }
+}
+
+const OPERATION_CALLER_OPERATION_READ: &str = "caller operation read";
+const OPERATION_CALLER_OPERATION_RESERVE: &str = "caller operation reserve";
+
+impl SqliteConnectionStore {
+    /// What this database's reservation table says about `caller`'s key:
+    /// the read-only pre-check a handler asks before any external work
+    /// (issue #425). Advisory: the change's own transaction decides again.
+    pub(crate) fn caller_operation_state(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<CallerKeyState, crate::storage::RepositoryError> {
+        let connection = self.connection_guard();
+        crate::storage::standalone_authority_events::read_caller_operation(&connection, caller)
+    }
+
+    /// The receipt of the Connection change `caller`'s key committed in this
+    /// database, read from its evidence row, or `None` when there is none.
+    pub(crate) fn caller_operation_receipt(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<Option<OperationReceipt>, crate::storage::RepositoryError> {
+        let connection = self.connection_guard();
+        connection_operation_receipt(&connection, caller).map_err(|source| {
+            tracing::error!(error = %source, "a Connection change receipt could not be read");
+            crate::storage::RepositoryError::new(
+                crate::storage::RepositoryErrorKind::Unavailable,
+                "connection_operation_receipt",
+            )
+        })
+    }
+}
+
+/// The operation ID a change records: the caller's key, or one minted once
+/// for an unkeyed call.
+fn operation_id_for(caller: Option<&CallerOperation>) -> String {
+    caller
+        .map_or_else(Uuid::new_v4, CallerOperation::id)
+        .to_string()
+}
+
+/// A caller key bound to another action than the store call it was passed
+/// to is a handler defect: refused before anything is read or written.
+pub(crate) fn ensure_caller_action(
+    caller: Option<&CallerOperation>,
+    action: &'static str,
+) -> Result<(), ConnectionStoreError> {
+    match caller {
+        Some(caller) if caller.action() != action => {
+            tracing::error!(
+                bound = caller.action(),
+                action,
+                "a Connection change was passed a caller key bound to another action; it is refused"
+            );
+            Err(ConnectionStoreError::CallerOperationConflict)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The receipt of the Connection change `caller`'s key committed: its
+/// evidence row for the key's action, never anything from the request.
+fn connection_operation_receipt(
+    connection: &Connection,
+    caller: &CallerOperation,
+) -> rusqlite::Result<Option<OperationReceipt>> {
+    connection
+        .query_row(
+            "SELECT connection_id, prior_version, new_version, committed_at \
+             FROM connection_change_evidence WHERE operation_id = ?1 AND action = ?2",
+            params![caller.id().to_string(), caller.action()],
+            |row| {
+                let prior: Option<i64> = row.get(1)?;
+                let new: Option<i64> = row.get(2)?;
+                Ok(OperationReceipt {
+                    operation_id: caller.id().to_string(),
+                    operation: caller.action().to_owned(),
+                    resource_id: row.get(0)?,
+                    // A deletion has no successor: its prior revision.
+                    revision: new.or(prior),
+                    committed_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+}
+
+/// Step 1 of a keyed change, inside its IMMEDIATE transaction: the key's
+/// reservation judged against this request. `None` for no key or an unused
+/// one; the receipt for an exact retry of a committed change; a conflict for
+/// a key reserved for anything else. A reservation without its evidence row
+/// is refused as unavailable: nothing can be answered from it.
+fn keyed_receipt(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    caller: Option<&CallerOperation>,
+) -> Result<Option<OperationReceipt>, ConnectionStoreError> {
+    let Some(caller) = caller else {
+        return Ok(None);
+    };
+    let state =
+        crate::storage::standalone_authority_events::read_caller_operation(transaction, caller)
+            .map_err(|_| ConnectionStoreError::Unavailable {
+                operation: OPERATION_CALLER_OPERATION_READ,
+            })?;
+    match state {
+        CallerKeyState::Unused => Ok(None),
+        CallerKeyState::OtherBinding => Err(ConnectionStoreError::CallerOperationConflict),
+        CallerKeyState::SameBinding => committed_receipt(transaction, path, caller).map(Some),
+    }
+}
+
+/// The committed receipt of an exact retry, or unavailable when the
+/// reservation has no evidence row.
+fn committed_receipt(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    caller: &CallerOperation,
+) -> Result<OperationReceipt, ConnectionStoreError> {
+    connection_operation_receipt(transaction, caller)
+        .map_err(|source| sqlite_error(path, OPERATION_CALLER_OPERATION_READ, source))?
+        .ok_or_else(|| {
+            tracing::error!(
+                "a caller operation is reserved without its Connection evidence row; the change is refused"
+            );
+            ConnectionStoreError::Unavailable {
+                operation: OPERATION_CALLER_OPERATION_READ,
+            }
+        })
+}
+
+/// Step 3 of a keyed change: reserve the key with its binding digest in the
+/// change's transaction, which commits or rolls back with the change and its
+/// evidence. The file's write lock is held, so step 1 already answered any
+/// committed holder; a holder found here is answered the same way.
+fn reserve_caller_key(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    caller: Option<&CallerOperation>,
+) -> Result<Option<OperationReceipt>, ConnectionStoreError> {
+    let Some(caller) = caller else {
+        return Ok(None);
+    };
+    let reservation =
+        crate::storage::standalone_authority_events::reserve_bound_operation(transaction, caller)
+            .map_err(|_| ConnectionStoreError::Unavailable {
+            operation: OPERATION_CALLER_OPERATION_RESERVE,
+        })?;
+    match reservation {
+        CallerKeyReservation::Reserved => Ok(None),
+        CallerKeyReservation::OtherBinding => Err(ConnectionStoreError::CallerOperationConflict),
+        CallerKeyReservation::SameBinding => committed_receipt(transaction, path, caller).map(Some),
     }
 }
 
