@@ -273,8 +273,117 @@ export type AnalysisFinding = Readonly<{
   remediation: string;
   // The access effect of the advisory patch, when there is one.
   patchEffect: string | null;
+  // The advisory patch itself, when it is one the Studio can open in a
+  // draft; null otherwise (the finding and its effect are still shown).
+  patch: AdvisoryPatch | null;
   suppression: FindingSuppression | null;
 }>;
+
+// The edits the analyzer proposes, as `policy-simulation.v1` edits. Only the
+// three operations it emits are projected; a patch holding any other is not
+// opened in a draft.
+export type AdvisorySection = 'rules' | 'routes' | 'rate_limits';
+export type AdvisoryEdit =
+  | Readonly<{ op: 'delete'; section: AdvisorySection; position: number; expectId: string | null }>
+  | Readonly<{
+      op: 'move';
+      section: AdvisorySection;
+      from: number;
+      to: number;
+      expectId: string | null;
+    }>
+  | Readonly<{
+      op: 'set';
+      field: 'default_action' | 'enforcement_mode';
+      value: 'allow' | 'deny' | 'enforce' | 'shadow';
+    }>;
+
+export type AdvisoryPatch = Readonly<{
+  // The analyzed document's ETag, which the edits' positions refer to.
+  appliesToEtag: string;
+  accessEffect: string;
+  edits: readonly AdvisoryEdit[];
+}>;
+
+const PATCH_FORMAT = 'policy-simulation.v1/edits';
+// MAX_EDITS and MAX_EXPECT_ID_BYTES in gateway/src/policy_simulation/edits.rs.
+const MAX_PATCH_EDITS = 64;
+const MAX_EXPECT_ID_BYTES = 256;
+const SECTIONS: readonly string[] = ['rules', 'routes', 'rate_limits'];
+
+function hasExactly(value: Record<string, unknown>, required: string[], optional: string[] = []) {
+  const keys = Object.keys(value);
+  return (
+    required.every((key) => key in value) &&
+    keys.every((key) => required.includes(key) || optional.includes(key))
+  );
+}
+
+function projectExpectId(value: unknown): string | null | undefined {
+  if (value === undefined) return null;
+  return typeof value === 'string' && new TextEncoder().encode(value).length <= MAX_EXPECT_ID_BYTES
+    ? value
+    : undefined;
+}
+
+function projectEdit(value: unknown): AdvisoryEdit | null {
+  if (!isJsonObject(value)) return null;
+  if (value.op === 'set') {
+    if (!hasExactly(value, ['op', 'field', 'value'])) return null;
+    if (value.field === 'default_action' && (value.value === 'allow' || value.value === 'deny')) {
+      return { op: 'set', field: 'default_action', value: value.value };
+    }
+    if (
+      value.field === 'enforcement_mode' &&
+      (value.value === 'enforce' || value.value === 'shadow')
+    ) {
+      return { op: 'set', field: 'enforcement_mode', value: value.value };
+    }
+    return null;
+  }
+  if (typeof value.section !== 'string' || !SECTIONS.includes(value.section)) return null;
+  const section = value.section as AdvisorySection;
+  const expectId = projectExpectId(value.expect_id);
+  if (expectId === undefined) return null;
+  if (value.op === 'delete') {
+    if (!hasExactly(value, ['op', 'section', 'position'], ['expect_id']) || !isCount(value.position)) {
+      return null;
+    }
+    return { op: 'delete', section, position: value.position, expectId };
+  }
+  if (value.op === 'move') {
+    if (
+      !hasExactly(value, ['op', 'section', 'from', 'to'], ['expect_id']) ||
+      !isCount(value.from) ||
+      !isCount(value.to)
+    ) {
+      return null;
+    }
+    return { op: 'move', section, from: value.from, to: value.to, expectId };
+  }
+  return null;
+}
+
+function projectPatch(value: unknown): AdvisoryPatch | null {
+  if (
+    !isJsonObject(value) ||
+    value.format !== PATCH_FORMAT ||
+    !isEtag(value.applies_to_etag) ||
+    !isCode(value.access_effect) ||
+    !Array.isArray(value.edits) ||
+    value.edits.length === 0 ||
+    value.edits.length > MAX_PATCH_EDITS
+  ) {
+    return null;
+  }
+  const edits: AdvisoryEdit[] = [];
+  for (const entry of value.edits) {
+    const edit = projectEdit(entry);
+    if (edit === null) return null;
+    edits.push(edit);
+  }
+  return { appliesToEtag: value.applies_to_etag, accessEffect: value.access_effect, edits };
+}
 
 type ReplayLane = Readonly<{
   projection: 'as_authored' | 'enforce_all_shadow';
@@ -577,6 +686,7 @@ function projectReportFinding(value: unknown): AnalysisFinding | null {
     rationale: value.rationale,
     remediation: value.remediation,
     patchEffect: isJsonObject(patch) && isCode(patch.access_effect) ? patch.access_effect : null,
+    patch: projectPatch(patch),
     suppression,
   };
 }

@@ -141,6 +141,66 @@ describe('policy analysis client', () => {
     }
   });
 
+  it('projects an advisory patch’s edits and drops an unbounded or unknown edit', () => {
+    const move = { op: 'move', section: 'rules', from: 1, to: 0, expect_id: 'deny-admin' };
+    const patch = (edits: unknown[], extra: Record<string, unknown> = {}) =>
+      report({
+        findings: [
+          {
+            ...finding(),
+            patch: {
+              format: 'policy-simulation.v1/edits',
+              applies_to_etag: LIVE_ETAG,
+              access_effect: 'narrowing',
+              edits,
+              ...extra,
+            },
+          },
+        ],
+      });
+    const projected = projectAnalysisReport(
+      patch([
+        move,
+        { op: 'delete', section: 'routes', position: 2 },
+        { op: 'set', field: 'default_action', value: 'deny' },
+      ]),
+    );
+    expect(projected?.findings[0].patch).toEqual({
+      appliesToEtag: LIVE_ETAG,
+      accessEffect: 'narrowing',
+      edits: [
+        { op: 'move', section: 'rules', from: 1, to: 0, expectId: 'deny-admin' },
+        { op: 'delete', section: 'routes', position: 2, expectId: null },
+        { op: 'set', field: 'default_action', value: 'deny' },
+      ],
+    });
+    expect(projected?.findings[0].patchEffect).toBe('narrowing');
+
+    for (const unusable of [
+      patch(Array.from({ length: 65 }, () => move)),
+      patch([]),
+      patch([{ op: 'insert', section: 'rules', position: 0, value: {} }]),
+      patch([{ op: 'replace', section: 'rules', position: 0, value: {} }]),
+      patch([{ ...move, extra: true }]),
+      patch([{ ...move, section: 'tools' }]),
+      patch([{ ...move, from: -1 }]),
+      patch([{ op: 'set', field: 'enforcement_mode', value: 'off' }]),
+      patch([move], { format: 'policy-simulation.v2/edits' }),
+      patch([move], { applies_to_etag: 'W/"weak"' }),
+      patch([move], { access_effect: 'Everything' }),
+    ]) {
+      const kept = projectAnalysisReport(unusable);
+      // The finding is still listed; only the patch is unavailable.
+      expect(kept?.findings).toHaveLength(1);
+      expect(kept?.findings[0].patch).toBeNull();
+    }
+    // An effect without edits (an older answer) is described, not applied.
+    expect(projectAnalysisReport(report())?.findings[0]).toMatchObject({
+      patch: null,
+      patchEffect: 'narrowing',
+    });
+  });
+
   it('judges a reason as the gateway does', () => {
     expect(isSuppressionReason('kept on purpose')).toBe(true);
     expect(isSuppressionReason('é'.repeat(256))).toBe(true);

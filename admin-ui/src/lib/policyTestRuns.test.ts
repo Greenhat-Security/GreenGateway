@@ -36,6 +36,43 @@ describe('policy test run client', () => {
     expect(inline?.body).toBe(`{"suite":${SUITE},"policy":${candidate},"format":"json"}`);
   });
 
+  it('runs the stored suite by reference pinned to its ETag', async () => {
+    const stored = {
+      ...report(),
+      suite: {
+        schema_version: 'policy-tests.v1',
+        digest: 'sha256:suite',
+        stored: { version: 3, etag: '"sha256:suite"' },
+      },
+    };
+    const fetch = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve(jsonResponse(200, stored)),
+    );
+    vi.stubGlobal('fetch', fetch);
+    const candidate = '{"schema_version":"1.0.0","rules":[]}';
+
+    const answer = await runPolicyTests({
+      suite: { kind: 'stored', etag: '"sha256:suite"' },
+      candidate: { kind: 'inline', source: candidate },
+      liveEtag: LIVE_ETAG,
+    });
+
+    const [, init] = fetch.mock.calls[0];
+    expect(init?.body).toBe(
+      `{"suite":{"source":"stored","etag":"\\"sha256:suite\\""},"policy":${candidate},"format":"json"}`,
+    );
+    expect(new Headers(init?.headers).has('If-Match')).toBe(false);
+    expect(answer).toMatchObject({
+      kind: 'report',
+      report: { suite_stored: { version: 3, etag: '"sha256:suite"' } },
+    });
+    // An inline suite's report names no stored version.
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(jsonResponse(200, report()))));
+    await expect(
+      runPolicyTests({ suiteSource: SUITE, candidate: { kind: 'active' }, liveEtag: LIVE_ETAG }),
+    ).resolves.toMatchObject({ report: { suite_stored: null } });
+  });
+
   it('reads a completed run as a report whatever its outcome, and a 422 as a refusal', async () => {
     const answers = [
       jsonResponse(200, report()),

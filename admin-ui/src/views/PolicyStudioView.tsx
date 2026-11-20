@@ -10,13 +10,17 @@ import {
 } from 'react';
 import { useSearchParams } from 'react-router-dom';
 
-import { AdminApiError } from '../lib/api';
+import { AdminApiError, type AdminRequiredTests } from '../lib/api';
 import { hasAdminPermission, useAdminCapabilities } from '../lib/adminCapabilities';
 import { AdminCapabilitiesNotice } from '../lib/AdminCapabilitiesNotice';
 import { subscribeAdminSession } from '../lib/adminSession';
 import { fetchPolicy, type PolicyDocument } from '../lib/policy';
 import { POLICY_ANALYZE_PERMISSION } from '../lib/policyAnalyses';
 import { POLICY_EVIDENCE_READ } from '../lib/policyEvidence';
+import {
+  POLICY_TESTS_REQUIRED_FAILED_REASON,
+  POLICY_TESTS_UNAVAILABLE_REASON,
+} from '../lib/policyTests';
 import {
   POLICY_DRAFT_BASE_STALE_REASON,
   POLICY_DRAFT_DEPLOYMENT_QUOTA_REASON,
@@ -157,6 +161,8 @@ type StudioProblem =
   | { kind: 'draft-gone'; message: string }
   | { kind: 'save-unknown'; message: string }
   | { kind: 'publish-unknown'; message: string }
+  // A publication the required stored suite refused; nothing was written.
+  | { kind: 'tests-required'; requiredTests: AdminRequiredTests | null }
   | { kind: 'alert'; alert: StudioAlert };
 
 type ValidationState =
@@ -263,6 +269,8 @@ export function PolicyStudioView() {
   const [candidateChoice, setCandidateChoice] = useState<'draft' | 'live'>('draft');
   // The cases the Simulator and the Test view share, in page memory only.
   const [suiteSource, setSuiteSource] = useState(emptySuiteSource);
+  // Bumped to have the Test view run the stored suite against the candidate.
+  const [storedRunRequest, setStoredRunRequest] = useState(0);
   // The suggestions, read once their view is first shown, and the drafts in
   // this page that hold a suggestion's rule. Page memory only.
   const suggestions = useSuggestionList(canReadSuggestions && view === 'suggestions');
@@ -788,13 +796,20 @@ export function PolicyStudioView() {
     }
   }
 
-  // A new draft on the live revision on screen: a copy of it, or the local
-  // candidate when it outlived the draft it was edited in.
-  async function createDraft(fromLocal: boolean) {
+  // A new draft on the live revision on screen: a copy of it, the local
+  // candidate when it outlived the draft it was edited in, or the live
+  // policy with an analyzer's advisory patch applied. The patched one
+  // replaces what is on screen, so it is refused while the Create button
+  // would be: never over unsaved edits.
+  async function createDraft(from: 'live' | 'local' | { patched: string }) {
+    if (typeof from === 'object' && startDraftBlocker !== null) {
+      return;
+    }
     if (!canWrite || live === null || !beginBusy('create')) {
       return;
     }
-    const candidate = fromLocal ? sourceRef.current : undefined;
+    const candidate =
+      from === 'local' ? sourceRef.current : from === 'live' ? undefined : from.patched;
     if (candidate !== undefined && !parseCandidate(candidate).ok) {
       endBusy();
       setProblem({
@@ -812,14 +827,21 @@ export function PolicyStudioView() {
     setConfirming(null);
     try {
       const created = await createPolicyDraft(live.etag, candidate);
-      showServerDraft(created, sourceRef.current === candidate || candidate === undefined);
+      showServerDraft(
+        created,
+        typeof from === 'object' || sourceRef.current === candidate || candidate === undefined,
+      );
       setConversion(null);
       setNotice({
         title: 'Draft created',
-        message: `Draft ${created.summary.draft_id} is pinned to live revision ${shortEtag(created.summary.base_etag)}. Nothing changes until it is published.`,
+        message: `Draft ${created.summary.draft_id} is pinned to live revision ${shortEtag(created.summary.base_etag)}. Nothing changes until it is published.${
+          typeof from === 'object'
+            ? ' It holds the analyzer’s advisory change: simulate, test and analyze it before publishing.'
+            : ''
+        }`,
         tone: 'info',
       });
-      if (!fromLocal) selectDraftSection(created.policy);
+      if (from === 'live') selectDraftSection(created.policy);
     } catch (error) {
       noteWriteError(error);
       if (refusal(error) === POLICY_ETAG_MISMATCH_REASON) {
@@ -1359,7 +1381,14 @@ export function PolicyStudioView() {
       });
       return;
     }
-    if (isAmbiguous(error)) {
+    if (
+      error instanceof AdminApiError &&
+      (reason === POLICY_TESTS_REQUIRED_FAILED_REASON ||
+        (reason === POLICY_TESTS_UNAVAILABLE_REASON && error.details.required_tests !== undefined))
+    ) {
+      // The gateway's answer says nothing was written; it is not ambiguous.
+      setProblem({ kind: 'tests-required', requiredTests: error.details.required_tests ?? null });
+    } else if (isAmbiguous(error)) {
       setProblem({
         kind: 'publish-unknown',
         message:
@@ -1865,6 +1894,21 @@ export function PolicyStudioView() {
     dirty ||
     busy !== null ||
     (ownerLimit !== null && ownedDrafts >= ownerLimit);
+  // The same conditions in words, for starting a draft from an analyzer's
+  // advisory patch.
+  const startDraftBlocker = !canWrite
+    ? 'Starting a draft needs admin:policy:write.'
+    : live === null
+      ? 'The live policy has not been read, so no draft can be pinned to it.'
+      : draftList === null
+        ? 'Policy drafts are unavailable, so no draft can be started.'
+        : dirty
+          ? 'Save or discard the edits in the open draft first.'
+          : busy !== null
+            ? 'Another Policy Studio action is in progress.'
+            : ownerLimit !== null && ownedDrafts >= ownerLimit
+              ? `You already hold the maximum of ${ownerLimit} drafts. Delete one first.`
+              : null;
 
   return (
     <main className="logs-page policy-studio-page">
@@ -1934,9 +1978,15 @@ export function PolicyStudioView() {
             onOverwrite={() => void saveDraft(true)}
             onRefreshLive={() => void refreshLive()}
             onRebase={() => setConfirming('rebase')}
-            onSaveAsNew={() => void createDraft(true)}
+            onSaveAsNew={() => void createDraft('local')}
             onCheck={() => void checkDraftState()}
             onDismiss={() => setProblem(null)}
+            canRunTests={canSimulate}
+            onRunStoredSuite={() => {
+              setCandidateChoice('draft');
+              setView('test');
+              setStoredRunRequest((count) => count + 1);
+            }}
           />
         ) : null}
 
@@ -1950,7 +2000,7 @@ export function PolicyStudioView() {
             createBlocked={createBlocked}
             canWrite={canWrite}
             onOpen={(id) => void openDraft(id)}
-            onCreate={() => void createDraft(false)}
+            onCreate={() => void createDraft('live')}
           />
         ) : null}
 
@@ -2366,13 +2416,16 @@ export function PolicyStudioView() {
               hidden={view !== 'test'}
             >
               <TestsPanel
+                active={view === 'test'}
                 candidate={workbenchCandidate}
                 candidateProblem={candidateProblem}
                 canSimulate={canSimulate}
+                canWritePolicy={canWrite}
                 validationBlocker={runBlocker(workbenchCandidate, currentInspection, 'tests')}
                 suiteSource={suiteSource}
                 onSuiteChange={setSuiteSource}
                 onReloadLive={() => void refreshLive()}
+                storedRunRequest={storedRunRequest}
               />
             </div>
             <div
@@ -2414,6 +2467,11 @@ export function PolicyStudioView() {
                   canReplay={canReplay}
                   canWritePolicy={canWrite}
                   onShowInEditor={showDiagnostic}
+                  startDraftBlocker={startDraftBlocker}
+                  onApplyPatch={(document) => {
+                    if (editable) setSource(formatCandidate(document), true);
+                  }}
+                  onStartDraft={(patched) => void createDraft({ patched })}
                 />
               ) : null}
             </div>
@@ -3042,6 +3100,8 @@ function ProblemPanel({
   onSaveAsNew,
   onCheck,
   onDismiss,
+  canRunTests,
+  onRunStoredSuite,
 }: {
   panelRef: RefObject<HTMLDivElement | null>;
   problem: StudioProblem;
@@ -3055,7 +3115,63 @@ function ProblemPanel({
   onSaveAsNew: () => void;
   onCheck: () => void;
   onDismiss: () => void;
+  canRunTests: boolean;
+  onRunStoredSuite: () => void;
 }) {
+  if (problem.kind === 'tests-required') {
+    const required = problem.requiredTests;
+    const summary = required?.summary ?? null;
+    return (
+      <div
+        ref={panelRef}
+        tabIndex={-1}
+        className="policy-studio-problem error-panel alert warning"
+        role="alert"
+      >
+        <h3>
+          {required?.status === 'suite_unavailable'
+            ? 'Not published: the required test suite could not be read'
+            : 'Not published: the required test suite did not pass'}
+        </h3>
+        <p>
+          This gateway requires the stored policy test suite to pass before a policy change.{' '}
+          {requiredTestsText(required?.status ?? null)} Nothing was published and the live policy is
+          unchanged.
+        </p>
+        {required !== null && required.suite_version !== null ? (
+          <p>
+            Judged by stored suite version {required.suite_version}
+            {required.suite_etag !== null ? ` (${shortEtag(required.suite_etag)})` : ''}.
+          </p>
+        ) : null}
+        {summary !== null ? (
+          <p>
+            {`${summary.total} ${summary.total === 1 ? 'case' : 'cases'}: ${summary.passed} passed, ${summary.failed} failed, ${summary.incomplete} incomplete, ${summary.errors} errors.`}
+          </p>
+        ) : null}
+        <p className="rule-hint">
+          The answer carries counts only. Run the stored suite against this draft to see which
+          cases did not pass.
+        </p>
+        <div className="form-actions">
+          {canRunTests ? (
+            <button type="button" className="secondary-button" onClick={onRunStoredSuite}>
+              Run the stored suite against this draft
+            </button>
+          ) : null}
+          <button type="button" className="secondary-button" onClick={onDismiss}>
+            Dismiss
+          </button>
+        </div>
+        {!canRunTests ? (
+          <p className="rule-hint">
+            Running the stored suite needs admin:policy:read and admin:policy:simulate.
+          </p>
+        ) : null}
+      </div>
+    );
+  }
+
   if (problem.kind === 'alert') {
     return (
       <div ref={panelRef} tabIndex={-1} className="policy-studio-problem">
@@ -3128,6 +3244,33 @@ function ProblemPanel({
       </div>
     </div>
   );
+}
+
+// What the required stored suite answered, in words
+// (docs/policy-tests.md, "Requiring the stored suite before activation").
+function requiredTestsText(status: string | null): string {
+  switch (status) {
+    case 'suite_missing':
+      return 'No suite is stored, so no policy change can pass it.';
+    case 'suite_invalid':
+      return 'The stored suite no longer verifies against its ETag, or this gateway no longer accepts it.';
+    case 'suite_unavailable':
+      return 'The suite store is not configured or could not be read.';
+    case 'failed':
+      return 'At least one case did not give the expected answer.';
+    case 'incomplete':
+      return 'At least one case could not be decided, and an undecided case never passes.';
+    case 'error':
+      return 'The evaluator refused at least one case, and a refusal never passes.';
+    case 'deadline_exceeded':
+      return 'The run did not finish within its deadline.';
+    case 'evaluation_failed':
+      return 'The candidate did not compile, or the evaluation did not complete.';
+    default:
+      return status === null
+        ? 'The gateway did not say how the suite answered.'
+        : `The suite answered ${status.replace(/_/g, ' ')}.`;
+  }
 }
 
 // The draft's current validation already answers that the gateway would

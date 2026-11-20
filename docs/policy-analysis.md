@@ -441,6 +441,19 @@ returned. To adopt one:
 Each patch stands alone and is computed against the analyzed document; two
 patches are not guaranteed to compose, and positions shift once one is applied.
 
+The admin UI's Policy Studio (Optimize view) opens a patch in a draft for
+that review, and does nothing more. It applies the `delete`, `move` and `set`
+edits the analyzer emits exactly as a simulation's edits apply (a position
+that does not exist or an `expect_id` that does not match refuses the whole
+patch), and offers it only while the analysis is of what is on screen: for
+an analysis of the open draft, the draft text unchanged since, as an unsaved
+edit of that draft; for an analysis of the active policy, the live revision
+`applies_to_etag` names, as a new draft created from it under `If-Match`
+(`admin:policy:write`, and only when the Studio could create a draft at all).
+An `expanding` or `unknown` access effect is named on the action. Nothing is
+saved, published or suppressed by it. See **Policy Studio workbench** in
+[the configuration reference](configuration.md#policy_file).
+
 ## Bounds and completeness
 
 An analysis runs on a blocking thread behind its own limiter: at most two per

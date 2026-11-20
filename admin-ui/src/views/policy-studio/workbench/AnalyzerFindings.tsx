@@ -1,4 +1,4 @@
-import { useCallback, useId, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 
 import { AdminApiError } from '../../../lib/api';
 import {
@@ -15,13 +15,16 @@ import {
   fetchAnalysisSuppressions,
   isSuppressionReason,
   runPolicyAnalysisReport,
+  type AdvisoryPatch,
   type AnalysisFinding,
   type AnalysisReport,
   type ObservedReplay,
   type AnalysisSuppressionRecord,
 } from '../../../lib/policyAnalyses';
 import type { PolicyRunRefusal } from '../../../lib/policyRuns';
+import { formatCandidate, parseCandidate, type JsonObject } from '../model';
 import { StudioAlertPanel, type StudioAlert } from '../StudioAlert';
+import { applyPatch, describeEdit } from './patch';
 import {
   RefusalPanel,
   StaleNotice,
@@ -186,13 +189,34 @@ export function AnalyzerFindings({
   canAnalyze,
   canReplay,
   canWritePolicy,
+  canEditDraft = false,
+  liveSource = null,
+  startDraftBlocker = null,
+  onApplyPatch,
+  onStartDraft,
 }: {
   candidate: WorkbenchCandidate | null;
   canAnalyze: boolean;
   canReplay: boolean;
   canWritePolicy: boolean;
+  // Whether the open draft, the candidate when it is one, takes edits here.
+  canEditDraft?: boolean;
+  // The live policy as text, which a patch of a live analysis applies to.
+  liveSource?: string | null;
+  // Why a new draft cannot be started now; null when it can.
+  startDraftBlocker?: string | null;
+  // Put a patched document on screen as the open draft's unsaved text.
+  onApplyPatch?: (document: JsonObject) => void;
+  // Start a new draft, pinned to the live revision, holding `source`.
+  onStartDraft?: (source: string) => void;
 }) {
   const headingId = useId();
+  const [reviewing, setReviewing] = useState<string | null>(null);
+  const [patchNotice, setPatchNotice] = useState<StudioAlert | null>(null);
+  const patchNoticeRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (patchNotice !== null) patchNoticeRef.current?.focus();
+  }, [patchNotice]);
   const [run, setRun] = useState<RunState>({ kind: 'idle' });
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [replayInput, setReplayInput] = useState('');
@@ -213,6 +237,8 @@ export function AnalyzerFindings({
     const key = candidateKey(candidate);
     setRun({ kind: 'running' });
     setWriteAlert(null);
+    setReviewing(null);
+    setPatchNotice(null);
     try {
       const answer = await runPolicyAnalysisReport({
         baseEtag: candidate.liveEtag,
@@ -297,6 +323,62 @@ export function AnalyzerFindings({
     report.resourceSnapshotComplete &&
     report.resourceSnapshotDigest !== null;
 
+  // Whether a finding's advisory patch can be opened in a draft now, and if
+  // not, why. Only while the analysis is of what is on screen: the open
+  // draft's text exactly, or the live revision the patch names (the one a
+  // new draft is pinned to).
+  function patchOffer(finding: AnalysisFinding): PatchOffer {
+    const patch = finding.patch;
+    if (patch === null || analysis === null || candidate === null || stale) {
+      return { kind: 'none' };
+    }
+    if (analysis.live) {
+      if (patch.appliesToEtag !== candidate.liveEtag) {
+        return {
+          kind: 'note',
+          text: 'This change names another revision than the one on screen, so it cannot be opened in a draft. Run the analysis again.',
+        };
+      }
+      if (!canWritePolicy || onStartDraft === undefined) {
+        return { kind: 'note', text: 'Opening it in a draft needs admin:policy:write.' };
+      }
+      return { kind: 'review', patch };
+    }
+    if (!canWritePolicy || onApplyPatch === undefined) {
+      return { kind: 'note', text: 'Opening it in a draft needs admin:policy:write.' };
+    }
+    if (!canEditDraft) {
+      return { kind: 'note', text: 'The open draft accepts no edits, so the change cannot be applied to it.' };
+    }
+    return { kind: 'review', patch };
+  }
+
+  function applyPatchTo(finding: AnalysisFinding, patch: AdvisoryPatch) {
+    if (candidate === null || analysis === null) return;
+    const text = analysis.live ? liveSource : candidate.kind === 'draft' ? candidate.source : null;
+    const document = text === null ? null : parseCandidate(text);
+    const applied = document !== null && document.ok ? applyPatch(document.document, patch.edits) : null;
+    setReviewing(null);
+    if (applied === null || !applied.ok) {
+      setPatchNotice({
+        title: 'Change not applied',
+        message: `The change no longer applies to the ${analysis.live ? 'live policy' : 'draft'}${applied !== null && !applied.ok ? ` (edit ${applied.index + 1}: ${applied.code})` : ''}, so nothing changed. Run the analysis again.`,
+        tone: 'warning',
+      });
+      return;
+    }
+    if (analysis.live) {
+      onStartDraft?.(formatCandidate(applied.document));
+      return;
+    }
+    onApplyPatch?.(applied.document);
+    setPatchNotice({
+      title: 'Change applied',
+      message: `Applied to the draft as an unsaved edit for ${finding.code}. Nothing was saved, published or suppressed: simulate, test and analyze the draft again, then save it and publish it through the ordinary review.`,
+      tone: 'info',
+    });
+  }
+
   return (
     <section className="workbench-findings" aria-labelledby={headingId}>
       <h4 id={headingId}>Analyzer findings</h4>
@@ -332,6 +414,11 @@ export function AnalyzerFindings({
         <RefusalPanel title="Analysis refused" refusal={run.refusal} cases={[]} />
       ) : null}
       {writeAlert !== null ? <StudioAlertPanel alert={writeAlert} /> : null}
+      {patchNotice !== null ? (
+        <div ref={patchNoticeRef} tabIndex={-1}>
+          <StudioAlertPanel alert={patchNotice} />
+        </div>
+      ) : null}
       {analysis !== null && report !== null ? (
         <>
           <p className="rule-hint">Analyzed: {analysis.label}.</p>
@@ -382,6 +469,16 @@ export function AnalyzerFindings({
                   canExpire={canWritePolicy && !writing}
                   suppressing={suppressing === finding.fingerprint}
                   writing={writing}
+                  offer={patchOffer(finding)}
+                  live={analysis.live}
+                  reviewing={reviewing === `${finding.fingerprint}:${finding.code}`}
+                  startDraftBlocker={startDraftBlocker}
+                  onReview={() => {
+                    setPatchNotice(null);
+                    setReviewing(`${finding.fingerprint}:${finding.code}`);
+                  }}
+                  onCancelReview={() => setReviewing(null)}
+                  onApply={(patch) => applyPatchTo(finding, patch)}
                   onStartSuppress={() => setSuppressing(finding.fingerprint)}
                   onCancelSuppress={() => setSuppressing(null)}
                   onSuppress={(reason, expiresOn) =>
@@ -429,6 +526,13 @@ function FindingItem({
   onCancelSuppress,
   onSuppress,
   onExpire,
+  offer,
+  live,
+  reviewing,
+  startDraftBlocker,
+  onReview,
+  onCancelReview,
+  onApply,
 }: {
   finding: AnalysisFinding;
   record: AnalysisSuppressionRecord | null;
@@ -440,6 +544,13 @@ function FindingItem({
   onCancelSuppress: () => void;
   onSuppress: (reason: string, expiresOn: string) => void;
   onExpire: (record: AnalysisSuppressionRecord) => void;
+  offer: PatchOffer;
+  live: boolean;
+  reviewing: boolean;
+  startDraftBlocker: string | null;
+  onReview: () => void;
+  onCancelReview: () => void;
+  onApply: (patch: AdvisoryPatch) => void;
 }) {
   const where = `${finding.code} at ${finding.pointer || 'the whole document'}`;
   const state = stateText(finding);
@@ -469,6 +580,26 @@ function FindingItem({
         ) : null}
         .
       </p>
+      {offer.kind === 'note' ? <p className="rule-hint">{offer.text}</p> : null}
+      {offer.kind === 'review' && !reviewing ? (
+        <button
+          type="button"
+          className="secondary-button"
+          aria-label={`Review the advisory change for ${where}`}
+          onClick={onReview}
+        >
+          Review the advisory change…
+        </button>
+      ) : null}
+      {offer.kind === 'review' && reviewing ? (
+        <PatchReview
+          patch={offer.patch}
+          live={live}
+          startDraftBlocker={startDraftBlocker}
+          onApply={() => onApply(offer.patch)}
+          onCancel={onCancelReview}
+        />
+      ) : null}
       {state !== null ? (
         <p>
           <span className={`badge ${suppressed ? 'neutral' : 'warning'}`}>{state}</span>
@@ -515,6 +646,87 @@ function FindingItem({
         />
       ) : null}
     </li>
+  );
+}
+
+type PatchOffer =
+  | { kind: 'none' }
+  | { kind: 'note'; text: string }
+  | { kind: 'review'; patch: AdvisoryPatch };
+
+const EFFECT_TEXT: Record<string, string> = {
+  equivalent: 'equivalent: the analyzer proved every request is decided as before.',
+  narrowing: 'narrowing: the analyzer proved the change only removes access.',
+  expanding: 'expanding: the analyzer found requests the change newly lets through.',
+  unknown: 'unknown: the analyzer could not establish the change’s effect on access.',
+};
+
+// The edits of an advisory patch, its access effect, and the one action it
+// may lead to: an unsaved edit of the open draft, or a new draft pinned to
+// the live revision. An expanding or unknown effect is named on the action
+// itself. Nothing is saved, published or suppressed here.
+function PatchReview({
+  patch,
+  live,
+  startDraftBlocker,
+  onApply,
+  onCancel,
+}: {
+  patch: AdvisoryPatch;
+  live: boolean;
+  startDraftBlocker: string | null;
+  onApply: () => void;
+  onCancel: () => void;
+}) {
+  const blockerId = useId();
+  const widening = patch.accessEffect === 'expanding' || patch.accessEffect === 'unknown';
+  const subject = live ? 'live policy' : 'draft';
+  const action = live ? 'Start a draft with this change' : 'Apply to the draft';
+  const blocked = live && startDraftBlocker !== null;
+  return (
+    <div className="policy-studio-confirmation" role="group" aria-label="Apply this advisory change?">
+      <p>
+        Access effect: {EFFECT_TEXT[patch.accessEffect] ?? `${patch.accessEffect}.`}
+      </p>
+      <ol>
+        {patch.edits.map((edit, index) => (
+          <li key={index}>{describeEdit(edit)}</li>
+        ))}
+      </ol>
+      {widening ? (
+        <p className="alert warning">
+          This change may let through requests the {subject} denies today. Review each edit, then
+          simulate and test the result before you save it.
+        </p>
+      ) : null}
+      <p className="rule-hint">
+        {live
+          ? 'A new draft is created from the live policy with this change, pinned to the live revision. The live policy is unchanged until that draft is published through the ordinary review.'
+          : 'The change becomes an unsaved edit of the open draft. The whole draft text is written out again, as the structured editors do; review it in Source.'}{' '}
+        Simulate, test and analyze it again before publishing.
+      </p>
+      <div className="form-actions">
+        <button
+          type="button"
+          className="primary-button"
+          disabled={blocked}
+          aria-describedby={blocked ? blockerId : undefined}
+          onClick={() => {
+            if (!blocked) onApply();
+          }}
+        >
+          {widening ? `${action}, accepting the ${patch.accessEffect} effect` : action}
+        </button>
+        <button type="button" className="secondary-button" onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+      {blocked ? (
+        <p className="rule-hint" id={blockerId}>
+          {startDraftBlocker}
+        </p>
+      ) : null}
+    </div>
   );
 }
 

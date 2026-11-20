@@ -632,9 +632,15 @@ Not part of this slice, and not to be inferred from it:
   to this endpoint and reports the gateway's run, as JSON or the gateway's
   own JUnit report; it does not run cases itself.
 
-The admin UI's Policy Studio has a Test view over this API (#243 slice 18).
-It keeps the suite in page memory only, runs it against the live policy under
+The admin UI's Policy Studio has a Test view over this API (#243 item 18).
+It edits the cases in page memory, runs them against the live policy under
 `If-Match` or against the open draft's text as a candidate, and never shows an
-incomplete or refused case as a pass. It does not read or write the stored
-suite yet. See **Policy Studio workbench** in
+incomplete or refused case as a pass. It reads the stored suite, loads it
+into the cases on screen after asking, runs it by reference pinned to the
+ETag on screen, and stores the cases on screen as its next version under
+`If-None-Match: *` or `If-Match` after a confirmation. A save whose answer is
+lost is resolved by reading the stored suite, never by sending it again. A
+draft publication the required suite refuses is shown with its
+`required_tests` status and counts, with a way to run the stored suite
+against the draft. See **Policy Studio workbench** in
 [the configuration reference](configuration.md#policy_file).
