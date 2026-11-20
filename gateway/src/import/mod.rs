@@ -27,10 +27,11 @@
 //!   emptiness and writes NOTHING. It reports the counts and checksums an
 //!   apply would produce, so a cutover rehearsal is free.
 //! - `--apply` performs the import. Under
-//!   `AUTHORITY_EVIDENCE_DURABILITY=required` it is refused before anything
-//!   is read or opened ([`ImportError::AuthorityEvidenceUnsupported`]): only
-//!   the policy and tools activations record authority evidence. The dry run
-//!   is not refused.
+//!   `AUTHORITY_EVIDENCE_DURABILITY=required` an apply into a cluster
+//!   target is refused before anything is read or opened
+//!   ([`ImportError::AuthorityEvidenceUnsupported`]): only the policy and
+//!   tools activations record authority evidence. The dry run is not
+//!   refused.
 //! - `--apply --resume` re-runs an import interrupted after some sections
 //!   committed. Each section is its own transaction, so an interrupted run
 //!   leaves whole sections committed and nothing partial; a resumed
@@ -649,8 +650,11 @@ pub(crate) async fn run(
     // are refused before the source is read or the target opened, because
     // only the policy and tools activations below record authority
     // evidence. The dry run writes nothing and is not asked. The gate reads
-    // this command's own environment, not a mode the fleet recorded.
-    if request.mode.writes() {
+    // this command's own environment, not a mode the fleet recorded. Only a
+    // cluster target is asked: the gate calls the import unavailable in
+    // standalone mode, and a standalone target keeps its own refusal,
+    // `target_not_postgres`, below.
+    if request.mode.writes() && target.state_backend == crate::config::StateBackend::Postgres {
         if let Some(refusal) =
             crate::authority_events::required::AuthorityEvidenceGate::from_config(target)
                 .refusal(crate::authority_events::required::AuthorityOperation::ConfigurationImport)

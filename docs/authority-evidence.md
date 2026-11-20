@@ -1300,7 +1300,8 @@ Enforcement:
   was changed` and a non-zero exit. Only its policy and tools activations record
   evidence; its Connections, audit, discovery and token sections commit none, and
   the owner ruled (2026-11-20) that the writing form is refused rather than given
-  per-section evidence. The default `--dry-run` writes nothing and still runs. An
+  per-section evidence. The default `--dry-run` writes nothing and still runs. Only
+  a cluster target asks: one that is not cluster mode still gets `target_not_postgres`. An
   offline command's gate follows that command's own environment: the import is
   refused when the environment it runs with sets `required`, and not because the
   fleet's replicas run with it.

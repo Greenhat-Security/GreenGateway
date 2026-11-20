@@ -2139,11 +2139,16 @@ async fn a_second_apply_is_refused_and_the_source_survives_the_cutover() {
 /// matches on them, so each is provoked and asserted by name, and the
 /// message is checked for what it must NOT carry as well as what it must.
 ///
-/// Fifteen of the nineteen codes are provoked by this drill: twelve here,
+/// Fifteen of the twenty codes are provoked by this drill: twelve here,
 /// and `target_namespace_not_empty`, `section_failed` and `store_failure`
 /// in the rollback and resume drills, where the state they need already
-/// exists. The remaining **four** are not provoked anywhere in this suite,
-/// and each for a reason rather than by omission:
+/// exists. A sixteenth, `authority_evidence_unsupported` (the writing
+/// forms under `AUTHORITY_EVIDENCE_DURABILITY=required`, issue #425), is
+/// provoked through the real binary outside this suite, by
+/// `gateway/tests/audit_durability_startup.rs`'s
+/// `the_import_writes_nothing_under_required_and_its_dry_run_still_runs`.
+/// The remaining **four** are not provoked anywhere in this suite, and
+/// each for a reason rather than by omission:
 ///
 /// * `target_deployment_id_missing` is **unreachable through the CLI**.
 ///   `Config::from_env` refuses `STATE_BACKEND=postgres` with no

@@ -443,6 +443,52 @@ async fn a_dry_run_import_under_required_still_runs() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// The evidence gate is asked only of a cluster target. A target that is
+/// not PostgreSQL keeps the refusal it had before the gate existed,
+/// `target_not_postgres`, under `required` as under `best_effort` and in
+/// every mode, rather than the gate's "standalone mode does not perform
+/// it", whose documented remedy (`best_effort`) would only lead to the same
+/// `target_not_postgres`.
+#[tokio::test]
+async fn a_standalone_target_under_required_is_still_refused_as_not_postgres() {
+    let directory = temp_directory("required-standalone-target");
+    let policy_file = directory.join("policy.json");
+    std::fs::write(
+        &policy_file,
+        r#"{"schema_version":"0.1.0","id":"v0-live","default_action":"deny"}"#,
+    )
+    .expect("the policy file should write");
+    let env_file = directory.join("standalone.env");
+    std::fs::write(
+        &env_file,
+        format!("POLICY_FILE={}\n", policy_file.display()),
+    )
+    .expect("the environment file should write");
+    let mut target = Config::test_defaults();
+    target.state_backend = crate::config::StateBackend::Sqlite;
+    for durability in [
+        crate::config::AuthorityEvidenceDurability::Required,
+        crate::config::AuthorityEvidenceDurability::BestEffort,
+    ] {
+        target.authority_events.durability = durability;
+        for mode in [ImportMode::DryRun, ImportMode::Apply, ImportMode::Resume] {
+            let request = ImportRequest {
+                standalone_env_file: env_file.clone(),
+                mode,
+            };
+            let Err(refused) = run(&request, &target).await else {
+                panic!("{durability:?} {mode:?} against a standalone target must be refused");
+            };
+            assert_eq!(
+                refused.code(),
+                "target_not_postgres",
+                "{durability:?} {mode:?}: {refused}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 /// A keyring declaration for a fixture configuration. It names a key
 /// FILE, not key material -- the file is never read by validation and
 /// never exists here.
