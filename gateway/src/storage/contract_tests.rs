@@ -7699,6 +7699,195 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(evidence[0].expires_at, None);
     }
 
+    /// The JWT revocation's evidence, outbox and journal rows, and the
+    /// shared security revision, as the natural-key tests compare them.
+    async fn jwt_revocation_footprint(pool: &deadpool_postgres::Pool) -> [i64; 4] {
+        [
+            scalar_i64(
+                pool,
+                "SELECT COUNT(*) FROM greengateway.jwt_revocation_evidence",
+            )
+            .await,
+            scalar_i64(
+                pool,
+                "SELECT COUNT(*) FROM greengateway.security_outbox \
+                 WHERE resource_type = 'jwt_revocation'",
+            )
+            .await,
+            scalar_i64(
+                pool,
+                "SELECT COUNT(*) FROM greengateway.authority_event_journal \
+                 WHERE source = 'jwt_revocation_evidence'",
+            )
+            .await,
+            scalar_i64(
+                pool,
+                "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton",
+            )
+            .await,
+        ]
+    }
+
+    /// `gateway revoke-jwt` has no caller key: it is reconciled by its
+    /// natural key, the issuer-scoped JTI digest (issue #425). Characterizes
+    /// behaviour that predates this test: repeating a revoke that is still
+    /// effective -- the same expiry, an earlier one, or any expiry or none
+    /// over an unbounded entry -- reports `AlreadyRevoked` and records no
+    /// second evidence row, outbox row or journal entry, and spends no
+    /// shared security revision.
+    #[tokio::test]
+    async fn repeating_an_effective_jwt_revoke_records_no_second_evidence_row() {
+        use crate::storage::JwtRevocationOutcome;
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_tokens, pool) = migrated_service_token_store(&database).await;
+        let store = crate::storage::PostgresJwtRevocationStore::new(
+            pool.clone(),
+            "deploy-jwt-repeat",
+            "https://issuer.example",
+        );
+        let actor = ChangeActor::system("operator:revoke-jwt");
+        let in_seconds = |seconds: u64| {
+            (time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(seconds))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("rfc3339")
+        };
+        let bounded = in_seconds(600);
+        let earlier = in_seconds(300);
+        for (jti, expires_at) in [
+            ("jti-bounded", Some(bounded.as_str())),
+            ("jti-unbounded", None),
+        ] {
+            assert!(
+                matches!(
+                    store
+                        .revoke(jti, expires_at, &actor)
+                        .await
+                        .expect("the first revoke"),
+                    JwtRevocationOutcome::Revoked { .. }
+                ),
+                "{jti}"
+            );
+        }
+        let after_first = jwt_revocation_footprint(&pool).await;
+        assert_eq!(after_first[..3], [2, 2, 2], "one row of each per revoke");
+
+        for (jti, expires_at) in [
+            ("jti-bounded", Some(bounded.as_str())),
+            ("jti-bounded", Some(earlier.as_str())),
+            ("jti-unbounded", None),
+            ("jti-unbounded", Some(bounded.as_str())),
+        ] {
+            assert_eq!(
+                store
+                    .revoke(jti, expires_at, &ChangeActor::system("another-operator"))
+                    .await
+                    .expect("the repeat"),
+                JwtRevocationOutcome::AlreadyRevoked,
+                "{jti} {expires_at:?}"
+            );
+        }
+        assert_eq!(
+            jwt_revocation_footprint(&pool).await,
+            after_first,
+            "a repeat of an effective revoke records nothing and spends no revision"
+        );
+        assert_eq!(
+            jwt_evidence_rows(&pool)
+                .await
+                .iter()
+                .map(|row| row.actor_user_id.as_str())
+                .collect::<Vec<_>>(),
+            ["operator:revoke-jwt", "operator:revoke-jwt"],
+            "the evidence still names only the revokes that changed the denylist"
+        );
+    }
+
+    /// The other half of the natural-key reconciliation: a repeat that
+    /// extends the entry -- a later expiry, then no expiry -- changes the
+    /// denylist (`ON CONFLICT ... DO UPDATE`) and records exactly one more
+    /// evidence row, outbox row and journal entry each time, at the next
+    /// shared security revision. Characterizes behaviour that predates this
+    /// test; the reactivation of an expired entry is covered by
+    /// `jwt_revocation_evidence_survives_extension_reactivation_and_cleanup`.
+    #[tokio::test]
+    async fn extending_a_jwt_revocation_records_exactly_one_more_evidence_row() {
+        use crate::storage::JwtRevocationOutcome;
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_tokens, pool) = migrated_service_token_store(&database).await;
+        let store = crate::storage::PostgresJwtRevocationStore::new(
+            pool.clone(),
+            "deploy-jwt-extend",
+            "https://issuer.example",
+        );
+        let actor = ChangeActor::system("operator:revoke-jwt");
+        let in_seconds = |seconds: u64| {
+            (time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(seconds))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("rfc3339")
+        };
+        let first = in_seconds(300);
+        let later = in_seconds(600);
+        let mut expected = None;
+        for (step, expires_at) in [Some(first.as_str()), Some(later.as_str()), None]
+            .into_iter()
+            .enumerate()
+        {
+            let before = jwt_revocation_footprint(&pool).await;
+            let outcome = store
+                .revoke("jti-extended", expires_at, &actor)
+                .await
+                .expect("the revoke or its extension");
+            assert_eq!(
+                outcome,
+                JwtRevocationOutcome::Revoked {
+                    security_revision: before[3] + 1
+                },
+                "step {step}"
+            );
+            let after = jwt_revocation_footprint(&pool).await;
+            assert_eq!(
+                after,
+                [before[0] + 1, before[1] + 1, before[2] + 1, before[3] + 1],
+                "step {step}: exactly one more row of each"
+            );
+            expected = Some(after);
+        }
+        assert_eq!(
+            store
+                .revoke("jti-extended", None, &actor)
+                .await
+                .expect("the repeat"),
+            JwtRevocationOutcome::AlreadyRevoked,
+            "an unbounded entry cannot be extended further"
+        );
+        assert_eq!(Some(jwt_revocation_footprint(&pool).await), expected);
+        let evidence = jwt_evidence_rows(&pool).await;
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|row| row.expires_at.is_some())
+                .collect::<Vec<_>>(),
+            [true, true, false],
+            "each row records the expiry the denylist held after its change"
+        );
+        assert!(evidence[1].expires_at > evidence[0].expires_at);
+        assert_eq!(
+            scalar_i64(&pool, "SELECT COUNT(*) FROM greengateway.jwt_revocations").await,
+            1,
+            "one denylist entry, extended in place"
+        );
+    }
+
     /// A verify that lands after a revoke reports Revoked and writes
     /// nothing: last_used_at is exactly what it was before the revoke.
     #[tokio::test]

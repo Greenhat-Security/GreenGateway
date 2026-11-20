@@ -4,8 +4,9 @@
 //! refused at startup rather than served in a mode that would quietly
 //! downgrade to best effort -- or refuse every request. These rows run the
 //! real binary with a cleared environment, so what they observe is what an
-//! operator who sets nothing gets. The last row runs it under
-//! `AUTHORITY_EVIDENCE_DURABILITY=required`, which refuses to start at all.
+//! operator who sets nothing gets. The last two rows run it under
+//! `AUTHORITY_EVIDENCE_DURABILITY=required`, which refuses to start at all
+//! and refuses the offline import's writing forms.
 
 use std::{
     io::{Read, Write},
@@ -311,4 +312,66 @@ fn required_authority_evidence_exits_before_writing_anything() {
         assert!(!message.contains(MARKER), "{mode}: {message}");
         assert_eq!(directory.entries(), Vec::<PathBuf>::new(), "{mode}");
     }
+}
+
+/// `gateway import-standalone` under `AUTHORITY_EVIDENCE_DURABILITY=required`
+/// at the process boundary (issue #425, owner ruling of 2026-11-20). The
+/// writing forms print the gate's value-free refusal and exit with status 1
+/// before reading the `--from` file or the target's DSN file, neither of
+/// which exists; the dry run gets past the gate and fails on reading the
+/// `--from` file. Nothing is written in either case.
+#[cfg(feature = "postgres")]
+#[test]
+fn the_import_writes_nothing_under_required_and_its_dry_run_still_runs() {
+    const MARKER: &str = "import-refusal-marker";
+    let directory = EmptyDirectory::new("authority-evidence-import");
+    let inside = |name: &str| directory.0.join(format!("{MARKER}-{name}"));
+    let from = inside("standalone.env");
+    let import = |arguments: &[&str]| {
+        let mut command = gateway();
+        command
+            .current_dir(&directory.0)
+            .arg("import-standalone")
+            .arg("--from")
+            .arg(&from)
+            .args(arguments)
+            .env("AUTHORITY_EVIDENCE_DURABILITY", "required")
+            .env("AUTHORITY_EVENT_SINK", "log")
+            .env("AUTHORITY_PSEUDONYM_KEY_ALIAS", format!("{MARKER}-alias"))
+            .env("UPSTREAM_URL", format!("https://{MARKER}.invalid"))
+            .env("STATE_BACKEND", "postgres")
+            .env("DEPLOYMENT_ID", format!("{MARKER}-deployment"))
+            .env("DATABASE_URL_FILE", inside("database-url"))
+            .env("CONNECTION_SECRETS_ROOT", inside("secrets"))
+            .env(
+                "RATE_LIMIT_KEYRING",
+                r#"[{"id":"rl-primary","file":"rate-limit-key","role":"primary"}]"#,
+            );
+        run_to_refusal(command)
+    };
+    for arguments in [&["--apply"][..], &["--apply", "--resume"][..]] {
+        let output = import(arguments);
+        let message = stderr(&output);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}: {message}");
+        assert!(
+            message.lines().any(|line| line
+                == "Error: authority_evidence_unsupported: AUTHORITY_EVIDENCE_DURABILITY=required refuses configuration.import: cluster mode records evidence for only part of it; nothing was changed"),
+            "{arguments:?}: {message}"
+        );
+        assert!(!message.contains(MARKER), "{arguments:?}: {message}");
+    }
+    for arguments in [&[][..], &["--dry-run"][..]] {
+        let output = import(arguments);
+        let message = stderr(&output);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}: {message}");
+        assert!(
+            message.contains("Error: standalone_env_file_unreadable: "),
+            "{arguments:?}: {message}"
+        );
+        assert!(
+            !message.contains("authority_evidence_unsupported"),
+            "{arguments:?}: {message}"
+        );
+    }
+    assert_eq!(directory.entries(), Vec::<PathBuf>::new());
 }

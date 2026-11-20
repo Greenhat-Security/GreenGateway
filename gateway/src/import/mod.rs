@@ -26,7 +26,11 @@
 //! - `--dry-run` (the default) reads the source and the target's
 //!   emptiness and writes NOTHING. It reports the counts and checksums an
 //!   apply would produce, so a cutover rehearsal is free.
-//! - `--apply` performs the import.
+//! - `--apply` performs the import. Under
+//!   `AUTHORITY_EVIDENCE_DURABILITY=required` it is refused before anything
+//!   is read or opened ([`ImportError::AuthorityEvidenceUnsupported`]): only
+//!   the policy and tools activations record authority evidence. The dry run
+//!   is not refused.
 //! - `--apply --resume` re-runs an import interrupted after some sections
 //!   committed. Each section is its own transaction, so an interrupted run
 //!   leaves whole sections committed and nothing partial; a resumed
@@ -371,6 +375,11 @@ pub(crate) enum ImportError {
     TargetNamespaceNotEmpty {
         occupied: Vec<String>,
     },
+    /// `AUTHORITY_EVIDENCE_DURABILITY=required` in the process environment
+    /// refuses the writing forms (issue #425): the import records authority
+    /// evidence for its policy and tools activations only. Asked before the
+    /// source is read or the target opened, so nothing was read or written.
+    AuthorityEvidenceUnsupported(crate::authority_events::required::EvidenceRefusal),
     /// A section found its resource already initialized with something
     /// other than what this import would write. `--resume` cannot repair
     /// that: the namespace is another import's, or a cluster's.
@@ -412,6 +421,10 @@ impl ImportError {
             Self::TargetDeploymentMismatch { .. } => "target_deployment_mismatch",
             Self::TargetOperationRefused { .. } => "target_operation_refused",
             Self::TargetNamespaceNotEmpty { .. } => "target_namespace_not_empty",
+            // The gate's own stable reason, as an admin API refusal carries it.
+            Self::AuthorityEvidenceUnsupported(_) => {
+                crate::authority_events::required::REFUSAL_REASON
+            }
             Self::SectionConflict { .. } => "section_conflict",
             Self::SectionFailed { .. } => "section_failed",
             Self::ValidationFailed { .. } => "validation_failed",
@@ -499,6 +512,7 @@ impl fmt::Display for ImportError {
                  interrupted import",
                 occupied.join(", ")
             ),
+            Self::AuthorityEvidenceUnsupported(refusal) => formatter.write_str(&refusal.message()),
             Self::SectionConflict { section } => write!(
                 formatter,
                 "the {section} section's resource is already initialized with a different \
@@ -629,6 +643,21 @@ pub(crate) async fn run(
     use crate::storage::postgres::PostgresFoundation;
 
     let started = Instant::now();
+
+    // Section 0: whether the process environment lets this command write at
+    // all. Under AUTHORITY_EVIDENCE_DURABILITY=required the writing forms
+    // are refused before the source is read or the target opened, because
+    // only the policy and tools activations below record authority
+    // evidence. The dry run writes nothing and is not asked. The gate reads
+    // this command's own environment, not a mode the fleet recorded.
+    if request.mode.writes() {
+        if let Some(refusal) =
+            crate::authority_events::required::AuthorityEvidenceGate::from_config(target)
+                .refusal(crate::authority_events::required::AuthorityOperation::ConfigurationImport)
+        {
+            return Err(ImportError::AuthorityEvidenceUnsupported(refusal));
+        }
+    }
 
     // Section 1a: the source. Every SQLite read and every document parse
     // is blocking work; a one-shot command still owes the runtime the

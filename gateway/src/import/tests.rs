@@ -78,6 +78,16 @@ fn every_refusal_carries_a_stable_code() {
         .code(),
         "target_operation_refused"
     );
+    let refusal = crate::authority_events::required::AuthorityEvidenceGate::new(
+        crate::config::AuthorityEvidenceDurability::Required,
+        crate::config::StateBackend::Postgres,
+    )
+    .refusal(crate::authority_events::required::AuthorityOperation::ConfigurationImport)
+    .expect("required mode refuses the writing import");
+    assert_eq!(
+        ImportError::AuthorityEvidenceUnsupported(refusal).code(),
+        "authority_evidence_unsupported"
+    );
 }
 
 /// The report's "not imported" list and the list the validation pass
@@ -347,6 +357,89 @@ fn a_cluster_configuration_as_the_source_is_refused() {
         "standalone_config_is_not_standalone",
         "{error}"
     );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// A target configuration under `AUTHORITY_EVIDENCE_DURABILITY=required`
+/// whose DSN file is a path inside `directory` that does not exist.
+fn required_target(directory: &Path) -> Config {
+    let mut config = Config::test_defaults();
+    config.state_backend = crate::config::StateBackend::Postgres;
+    config.deployment_id = Some("deploy-import-required".to_owned());
+    config.database.url_file = Some(directory.join("database-url").display().to_string());
+    config.authority_events.durability = crate::config::AuthorityEvidenceDurability::Required;
+    config
+}
+
+fn entries(directory: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(directory)
+        .expect("the directory should be readable")
+        .map(|entry| entry.expect("the entry should be readable").path())
+        .collect()
+}
+
+/// The import's writing forms record authority evidence for two of their
+/// sections only, so `AUTHORITY_EVIDENCE_DURABILITY=required` refuses them
+/// (owner ruling 7 on issue #425) before anything is read or opened. The
+/// `--from` file and the target's DSN file named here do not exist, so the
+/// command would fail on the first thing it read or opened; the refusal
+/// comes first, with the gate's stable reason as its code. The same
+/// requests under `best_effort` fail on reading the `--from` file, which
+/// shows what the refusal stopped. Nothing is written: the directory both
+/// paths name stays empty.
+#[tokio::test]
+async fn a_writing_import_under_required_exits_before_opening_the_target_store() {
+    let directory = temp_directory("required-apply");
+    let mut target = required_target(&directory);
+    let request = |mode| ImportRequest {
+        standalone_env_file: directory.join("standalone.env"),
+        mode,
+    };
+    for mode in [ImportMode::Apply, ImportMode::Resume] {
+        let Err(refused) = run(&request(mode), &target).await else {
+            panic!("{mode:?} under required must be refused");
+        };
+        assert_eq!(refused.code(), "authority_evidence_unsupported", "{mode:?}");
+        assert_eq!(
+            refused.to_string(),
+            "authority_evidence_unsupported: AUTHORITY_EVIDENCE_DURABILITY=required refuses configuration.import: cluster mode records evidence for only part of it; nothing was changed",
+            "{mode:?}"
+        );
+    }
+    target.authority_events.durability = crate::config::AuthorityEvidenceDurability::BestEffort;
+    for mode in [ImportMode::Apply, ImportMode::Resume] {
+        let Err(unread) = run(&request(mode), &target).await else {
+            panic!("{mode:?} with no --from file cannot succeed");
+        };
+        assert_eq!(unread.code(), "standalone_env_file_unreadable", "{mode:?}");
+    }
+    assert_eq!(entries(&directory), Vec::<PathBuf>::new());
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// The dry run writes nothing, so `AUTHORITY_EVIDENCE_DURABILITY=required`
+/// does not refuse it: in its default and its explicit spelling it gets
+/// past the gate and fails only on reading the `--from` file, which does
+/// not exist here. `database::a_dry_run_under_required_plans_every_section_and_writes_nothing`
+/// runs one to completion against a real target.
+#[tokio::test]
+async fn a_dry_run_import_under_required_still_runs() {
+    let directory = temp_directory("required-dry-run");
+    let target = required_target(&directory);
+    let from = directory.join("standalone.env").display().to_string();
+    for arguments in [vec!["--from", &from], vec!["--from", &from, "--dry-run"]] {
+        let request = ImportRequest::parse(words(&arguments)).expect("the arguments parse");
+        assert_eq!(request.mode, ImportMode::DryRun);
+        let Err(unread) = run(&request, &target).await else {
+            panic!("a dry run with no --from file cannot succeed");
+        };
+        assert_eq!(
+            unread.code(),
+            "standalone_env_file_unreadable",
+            "{arguments:?}: {unread}"
+        );
+    }
+    assert_eq!(entries(&directory), Vec::<PathBuf>::new());
     let _ = std::fs::remove_dir_all(&directory);
 }
 
@@ -2862,6 +2955,72 @@ mod database {
             panic!("a dry run into a filled namespace must be refused");
         };
         assert_eq!(refused.code(), "target_namespace_not_empty");
+    }
+
+    /// Under `AUTHORITY_EVIDENCE_DURABILITY=required` the dry run still
+    /// plans every section against a real target and writes nothing, while
+    /// the apply against the same target is refused before it writes
+    /// anything either: the namespace and the deployment binding are as the
+    /// dry run found them.
+    #[tokio::test]
+    async fn a_dry_run_under_required_plans_every_section_and_writes_nothing() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (mut config, _dsn_file) =
+            target_config(&database.dsn, "deploy-import-required-dry-run");
+        config.authority_events.durability = crate::config::AuthorityEvidenceDurability::Required;
+        let pool = migrate(&config).await;
+        let fixture = build_fixture("required-dry-run", 2, 4);
+        let before = super::super::preflight::occupied_namespace(&pool)
+            .await
+            .expect("the namespace should be readable");
+        assert!(
+            before.is_empty(),
+            "the fixture starts on an empty namespace"
+        );
+        let binding_before = crate::storage::postgres::read_deployment_binding(&pool)
+            .await
+            .expect("the binding should be readable");
+
+        let planned = run(&request(&fixture, ImportMode::DryRun), &config)
+            .await
+            .expect("the dry run should succeed under required");
+        assert_eq!(planned.validation.status, "planned");
+        assert_eq!(
+            planned
+                .sections
+                .iter()
+                .map(|section| (section.section, section.status))
+                .collect::<Vec<_>>(),
+            [
+                ("policy", "planned"),
+                ("tools", "planned"),
+                ("connections", "planned"),
+                ("audit", "planned"),
+                ("observations_and_discovery", "planned"),
+                ("principals_and_service_tokens", "planned"),
+            ]
+        );
+        let Err(refused) = run(&request(&fixture, ImportMode::Apply), &config).await else {
+            panic!("the apply must be refused under required");
+        };
+        assert_eq!(refused.code(), "authority_evidence_unsupported");
+
+        assert_eq!(
+            super::super::preflight::occupied_namespace(&pool)
+                .await
+                .expect("the namespace should be readable"),
+            before
+        );
+        assert_eq!(
+            crate::storage::postgres::read_deployment_binding(&pool)
+                .await
+                .expect("the binding should be readable"),
+            binding_before
+        );
     }
 
     /// The two step-8 properties that would otherwise be assertions about

@@ -9,7 +9,7 @@
 //! `required_mode` for every row is the contract; [`AuthorityOperation`]'s
 //! table is its executable half, and a test holds the two together.
 //!
-//! Three places enforce it:
+//! Four places enforce it:
 //!
 //! - **Startup.** A configuration that enables an unsupported change on its
 //!   own (`ADMIN_SESSION_MODE=standalone_memory`), or a gateway of either mode
@@ -26,9 +26,15 @@
 //! - **Background activations.** A policy or tools file reload (file watcher
 //!   or `SIGHUP`) asks through [`BackgroundEvidenceGate`]; a refused reload
 //!   keeps the active document.
+//! - **The offline import.** `gateway import-standalone` asks
+//!   [`AuthorityEvidenceGate::refusal`] for its writing forms before it
+//!   reads the source or opens the target, under the command's own
+//!   environment; a refusal ends the command with nothing read or written.
 //!
-//! Each refusal is logged and audited as `authority_evidence.operation_refused`
-//! with the operation's inventory code, the deployment mode and what asked.
+//! Each refusal of a request or a background activation is logged and
+//! audited as `authority_evidence.operation_refused` with the operation's
+//! inventory code, the deployment mode and what asked; the offline import,
+//! which has no audit log of its own, prints its refusal and exits.
 //! The gate reads configuration only: it never waits on a store, a sink or a
 //! dispatcher, so no request -- an admin change or a proxied call -- waits on
 //! a downstream acknowledgement because of it. Under `best_effort`, the
@@ -71,9 +77,12 @@ pub(crate) enum AuthorityOperation {
     /// OpenAPI tools registered through the admin API, or a watched or
     /// signalled reload of `TOOLS_FILE`.
     ToolsPublish,
-    /// The offline import's activation of a policy or tools document. Only
-    /// cluster mode has one, and it records it; it is listed so that every
-    /// document action names an operation.
+    /// The offline import (`gateway import-standalone`). Only cluster mode
+    /// has one. Its policy and tools activations record evidence, but its
+    /// Connections, audit, discovery and token sections commit without any,
+    /// so required mode refuses its writing forms before anything is read
+    /// or opened (owner ruling 7 on issue #425, 2026-11-20); the dry run
+    /// writes nothing and is not asked. The document action names it too.
     ConfigurationImport,
     /// The stored policy test suite replaced or first stored (issue #243).
     PolicyTestsPublish,
@@ -161,7 +170,9 @@ impl AuthorityOperation {
     /// and their optional history are separate steps, and the stored
     /// policy test suite's versions name only the writer's subject. (The
     /// Connections database records catalog and overlay publication in its
-    /// own transaction, so those operations are not listed.)
+    /// own transaction, so those operations are not listed.) The offline
+    /// import is refused in cluster mode because it records evidence for
+    /// only two of its sections.
     pub(crate) const fn required_mode(self, backend: StateBackend) -> RequiredMode {
         match backend {
             StateBackend::Postgres => match self {
@@ -169,7 +180,8 @@ impl AuthorityOperation {
                 Self::MutationApprovalPrepare => RequiredMode::CallerKeyRequired,
                 Self::MutationApprovalConsume
                 | Self::MutationApprovalReview
-                | Self::MutationApprovalRevoke => RequiredMode::Refused,
+                | Self::MutationApprovalRevoke
+                | Self::ConfigurationImport => RequiredMode::Refused,
                 Self::PolicyPublish
                 | Self::PolicyRollback
                 | Self::PolicyRuleCreate
@@ -178,7 +190,6 @@ impl AuthorityOperation {
                 | Self::PolicyRuleReorder
                 | Self::PolicySuggestionAccept
                 | Self::ToolsPublish
-                | Self::ConfigurationImport
                 | Self::PolicyTestsPublish => RequiredMode::Admitted,
             },
             StateBackend::Sqlite => match self {
@@ -216,12 +227,17 @@ impl EvidenceRefusal {
     /// The operator-facing explanation, naming the operation and the mode
     /// and never anything from the request.
     pub(crate) fn message(&self) -> String {
-        let why = match self.mode {
-            RequiredMode::CallerKeyRequired => {
+        let why = match (self.mode, self.operation) {
+            (RequiredMode::CallerKeyRequired, _) => {
                 "requires a caller-bound preparation with qualified_v1"
             }
-            RequiredMode::Unavailable => "does not perform it",
-            RequiredMode::Admitted | RequiredMode::Refused => "records no durable evidence of it",
+            (RequiredMode::Unavailable, _) => "does not perform it",
+            (RequiredMode::Refused, AuthorityOperation::ConfigurationImport) => {
+                "records evidence for only part of it"
+            }
+            (RequiredMode::Admitted | RequiredMode::Refused, _) => {
+                "records no durable evidence of it"
+            }
         };
         format!(
             "AUTHORITY_EVIDENCE_DURABILITY=required refuses {}: {} mode {why}; nothing was changed",
