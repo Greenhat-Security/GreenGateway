@@ -1039,6 +1039,8 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
                 storage::postgres_discovery::PostgresDiscoveryStore::new(seed.pool.clone()),
             )),
             authority_event_retention: config.authority_events.retention(),
+            authority_event_hold_without_cursor:
+                cluster_maintenance::holds_a_journal_without_a_cursor(&config.authority_events),
             lease_holder: seed.instance_id,
             tool_lease_ttl: config.tool_lease_ttl(),
         });

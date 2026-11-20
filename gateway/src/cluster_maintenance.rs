@@ -46,7 +46,8 @@
 //!   member rows, audit events past `AUDIT_POSTGRES_RETENTION_DAYS` (never
 //!   past the retention floor, see [`AuditRetentionFloor`]), delivered
 //!   authority-event journal rows past `AUTHORITY_EVENT_RETENTION_HOURS`
-//!   (never above the dispatcher's cursor, see [`AuthorityEventRetention`]),
+//!   (never above the dispatcher's cursor, and under required durability
+//!   never before one exists, see [`AuthorityEventRetention`]),
 //!   and lease rows expired for more than one TTL. A failing job is logged,
 //!   recorded in the ledger with its classified code, and never blocks the
 //!   next one.
@@ -79,6 +80,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
+    config::{AuthorityEventSettings, AuthorityEvidenceDurability},
     connections::local_secret::LocalSecretKeyring,
     lifecycle::GatewayLifecycle,
     metrics::{
@@ -384,13 +386,34 @@ impl MaintenanceJob for AuditRetention {
 ///
 /// The cursor is the floor: a row above it is undelivered and stays, however
 /// old, holding its unit of capacity. Only before any dispatcher has claimed
-/// the cursor, and only while no keyed prepare has committed, may age alone decide. The
-/// evidence tables the journal indexes are never touched. Publishing the
-/// gauges here means a deployment with no sink configured, where no
-/// dispatcher runs, still sees its journal fill toward capacity.
+/// the cursor, only under best-effort durability, and only while no keyed
+/// prepare has committed, may age alone decide. The evidence tables the
+/// journal indexes are never touched. Publishing the gauges here means a
+/// deployment with no sink configured, where no dispatcher runs, still sees
+/// its journal fill toward capacity.
 pub(crate) struct AuthorityEventRetention {
     pub(crate) retention: Duration,
     pub(crate) limit: u32,
+    /// Whether a journal with no cursor is held whole rather than pruned by
+    /// age ([`holds_a_journal_without_a_cursor`]).
+    pub(crate) hold_without_cursor: bool,
+}
+
+/// Whether retention holds a journal that no dispatcher has claimed a cursor
+/// over (issue #425). Under `AUTHORITY_EVIDENCE_DURABILITY=required` it does:
+/// every committed change's evidence must reach a consumer, and required
+/// mode always configures a sink, so the hold lasts only while delivery has
+/// not established its cursor. Under `best_effort` it does not, so a
+/// deployment with no sink keeps pruning by age whatever its callers send.
+///
+/// The hold follows the configuration of whichever process runs the pass:
+/// the replica holding the maintenance lease, or `gateway maintenance-run`.
+/// Neither asks the membership gate before taking the lease, so a replica
+/// held at the fingerprint door, or a one-shot run with a different
+/// `AUTHORITY_EVIDENCE_DURABILITY`, applies its own value. Every process that
+/// can take the lease must carry the fleet's durability.
+pub(crate) fn holds_a_journal_without_a_cursor(settings: &AuthorityEventSettings) -> bool {
+    settings.durability == AuthorityEvidenceDurability::Required
 }
 
 #[async_trait]
@@ -400,8 +423,13 @@ impl MaintenanceJob for AuthorityEventRetention {
     }
 
     async fn run_step(&self, client: &tokio_postgres::Client) -> Result<u64, RepositoryError> {
-        let removed =
-            PostgresAuthorityEventStore::prune_with(client, self.retention, self.limit).await?;
+        let removed = PostgresAuthorityEventStore::prune_with(
+            client,
+            self.retention,
+            self.limit,
+            self.hold_without_cursor,
+        )
+        .await?;
         match PostgresAuthorityEventStore::stats_with(client).await {
             Ok(stats) => crate::authority_events::dispatcher::record_journal_stats(&stats),
             Err(error) => {
@@ -450,6 +478,9 @@ pub(crate) struct StandardJobSources {
     pub(crate) audit_floor: Option<Arc<dyn AuditRetentionFloor>>,
     /// How long a delivered authority event stays in the journal.
     pub(crate) authority_event_retention: Duration,
+    /// Whether a journal with no cursor is held whole
+    /// ([`holds_a_journal_without_a_cursor`]).
+    pub(crate) authority_event_hold_without_cursor: bool,
     /// The reaper's own lease store identity and the tool lease TTL (its
     /// grace).
     pub(crate) lease_holder: Uuid,
@@ -502,6 +533,7 @@ pub(crate) fn standard_jobs(sources: StandardJobSources) -> Vec<Arc<dyn Maintena
     jobs.push(Arc::new(AuthorityEventRetention {
         retention: sources.authority_event_retention,
         limit: JOB_STEP_LIMIT,
+        hold_without_cursor: sources.authority_event_hold_without_cursor,
     }));
     jobs.push(Arc::new(ExecutionLeaseReaper {
         store: PostgresExecutionLeaseStore::new(
@@ -1089,5 +1121,20 @@ mod tests {
             *MAINTENANCE_LOCK_KEY,
             *crate::storage::postgres_audit::AUDIT_STREAM_LOCK_KEY
         );
+    }
+
+    /// Required durability holds a cursorless journal for its first
+    /// consumer; best effort keeps pruning it by age, whatever the sink and
+    /// format.
+    #[test]
+    fn only_required_durability_holds_a_journal_without_a_cursor() {
+        let mut settings = AuthorityEventSettings::default();
+        assert!(!holds_a_journal_without_a_cursor(&settings));
+        settings.format = crate::config::AuthorityEventFormat::QualifiedV1;
+        assert!(!holds_a_journal_without_a_cursor(&settings));
+        settings.durability = AuthorityEvidenceDurability::Required;
+        assert!(holds_a_journal_without_a_cursor(&settings));
+        settings.format = crate::config::AuthorityEventFormat::DeliveryV1;
+        assert!(holds_a_journal_without_a_cursor(&settings));
     }
 }

@@ -6808,7 +6808,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::commands::run_one_shot_command#1",
-      "sha256": "7606b550e6d877fbe23747cb751cfffa0f9653ca0ad12be7f1c87004d4baa079",
+      "sha256": "19db8574f6d5c2464e85e2795f9399b1cda8b636d27cd2e0bb2e23194a463a31",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -8158,7 +8158,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::authority_events::delivery::file_attributes#1",
-      "sha256": "4e67f17b406b983fddfa6428cc61429567ab81243bf58bb7950bf3adcad8b38f",
+      "sha256": "f0301a716b3b1f6c7ae059ebcccd6bd1786a770f17290c61a25a482d94adb6b1",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
     },
@@ -8269,7 +8269,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::cluster_maintenance::StandardJobSources#1",
-      "sha256": "2613cbc6040d3e9a9c98c14b81f1b7057aaea0b680026694b4bbbe4aab9e2285",
+      "sha256": "14e4c5dfa79b47f46b15fcd02387644193cdfd3a98bf0e50705bc241ebc5bb76",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -16122,7 +16122,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::cluster_maintenance::impl MaintenanceJob AuthorityEventRetention::run_step#1",
-      "sha256": "aafd32ef0210b49eff05897f323831285868e60fb0625e85408cb62ca210930b",
+      "sha256": "a0c7d28d9c5c90947b5a215d0308a2ec4ed87f83ce0a256cdb3830c0da09fda7",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -16284,7 +16284,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::impl  PostgresAuthorityEventStore::prune_with#1",
-      "sha256": "469aa5bf9bd516c92003f99c8611f750a68b8bb1b41b0c69dbbc9ecfcf251041",
+      "sha256": "e421cb7cd0393a195fd01b06b9768ee4ac955e2ed1793344fa2adbbff13ac5f3",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

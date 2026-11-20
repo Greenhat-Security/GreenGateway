@@ -46,7 +46,8 @@
 //! 5. **Retention** ([`PostgresAuthorityEventStore::prune_with`]). The
 //!    maintenance singleton deletes journal rows at or below every cursor and
 //!    older than the retention window, decrementing `retained_events` in the
-//!    same statement. It never touches an evidence table.
+//!    same statement. With no cursor, required durability holds the whole
+//!    journal. It never touches an evidence table.
 //!
 //! Lock order: a producer has already taken its own store's locks and the
 //! shared `security_revision_state` row when it appends, and the state row
@@ -630,19 +631,32 @@ impl PostgresAuthorityEventStore {
     /// singleton's dedicated connection): delete up to `limit` journal rows
     /// at or below every cursor's position and journaled at least
     /// `retention` ago on the database clock, lowest positions first, and
-    /// give their capacity back. A keyed prepare keeps the pre-claim backlog for its negotiated consumer.
+    /// give their capacity back.
+    ///
+    /// With no cursor there is no floor, and age alone decides unless the
+    /// journal must be held for its first consumer: always when
+    /// `hold_without_cursor` is set, which the maintenance job sets under
+    /// `AUTHORITY_EVIDENCE_DURABILITY=required` (issue #425), and otherwise
+    /// once a keyed prepare has committed, whose receipt has no other
+    /// delivered form. Required mode always configures a sink, so the hold
+    /// lasts only while delivery has not established its cursor.
+    ///
     /// The candidates come from a window of `limit x RETENTION_SCAN_FACTOR`
     /// rows walked by primary key, so the step never scans the backlog.
     pub(crate) async fn prune_with(
         client: &tokio_postgres::Client,
         retention: Duration,
         limit: u32,
+        hold_without_cursor: bool,
     ) -> Result<u64, RepositoryError> {
         let retention_secs = retention.as_secs_f64();
         let limit = i64::from(limit.clamp(1, MAX_RETENTION_BATCH));
         let window = limit.saturating_mul(RETENTION_SCAN_FACTOR);
         let row = client
-            .query_opt(PRUNE_SQL, &[&retention_secs, &limit, &window])
+            .query_opt(
+                PRUNE_SQL,
+                &[&retention_secs, &limit, &window, &hold_without_cursor],
+            )
             .await
             .map_err(|error| classify_query(error, OPERATION_RETENTION))?
             .ok_or_else(|| invalid_data(OPERATION_RETENTION))?;
@@ -733,8 +747,10 @@ LEFT JOIN greengateway.authority_event_cursors c ON c.consumer = 'dispatcher'
 WHERE s.singleton
 "#;
 
-/// `$1` retention seconds, `$2` the row limit, `$3` the scan window. The
-/// floor is the lowest cursor position; with no cursor there is none.
+/// `$1` retention seconds, `$2` the row limit, `$3` the scan window, `$4`
+/// whether a journal with no cursor is held whole. The floor is the lowest
+/// cursor position; with no cursor there is none, and only age decides
+/// unless `$4` or a committed keyed prepare holds the journal.
 const PRUNE_SQL: &str = r#"
 WITH floor AS (
     SELECT min(position) AS position FROM greengateway.authority_event_cursors
@@ -743,6 +759,7 @@ candidates AS (
     SELECT j.position, j.journaled_at
     FROM greengateway.authority_event_journal j
     WHERE ((SELECT position FROM floor) IS NULL
+           AND NOT $4::boolean
            AND NOT EXISTS (SELECT 1 FROM greengateway.mutation_approval_prepare_evidence))
        OR j.position <= (SELECT position FROM floor)
     ORDER BY j.position
@@ -941,5 +958,274 @@ mod tests {
             ..unclaimed
         };
         assert_eq!(raced.undelivered(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Retention against a real database. Each test gets its own database; a
+    // checkout without the harness locator skips, and CI runs them.
+    // -----------------------------------------------------------------------
+
+    use crate::{
+        auth::change_actor::ChangeActor,
+        storage::{
+            contract_tests::postgres_audit_tests::{
+                create_test_database, locator, write_dsn_file, TestDatabase, DATABASE,
+            },
+            migrations,
+            postgres::PostgresFoundation,
+            PostgresJwtRevocationStore,
+        },
+    };
+
+    const DEPLOYMENT: &str = "deploy-authority-event-retention";
+
+    async fn migrated_pool(database: &TestDatabase) -> deadpool_postgres::Pool {
+        let dsn_file = write_dsn_file(&database.dsn);
+        let mut config = crate::config::Config::test_defaults();
+        config.state_backend = crate::config::StateBackend::Postgres;
+        config.deployment_id = Some(DEPLOYMENT.to_owned());
+        config.database.url_file = Some(dsn_file.path.clone());
+        crate::storage::postgres::test_support::use_test_tls(&mut config.database);
+        let foundation = PostgresFoundation::establish(&config)
+            .await
+            .expect("the test database should establish");
+        migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+            .await
+            .expect("the schema should migrate");
+        foundation.pool().clone()
+    }
+
+    /// Journal `count` JWT revocations, each one event, as `gateway
+    /// revoke-jwt` commits them.
+    async fn journal_revocations(pool: &deadpool_postgres::Pool, count: usize) {
+        let store = PostgresJwtRevocationStore::new(
+            pool.clone(),
+            DEPLOYMENT,
+            "https://issuer.example.test",
+        );
+        for index in 0..count {
+            store
+                .revoke(
+                    &format!("retention-jti-{index}"),
+                    None,
+                    &ChangeActor::system("operator:revoke-jwt"),
+                )
+                .await
+                .expect("the JWT revoke commits");
+        }
+    }
+
+    async fn evidence_rows(pool: &deadpool_postgres::Pool) -> i64 {
+        pool.get()
+            .await
+            .expect("checkout")
+            .query_one(
+                "SELECT count(*) FROM greengateway.jwt_revocation_evidence",
+                &[],
+            )
+            .await
+            .expect("the evidence counts")
+            .get(0)
+    }
+
+    /// Under `AUTHORITY_EVIDENCE_DURABILITY=required` a journal no dispatcher
+    /// has claimed a cursor over is never pruned, whatever its age: its
+    /// events have reached no consumer. Once a cursor exists the floor
+    /// decides as before, so the hold lasts only while delivery is missing,
+    /// and removing the cursor holds the journal again.
+    #[tokio::test]
+    async fn retention_under_required_never_prunes_a_journal_with_no_cursor() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database).await;
+        journal_revocations(&pool, 3).await;
+        let store = PostgresAuthorityEventStore::new(pool.clone());
+        let client = pool.get().await.expect("maintenance session");
+
+        assert_eq!(
+            PostgresAuthorityEventStore::prune_with(&client, Duration::ZERO, 1_000, true)
+                .await
+                .expect("the retention step runs"),
+            0,
+            "a cursorless journal is held under required durability"
+        );
+        let stats = store.stats().await.expect("stats");
+        assert_eq!((stats.retained, stats.cursor), (3, None));
+
+        // A dispatcher claims the cursor and delivers two events: those two
+        // go, the undelivered one stays.
+        let holder = Uuid::new_v4();
+        assert_eq!(store.claim(1, holder).await.expect("the cursor claims"), 0);
+        store
+            .advance(1, 0, 2, 2)
+            .await
+            .expect("the cursor advances");
+        assert_eq!(
+            PostgresAuthorityEventStore::prune_with(&client, Duration::ZERO, 1_000, true)
+                .await
+                .expect("the retention step runs"),
+            2
+        );
+        let stats = store.stats().await.expect("stats");
+        assert_eq!((stats.retained, stats.first_retained), (1, Some(3)));
+
+        // Removing the cursor holds what is left again.
+        client
+            .execute(
+                "DELETE FROM greengateway.authority_event_cursors WHERE consumer = 'dispatcher'",
+                &[],
+            )
+            .await
+            .expect("the cursor is removed");
+        assert_eq!(
+            PostgresAuthorityEventStore::prune_with(&client, Duration::ZERO, 1_000, true)
+                .await
+                .expect("the retention step runs"),
+            0
+        );
+        assert_eq!(store.stats().await.expect("stats").retained, 1);
+        assert_eq!(
+            evidence_rows(&pool).await,
+            3,
+            "retention never touches evidence"
+        );
+    }
+
+    /// Characterization: under `best_effort` (the default) a journal with
+    /// no cursor is still pruned by age alone, and its evidence stays.
+    #[tokio::test]
+    async fn best_effort_without_a_cursor_still_prunes_by_age() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database).await;
+        journal_revocations(&pool, 2).await;
+        let client = pool.get().await.expect("maintenance session");
+
+        assert_eq!(
+            PostgresAuthorityEventStore::prune_with(
+                &client,
+                Duration::from_secs(3_600),
+                1_000,
+                false
+            )
+            .await
+            .expect("the retention step runs"),
+            0,
+            "too young to prune by age"
+        );
+        assert_eq!(
+            PostgresAuthorityEventStore::prune_with(&client, Duration::ZERO, 1_000, false)
+                .await
+                .expect("the retention step runs"),
+            2
+        );
+        let stats = PostgresAuthorityEventStore::new(pool.clone())
+            .stats()
+            .await
+            .expect("stats");
+        assert_eq!((stats.retained, stats.cursor), (0, None));
+        assert_eq!(
+            evidence_rows(&pool).await,
+            2,
+            "retention never touches evidence"
+        );
+    }
+
+    /// The retention job of the production job list, built from
+    /// `settings` the way both `StandardJobSources` construction sites
+    /// build it.
+    fn standard_retention_job(
+        pool: &deadpool_postgres::Pool,
+        settings: &crate::config::AuthorityEventSettings,
+    ) -> std::sync::Arc<dyn crate::cluster_maintenance::MaintenanceJob> {
+        use crate::cluster_maintenance::{
+            holds_a_journal_without_a_cursor, standard_jobs, StandardJobSources,
+            JOB_AUTHORITY_EVENT_RETENTION,
+        };
+        let jobs = standard_jobs(StandardJobSources {
+            pool: pool.clone(),
+            deployment_id: DEPLOYMENT.to_owned(),
+            rate_limit_keyring:
+                crate::connections::local_secret::LocalSecretKeyring::from_material_for_test(
+                    "retention-rate-limit-key",
+                    vec![("retention-rate-limit-key".to_owned(), [7; 32])],
+                ),
+            rate_limit_max_buckets: 16,
+            rate_limit_idle: Duration::from_secs(60),
+            membership: std::sync::Arc::new(crate::storage::PostgresMembershipStore::new(
+                pool.clone(),
+                DEPLOYMENT,
+                crate::ha::InstanceIdentity::generate(),
+            )),
+            stale_window: Duration::from_secs(30),
+            audit: None,
+            audit_retention: None,
+            audit_floor: None,
+            authority_event_retention: settings.retention(),
+            authority_event_hold_without_cursor: holds_a_journal_without_a_cursor(settings),
+            lease_holder: Uuid::new_v4(),
+            tool_lease_ttl: Duration::from_secs(30),
+        });
+        jobs.into_iter()
+            .find(|job| job.name() == JOB_AUTHORITY_EVENT_RETENTION)
+            .expect("the job list holds authority-event retention")
+    }
+
+    /// From configuration to the prune statement: the job the maintenance
+    /// leader runs holds a cursorless journal under required durability and
+    /// prunes the same journal by age under best effort.
+    #[tokio::test]
+    async fn the_maintenance_retention_job_takes_its_cursorless_hold_from_durability() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database).await;
+        journal_revocations(&pool, 3).await;
+        let store = PostgresAuthorityEventStore::new(pool.clone());
+        let client = pool.get().await.expect("maintenance session");
+        let mut settings = crate::config::AuthorityEventSettings {
+            durability: crate::config::AuthorityEvidenceDurability::Required,
+            retention_hours: 0,
+            ..Default::default()
+        };
+
+        let held = standard_retention_job(&pool, &settings);
+        assert_eq!(
+            held.run_step(&client)
+                .await
+                .expect("the retention step runs"),
+            0,
+            "required durability holds a cursorless journal"
+        );
+        let stats = store.stats().await.expect("stats");
+        assert_eq!((stats.retained, stats.cursor), (3, None));
+
+        settings.durability = crate::config::AuthorityEvidenceDurability::BestEffort;
+        let pruning = standard_retention_job(&pool, &settings);
+        assert_eq!(
+            pruning
+                .run_step(&client)
+                .await
+                .expect("the retention step runs"),
+            3,
+            "best effort prunes a cursorless journal by age"
+        );
+        assert_eq!(store.stats().await.expect("stats").retained, 0);
+        assert_eq!(
+            evidence_rows(&pool).await,
+            3,
+            "retention never touches evidence"
+        );
     }
 }

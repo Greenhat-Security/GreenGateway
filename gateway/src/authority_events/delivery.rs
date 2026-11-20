@@ -7,8 +7,11 @@
 //! `docs/schemas/authority_event_delivery.v1.schema.json`, which the tests
 //! below validate every projection against.
 //!
-//! The default envelope retains its original format. An opted-in sink can
-//! receive an `authority_event.v1` for a caller-bound PostgreSQL token revoke or approval preparation. That
+//! The default envelope retains its original format. An opted-in sink
+//! receives an `authority_event.v1` for every caller-bound change by a
+//! provider-authenticated principal, under one rule for every source
+//! ([`qualify_caller_bound`]); today token revocation and approval
+//! preparation are the changes a caller binds. That
 //! contract names every actor by an issuer-scoped subject reference, an issuer
 //! reference, a kind and an authentication mode. Since migration 24 the
 //! evidence rows record the actor's kind, auth mode and, for a principal that
@@ -95,8 +98,9 @@ use uuid::Uuid;
 
 use super::pseudonym::{PseudonymError, PseudonymKeyring, ReferenceDomain};
 use crate::auth::change_actor::{auth_mode_agrees, ActorKind};
+use crate::auth::principal::canonical_issuer;
 #[cfg(feature = "postgres")]
-use crate::auth::principal::{canonical_issuer, AuthMethod};
+use crate::auth::principal::AuthMethod;
 use crate::config::AuthorityEventFormat;
 #[cfg(feature = "postgres")]
 use crate::storage::postgres_authority_events::{JournalSource, JournaledEvidence};
@@ -172,6 +176,10 @@ const FIRST_REVISION: i64 = 1;
 /// action)`), and nothing in between is an authority change.
 const SESSION_REVISION: i64 = 1;
 
+/// The v1 resource kind of a credential binding change
+/// ([`qualify_caller_bound`]); its delivery record names the Connection.
+const RESOURCE_CREDENTIAL_BINDING: &str = "credential_binding";
+
 /// The longest `committed_at` the schema admits.
 const MAX_COMMITTED_AT_CHARS: usize = 30;
 
@@ -179,10 +187,10 @@ const MAX_COMMITTED_AT_CHARS: usize = 30;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DeliveryRecord {
-    // Only negotiated PostgreSQL projection can create this actor. It never
-    // enters the closed delivery_v1 wire representation.
+    // Only a negotiated projection of a caller-bound change creates it. It
+    // never enters the closed delivery_v1 wire representation.
     #[serde(skip)]
-    pub(super) qualified_actor: Option<QualifiedActor>,
+    pub(super) qualified: Option<QualifiedForm>,
     pub(crate) schema_version: String,
     /// The persisted evidence-authority ID every reference is derived under.
     /// Consumers deduplicate on `(authority_id, event_id)`.
@@ -211,6 +219,15 @@ pub(super) struct QualifiedActor {
     auth_mode: String,
 }
 
+/// What an `authority_event.v1` says that the delivery record does not: the
+/// issuer-scoped actor, and the resource as the v1 contract names it, which
+/// differs from the delivery record's only for a credential binding change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct QualifiedForm {
+    actor: QualifiedActor,
+    resource: DeliveryResource,
+}
+
 /// Wire fields of authority_event.v1. A durable cursor position belongs to
 /// the delivery envelope. The qualified event carries its revision instead.
 #[derive(Serialize)]
@@ -229,7 +246,7 @@ struct QualifiedEvent<'a> {
 
 impl DeliveryRecord {
     pub(super) fn wire_json(&self, format: AuthorityEventFormat) -> serde_json::Result<String> {
-        if let (AuthorityEventFormat::QualifiedV1, Some(actor)) = (format, &self.qualified_actor) {
+        if let (AuthorityEventFormat::QualifiedV1, Some(qualified)) = (format, &self.qualified) {
             return serde_json::to_string(&QualifiedEvent {
                 schema_version: "authority_event.v1",
                 event_id: &self.event_id,
@@ -238,8 +255,8 @@ impl DeliveryRecord {
                 operation: &self.operation,
                 result: &self.result,
                 committed_at: &self.committed_at,
-                actor,
-                resource: &self.resource,
+                actor: &qualified.actor,
+                resource: &qualified.resource,
                 revision: &self.revision,
             });
         }
@@ -525,7 +542,7 @@ pub(crate) fn project(
     format: AuthorityEventFormat,
 ) -> Result<DeliveryRecord, ProjectionError> {
     let operation_id = required(evidence.operation_id.as_deref())?;
-    let actor = required(evidence.actor_user_id.as_deref())?;
+    let subject = required(evidence.actor_user_id.as_deref())?;
     let action = required(evidence.action.as_deref())?;
     let resource_id = required(evidence.resource_id.as_deref())?;
     let committed_at = required(evidence.committed_at.as_deref())?;
@@ -625,32 +642,65 @@ pub(crate) fn project(
         _ => return Err(ProjectionError::MissingEvidence),
     }
     .map_err(ProjectionError::Reference)?;
-    let actor = journal_actor(evidence, actor, keyring)?;
-    let qualified_actor = match format {
-        AuthorityEventFormat::DeliveryV1
-            if evidence.source == JournalSource::MutationApprovalPrepare =>
-        {
+    let actor = journal_actor(evidence, subject, keyring)?;
+    let resource = DeliveryResource {
+        kind: shape.resource_kind.to_owned(),
+        reference: resource_reference.as_str().to_owned(),
+    };
+    let prepare = evidence.source == JournalSource::MutationApprovalPrepare;
+    let qualified = match format {
+        // A preparation receipt has no legacy form: a delivery_v1 dispatcher
+        // holds its cursor there.
+        AuthorityEventFormat::DeliveryV1 if prepare => {
             return Err(ProjectionError::QualifiedFormatRequired)
         }
-        AuthorityEventFormat::QualifiedV1
-            if evidence.source == JournalSource::MutationApprovalPrepare =>
-        {
-            let id =
-                Uuid::parse_str(&operation_id).map_err(|_| ProjectionError::InvalidEvidence)?;
-            if !crate::auth::tokens::valid_caller_operation_id(id)
+        // The default format delivers every other row as it always has, and
+        // a caller key never stalls it.
+        AuthorityEventFormat::DeliveryV1 => None,
+        AuthorityEventFormat::QualifiedV1 if prepare => {
+            if !caller_bound(&operation_id)?
                 || Uuid::parse_str(resource_id).map(|id| id.get_version_num()) != Ok(4)
                 || canonical_uuid(resource_id)? != resource_id
             {
                 return Err(ProjectionError::InvalidEvidence);
             }
-            Some(qualified_principal_actor(evidence, &actor, keyring)?)
+            Some(QualifiedForm {
+                actor: qualified_principal_actor(
+                    subject,
+                    evidence.actor_issuer.as_deref(),
+                    &actor,
+                    keyring,
+                )?,
+                resource: resource.clone(),
+            })
         }
-        AuthorityEventFormat::DeliveryV1 => None,
-        AuthorityEventFormat::QualifiedV1 => qualified_revoke_actor(evidence, &actor, keyring)?,
+        AuthorityEventFormat::QualifiedV1 => {
+            // A token row's revision advances by exactly one per change (the
+            // store's `revision + 1`), so a keyed rotation or revocation that
+            // skipped one is not what any writer committed.
+            if evidence.source == JournalSource::ServiceTokenChange
+                && matches!(shape.transition, Transition::Advance)
+                && caller_bound(&operation_id)?
+                && before.and_then(|prior| prior.checked_add(1)) != after
+            {
+                return Err(ProjectionError::InvalidEvidence);
+            }
+            qualify_caller_bound(
+                &CallerBoundRow {
+                    operation_id: &operation_id,
+                    subject,
+                    issuer: evidence.actor_issuer.as_deref(),
+                    action,
+                    resource_id,
+                },
+                &actor,
+                &resource,
+                keyring,
+            )?
+        }
     };
-
     Ok(DeliveryRecord {
-        qualified_actor,
+        qualified,
         schema_version: DELIVERY_SCHEMA_VERSION.to_owned(),
         authority_id: keyring.authority_id().to_string(),
         event_id,
@@ -660,10 +710,7 @@ pub(crate) fn project(
         result: RESULT_COMMITTED.to_owned(),
         committed_at: committed_at.to_owned(),
         actor,
-        resource: DeliveryResource {
-            kind: shape.resource_kind.to_owned(),
-            reference: resource_reference.as_str().to_owned(),
-        },
+        resource,
         revision: DeliveryRevision {
             axis: shape.axis.to_owned(),
             before: before.map(|value| value.to_string()),
@@ -673,50 +720,88 @@ pub(crate) fn project(
     })
 }
 
-/// V7 is reserved for caller-bound service-token operations. Historical and
-/// unkeyed v4 revokes retain their legacy representation, as do authenticated
-/// gateway service tokens, which have no provider issuer. An impossible v7
-/// writer shape blocks the batch so corruption cannot pass as a fallback.
-#[cfg(feature = "postgres")]
-fn qualified_revoke_actor(
-    evidence: &JournaledEvidence,
-    actor: &DeliveryActor,
-    keyring: &PseudonymKeyring,
-) -> Result<Option<QualifiedActor>, ProjectionError> {
-    if evidence.source != JournalSource::ServiceTokenChange
-        || evidence.action.as_deref() != Some(ACTION_SERVICE_TOKEN_REVOKE)
-    {
-        return Ok(None);
-    }
-    let id = Uuid::parse_str(required(evidence.operation_id.as_deref())?)
-        .map_err(|_| ProjectionError::InvalidEvidence)?;
-    if !crate::auth::tokens::valid_caller_operation_id(id) {
-        return Ok(None);
-    }
-    let prior = positive(evidence.prior_version)?;
-    if prior.checked_add(1) != evidence.new_version {
-        return Err(ProjectionError::InvalidEvidence);
-    }
-    if actor.kind.as_deref() == Some("service_token") && evidence.actor_issuer.is_none() {
-        return Ok(None);
-    }
-    qualified_principal_actor(evidence, actor, keyring).map(Some)
+/// What the qualification rule reads from an evidence row, journaled or
+/// standalone: its operation ID in canonical form, its recorded subject and
+/// issuer as stored, its action and the identifier of its resource.
+pub(super) struct CallerBoundRow<'a> {
+    pub(super) operation_id: &'a str,
+    pub(super) subject: &'a str,
+    pub(super) issuer: Option<&'a str>,
+    pub(super) action: &'a str,
+    pub(super) resource_id: &'a str,
 }
 
-#[cfg(feature = "postgres")]
+/// The one qualification rule for a negotiated `qualified_v1` stream (issue
+/// #425), shared by every journal source and by every standalone table that
+/// records revisions. `actor` and `resource` are the row's delivery
+/// projection, whose revisions were already checked against the operation's
+/// transition; an actor that is not a principal but carries an issuer was
+/// already refused ([`project_actor`]).
+///
+/// 1. A caller UUIDv7 operation ID and a provider-authenticated principal
+///    with a canonical issuer: an `authority_event.v1`, returned here.
+/// 2. A caller UUIDv7 and a gateway service-token actor, which has no
+///    provider issuer to scope its subject: `None`, the delivery record.
+/// 3. A UUIDv4, which a store minted for an unkeyed change: `None`.
+/// 4. A caller UUIDv7 with any other actor -- a system actor, a principal
+///    with no or a non-canonical issuer, or none recorded -- is refused, so
+///    the batch stalls. No writer binds a caller key to such an actor, and
+///    corruption must not pass as a legacy record.
+///
+/// A credential binding change names, in v1, the binding of its Connection
+/// rather than the Connection: a `credential_binding` resource whose
+/// reference is derived from the Connection ID in its own domain. It shares
+/// its operation ID with the Connection change that made it, which is how a
+/// consumer joins the two; the binding's own identifier is never evidence.
+pub(super) fn qualify_caller_bound(
+    row: &CallerBoundRow<'_>,
+    actor: &DeliveryActor,
+    resource: &DeliveryResource,
+    keyring: &PseudonymKeyring,
+) -> Result<Option<QualifiedForm>, ProjectionError> {
+    if !caller_bound(row.operation_id)? {
+        return Ok(None);
+    }
+    if actor.kind.as_deref() == Some(ActorKind::ServiceToken.as_str()) {
+        return Ok(None);
+    }
+    let actor = qualified_principal_actor(row.subject, row.issuer, actor, keyring)?;
+    let resource = if row.action == ACTION_CREDENTIAL_BINDING_CHANGE {
+        DeliveryResource {
+            kind: RESOURCE_CREDENTIAL_BINDING.to_owned(),
+            reference: keyring
+                .derive(ReferenceDomain::CredentialBinding, &[row.resource_id])
+                .map_err(ProjectionError::Reference)?
+                .as_str()
+                .to_owned(),
+        }
+    } else {
+        resource.clone()
+    };
+    Ok(Some(QualifiedForm { actor, resource }))
+}
+
+/// Whether `operation_id` is a caller's key: a UUIDv7, which no store mints.
+/// Unkeyed and historical changes carry the UUIDv4 their store minted.
+fn caller_bound(operation_id: &str) -> Result<bool, ProjectionError> {
+    let id = Uuid::parse_str(operation_id).map_err(|_| ProjectionError::InvalidEvidence)?;
+    Ok(crate::auth::tokens::valid_caller_operation_id(id))
+}
+
+/// The issuer-scoped actor of a keyed change, which only a
+/// provider-authenticated principal with a canonical issuer can be.
 fn qualified_principal_actor(
-    evidence: &JournaledEvidence,
+    subject: &str,
+    issuer: Option<&str>,
     actor: &DeliveryActor,
     keyring: &PseudonymKeyring,
 ) -> Result<QualifiedActor, ProjectionError> {
-    let issuer =
-        required(evidence.actor_issuer.as_deref()).map_err(|_| ProjectionError::InvalidEvidence)?;
-    if actor.kind.as_deref() != Some("principal")
+    let issuer = required(issuer).map_err(|_| ProjectionError::InvalidEvidence)?;
+    if actor.kind.as_deref() != Some(ActorKind::Principal.as_str())
         || canonical_issuer(issuer).as_deref() != Some(issuer)
     {
         return Err(ProjectionError::InvalidEvidence);
     }
-    let subject = required(evidence.actor_user_id.as_deref())?;
     let reference = keyring
         .derive(ReferenceDomain::ActorSubject, &[issuer, subject])
         .map_err(ProjectionError::Reference)?;
