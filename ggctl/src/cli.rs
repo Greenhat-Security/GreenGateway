@@ -296,6 +296,14 @@ const BUNDLE_OR_ENV: ArgumentSpec = ArgumentSpec {
     required: false,
     help: "the bundle directory, which holds bundle.yaml; give it or --env FILE",
 };
+/// `BUNDLE` for `doctor`, which reads an environment file with `--env` or a
+/// state directory with `--state-dir` instead; it requires exactly one.
+const DOCTOR_SOURCE: ArgumentSpec = ArgumentSpec {
+    name: "BUNDLE",
+    kind: ValueKind::Path,
+    required: false,
+    help: "the bundle directory, which holds bundle.yaml; give it, --env FILE or --state-dir DIR",
+};
 const REVISION: ArgumentSpec = ArgumentSpec {
     name: "REVISION",
     kind: ValueKind::Text,
@@ -398,6 +406,12 @@ const STATE_DIR: OptionSpec = OptionSpec {
     value: Some(("DIR", ValueKind::Path)),
     repeatable: false,
     help: "the standalone state directory (required), which ggctl holds under its exclusive lock while it runs",
+};
+const DOCTOR_STATE_DIR: OptionSpec = OptionSpec {
+    name: "--state-dir",
+    value: Some(("DIR", ValueKind::Path)),
+    repeatable: false,
+    help: "a standalone state directory to check instead of BUNDLE, held under its exclusive lock while the doctor runs",
 };
 const ACKNOWLEDGE: OptionSpec = OptionSpec {
     name: "--acknowledge",
@@ -700,7 +714,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "doctor",
-        summary: "Diagnose a configuration bundle or an environment file offline",
+        summary: "Diagnose a configuration bundle, an environment file or a state directory offline",
         description: &[
             "Runs the offline checks on the bundle in the directory BUNDLE: each stage of the \
              gateway's bundle reader as its own check, the deployment profile, and the checks \
@@ -710,11 +724,18 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             "With --env FILE instead, checks the environment file and runs the gateway's \
              configuration compiler over it as required checks, then evaluates what it \
              configures against the production profile as advice, which warns and never fails.",
-            "Exits 0 when no required check failed, 3 when one did, and 1 when the bundle or file \
-             could not be read.",
+            "With --state-dir DIR instead, takes the standalone state directory's exclusive lock \
+             without waiting and checks each store beneath it where it is, read-only, with the \
+             checks a backup applies to a store: admission, SQLite's integrity check, the store's \
+             identity and, for the ledger, its full verification. A store the directory does not \
+             hold is skipped, but a directory that holds no store fails, as does a store with an \
+             interrupted transaction in its rollback journal, which cannot be checked. A \
+             write-ahead log not yet checkpointed is a warning. Nothing in a store is written.",
+            "Exits 0 when no required check failed, 3 when one did, 5 when the state directory \
+             is locked, and 1 when the bundle, the file or a store could not be read.",
         ],
-        arguments: &[BUNDLE_OR_ENV],
-        options: &[ENV, FORMAT],
+        arguments: &[DOCTOR_SOURCE],
+        options: &[ENV, DOCTOR_STATE_DIR, FORMAT],
         run: crate::doctor::run,
     },
     CommandSpec {
@@ -1258,6 +1279,11 @@ impl Invocation {
         self.positionals
             .get(index)
             .and_then(|(position, value)| value.to_str().map(|value| (*position, value)))
+    }
+
+    /// Whether a positional argument was given at `index`, UTF-8 or not.
+    pub(crate) fn has_positional(&self, index: usize) -> bool {
+        self.positionals.get(index).is_some()
     }
 }
 

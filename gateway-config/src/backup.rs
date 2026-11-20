@@ -56,6 +56,10 @@
 //! switches the staging directory into the target's place by renames, or
 //! leaves the target as it was.
 //!
+//! **Check** ([`check_store`], for `ggctl doctor --state-dir`) applies
+//! create's admission and verify's integrity check and description to one
+//! store where it is, through a read-only connection, without a snapshot.
+//!
 //! Every error is value-free: a stable code and, at most, the store it
 //! concerns or an archive entry's position. A digest is integrity evidence,
 //! not authenticity: whoever can write an archive can write a consistent
@@ -493,6 +497,96 @@ pub fn verify(archive: &Path) -> Result<BackupSummary, BackupError> {
     let manifest = read_archive(archive, staging.path())?;
     drop(staging);
     Ok(summary(&manifest))
+}
+
+/// What [`check_store`] found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreCheck {
+    /// The state directory does not hold the store.
+    Absent,
+    /// A rollback journal with a live header is beside the store: an
+    /// interrupted transaction, which a read-only connection cannot roll
+    /// back. The store was not opened, so it was not checked.
+    JournalPending,
+    /// The store passed SQLite's integrity check, but its application ID is
+    /// not the one its file name calls for ([`StateFile::application_id`]):
+    /// it is another store's database under this name.
+    ForeignIdentity,
+    /// The store passed: admitted, opened read-only, SQLite's integrity check
+    /// passed and it describes within a backup's bounds. `wal_pending` when a
+    /// non-empty write-ahead log is beside it: transactions not yet
+    /// checkpointed into the main file, which the checks read through.
+    Passed { wal_pending: bool },
+}
+
+/// Checks `store` where it is beneath the held `state_dir`, with the checks
+/// [`create`] and [`verify`] apply to a store: [`create`]'s admission (a
+/// regular file, not a link or reparse point, and on Unix not writable by
+/// group or other), then SQLite's integrity check and the description of the
+/// database through a read-only connection, as [`verify`] checks an entry.
+///
+/// Nothing is copied and nothing in the store is written: not its main file,
+/// not its write-ahead log, not a checkpoint. Like any reader, SQLite may
+/// create the `-wal` and `-shm` files beside a write-ahead store. A store
+/// whose `-journal` holds an interrupted transaction (see
+/// [`StoreCheck::JournalPending`]) is not opened at all. The ledger
+/// gets these checks only; its own verification is
+/// [`crate::ledger::RevisionLedger::inspect`].
+pub fn check_store(
+    state_dir: &StateDirectory,
+    store: StateFile,
+) -> Result<StoreCheck, BackupError> {
+    let directory = Dir::open_ambient_dir(state_dir.path(), ambient_authority())
+        .map_err(|_| BackupError::StateDirUnavailable)?;
+    if admit_store(state_dir, &directory, store)?.is_none() {
+        return Ok(StoreCheck::Absent);
+    }
+    let refuse = |problem| BackupError::Store { store, problem };
+    if journal_pending(&directory, store)? {
+        return Ok(StoreCheck::JournalPending);
+    }
+    let wal_pending = match directory.symlink_metadata(format!("{}-wal", store.file_name())) {
+        Ok(metadata) => metadata.len() > 0,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(_) => return Err(refuse(StoreProblem::Unavailable)),
+    };
+    let database = store::describe(&state_dir.file(store))
+        .map_err(|failure| refuse(store_problem(failure)))?;
+    if database.application_id != store.application_id() {
+        return Ok(StoreCheck::ForeignIdentity);
+    }
+    Ok(StoreCheck::Passed { wal_pending })
+}
+
+/// Whether the rollback journal beside `store` would be rolled back by the
+/// next connection that opens the store, as SQLite decides it: the journal
+/// is not empty and its first byte is not zero. A journal that a commit in
+/// `PERSIST` mode left behind with a zeroed header, or one truncated to
+/// nothing, holds no interrupted transaction. A `-journal` that is a link or
+/// not a regular file is never followed or read, and counts as pending.
+fn journal_pending(directory: &Dir, store: StateFile) -> Result<bool, BackupError> {
+    let refuse = |problem| BackupError::Store { store, problem };
+    let name = format!("{}-journal", store.file_name());
+    match directory.symlink_metadata(&name) {
+        Ok(metadata) if !metadata.is_file() => return Ok(true),
+        Ok(metadata) if metadata.len() == 0 => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(refuse(StoreProblem::Unavailable)),
+    }
+    let mut options = CapabilityOpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    options.nonblock(true);
+    let mut journal = directory
+        .open_with(&name, &options)
+        .map_err(|_| refuse(StoreProblem::Unavailable))?;
+    let mut first = [0_u8; 1];
+    match journal.read(&mut first) {
+        Ok(0) => Ok(false),
+        Ok(_) => Ok(first[0] != 0),
+        Err(_) => Err(refuse(StoreProblem::Unavailable)),
+    }
 }
 
 /// The archive's directory and file name, which hidden names beside it are
