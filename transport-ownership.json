@@ -8143,6 +8143,16 @@
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
+      "file": "gateway/src/authority_events/caller_operation.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::authority_events::caller_operation::file_attributes#1",
+      "sha256": "d08a9f90cf24307d4e309725d64a1f70a944e74efba3aacca6c7bb8d373baed2",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Allows dead code outside tests for the caller operation types (issue #425) until an operation family binds a key; no I/O and no transport authority."
+    },
+    {
       "file": "gateway/src/authority_events/delivery.rs",
       "reasons": [
         "unexpanded-attribute"
@@ -14895,6 +14905,26 @@
       "reasons": [
         "unexpanded-attribute"
       ],
+      "scope": "gateway::storage::standalone_authority_events::read_caller_operation#1",
+      "sha256": "56296f23fa582cf457d1d25dd6e6d1599ca2c6e268ecb5ab4a3f1ea53d1fe065",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Reads one caller key's reserved action and binding digest from the local SQLite file that owns the evidence; no transport authority. Allowed dead outside tests until an operation family binds a key."
+    },
+    {
+      "file": "gateway/src/storage/standalone_authority_events.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::storage::standalone_authority_events::reserve_bound_operation#1",
+      "sha256": "0f2c4e5355c018907652332ecbf86bd66f841387faae79cd4ea5869540a3fc66",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Inserts a caller UUID, operation family and binding digest in the caller's IMMEDIATE transaction on the local SQLite file; no transport authority. Allowed dead outside tests until an operation family binds a key."
+    },
+    {
+      "file": "gateway/src/storage/standalone_authority_events.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
       "scope": "gateway::storage::standalone_authority_events::impl  StandaloneEvidenceSource::ALL#1",
       "sha256": "c45e771d64a73c58cadfc03eb7e92933988a91d08be77a4943addd458b671e53",
       "owner": "GreenGateway maintainers",
@@ -16165,6 +16195,28 @@
       "sha256": "f1c8a142d0c5e6732a9d6f5e3809b74dded9ff041b10ab8cc8d9cfa35fe3a653",
       "owner": "GreenGateway authority evidence maintainers",
       "purpose": "Inserts a caller UUID and operation family on the existing PostgreSQL transaction, serializing reuse across authority writers."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "network-or-process-reference",
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::read_caller_operation#1",
+      "sha256": "72f3e5f062c6bc6ac9181d783588a2ef79c82c0ab2e78b76efdb2ed81c9467e8",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Reads one caller key's reserved action and binding digest on a caller-supplied PostgreSQL session, read only; no caller-selected HTTP authority. Allowed dead outside tests until an operation family binds a key."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "network-or-process-reference",
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::reserve_bound_operation#1",
+      "sha256": "1236d85192bac4b483f8a9f56365b328a22f35f002f11f93b8005fb612e3fb09",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Inserts a caller UUID, operation family and binding digest on the existing PostgreSQL transaction, serializing reuse across authority writers; no caller-selected HTTP authority. Allowed dead outside tests until an operation family binds a key."
     },
     {
       "file": "gateway/src/storage/postgres_authority_events.rs",

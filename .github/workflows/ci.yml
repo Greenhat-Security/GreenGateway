@@ -759,6 +759,9 @@ jobs:
             storage::contract_tests::postgres_audit_tests::revoke_and_rotate_race_never_leaves_a_live_plaintext
             storage::contract_tests::postgres_audit_tests::an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction
             storage::contract_tests::postgres_audit_tests::a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity
+            storage::contract_tests::postgres_audit_tests::postgres_caller_operation_reservation_contract
+            storage::contract_tests::postgres_audit_tests::postgres_a_rolled_back_transaction_leaves_no_reservation
+            storage::contract_tests::postgres_audit_tests::postgres_two_transactions_racing_one_key_reserve_it_once
             connections::pg_store::tests::
             tests::issue_757_mutation_approvals::postgres::
             storage::postgres_documents::tests::
@@ -774,6 +777,9 @@ jobs:
             storage::migrations::tests::migration_thirty_five_preserves_approvals_and_reserves_only_keyed_revocations
             storage::migrations::tests::migration_twenty_seven_admits_token_issue_evidence_and_backfills_nothing
             storage::migrations::tests::migration_twenty_eight_admits_connection_create_and_replace_evidence_and_backfills_nothing
+            storage::migrations::tests::migration_twenty_nine_adds_the_suite_and_widens_document_evidence
+            storage::migrations::tests::migration_thirty_two_journals_document_and_catalog_evidence_and_aligns_the_actor
+            storage::migrations::tests::migration_thirty_six_keeps_existing_reservations_and_requires_a_binding_for_new_actions
             tests::admin_tokens_app_tests::admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_postgres
           )
           listed="$(cargo test -p gateway --locked --bin gateway -- --list 2>/dev/null)"

@@ -31,13 +31,21 @@
 //! dies between acceptance and the advance reads the same rows again: delivery
 //! is at least once. Nothing here ever updates or deletes an evidence row.
 //!
+//! The same owners also create the file's caller-key reservations
+//! ([`CALLER_OPERATION_TABLE_SQL`]): one row per caller-assigned operation ID
+//! a committed change used, so a key belongs to one action and one request.
+//!
 //! Errors carry a classification and a static operation label only.
 
 use std::sync::MutexGuard;
 
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
+
+use crate::authority_events::caller_operation::{
+    CallerKeyReservation, CallerKeyState, CallerOperation,
+};
 
 use super::{
     classify_rusqlite, log_classified, RepositoryError, RepositoryErrorKind,
@@ -77,6 +85,190 @@ CREATE TABLE IF NOT EXISTS authority_event_cursors (
     advanced_at TEXT NOT NULL CHECK (length(CAST(advanced_at AS BLOB)) BETWEEN 1 AND 64)
 );
 "#;
+
+/// The standalone caller keys (issue #425): one row per caller-assigned
+/// operation ID used in this file, the action it is reserved for and, for
+/// every action but a keyed revoke, the binding digest of the one request it
+/// belongs to (`authority_events::caller_operation`). The row commits in the
+/// IMMEDIATE transaction of the change and its evidence row, so a key is
+/// reserved exactly when its change committed. The operation ID is a
+/// canonical lowercase RFC UUIDv7, the text form the evidence tables store;
+/// gateway-assigned IDs are v4 and can never be reserved.
+///
+/// Both owning stores create it from this one definition, as they create
+/// [`AUTHORITY_EVENT_TABLES_SQL`]: the token store in its open-time schema
+/// and the Connections store in its migration 16, each `IF NOT EXISTS`, so a
+/// token store and a Connections store pointed at the same file share one
+/// table whichever opens it first. That is also why the action list is
+/// complete for every keyable standalone action now: SQLite cannot widen a
+/// CHECK in place, and whichever store creates the table fixes it. A later
+/// standalone action needs a table rebuild in both places, the token store's
+/// open-time schema and a new Connections migration.
+///
+/// Each SQLite file is its own authority, so a key is unique within one
+/// file, as `(authority_id, event_id)` identifies its delivered events: the
+/// token database and a separate Connections database each accept a key
+/// once.
+pub(crate) const CALLER_OPERATION_TABLE_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS authority_caller_operation_ids (
+    operation_id TEXT NOT NULL PRIMARY KEY CHECK (
+        operation_id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-7[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+    ),
+    action TEXT NOT NULL CHECK (
+        action IN (
+            'service_token.issue', 'service_token.rotate', 'service_token.revoke',
+            'connection.create', 'connection.replace', 'connection.delete',
+            'catalog.mcp.publish', 'catalog.openapi.publish',
+            'catalog.overlay.replace', 'catalog.overlay.delete',
+            'secret.create', 'secret.rotate', 'secret.delete'
+        )
+    ),
+    binding_digest TEXT CHECK (
+        binding_digest IS NULL
+        OR (length(binding_digest) = 64 AND binding_digest NOT GLOB '*[^0-9a-f]*')
+    ),
+    CHECK (binding_digest IS NOT NULL OR action IN ('service_token.revoke'))
+);
+"#;
+
+/// Every action [`CALLER_OPERATION_TABLE_SQL`] admits, value for value.
+pub(crate) const STANDALONE_CALLER_OPERATION_ACTIONS: [&str; 13] = [
+    "service_token.issue",
+    "service_token.rotate",
+    "service_token.revoke",
+    "connection.create",
+    "connection.replace",
+    "connection.delete",
+    "catalog.mcp.publish",
+    "catalog.openapi.publish",
+    "catalog.overlay.replace",
+    "catalog.overlay.delete",
+    "secret.create",
+    "secret.rotate",
+    "secret.delete",
+];
+
+/// The one standalone action keyed before binding digests existed: its
+/// reservation has no digest, and the token store's own evidence check
+/// decides its replays.
+pub(crate) const STANDALONE_UNBOUND_CALLER_OPERATION_ACTIONS: [&str; 1] = ["service_token.revoke"];
+
+const OPERATION_CALLER_KEY_READ: &str = "standalone_caller_operation_read";
+const OPERATION_CALLER_KEY_RESERVE: &str = "standalone_caller_operation_reserve";
+
+/// Whether `action` is one a key is bound to by digest in a standalone file.
+fn is_bound_standalone_action(action: &str) -> bool {
+    STANDALONE_CALLER_OPERATION_ACTIONS.contains(&action)
+        && !STANDALONE_UNBOUND_CALLER_OPERATION_ACTIONS.contains(&action)
+}
+
+/// The stored action and digest of `id`'s reservation, if it has one.
+fn stored_caller_operation(
+    connection: &Connection,
+    id: Uuid,
+) -> rusqlite::Result<Option<(String, Option<String>)>> {
+    connection
+        .query_row(
+            "SELECT action, binding_digest FROM authority_caller_operation_ids \
+             WHERE operation_id = ?1",
+            params![id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+}
+
+/// What this file's reservation table says about `operation`'s key: read
+/// only, so a handler can ask before it does any external work. The answer
+/// is advisory until the change's own transaction reserves the key with
+/// [`reserve_bound_operation`].
+#[cfg_attr(not(test), allow(dead_code))] // Asked by the operation families that bind keys.
+pub(crate) fn read_caller_operation(
+    connection: &Connection,
+    operation: &CallerOperation,
+) -> Result<CallerKeyState, RepositoryError> {
+    if !is_bound_standalone_action(operation.action()) {
+        return Err(RepositoryError::invalid_parameter(
+            OPERATION_CALLER_KEY_READ,
+            "action",
+        ));
+    }
+    let stored = stored_caller_operation(connection, operation.id())
+        .map_err(|error| failure(OPERATION_CALLER_KEY_READ, &error))?;
+    Ok(match stored {
+        None => CallerKeyState::Unused,
+        Some((action, digest)) => operation.judge(&action, digest.as_deref()),
+    })
+}
+
+/// Reserve `operation`'s key with its binding digest inside the caller's
+/// IMMEDIATE transaction, which also commits the change and its evidence.
+/// A key already reserved is judged instead: the same action and digest is
+/// an exact retry, anything else a conflict, and nothing is written either
+/// way. The caller holds the file's write lock, so no other writer can
+/// reserve the key between the look and the insert.
+#[cfg_attr(not(test), allow(dead_code))] // Called by the operation families that bind keys.
+pub(crate) fn reserve_bound_operation(
+    connection: &Connection,
+    operation: &CallerOperation,
+) -> Result<CallerKeyReservation, RepositoryError> {
+    if !is_bound_standalone_action(operation.action()) {
+        return Err(RepositoryError::invalid_parameter(
+            OPERATION_CALLER_KEY_RESERVE,
+            "action",
+        ));
+    }
+    let reserve = || -> rusqlite::Result<CallerKeyReservation> {
+        let inserted = connection.execute(
+            "INSERT INTO authority_caller_operation_ids (operation_id, action, binding_digest) \
+             VALUES (?1, ?2, ?3) ON CONFLICT (operation_id) DO NOTHING",
+            params![
+                operation.id().to_string(),
+                operation.action(),
+                operation.binding_digest()
+            ],
+        )?;
+        if inserted == 1 {
+            return Ok(CallerKeyReservation::Reserved);
+        }
+        Ok(
+            match stored_caller_operation(connection, operation.id())?
+                .map(|(action, digest)| operation.judge(&action, digest.as_deref()))
+            {
+                Some(CallerKeyState::SameBinding) => CallerKeyReservation::SameBinding,
+                // A key that refused the insert and then reads as absent is
+                // not this request's either.
+                _ => CallerKeyReservation::OtherBinding,
+            },
+        )
+    };
+    reserve().map_err(|error| failure(OPERATION_CALLER_KEY_RESERVE, &error))
+}
+
+/// The action `id` is reserved for in this file, if any. The keyed revoke
+/// reads it in its IMMEDIATE transaction before its own evidence check.
+pub(crate) fn caller_operation_action(
+    connection: &Connection,
+    id: Uuid,
+) -> rusqlite::Result<Option<String>> {
+    Ok(stored_caller_operation(connection, id)?.map(|(action, _)| action))
+}
+
+/// Reserve `id` for a keyed revoke, with no digest, inside the caller's
+/// IMMEDIATE transaction. `false` when the key is taken; the revoke then
+/// commits nothing.
+pub(crate) fn reserve_unbound_operation(
+    connection: &Connection,
+    id: Uuid,
+    action: &str,
+) -> rusqlite::Result<bool> {
+    connection
+        .execute(
+            "INSERT INTO authority_caller_operation_ids (operation_id, action) \
+             VALUES (?1, ?2) ON CONFLICT (operation_id) DO NOTHING",
+            params![id.to_string(), action],
+        )
+        .map(|inserted| inserted == 1)
+}
 
 /// One standalone evidence table: a source of delivered events. Each
 /// variant is named for its table, as the journal's sources are.
@@ -526,6 +718,111 @@ mod tests {
                 [],
             )
             .is_err());
+    }
+
+    /// The quoted values between `opening` and the next `)` of `sql`.
+    fn quoted_list(sql: &str, opening: &str) -> Vec<String> {
+        let (_, rest) = sql
+            .split_once(opening)
+            .unwrap_or_else(|| panic!("the table states {opening}"));
+        let (list, _) = rest.split_once(')').expect("the list closes");
+        list.split('\'')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The table's action CHECK is the Rust list, value for value, and only
+    /// the keyed revoke may go without a binding digest.
+    #[test]
+    fn the_caller_operation_actions_are_the_tables_closed_vocabulary() {
+        let actions = quoted_list(CALLER_OPERATION_TABLE_SQL, "action IN (");
+        assert_eq!(actions, STANDALONE_CALLER_OPERATION_ACTIONS);
+        let unbound = quoted_list(
+            CALLER_OPERATION_TABLE_SQL,
+            "binding_digest IS NOT NULL OR action IN (",
+        );
+        assert_eq!(unbound, STANDALONE_UNBOUND_CALLER_OPERATION_ACTIONS);
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/schemas/authority_event.v1.schema.json"
+        ))
+        .expect("the published schema is JSON");
+        let published = schema.to_string();
+        for action in STANDALONE_CALLER_OPERATION_ACTIONS {
+            assert!(
+                published.contains(&format!("\"{action}\"")),
+                "{action} is an authority_event.v1 operation"
+            );
+        }
+    }
+
+    /// The table refuses a key the caller did not assign, an action outside
+    /// its list, a digest that is not lowercase SHA-256 hex, and a bound
+    /// action without one; a second row for a key is a conflict.
+    #[test]
+    fn the_caller_operation_table_refuses_rows_that_do_not_fit() {
+        let connection = Connection::open_in_memory().expect("an in-memory database opens");
+        connection
+            .execute_batch(CALLER_OPERATION_TABLE_SQL)
+            .expect("the table creates");
+        connection
+            .execute_batch(CALLER_OPERATION_TABLE_SQL)
+            .expect("and again, unchanged");
+        let key = crate::authority_events::caller_operation::test_caller_key(1).to_string();
+        let digest = "a".repeat(64);
+        let insert = |id: &str, action: &str, digest: Option<&str>| {
+            connection.execute(
+                "INSERT INTO authority_caller_operation_ids (operation_id, action, binding_digest) \
+                 VALUES (?1, ?2, ?3)",
+                params![id, action, digest],
+            )
+        };
+        insert(&key, "connection.create", Some(&digest)).expect("a bound key inserts");
+        for (id, action, stored) in [
+            (key.clone(), "connection.replace", Some(digest.clone())),
+            (
+                Uuid::new_v4().to_string(),
+                "connection.create",
+                Some(digest.clone()),
+            ),
+            (
+                key.to_uppercase(),
+                "connection.create",
+                Some(digest.clone()),
+            ),
+            (
+                crate::authority_events::caller_operation::test_caller_key(2).to_string(),
+                "policy.publish",
+                Some(digest.clone()),
+            ),
+            (
+                crate::authority_events::caller_operation::test_caller_key(3).to_string(),
+                "connection.create",
+                None,
+            ),
+            (
+                crate::authority_events::caller_operation::test_caller_key(4).to_string(),
+                "connection.create",
+                Some("A".repeat(64)),
+            ),
+            (
+                crate::authority_events::caller_operation::test_caller_key(5).to_string(),
+                "connection.create",
+                Some("a".repeat(63)),
+            ),
+        ] {
+            assert!(
+                insert(&id, action, stored.as_deref()).is_err(),
+                "{id} {action} {stored:?}"
+            );
+        }
+        insert(
+            &crate::authority_events::caller_operation::test_caller_key(6).to_string(),
+            "service_token.revoke",
+            None,
+        )
+        .expect("a keyed revoke reserves without a digest");
     }
 
     /// The authority ID is written once: a later candidate reads back the
