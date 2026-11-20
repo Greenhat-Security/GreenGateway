@@ -639,8 +639,11 @@ incomplete or refused case as a pass. It reads the stored suite, loads it
 into the cases on screen after asking, runs it by reference pinned to the
 ETag on screen, and stores the cases on screen as its next version under
 `If-None-Match: *` or `If-Match` after a confirmation. A save whose answer is
-lost is resolved by reading the stored suite, never by sending it again. A
-draft publication the required suite refuses is shown with its
-`required_tests` status and counts, with a way to run the stored suite
-against the draft. See **Policy Studio workbench** in
+lost or unreadable is resolved by reading the stored suite and comparing its
+version, never by sending it again. A draft publication the required suite
+refuses is shown with its `required_tests` status and counts, with a way to
+run the stored suite against the draft, pinned to the version that refused
+it. Storing needs `admin:policy:write` as well as the read permissions,
+because the Studio reads the suite first to name the version a save
+replaces. See **Policy Studio workbench** in
 [the configuration reference](configuration.md#policy_file).

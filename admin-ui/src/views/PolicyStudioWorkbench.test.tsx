@@ -780,6 +780,202 @@ describe('Policy Studio workbench', () => {
     expect(within(tests).getByText(/Ran the stored suite, version 3/)).toBeTruthy();
   });
 
+  it('Test moves focus into each stored-suite confirmation and back to its opener on Cancel', async () => {
+    const gateway = fakeGateway();
+    gateway.suites.push(storedSuite());
+    renderStudio(gateway);
+    await studioLoaded();
+    openView('Test');
+    const tests = viewPanel('Test');
+    await within(tests).findByText(/Stored suite: version 3/, undefined, WAIT);
+    addExpectedCase(tests);
+
+    const save = within(tests).getByRole('button', { name: 'Save as the stored suite' });
+    save.focus();
+    fireEvent.click(save);
+    let confirm = within(tests).getByRole('group', { name: 'Store these cases as the suite?' });
+    expect(document.activeElement).toBe(within(confirm).getByRole('button', { name: 'Store the suite' }));
+    fireEvent.click(within(confirm).getByRole('button', { name: 'Cancel' }));
+    expect(within(tests).queryByRole('group', { name: 'Store these cases as the suite?' })).toBeNull();
+    expect(document.activeElement).toBe(save);
+
+    const load = within(tests).getByRole('button', { name: 'Load the stored suite' });
+    load.focus();
+    fireEvent.click(load);
+    const ask = within(tests).getByRole('group', { name: 'Replace the cases on screen?' });
+    expect(document.activeElement).toBe(
+      within(ask).getByRole('button', { name: 'Replace them with the stored suite' }),
+    );
+    fireEvent.click(within(ask).getByRole('button', { name: 'Cancel' }));
+    expect(document.activeElement).toBe(load);
+
+    // Storing moves focus to the answer that replaces the confirmation.
+    fireEvent.click(save);
+    confirm = within(tests).getByRole('group', { name: 'Store these cases as the suite?' });
+    fireEvent.click(within(confirm).getByRole('button', { name: 'Store the suite' }));
+    await within(tests).findByText(/Stored as version 4\./, undefined, WAIT);
+    await waitFor(
+      () => expect(document.activeElement?.textContent).toMatch(/Stored as version 4\./),
+      WAIT,
+    );
+  });
+
+  it('Test compares case counts when the loaded suite was edited, and warns when it holds fewer cases', async () => {
+    const gateway = fakeGateway();
+    gateway.suites.push(storedSuite(3, ['one', 'two', 'three']));
+    renderStudio(gateway);
+    await studioLoaded();
+    openView('Test');
+    const tests = viewPanel('Test');
+    await within(tests).findByText(/Stored suite: version 3/, undefined, WAIT);
+    fireEvent.click(within(tests).getByRole('button', { name: 'Load the stored suite' }));
+    fireEvent.click(within(tests).getByRole('button', { name: 'Remove case' }));
+    fireEvent.click(within(tests).getByRole('button', { name: 'Remove case' }));
+
+    fireEvent.click(within(tests).getByRole('button', { name: 'Save as the stored suite' }));
+    const confirm = within(tests).getByRole('group', { name: 'Store these cases as the suite?' });
+    expect(within(confirm).getByText(/which the cases on screen were loaded from and have been edited since/)).toBeTruthy();
+    expect(within(confirm).getByText('Stored version 3: 3 cases (3 HTTP request).')).toBeTruthy();
+    expect(within(confirm).getByText('On screen: 1 case (1 HTTP request).')).toBeTruthy();
+    expect(
+      within(confirm).getByText(
+        'The cases on screen hold fewer cases than stored version 3: 1 instead of 3 in all, 1 instead of 3 HTTP request.',
+      ),
+    ).toBeTruthy();
+  });
+
+  it('Test treats a stored answer it cannot read as an unconfirmed save, not a refusal', async () => {
+    const gateway = fakeGateway();
+    renderStudio(gateway);
+    await studioLoaded();
+    openView('Test');
+    const tests = viewPanel('Test');
+    await within(tests).findByText(/No suite is stored beside the policy/, undefined, WAIT);
+    addExpectedCase(tests);
+    // Stored, but answered without the version header.
+    gateway.storeSuite = (_headers, body) => {
+      const next = { version: 1, etag: '"sha256:suite-1"', suite: JSON.parse(body) };
+      gateway.suites.push(next);
+      return jsonResponse(201, next.suite, { ETag: next.etag });
+    };
+
+    fireEvent.click(within(tests).getByRole('button', { name: 'Save as the stored suite' }));
+    fireEvent.click(
+      within(within(tests).getByRole('group', { name: 'Store these cases as the suite?' })).getByRole(
+        'button',
+        { name: 'Store the suite' },
+      ),
+    );
+    expect(await within(tests).findByText('Save not confirmed', undefined, WAIT)).toBeTruthy();
+    expect(within(tests).queryByText('Suite not stored')).toBeNull();
+    fireEvent.click(within(tests).getByRole('button', { name: 'Check the stored suite' }));
+    expect(await within(tests).findByText(/Your save was stored as version 1\./, undefined, WAIT)).toBeTruthy();
+    expect(gateway.requests('PUT', '/v1/admin/policy/tests')).toHaveLength(1);
+  });
+
+  it('Test resolves an unconfirmed save by version: not stored, stored under the same ETag, or changed', async () => {
+    const outcomes: Array<{
+      store: (gateway: ReturnType<typeof fakeGateway>, body: string) => void;
+      expected: RegExp | string;
+    }> = [
+      // Nothing was written.
+      { store: () => undefined, expected: /Your save was not stored: the stored suite is unchanged/ },
+      // The same suite stored again is a new version under the same ETag.
+      {
+        store: (gateway, body) =>
+          gateway.suites.push({ version: 4, etag: '"sha256:suite-3"', suite: JSON.parse(body) }),
+        expected: /Your save was stored as version 4\./,
+      },
+      // Someone else stored another suite.
+      {
+        store: (gateway) => gateway.suites.push(storedSuite(4, ['theirs'])),
+        expected: /The stored suite changed, possibly after your save.*version 4/,
+      },
+    ];
+    for (const { store, expected } of outcomes) {
+      const gateway = fakeGateway();
+      gateway.suites.push(storedSuite());
+      renderStudio(gateway);
+      await studioLoaded();
+      openView('Test');
+      const tests = viewPanel('Test');
+      await within(tests).findByText(/Stored suite: version 3/, undefined, WAIT);
+      addExpectedCase(tests);
+      gateway.storeSuite = (_headers, body) => {
+        store(gateway, body);
+        throw new TypeError('Failed to fetch');
+      };
+      fireEvent.click(within(tests).getByRole('button', { name: 'Save as the stored suite' }));
+      fireEvent.click(
+        within(within(tests).getByRole('group', { name: 'Store these cases as the suite?' })).getByRole(
+          'button',
+          { name: 'Store the suite' },
+        ),
+      );
+      await within(tests).findByText('Save not confirmed', undefined, WAIT);
+      fireEvent.click(within(tests).getByRole('button', { name: 'Check the stored suite' }));
+      expect(await within(tests).findByText(expected, undefined, WAIT)).toBeTruthy();
+      expect(gateway.requests('PUT', '/v1/admin/policy/tests')).toHaveLength(1);
+      cleanup();
+    }
+  });
+
+  it('Test withdraws a stored-suite confirmation when the suite is read again', async () => {
+    const gateway = fakeGateway();
+    gateway.suites.push(storedSuite());
+    renderStudio(gateway);
+    await studioLoaded();
+    openView('Test');
+    const tests = viewPanel('Test');
+    await within(tests).findByText(/Stored suite: version 3/, undefined, WAIT);
+    addExpectedCase(tests);
+    fireEvent.click(within(tests).getByRole('button', { name: 'Load the stored suite' }));
+    expect(within(tests).getByRole('group', { name: 'Replace the cases on screen?' })).toBeTruthy();
+
+    // The read finds no suite: the confirmation goes, and nothing is stuck.
+    gateway.suites.length = 0;
+    fireEvent.click(within(tests).getByRole('button', { name: 'Read the stored suite again' }));
+    await within(tests).findByText(/No suite is stored beside the policy/, undefined, WAIT);
+    expect(within(tests).queryByRole('group', { name: 'Replace the cases on screen?' })).toBeNull();
+    const save = within(tests).getByRole('button', { name: 'Save as the stored suite' }) as HTMLButtonElement;
+    expect(save.disabled).toBe(false);
+  });
+
+  it('Test names the stored version a run is running, and marks its report stale once the stored suite changes', async () => {
+    const gateway = fakeGateway();
+    gateway.suites.push(storedSuite());
+    let answer: (response: Response) => void = () => undefined;
+    gateway.testRun = () =>
+      new Promise<Response>((resolve) => {
+        answer = resolve;
+      }) as unknown as Response;
+    renderStudio(gateway);
+    await openDraft();
+    openView('Test');
+    const tests = viewPanel('Test');
+    await within(tests).findByText(/Stored suite: version 3/, undefined, WAIT);
+    fireEvent.click(within(tests).getByRole('button', { name: 'Run the stored suite' }));
+    expect(await within(tests).findByText('Running stored suite version 3.', undefined, WAIT)).toBeTruthy();
+    expect(within(tests).queryByText(/Running 0 cases/)).toBeNull();
+    answer(
+      jsonResponse(200, {
+        ...testReport('passed'),
+        suite: {
+          schema_version: 'policy-tests.v1',
+          digest: 'sha256:suite-3',
+          stored: { version: 3, etag: '"sha256:suite-3"' },
+        },
+      }),
+    );
+    await within(tests).findByText('Test report', undefined, WAIT);
+    expect(within(tests).queryByText(/changed since this run/)).toBeNull();
+
+    gateway.suites.push(storedSuite(4, ['theirs']));
+    fireEvent.click(within(tests).getByRole('button', { name: 'Read the stored suite again' }));
+    await within(tests).findByText(/Stored suite: version 4/, undefined, WAIT);
+    expect(within(tests).getByText(/changed since this run/)).toBeTruthy();
+  });
+
   it('Optimize applies an analyzer patch to the open draft as an unsaved edit and marks the analysis stale', async () => {
     const gateway = fakeGateway({ permissions: [READ, WRITE, SIMULATE, ANALYZE] });
     gateway.analysis = () => patchedAnalysis('"sha256:candidate-text"', 'narrowing', [DELETE_WATCH]);
@@ -843,6 +1039,29 @@ describe('Policy Studio workbench', () => {
     expect(await screen.findByText('Unsaved edits', { selector: '.result-count' }, WAIT)).toBeTruthy();
   });
 
+  it('Optimize moves focus into an advisory change review and back to its opener on Cancel', async () => {
+    const gateway = fakeGateway({ permissions: [READ, WRITE, SIMULATE, ANALYZE] });
+    gateway.analysis = () => patchedAnalysis('"sha256:candidate-text"', 'narrowing', [DELETE_WATCH]);
+    renderStudio(gateway);
+    await openDraft();
+    openView('Optimize');
+    const optimize = viewPanel('Optimize');
+    fireEvent.click(within(optimize).getByRole('button', { name: 'Run analysis' }));
+    const opener = await within(optimize).findByRole(
+      'button',
+      { name: /Review the advisory change/ },
+      WAIT,
+    );
+    opener.focus();
+    fireEvent.click(opener);
+    const review = within(optimize).getByRole('group', { name: 'Apply this advisory change?' });
+    expect(document.activeElement).toBe(within(review).getByRole('button', { name: 'Apply to the draft' }));
+    fireEvent.click(within(review).getByRole('button', { name: 'Cancel' }));
+    expect(document.activeElement).toBe(
+      within(optimize).getByRole('button', { name: /Review the advisory change/ }),
+    );
+  });
+
   it('Optimize starts a draft from the live policy with the patch, pinned to the live ETag, and changes nothing live', async () => {
     const gateway = fakeGateway({ permissions: [READ, WRITE, SIMULATE, ANALYZE] });
     gateway.analysis = () => patchedAnalysis(LIVE_ETAG, 'narrowing', [DELETE_WATCH]);
@@ -866,6 +1085,35 @@ describe('Policy Studio workbench', () => {
     expect(policy.id).toBe('billing-policy');
     expect(gateway.log.filter((entry) => entry.method === 'PUT' || entry.method === 'PATCH')).toEqual([]);
     expect(gateway.requests('POST', `/v1/admin/policy/drafts/${DRAFT_ID}/publish`)).toEqual([]);
+  });
+
+  it('Optimize judges the new draft once a draft is started from a live analysis, so the patch is not offered again', async () => {
+    const gateway = fakeGateway({ permissions: [READ, WRITE, SIMULATE, ANALYZE] });
+    gateway.analysis = () => patchedAnalysis(LIVE_ETAG, 'narrowing', [DELETE_WATCH]);
+    renderStudio(gateway);
+    await openDraft();
+    openView('Optimize');
+    fireEvent.click(screen.getByRole('radio', { name: /The live policy/ }));
+    const optimize = viewPanel('Optimize');
+    fireEvent.click(within(optimize).getByRole('button', { name: 'Run analysis' }));
+    fireEvent.click(
+      await within(optimize).findByRole('button', { name: /Review the advisory change/ }, WAIT),
+    );
+    fireEvent.click(
+      within(within(optimize).getByRole('group', { name: 'Apply this advisory change?' })).getByRole(
+        'button',
+        { name: 'Start a draft with this change' },
+      ),
+    );
+    expect(await screen.findByText('Draft created', undefined, WAIT)).toBeTruthy();
+    await waitFor(
+      () =>
+        expect((screen.getByRole('radio', { name: /The open draft/ }) as HTMLInputElement).checked).toBe(true),
+      WAIT,
+    );
+    expect(within(viewPanel('Optimize')).getByText(/changed after this analysis/)).toBeTruthy();
+    expect(within(viewPanel('Optimize')).queryByRole('button', { name: /Review the advisory change/ })).toBeNull();
+    expect(gateway.requests('POST', '/v1/admin/policy/drafts')).toHaveLength(1);
   });
 
   it('Optimize does not start a draft from a patch while the open draft has unsaved edits', async () => {

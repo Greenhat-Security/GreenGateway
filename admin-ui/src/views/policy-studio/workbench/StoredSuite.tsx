@@ -27,9 +27,38 @@ type ReadState =
   | { kind: 'stored'; stored: StoredPolicyTests }
   | { kind: 'failed'; alert: StudioAlert };
 
-// A save whose answer did not arrive: what was sent, and the ETag stored
-// before it (null for none), so a fresh read can tell what happened.
-type UnconfirmedSave = { sent: string; before: string | null };
+// A save whose answer did not arrive, or arrived unreadable: what was sent,
+// and the version stored before it (null for none), so a fresh read can tell
+// what happened. The ETag alone cannot: it is the suite's semantic digest, so
+// a save of the suite already stored is a new version under the same ETag.
+type UnconfirmedSave = {
+  sent: string;
+  before: Readonly<{ etag: string; version: number }> | null;
+};
+
+// The stored suite version a run is pinned to. `version` is null when it is
+// not known; `fromRefusal` marks the version that refused a publication.
+export type StoredRunTarget = Readonly<{
+  etag: string;
+  version: number | null;
+  fromRefusal?: boolean;
+}>;
+
+// What became of a stored run: it ran (or was refused with an answer shown),
+// the stored suite is no longer the pinned version, or it could not start
+// (the Test view says why).
+export type StoredRunOutcome = 'ran' | 'changed' | 'blocked';
+
+// A request from elsewhere (a publication the required suite refused) to run
+// the stored suite against the candidate: pinned to the version that refused
+// it when the refusal named one. `seq` changes with each request.
+export type StoredRunRequest = Readonly<{
+  seq: number;
+  etag: string | null;
+  version: number | null;
+}>;
+
+export const NO_STORED_RUN_REQUEST: StoredRunRequest = { seq: 0, etag: null, version: null };
 
 // The stored suite beside the policy, in the Test view: read it, load it
 // into the cases on screen, run it by reference, or store the cases on
@@ -45,6 +74,7 @@ export function StoredSuite({
   runBlockers,
   running,
   onRunStored,
+  onStoredEtag,
   runRequest,
 }: {
   // Whether the Test view is shown: the suite is first read then.
@@ -57,11 +87,12 @@ export function StoredSuite({
   // Why a run cannot start now, from the Test view.
   runBlockers: readonly string[];
   running: boolean;
-  // Run the stored suite pinned to `stored`; resolves to whether the gateway
-  // answered that the stored suite is no longer that version.
-  onRunStored: (stored: StoredPolicyTests) => Promise<boolean>;
-  // Bumped to read the stored suite again and run it at once.
-  runRequest: number;
+  // Run the stored suite pinned to `target`.
+  onRunStored: (target: StoredRunTarget) => Promise<StoredRunOutcome>;
+  // The ETag of the stored suite each time a read or save settles it; null
+  // when none is stored.
+  onStoredEtag: (etag: string | null) => void;
+  runRequest: StoredRunRequest;
 }) {
   const headingId = useId();
   const statusId = useId();
@@ -76,14 +107,37 @@ export function StoredSuite({
   const [outcome, setOutcome] = useState<StudioAlert | null>(null);
   const [refusal, setRefusal] = useState<{ refusal: PolicyRunRefusal; cases: readonly JsonObject[] } | null>(null);
   const controller = useRef<AbortController | null>(null);
-  const handledRunRequest = useRef(runRequest);
+  const handledRunRequest = useRef(runRequest.seq);
+  // Focus: the button a cancelled confirmation returns to, and the answer
+  // that replaces a confirmation once a save settles.
+  const loadButton = useRef<HTMLButtonElement>(null);
+  const saveButton = useRef<HTMLButtonElement>(null);
+  const restoreFocusTo = useRef<'load' | 'save' | null>(null);
+  const outcomeRef = useRef<HTMLDivElement>(null);
+  const refusalRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => () => controller.current?.abort(), []);
+
+  useEffect(() => {
+    if (confirming !== null || restoreFocusTo.current === null) return;
+    (restoreFocusTo.current === 'load' ? loadButton : saveButton).current?.focus();
+    restoreFocusTo.current = null;
+  }, [confirming]);
+
+  useEffect(() => {
+    if (outcome !== null) outcomeRef.current?.focus();
+  }, [outcome]);
+
+  useEffect(() => {
+    if (refusal !== null) refusalRef.current?.focus();
+  }, [refusal]);
 
   const readStored = useCallback(async (): Promise<ReadState> => {
     controller.current?.abort();
     const current = new AbortController();
     controller.current = current;
+    // A confirmation names what was read; a new read withdraws it.
+    setConfirming(null);
     setRead({ kind: 'reading' });
     let next: ReadState;
     try {
@@ -98,8 +152,10 @@ export function StoredSuite({
     }
     if (controller.current === current) controller.current = null;
     setRead(next);
+    if (next.kind === 'stored') onStoredEtag(next.stored.etag);
+    else if (next.kind === 'none') onStoredEtag(null);
     return next;
-  }, []);
+  }, [onStoredEtag]);
 
   useEffect(() => {
     if (active && canRead && read.kind === 'unread') {
@@ -108,13 +164,28 @@ export function StoredSuite({
   }, [active, canRead, read.kind, readStored]);
 
   // Asked from elsewhere (a publication the required suite refused): read
-  // the stored suite as it is now and run it against the candidate.
+  // the stored suite as it is now, and run the version that refused the
+  // publication when the refusal named it, otherwise the version read.
   useEffect(() => {
-    if (runRequest === handledRunRequest.current || !canRead) return;
-    handledRunRequest.current = runRequest;
+    if (runRequest.seq === handledRunRequest.current || !canRead) return;
+    handledRunRequest.current = runRequest.seq;
+    const { etag, version } = runRequest;
     void (async () => {
       const next = await readStored();
-      if (next.kind === 'stored') await onRunStored(next.stored);
+      if (etag !== null) {
+        const ran = await onRunStored({ etag, version, fromRefusal: true });
+        if (ran === 'changed') await readStored();
+      } else if (next.kind === 'stored') {
+        const ran = await onRunStored({ etag: next.stored.etag, version: next.stored.version });
+        if (ran === 'changed') await readStored();
+      } else if (next.kind === 'none') {
+        setOutcome({
+          title: 'Nothing to run',
+          message:
+            'No suite is stored beside the policy, so there is nothing to run. Store one with Save as the stored suite.',
+          tone: 'warning',
+        });
+      }
     })();
   }, [runRequest, canRead, readStored, onRunStored]);
 
@@ -157,6 +228,7 @@ export function StoredSuite({
 
   function load() {
     if (stored === null) return;
+    if (confirming === 'load') restoreFocusTo.current = 'load';
     onSuiteChange(stored.source);
     setLoaded(stored);
     setConfirming(null);
@@ -174,6 +246,11 @@ export function StoredSuite({
     }
   }
 
+  function cancel() {
+    restoreFocusTo.current = confirming;
+    setConfirming(null);
+  }
+
   // The precondition a save sends: the first suite when the read said none
   // is stored; otherwise exactly the version the confirmation names.
   const precondition: PolicyTestsPrecondition | null =
@@ -186,7 +263,7 @@ export function StoredSuite({
   async function save() {
     if (precondition === null || saveBlockers.length > 0 || busy) return;
     const sent = suiteSource;
-    const before = stored?.etag ?? null;
+    const before = stored === null ? null : { etag: stored.etag, version: stored.version };
     setConfirming(null);
     setSaving(true);
     setOutcome(null);
@@ -198,6 +275,7 @@ export function StoredSuite({
         return;
       }
       setRead({ kind: 'stored', stored: answer.stored });
+      onStoredEtag(answer.stored.etag);
       setLoaded(answer.stored);
       setOutcome({
         title: answer.created ? 'Suite stored' : 'Suite replaced',
@@ -220,7 +298,13 @@ export function StoredSuite({
           tone: 'warning',
         });
         await readStored();
-      } else if (!(error instanceof AdminApiError) || error.status >= 500) {
+      } else if (error instanceof AdminApiError && error.status >= 400 && error.status < 500) {
+        // A refusal: the gateway answered that nothing was stored.
+        setOutcome(runAlert(error, 'Suite not stored', WRITE_PERMISSION));
+      } else {
+        // No answer, a server error, or a success this page could not read
+        // (a 2xx without the stored suite's ETag or version): the suite may
+        // or may not have been stored.
         setUnconfirmed({ sent, before });
         setOutcome({
           title: 'Save not confirmed',
@@ -228,8 +312,6 @@ export function StoredSuite({
             'The gateway did not confirm the save, so the suite may or may not have been stored. Nothing is sent again on your behalf: check the stored suite before saving again.',
           tone: 'error',
         });
-      } else {
-        setOutcome(runAlert(error, 'Suite not stored', WRITE_PERMISSION));
       }
     } finally {
       setSaving(false);
@@ -245,14 +327,25 @@ export function StoredSuite({
     }
     if (next.kind !== 'none' && next.kind !== 'stored') return;
     const now = next.kind === 'stored' ? next.stored : null;
+    const { before, sent } = unconfirmed;
     setUnconfirmed(null);
-    if ((now?.etag ?? null) === unconfirmed.before) {
+    // Decided by version: the save could only have become the version after
+    // the one it named.
+    const unchanged =
+      now === null
+        ? before === null
+        : before !== null && now.version === before.version && now.etag === before.etag;
+    if (unchanged) {
       setOutcome({
         title: 'Not stored',
         message: 'Your save was not stored: the stored suite is unchanged. You can save again.',
         tone: 'info',
       });
-    } else if (now !== null && sameSuite(now.source, unconfirmed.sent)) {
+    } else if (
+      now !== null &&
+      now.version === (before?.version ?? 0) + 1 &&
+      sameSuite(now.source, sent)
+    ) {
       setLoaded(now);
       setOutcome({
         title: 'Suite stored',
@@ -271,8 +364,8 @@ export function StoredSuite({
 
   async function runStored() {
     if (stored === null || storedRunBlockers.length > 0 || running) return;
-    const changed = await onRunStored(stored);
-    if (changed) await readStored();
+    const ran = await onRunStored({ etag: stored.etag, version: stored.version });
+    if (ran === 'changed') await readStored();
   }
 
   return (
@@ -298,6 +391,7 @@ export function StoredSuite({
           {read.kind === 'unread' ? 'Read the stored suite' : 'Read the stored suite again'}
         </button>
         <button
+          ref={loadButton}
           type="button"
           className="secondary-button"
           disabled={stored === null || busy || confirming !== null}
@@ -315,6 +409,7 @@ export function StoredSuite({
           Run the stored suite
         </button>
         <button
+          ref={saveButton}
           type="button"
           className="secondary-button"
           disabled={saveBlockers.length > 0 || busy || confirming !== null}
@@ -339,24 +434,12 @@ export function StoredSuite({
       ) : null}
 
       {confirming === 'load' && stored !== null ? (
-        <div className="policy-studio-confirmation" role="group" aria-label="Replace the cases on screen?">
-          <p>
-            {onScreenCount === null
-              ? 'The suite source on screen is not a suite.'
-              : `${plural(onScreenCount, 'case')} on screen.`}{' '}
-            Loading replaces them with stored version {stored.version} (
-            {plural(suiteCaseCounts(stored.source)?.total ?? 0, 'case')}). The cases on screen are
-            not kept anywhere.
-          </p>
-          <div className="form-actions">
-            <button type="button" className="primary-button" onClick={load}>
-              Replace them with the stored suite
-            </button>
-            <button type="button" className="secondary-button" onClick={() => setConfirming(null)}>
-              Cancel
-            </button>
-          </div>
-        </div>
+        <LoadConfirmation
+          stored={stored}
+          onScreenCount={onScreenCount}
+          onConfirm={load}
+          onCancel={cancel}
+        />
       ) : null}
 
       {confirming === 'save' && precondition !== null ? (
@@ -365,7 +448,7 @@ export function StoredSuite({
           loadedIsStored={loadedIsStored}
           suiteSource={suiteSource}
           onConfirm={() => void save()}
-          onCancel={() => setConfirming(null)}
+          onCancel={cancel}
         />
       ) : null}
 
@@ -381,9 +464,15 @@ export function StoredSuite({
           </button>
         </div>
       ) : null}
-      {outcome !== null ? <StudioAlertPanel alert={outcome} /> : null}
+      {outcome !== null ? (
+        <div ref={outcomeRef} tabIndex={-1}>
+          <StudioAlertPanel alert={outcome} />
+        </div>
+      ) : null}
       {refusal !== null ? (
-        <RefusalPanel title="Suite not stored" refusal={refusal.refusal} cases={refusal.cases} />
+        <div ref={refusalRef} tabIndex={-1}>
+          <RefusalPanel title="Suite not stored" refusal={refusal.refusal} cases={refusal.cases} />
+        </div>
       ) : null}
     </section>
   );
@@ -414,15 +503,31 @@ function statusText(read: ReadState, loaded: StoredPolicyTests | null, edited: b
   }
 }
 
+function kindName(kind: string): string {
+  if (kind === 'unknown') return 'of an unknown kind';
+  const label = caseKindLabel(kind);
+  return label === 'Unknown kind' ? kind : label;
+}
+
 function countsText(counts: SuiteCaseCounts | null): string {
   if (counts === null) return 'not a suite';
-  const kindName = (kind: string) => {
-    if (kind === 'unknown') return 'of an unknown kind';
-    const label = caseKindLabel(kind);
-    return label === 'Unknown kind' ? kind : label;
-  };
   const kinds = counts.byKind.map((entry) => `${entry.count} ${kindName(entry.kind)}`).join(', ');
   return `${plural(counts.total, 'case')}${kinds ? ` (${kinds})` : ''}`;
+}
+
+// Where the cases on screen hold fewer cases than the stored suite, in all
+// or of any kind; empty when none.
+function fewerCases(stored: SuiteCaseCounts | null, onScreen: SuiteCaseCounts | null): string[] {
+  if (stored === null || onScreen === null) return [];
+  const fewer: string[] = [];
+  if (onScreen.total < stored.total) {
+    fewer.push(`${onScreen.total} instead of ${stored.total} in all`);
+  }
+  for (const entry of stored.byKind) {
+    const now = onScreen.byKind.find((other) => other.kind === entry.kind)?.count ?? 0;
+    if (now < entry.count) fewer.push(`${now} instead of ${entry.count} ${kindName(entry.kind)}`);
+  }
+  return fewer;
 }
 
 function activeStatusText(status: string | null): string {
@@ -431,6 +536,43 @@ function activeStatusText(status: string | null): string {
     return 'The live policy passes the suite just stored.';
   }
   return `The live policy does not pass the suite just stored (${status.replace(/_/g, ' ')}). Storing it changed nothing live, but the next policy publication must pass it.`;
+}
+
+function LoadConfirmation({
+  stored,
+  onScreenCount,
+  onConfirm,
+  onCancel,
+}: {
+  stored: StoredPolicyTests;
+  onScreenCount: number | null;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    confirmRef.current?.focus();
+  }, []);
+  return (
+    <div className="policy-studio-confirmation" role="group" aria-label="Replace the cases on screen?">
+      <p>
+        {onScreenCount === null
+          ? 'The suite source on screen is not a suite.'
+          : `${plural(onScreenCount, 'case')} on screen.`}{' '}
+        Loading replaces them with stored version {stored.version} (
+        {plural(suiteCaseCounts(stored.source)?.total ?? 0, 'case')}). The cases on screen are
+        not kept anywhere.
+      </p>
+      <div className="form-actions">
+        <button ref={confirmRef} type="button" className="primary-button" onClick={onConfirm}>
+          Replace them with the stored suite
+        </button>
+        <button type="button" className="secondary-button" onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
 }
 
 function SaveConfirmation({
@@ -446,6 +588,13 @@ function SaveConfirmation({
   onConfirm: () => void;
   onCancel: () => void;
 }) {
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    confirmRef.current?.focus();
+  }, []);
+  const storedCounts = stored === null ? null : suiteCaseCounts(stored.source);
+  const onScreenCounts = suiteCaseCounts(suiteSource);
+  const fewer = fewerCases(storedCounts, onScreenCounts);
   return (
     <div
       className="policy-studio-confirmation"
@@ -454,20 +603,28 @@ function SaveConfirmation({
     >
       {stored === null ? (
         <p>No suite is stored: these cases become the first version.</p>
-      ) : loadedIsStored ? (
-        <p>
-          Replaces stored version {stored.version}, which the cases on screen were loaded from.
-        </p>
       ) : (
         <>
-          <p className="alert warning">
-            Saving replaces stored version {stored.version}, which the cases on screen were not
-            loaded from. Compare them before you store:
-          </p>
+          {loadedIsStored ? (
+            <p>
+              Replaces stored version {stored.version}, which the cases on screen were loaded from
+              and have been edited since. Compare them before you store:
+            </p>
+          ) : (
+            <p className="alert warning">
+              Saving replaces stored version {stored.version}, which the cases on screen were not
+              loaded from. Compare them before you store:
+            </p>
+          )}
           <ul>
-            <li>{`Stored version ${stored.version}: ${countsText(suiteCaseCounts(stored.source))}.`}</li>
-            <li>{`On screen: ${countsText(suiteCaseCounts(suiteSource))}.`}</li>
+            <li>{`Stored version ${stored.version}: ${countsText(storedCounts)}.`}</li>
+            <li>{`On screen: ${countsText(onScreenCounts)}.`}</li>
           </ul>
+          {fewer.length > 0 ? (
+            <p className="alert warning">
+              {`The cases on screen hold fewer cases than stored version ${stored.version}: ${fewer.join(', ')}.`}
+            </p>
+          ) : null}
         </>
       )}
       <p className="rule-hint">
@@ -477,7 +634,7 @@ function SaveConfirmation({
         nothing is edited in place.
       </p>
       <div className="form-actions">
-        <button type="button" className="primary-button" onClick={onConfirm}>
+        <button ref={confirmRef} type="button" className="primary-button" onClick={onConfirm}>
           Store the suite
         </button>
         <button type="button" className="secondary-button" onClick={onCancel}>

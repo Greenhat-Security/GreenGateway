@@ -9,11 +9,16 @@ import {
   type PolicyTestRunStatus,
   type PolicyTestRunSuite,
 } from '../../../lib/policyTestRuns';
-import { POLICY_TESTS_ETAG_MISMATCH_REASON, type StoredPolicyTests } from '../../../lib/policyTests';
+import { POLICY_TESTS_ETAG_MISMATCH_REASON } from '../../../lib/policyTests';
 import { shortEtag, type JsonObject } from '../model';
 import { StudioAlertPanel, type StudioAlert } from '../StudioAlert';
 import { CasesEditor } from './CasesEditor';
-import { StoredSuite } from './StoredSuite';
+import {
+  StoredSuite,
+  type StoredRunOutcome,
+  type StoredRunRequest,
+  type StoredRunTarget,
+} from './StoredSuite';
 import {
   CheckboxOption,
   CountList,
@@ -43,8 +48,9 @@ const PERMISSIONS = `admin:policy:read and ${POLICY_SIMULATE_PERMISSION}`;
 const LISTED_MISSING_EXPECTATIONS = 8;
 
 // A run is stale once what it ran is no longer on screen: the candidate and
-// the cases for a run of the cases on screen, the candidate for a run of the
-// stored suite (which names the version it ran).
+// the cases for a run of the cases on screen (`key`), the candidate and the
+// stored version for a run of the stored suite (`key` is then the candidate
+// alone, and the report names the stored ETag it ran).
 type TestRun = { key: string; subject: string; report: PolicyTestReport };
 type TestRefusal = { refusal: PolicyRunRefusal; cases: readonly JsonObject[] };
 
@@ -73,11 +79,15 @@ export function TestsPanel({
   suiteSource: string;
   onSuiteChange: (source: string) => void;
   onReloadLive: () => void;
-  storedRunRequest: number;
+  storedRunRequest: StoredRunRequest;
 }) {
   const headingId = useId();
   const blockersId = useId();
   const [busy, setBusy] = useState(false);
+  // What the run in progress runs, for the status line.
+  const [runningText, setRunningText] = useState('');
+  // The ETag of the stored suite as last read here; null for none.
+  const [storedEtag, setStoredEtag] = useState<string | null>(null);
   const [rejected, setRejected] = useState(false);
   const [run, setRun] = useState<TestRun | null>(null);
   const [refusal, setRefusal] = useState<TestRefusal | null>(null);
@@ -92,9 +102,12 @@ export function TestsPanel({
   const cases = parsed.ok ? parsed.cases : [];
   const missing = casesWithoutExpectation(cases);
   const key = candidate === null ? null : `${candidateKey(candidate)}\n${suiteSource}`;
-  const storedKey = candidate === null ? null : `${candidateKey(candidate)}\nstored`;
+  const storedKey = candidate === null ? null : candidateKey(candidate);
   const stale =
-    run !== null && run.key !== (run.report.suite_stored !== null ? storedKey : key);
+    run !== null &&
+    (run.report.suite_stored !== null
+      ? run.key !== storedKey || run.report.suite_stored.etag !== storedEtag
+      : run.key !== key);
 
   // What any run needs; a run of the cases on screen also needs the cases.
   const common: string[] = [];
@@ -115,10 +128,10 @@ export function TestsPanel({
   }
   if (validationBlocker !== null) blockers.push(validationBlocker);
 
-  // Run the cases on screen, or the stored suite pinned to the version on
-  // screen. Resolves to whether the gateway answered that the stored suite
-  // is no longer that version.
-  async function execute(suite: PolicyTestRunSuite): Promise<boolean> {
+  // Run the cases on screen, or the stored suite pinned to `target`.
+  // Resolves to whether the gateway answered that the stored suite is no
+  // longer that version.
+  async function execute(suite: PolicyTestRunSuite, target?: StoredRunTarget): Promise<boolean> {
     const runKey = suite.kind === 'stored' ? storedKey : key;
     if (candidate === null || runKey === null || busy) {
       return false;
@@ -127,6 +140,13 @@ export function TestsPanel({
     const current = new AbortController();
     controller.current = current;
     setBusy(true);
+    setRunningText(
+      suite.kind === 'stored'
+        ? target !== undefined && target.version !== null
+          ? `Running stored suite version ${target.version}.`
+          : 'Running the stored suite.'
+        : `Running ${plural(cases.length, 'case')}.`,
+    );
     setAlert(null);
     setBaseStale(false);
     setRefusal(null);
@@ -150,7 +170,15 @@ export function TestsPanel({
       const suiteChanged =
         error instanceof AdminApiError && error.code === POLICY_TESTS_ETAG_MISMATCH_REASON;
       setBaseStale(error instanceof AdminApiError && error.status === 412 && !suiteChanged);
-      setAlert(runAlert(error, 'Policy tests did not run', PERMISSIONS));
+      setAlert(
+        suiteChanged && target?.fromRefusal === true
+          ? {
+              title: 'Stored suite changed',
+              message: `The stored suite is no longer ${target.version !== null ? `version ${target.version}, ` : 'the version '}which refused the publication, so nothing ran. Run the stored suite to see how this draft fares against the version stored now.`,
+              tone: 'warning',
+            }
+          : runAlert(error, 'Policy tests did not run', PERMISSIONS),
+      );
       return suiteChanged;
     } finally {
       if (controller.current === current) {
@@ -167,10 +195,19 @@ export function TestsPanel({
     await execute({ kind: 'inline', source: suiteSource });
   }
 
-  function runStored(stored: StoredPolicyTests): Promise<boolean> {
-    return storedRunBlockers.length > 0
-      ? Promise.resolve(false)
-      : execute({ kind: 'stored', etag: stored.etag });
+  async function runStored(target: StoredRunTarget): Promise<StoredRunOutcome> {
+    if (storedRunBlockers.length > 0) {
+      // Only a run asked from elsewhere gets here: the button is disabled.
+      setRefusal(null);
+      setAlert({
+        title: 'The stored suite did not run',
+        message: 'It cannot run against this candidate now:',
+        details: storedRunBlockers,
+        tone: 'warning',
+      });
+      return 'blocked';
+    }
+    return (await execute({ kind: 'stored', etag: target.etag }, target)) ? 'changed' : 'ran';
   }
 
   const problems = new Map<number, string[]>();
@@ -206,6 +243,7 @@ export function TestsPanel({
         runBlockers={storedRunBlockers}
         running={busy}
         onRunStored={runStored}
+        onStoredEtag={setStoredEtag}
         runRequest={storedRunRequest}
       />
 
@@ -230,7 +268,7 @@ export function TestsPanel({
       <RunBlockers id={blockersId} blockers={blockers} />
 
       <div className="policy-studio-status" role="status" aria-live="polite">
-        {busy ? <p className="rule-hint">Running {plural(cases.length, 'case')}.</p> : null}
+        {busy ? <p className="rule-hint">{runningText}</p> : null}
       </div>
       {alert ? (
         <>

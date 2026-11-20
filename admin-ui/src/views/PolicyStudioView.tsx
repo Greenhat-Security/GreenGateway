@@ -112,6 +112,10 @@ import { EvidencePanel } from './policy-studio/workbench/EvidencePanel';
 import { OptimizePanel } from './policy-studio/workbench/OptimizePanel';
 import { SimulatorPanel } from './policy-studio/workbench/SimulatorPanel';
 import { emptySuiteSource, parseSuite } from './policy-studio/workbench/suite';
+import {
+  NO_STORED_RUN_REQUEST,
+  type StoredRunRequest,
+} from './policy-studio/workbench/StoredSuite';
 import { TestsPanel } from './policy-studio/workbench/TestsPanel';
 import { targetText } from './policy-studio/suggestions/model';
 import {
@@ -269,8 +273,10 @@ export function PolicyStudioView() {
   const [candidateChoice, setCandidateChoice] = useState<'draft' | 'live'>('draft');
   // The cases the Simulator and the Test view share, in page memory only.
   const [suiteSource, setSuiteSource] = useState(emptySuiteSource);
-  // Bumped to have the Test view run the stored suite against the candidate.
-  const [storedRunRequest, setStoredRunRequest] = useState(0);
+  // Replaced to have the Test view run the stored suite against the
+  // candidate, pinned to the version a refused publication named.
+  const [storedRunRequest, setStoredRunRequest] =
+    useState<StoredRunRequest>(NO_STORED_RUN_REQUEST);
   // The suggestions, read once their view is first shown, and the drafts in
   // this page that hold a suggestion's rule. Page memory only.
   const suggestions = useSuggestionList(canReadSuggestions && view === 'suggestions');
@@ -832,6 +838,9 @@ export function PolicyStudioView() {
         typeof from === 'object' || sourceRef.current === candidate || candidate === undefined,
       );
       setConversion(null);
+      // The workbench now judges the new draft, which holds the change, so an
+      // analysis of the live policy is stale and offers its patch no more.
+      if (typeof from === 'object') setCandidateChoice('draft');
       setNotice({
         title: 'Draft created',
         message: `Draft ${created.summary.draft_id} is pinned to live revision ${shortEtag(created.summary.base_etag)}. Nothing changes until it is published.${
@@ -1983,9 +1992,14 @@ export function PolicyStudioView() {
             onDismiss={() => setProblem(null)}
             canRunTests={canSimulate}
             onRunStoredSuite={() => {
+              const required = problem.kind === 'tests-required' ? problem.requiredTests : null;
               setCandidateChoice('draft');
               setView('test');
-              setStoredRunRequest((count) => count + 1);
+              setStoredRunRequest((previous) => ({
+                seq: previous.seq + 1,
+                etag: required?.suite_etag ?? null,
+                version: required?.suite_version ?? null,
+              }));
             }}
           />
         ) : null}
@@ -3121,6 +3135,9 @@ function ProblemPanel({
   if (problem.kind === 'tests-required') {
     const required = problem.requiredTests;
     const summary = required?.summary ?? null;
+    // No suite is stored, or none can be read: there is nothing to run.
+    const suiteRunnable =
+      required?.status !== 'suite_missing' && required?.status !== 'suite_unavailable';
     return (
       <div
         ref={panelRef}
@@ -3149,12 +3166,24 @@ function ProblemPanel({
             {`${summary.total} ${summary.total === 1 ? 'case' : 'cases'}: ${summary.passed} passed, ${summary.failed} failed, ${summary.incomplete} incomplete, ${summary.errors} errors.`}
           </p>
         ) : null}
-        <p className="rule-hint">
-          The answer carries counts only. Run the stored suite against this draft to see which
-          cases did not pass.
-        </p>
+        {required?.status === 'suite_missing' ? (
+          <p className="rule-hint">
+            There is no suite to run. Store one from the Test view (Save as the stored suite),
+            then publish again.
+          </p>
+        ) : required?.status === 'suite_unavailable' ? (
+          <p className="rule-hint">
+            There is no suite that can be run now. Check that the gateway has a suite store
+            configured and can read it, then publish again.
+          </p>
+        ) : (
+          <p className="rule-hint">
+            The answer carries counts only. Run the stored suite against this draft to see which
+            cases did not pass.
+          </p>
+        )}
         <div className="form-actions">
-          {canRunTests ? (
+          {canRunTests && suiteRunnable ? (
             <button type="button" className="secondary-button" onClick={onRunStoredSuite}>
               Run the stored suite against this draft
             </button>
@@ -3163,7 +3192,7 @@ function ProblemPanel({
             Dismiss
           </button>
         </div>
-        {!canRunTests ? (
+        {!canRunTests && suiteRunnable ? (
           <p className="rule-hint">
             Running the stored suite needs admin:policy:read and admin:policy:simulate.
           </p>

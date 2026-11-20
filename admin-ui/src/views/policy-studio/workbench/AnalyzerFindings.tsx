@@ -555,6 +555,15 @@ function FindingItem({
   const where = `${finding.code} at ${finding.pointer || 'the whole document'}`;
   const state = stateText(finding);
   const suppressed = finding.suppression?.state === 'suppressed';
+  // A cancelled review returns focus to the button that opened it.
+  const reviewButton = useRef<HTMLButtonElement>(null);
+  const returnToReview = useRef(false);
+  useEffect(() => {
+    if (!reviewing && returnToReview.current) {
+      returnToReview.current = false;
+      reviewButton.current?.focus();
+    }
+  }, [reviewing]);
   return (
     <li className={suppressed ? 'warning' : 'risk'}>
       <div className="policy-studio-diagnostic-head">
@@ -583,6 +592,7 @@ function FindingItem({
       {offer.kind === 'note' ? <p className="rule-hint">{offer.text}</p> : null}
       {offer.kind === 'review' && !reviewing ? (
         <button
+          ref={reviewButton}
           type="button"
           className="secondary-button"
           aria-label={`Review the advisory change for ${where}`}
@@ -597,7 +607,10 @@ function FindingItem({
           live={live}
           startDraftBlocker={startDraftBlocker}
           onApply={() => onApply(offer.patch)}
-          onCancel={onCancelReview}
+          onCancel={() => {
+            returnToReview.current = true;
+            onCancelReview();
+          }}
         />
       ) : null}
       {state !== null ? (
@@ -683,8 +696,22 @@ function PatchReview({
   const subject = live ? 'live policy' : 'draft';
   const action = live ? 'Start a draft with this change' : 'Apply to the draft';
   const blocked = live && startDraftBlocker !== null;
+  // Focus moves into the review when it opens: to its action, or to the
+  // review itself while the action is unavailable.
+  const groupRef = useRef<HTMLDivElement>(null);
+  const actionRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    (blocked ? groupRef.current : actionRef.current)?.focus();
+    // Only on opening: a blocker that clears later does not move focus.
+  }, []);
   return (
-    <div className="policy-studio-confirmation" role="group" aria-label="Apply this advisory change?">
+    <div
+      ref={groupRef}
+      tabIndex={-1}
+      className="policy-studio-confirmation"
+      role="group"
+      aria-label="Apply this advisory change?"
+    >
       <p>
         Access effect: {EFFECT_TEXT[patch.accessEffect] ?? `${patch.accessEffect}.`}
       </p>
@@ -707,6 +734,7 @@ function PatchReview({
       </p>
       <div className="form-actions">
         <button
+          ref={actionRef}
           type="button"
           className="primary-button"
           disabled={blocked}
