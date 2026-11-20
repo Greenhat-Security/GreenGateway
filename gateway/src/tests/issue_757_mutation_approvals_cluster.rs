@@ -121,6 +121,15 @@ async fn postgres_keyed_mutation_prepare_recovers_the_receipt_after_catalog_drif
     let (id, connection_etag, _) = create_widget_connection(&best_effort, &operator, &origin).await;
     let (prepare, etag) = prepare_route(&best_effort, &requester, "updateWidget").await;
     config.authority_events.durability = config::AuthorityEvidenceDurability::Required;
+    // Required mode admits the keyed preparation only with the synced file
+    // sink (issue #425); this replica never starts a dispatcher, so the file
+    // is never written.
+    config.authority_events.sink = config::AuthorityEventSinkSetting::File(
+        std::env::temp_dir()
+            .join("issue-757-keyed-prepare-events.jsonl")
+            .to_string_lossy()
+            .into_owned(),
+    );
     let required = replica(config.clone(), pool).await;
     let body = json!({"arguments":{"id":PRIVATE_ID,"name":PRIVATE_NAME}});
     let raw = body.to_string();

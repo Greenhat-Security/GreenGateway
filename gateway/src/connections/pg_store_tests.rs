@@ -520,6 +520,25 @@ async fn a_key_reserved_for_a_bound_action_refuses_the_keyed_revoke_and_prepare(
     )
     .expect("the key binds");
     let client = pool.get().await.unwrap();
+    // A bound reservation needs the contract fence the operation gate raises
+    // for `caller_operation_keys`; raise it as that first admission does.
+    let requirement = &crate::storage::compatibility::CALLER_OPERATION_KEYS;
+    client
+        .execute(
+            "UPDATE greengateway.contract_fence
+             SET generation = generation + 1,
+                 minimum_schema = GREATEST(minimum_schema, $1),
+                 capabilities = $2,
+                 raised_at = now(),
+                 raised_by = 'fixture.caller_operation_keys'
+             WHERE singleton",
+            &[
+                &requirement.minimum_schema,
+                &requirement.capability.as_str(),
+            ],
+        )
+        .await
+        .unwrap();
     client.batch_execute("BEGIN").await.unwrap();
     assert_eq!(
         crate::storage::postgres_authority_events::reserve_bound_operation(&client, &bound)
