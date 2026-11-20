@@ -1673,3 +1673,346 @@ fn the_committed_at_shape_is_the_schemas() {
         assert!(!committed_at_in_shape(refused), "{refused}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// One qualification rule for every journaled source (issue #425): under
+// `qualified_v1`, a caller UUIDv7 operation ID and a provider-authenticated
+// principal with a canonical issuer make an `authority_event.v1`; a UUIDv4
+// row or a service-token actor keeps the delivery record; any other actor
+// behind a caller key, or a revision outside the operation's transition,
+// stalls the batch.
+// ---------------------------------------------------------------------------
+
+/// A caller-bound operation ID, as an `Idempotency-Key` supplies one.
+fn caller_key(seed: u8) -> String {
+    crate::auth::tokens::test_revoke_operation_id(seed).to_string()
+}
+
+fn v1_schema() -> jsonschema::Validator {
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../../docs/schemas/authority_event.v1.schema.json"
+    ))
+    .expect("the v1 schema should be JSON");
+    jsonschema::validator_for(&schema).expect("the v1 schema should compile")
+}
+
+/// `row` recorded under a caller key by a provider-authenticated principal
+/// with a canonical issuer.
+fn keyed(row: JournaledEvidence, seed: u8) -> JournaledEvidence {
+    let mut row = with_actor(
+        row,
+        Some("principal"),
+        Some("session_cookie"),
+        Some(ACTOR_ISSUER_MARKER),
+    );
+    row.operation_id = Some(caller_key(seed));
+    row
+}
+
+/// Every action of every journal source, approval preparation included,
+/// recorded under a caller key by a provider-authenticated principal.
+fn every_keyed_shape() -> Vec<JournaledEvidence> {
+    let mut shapes = every_delivered_shape();
+    shapes.push(evidence(
+        JournalSource::MutationApprovalPrepare,
+        "mutation_approval.prepare",
+    ));
+    shapes
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| keyed(row, u8::try_from(index).expect("few shapes")))
+        .collect()
+}
+
+fn action_of(row: &JournaledEvidence) -> String {
+    row.action.clone().expect("fixture has an action")
+}
+
+#[test]
+fn every_keyed_operation_projects_a_closed_v1_event_with_an_issuer_scoped_subject() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let validator = v1_schema();
+    let format = AuthorityEventFormat::QualifiedV1;
+    let subject = keyring
+        .derive(
+            ReferenceDomain::ActorSubject,
+            &[ACTOR_ISSUER_MARKER, ACTOR_MARKER],
+        )
+        .unwrap();
+    let issuer = keyring
+        .derive(ReferenceDomain::ActorIssuer, &[ACTOR_ISSUER_MARKER])
+        .unwrap();
+    let mut sources = std::collections::BTreeSet::new();
+    let mut actions = std::collections::BTreeSet::new();
+    for row in every_keyed_shape() {
+        let action = action_of(&row);
+        let record = super::project(&row, &keyring, format).unwrap_or_else(|error| {
+            panic!("{action}: a keyed principal change qualifies: {error}")
+        });
+        let wire = record.wire_json(format).expect("the event serializes");
+        let event: Value = serde_json::from_str(&wire).unwrap();
+        if let Err(error) = validator.validate(&event) {
+            panic!("{action}: the v1 schema must accept {event}: {error}");
+        }
+        assert_eq!(event["schema_version"], "authority_event.v1", "{action}");
+        assert_eq!(event["operation"], action.as_str());
+        assert_eq!(event["event_id"], row.event_id.as_str(), "{action}");
+        assert_eq!(
+            event["operation_id"],
+            row.operation_id.as_deref().unwrap(),
+            "{action}: the caller's key is the operation"
+        );
+        assert_eq!(event["actor"]["kind"], "principal", "{action}");
+        assert_eq!(event["actor"]["auth_mode"], "session_cookie", "{action}");
+        assert_eq!(event["actor"]["subject_ref"], subject.as_str(), "{action}");
+        assert_eq!(event["actor"]["issuer_ref"], issuer.as_str(), "{action}");
+        assert_ne!(
+            event["actor"]["subject_ref"],
+            record.actor.recorded_ref.as_str()
+        );
+        assert!(
+            event.get("sequence").is_none(),
+            "{action}: v1 has no sequence"
+        );
+        assert_eq!(
+            event["revision"],
+            serde_json::to_value(&record.revision).unwrap(),
+            "{action}: the revisions are the projected transition"
+        );
+        for marker in [
+            ACTOR_MARKER,
+            ACTOR_ISSUER_MARKER,
+            CONNECTION_MARKER,
+            TOKEN_MARKER,
+            ISSUER_MARKER,
+            JTI_DIGEST_MARKER,
+            SESSION_MARKER,
+            CATALOG_MARKER,
+        ] {
+            assert!(!wire.contains(marker), "{action}: raw identifier in {wire}");
+        }
+        sources.insert(row.source.table());
+        actions.insert(action);
+    }
+    assert_eq!(
+        sources.len(),
+        JournalSource::ALL.len(),
+        "every journal source"
+    );
+    assert_eq!(actions.len(), 25, "every journaled action: {actions:?}");
+}
+
+#[test]
+fn a_v4_or_service_token_row_keeps_the_delivery_v1_record() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let format = AuthorityEventFormat::QualifiedV1;
+    for row in every_delivered_shape() {
+        let action = action_of(&row);
+        // Unkeyed: the store minted a UUIDv4.
+        let unkeyed = with_actor(
+            row.clone(),
+            Some("principal"),
+            Some("session_cookie"),
+            Some(ACTOR_ISSUER_MARKER),
+        );
+        // A gateway service token has no provider issuer to scope it.
+        let mut service_token = with_actor(row, Some("service_token"), Some("service_token"), None);
+        service_token.operation_id = Some(caller_key(9));
+        for legacy in [unkeyed, service_token] {
+            let expected = serde_json::to_string(&project(&legacy, &keyring).unwrap()).unwrap();
+            let negotiated = super::project(&legacy, &keyring, format)
+                .unwrap_or_else(|error| panic!("{action}: {error}"));
+            assert_eq!(negotiated.wire_json(format).unwrap(), expected, "{action}");
+            assert!(negotiated.qualified.is_none(), "{action}");
+        }
+    }
+}
+
+#[test]
+fn a_v7_principal_row_with_an_invalid_transition_stalls_instead_of_falling_back() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let format = AuthorityEventFormat::QualifiedV1;
+    let row = |source, action| keyed(evidence(source, action), 3);
+    let mut broken = Vec::new();
+    let mut created_again = row(JournalSource::ConnectionChange, ACTION_CONNECTION_CREATE);
+    created_again.prior_version = Some(1);
+    broken.push(created_again);
+    let mut unchanged = row(JournalSource::ConnectionChange, ACTION_CONNECTION_REPLACE);
+    unchanged.new_version = unchanged.prior_version;
+    broken.push(unchanged);
+    let mut rebound_backwards = row(
+        JournalSource::ConnectionChange,
+        ACTION_CREDENTIAL_BINDING_CHANGE,
+    );
+    rebound_backwards.prior_version = Some(2);
+    broken.push(rebound_backwards);
+    let mut revived = row(JournalSource::ConnectionChange, ACTION_CONNECTION_DELETE);
+    revived.new_version = Some(4);
+    broken.push(revived);
+    let mut reissued = row(
+        JournalSource::ServiceTokenChange,
+        ACTION_SERVICE_TOKEN_ISSUE,
+    );
+    reissued.new_version = Some(2);
+    broken.push(reissued);
+    // A token row's revision advances by exactly one per change.
+    for action in [ACTION_SERVICE_TOKEN_ROTATE, ACTION_SERVICE_TOKEN_REVOKE] {
+        let mut skipped = row(JournalSource::ServiceTokenChange, action);
+        skipped.new_version = Some(3);
+        broken.push(skipped);
+    }
+    let mut versioned_jwt = row(JournalSource::JwtRevocation, ACTION_JWT_REVOKE);
+    versioned_jwt.prior_version = Some(1);
+    broken.push(versioned_jwt);
+    let mut versioned_grant = row(JournalSource::AdminSession, ACTION_ADMIN_SESSION_GRANT);
+    versioned_grant.new_version = Some(1);
+    broken.push(versioned_grant);
+    let mut stale_policy = row(JournalSource::DocumentChange, ACTION_POLICY_PUBLISH);
+    stale_policy.new_version = stale_policy.prior_version;
+    broken.push(stale_policy);
+    let mut stale_catalog = row(JournalSource::CatalogChange, ACTION_CATALOG_OVERLAY_DELETE);
+    stale_catalog.new_version = Some(1);
+    broken.push(stale_catalog);
+    for invalid in broken {
+        let action = action_of(&invalid);
+        assert_eq!(
+            super::project(&invalid, &keyring, format).expect_err("the batch stalls"),
+            ProjectionError::InvalidEvidence,
+            "{action}"
+        );
+    }
+
+    // No writer binds a caller key to anything but a provider-authenticated
+    // principal with a canonical issuer, or a gateway service token.
+    for row in every_keyed_shape() {
+        let action = action_of(&row);
+        for (kind, auth_mode, issuer) in [
+            (None, None, None),
+            (Some("system"), Some("system"), None),
+            (Some("principal"), Some("bearer_token"), None),
+            (
+                Some("principal"),
+                Some("bearer_token"),
+                Some(" https://issuer.example.test/ "),
+            ),
+            (
+                Some("service_token"),
+                Some("service_token"),
+                Some(ACTOR_ISSUER_MARKER),
+            ),
+        ] {
+            let impossible = with_actor(row.clone(), kind, auth_mode, issuer);
+            let error = super::project(&impossible, &keyring, format)
+                .expect_err("a caller key on an impossible actor stalls the batch");
+            assert!(
+                matches!(
+                    error,
+                    ProjectionError::InvalidEvidence | ProjectionError::MissingEvidence
+                ),
+                "{action} {kind:?} {issuer:?}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn under_delivery_v1_every_keyed_family_row_is_a_legacy_record_and_none_stalls() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let validator = delivery_schema();
+    let mut prepares = 0;
+    for row in every_keyed_shape() {
+        let action = action_of(&row);
+        if row.source == JournalSource::MutationApprovalPrepare {
+            // A receipt has no legacy form: the dispatcher holds its cursor.
+            assert_eq!(
+                project(&row, &keyring).expect_err("prepare needs qualified_v1"),
+                ProjectionError::QualifiedFormatRequired
+            );
+            prepares += 1;
+            continue;
+        }
+        for variant in [
+            row.clone(),
+            with_actor(row.clone(), Some("principal"), Some("bearer_token"), None),
+            with_actor(row.clone(), Some("system"), Some("system"), None),
+            with_actor(row, Some("service_token"), Some("service_token"), None),
+        ] {
+            let record = project(&variant, &keyring).unwrap_or_else(|error| {
+                panic!("{action}: delivery_v1 never stalls on a caller key: {error}")
+            });
+            assert!(record.qualified.is_none(), "{action}");
+            let wire = record
+                .wire_json(AuthorityEventFormat::DeliveryV1)
+                .expect("the record serializes");
+            let value: Value = serde_json::from_str(&wire).unwrap();
+            if let Err(error) = validator.validate(&value) {
+                panic!("{action}: the delivery schema must accept {value}: {error}");
+            }
+            assert_eq!(value["schema_version"], DELIVERY_SCHEMA_VERSION);
+            assert_eq!(
+                value["operation_id"],
+                variant.operation_id.as_deref().unwrap()
+            );
+        }
+    }
+    assert_eq!(prepares, 1);
+}
+
+#[test]
+fn a_credential_binding_change_names_a_credential_binding_and_shares_its_operation() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let format = AuthorityEventFormat::QualifiedV1;
+    // One keyed replace that changed credential authority: two rows, one
+    // operation.
+    let replace = keyed(
+        evidence(JournalSource::ConnectionChange, ACTION_CONNECTION_REPLACE),
+        5,
+    );
+    let binding = keyed(
+        evidence(
+            JournalSource::ConnectionChange,
+            ACTION_CREDENTIAL_BINDING_CHANGE,
+        ),
+        5,
+    );
+    let wire = |row: &JournaledEvidence| -> (DeliveryRecord, Value) {
+        let record = super::project(row, &keyring, format).expect("a keyed change qualifies");
+        let event = serde_json::from_str(&record.wire_json(format).unwrap()).unwrap();
+        (record, event)
+    };
+    let (_, replaced) = wire(&replace);
+    let (bound_record, bound) = wire(&binding);
+    assert_eq!(bound["schema_version"], "authority_event.v1");
+    assert_eq!(bound["operation_id"], caller_key(5));
+    assert_eq!(bound["operation_id"], replaced["operation_id"]);
+    assert_ne!(bound["event_id"], replaced["event_id"]);
+    assert_eq!(bound["operation"], ACTION_CREDENTIAL_BINDING_CHANGE);
+    assert_eq!(bound["resource"]["kind"], "credential_binding");
+    assert_eq!(
+        bound["resource"]["ref"],
+        keyring
+            .derive(ReferenceDomain::CredentialBinding, &[CONNECTION_MARKER])
+            .unwrap()
+            .as_str(),
+        "the binding is referenced from its Connection in its own domain"
+    );
+    assert_eq!(replaced["resource"]["kind"], "connection");
+    assert_ne!(bound["resource"]["ref"], replaced["resource"]["ref"]);
+    assert_eq!(
+        bound["revision"],
+        serde_json::json!({"axis":"credential","before":"0","after":"1","security":"17"})
+    );
+    assert!(v1_schema().is_valid(&bound));
+    // The delivery record keeps naming the Connection, byte for byte.
+    assert_eq!(
+        bound_record
+            .wire_json(AuthorityEventFormat::DeliveryV1)
+            .unwrap(),
+        serde_json::to_string(&project(&binding, &keyring).unwrap()).unwrap()
+    );
+    assert_eq!(bound_record.resource.kind, "connection");
+    let encoded = serde_json::to_string(&bound).unwrap();
+    for marker in [CONNECTION_MARKER, ACTOR_MARKER, ACTOR_ISSUER_MARKER] {
+        assert!(!encoded.contains(marker));
+    }
+}

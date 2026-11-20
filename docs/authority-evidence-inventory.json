@@ -1820,7 +1820,7 @@
           "sources": [
             {
               "path": "gateway/src/authority_events/delivery.rs",
-              "anchor": "fn qualified_revoke_actor("
+              "anchor": "pub(super) fn qualify_caller_bound("
             },
             {
               "path": "gateway/src/authority_events/delivery.rs",
@@ -1843,6 +1843,10 @@
             {
               "path": "gateway/src/authority_events/delivery_tests.rs",
               "anchor": "fn negotiated_revocation_refuses_impossible_keyed_evidence("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery_tests.rs",
+              "anchor": "fn a_v7_principal_row_with_an_invalid_transition_stalls_instead_of_falling_back("
             },
             {
               "path": "gateway/src/authority_events/dispatcher_tests.rs",

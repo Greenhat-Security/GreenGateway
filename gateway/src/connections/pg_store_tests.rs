@@ -521,7 +521,7 @@ async fn keyed_prepare_file_delivery_resumes_after_format_downgrade_and_cursor_l
     let store = std::sync::Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
     let client = pool.get().await.unwrap();
     assert_eq!(
-        PostgresAuthorityEventStore::prune_with(&client, std::time::Duration::ZERO, 100)
+        PostgresAuthorityEventStore::prune_with(&client, std::time::Duration::ZERO, 100, false)
             .await
             .unwrap(),
         0,
@@ -604,7 +604,7 @@ async fn keyed_prepare_file_delivery_resumes_after_format_downgrade_and_cursor_l
         assert!(!bytes.contains(marker));
     }
     assert_eq!(
-        PostgresAuthorityEventStore::prune_with(&client, std::time::Duration::ZERO, 100)
+        PostgresAuthorityEventStore::prune_with(&client, std::time::Duration::ZERO, 100, false)
             .await
             .unwrap(),
         rows.len() as u64

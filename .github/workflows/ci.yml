@@ -764,6 +764,8 @@ jobs:
             storage::postgres_documents::tests::
             storage::postgres_admin_sessions::tests::
             authority_events::dispatcher::tests::
+            storage::postgres_authority_events::tests::retention_under_required_never_prunes_a_journal_with_no_cursor
+            storage::postgres_authority_events::tests::best_effort_without_a_cursor_still_prunes_by_age
             storage::migrations::tests::migrations_twelve_through_sixteen_preserve_existing_connection_state
             storage::migrations::tests::migration_eighteen_fabricates_no_evidence_for_existing_tokens_or_revocations
             storage::migrations::tests::migration_twenty_one_journals_existing_evidence_in_commit_order

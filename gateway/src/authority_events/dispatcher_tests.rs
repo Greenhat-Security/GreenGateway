@@ -1021,7 +1021,7 @@ async fn retention_never_prunes_an_undelivered_event() {
     let prune = |retention: Duration| {
         let client = &client;
         async move {
-            PostgresAuthorityEventStore::prune_with(client, retention, 1_000)
+            PostgresAuthorityEventStore::prune_with(client, retention, 1_000, false)
                 .await
                 .expect("the retention step runs")
         }
@@ -1089,7 +1089,7 @@ async fn without_a_consumer_retention_is_by_age_alone() {
     producers.revoke_jwt("unclaimed-jti").await;
     let client = pool.get().await.expect("maintenance session");
     assert_eq!(
-        PostgresAuthorityEventStore::prune_with(&client, Duration::ZERO, 1_000)
+        PostgresAuthorityEventStore::prune_with(&client, Duration::ZERO, 1_000, false)
             .await
             .expect("the retention step runs"),
         1
@@ -1295,7 +1295,7 @@ async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing() {
     );
     let client = pool.get().await.expect("maintenance session");
     assert_eq!(
-        PostgresAuthorityEventStore::prune_with(&client, Duration::ZERO, 1_000)
+        PostgresAuthorityEventStore::prune_with(&client, Duration::ZERO, 1_000, false)
             .await
             .expect("retention runs"),
         3
@@ -1444,7 +1444,7 @@ async fn a_full_journal_refuses_policy_and_catalog_publications_and_commits_noth
     );
     let client = pool.get().await.expect("maintenance session");
     assert_eq!(
-        PostgresAuthorityEventStore::prune_with(&client, Duration::ZERO, 1_000)
+        PostgresAuthorityEventStore::prune_with(&client, Duration::ZERO, 1_000, false)
             .await
             .expect("retention runs"),
         2

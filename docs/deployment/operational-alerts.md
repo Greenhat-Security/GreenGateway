@@ -362,8 +362,12 @@ the retention window. `_reserved` is the part of `_retained` held for admin sess
 withdrawals: retention cannot free it, and it shrinks only as sessions end. A
 dispatcher that once claimed the cursor stays a required
 consumer after its sink is turned off; stop delivering deliberately as the durable
-delivery section describes instead of waiting for retention. Never delete journal
-or evidence rows by hand.
+delivery section describes instead of waiting for retention. Under
+`AUTHORITY_EVIDENCE_DURABILITY=required`, retention prunes nothing until a
+dispatcher has claimed the cursor, whatever the events' age: a required deployment
+whose dispatcher never starts delivering fills its journal, and
+`GreenGatewayAuthorityEventJournalFilling` is the first sign. Restore delivery; removing the cursor holds the journal again. Never
+delete journal or evidence rows by hand.
 
 For `GreenGatewayAuthorityEventJournalUnobserved`, find the maintenance leader
 (`greengateway_cluster_lease_age_seconds{scope="maintenance"}` above zero, or

@@ -73,7 +73,8 @@ fn every_standalone_operation_matches_the_published_schema() {
             shape.action
         );
         let evidence = evidence(shape);
-        let record = project_standalone(&evidence, &keyring).expect("well-formed rows project");
+        let record = project_standalone(&evidence, &keyring, AuthorityEventFormat::DeliveryV1)
+            .expect("well-formed rows project");
         let value = serde_json::to_value(&record).expect("a record serializes");
         if let Err(error) = validator.validate(&value) {
             panic!("the published schema must accept {value}: {error}");
@@ -150,7 +151,9 @@ fn revisions_follow_each_tables_transition() {
             .iter()
             .find(|shape| shape.action == action)
             .expect("a known action");
-        let record = project_standalone(&evidence(shape), &keyring).expect("projects");
+        let record =
+            project_standalone(&evidence(shape), &keyring, AuthorityEventFormat::DeliveryV1)
+                .expect("projects");
         (
             record.resource.kind,
             record.revision.axis,
@@ -234,7 +237,8 @@ fn references_name_the_recorded_identities_and_carry_none_of_them() {
     let keyring = generated_keyring(Uuid::new_v4());
     for shape in &STANDALONE_SHAPES {
         let evidence = evidence(shape);
-        let record = project_standalone(&evidence, &keyring).expect("projects");
+        let record = project_standalone(&evidence, &keyring, AuthorityEventFormat::DeliveryV1)
+            .expect("projects");
         let serialized = serde_json::to_string(&record).expect("a record serializes");
         for marker in [
             ACTOR_MARKER,
@@ -302,10 +306,14 @@ fn the_same_row_projects_to_identical_bytes() {
     let keyring = generated_keyring(Uuid::new_v4());
     for shape in &STANDALONE_SHAPES {
         let evidence = evidence(shape);
-        let first = serde_json::to_string(&project_standalone(&evidence, &keyring).expect("ok"))
-            .expect("serializes");
-        let second = serde_json::to_string(&project_standalone(&evidence, &keyring).expect("ok"))
-            .expect("serializes");
+        let first = serde_json::to_string(
+            &project_standalone(&evidence, &keyring, AuthorityEventFormat::DeliveryV1).expect("ok"),
+        )
+        .expect("serializes");
+        let second = serde_json::to_string(
+            &project_standalone(&evidence, &keyring, AuthorityEventFormat::DeliveryV1).expect("ok"),
+        )
+        .expect("serializes");
         assert_eq!(first, second);
     }
 }
@@ -319,7 +327,8 @@ fn a_token_row_without_actor_metadata_guesses_none() {
     row.actor_issuer = None;
     row.actor_kind = None;
     row.actor_auth_mode = None;
-    let record = project_standalone(&row, &keyring).expect("projects");
+    let record =
+        project_standalone(&row, &keyring, AuthorityEventFormat::DeliveryV1).expect("projects");
     assert_eq!(
         (
             record.actor.kind,
@@ -342,7 +351,8 @@ fn rows_that_cannot_be_projected_faithfully_are_refused() {
         )
     };
     let refused = |row: StandaloneEvidence| {
-        project_standalone(&row, &keyring).expect_err("the row is refused")
+        project_standalone(&row, &keyring, AuthorityEventFormat::DeliveryV1)
+            .expect_err("the row is refused")
     };
 
     let mut wrong_table = by_action("connection.delete");
@@ -389,4 +399,232 @@ fn rows_that_cannot_be_projected_faithfully_are_refused() {
     let mut not_a_uuid = by_action("connection.create");
     not_a_uuid.event_id = CONNECTION_MARKER.replace('c', "g");
     assert_eq!(refused(not_a_uuid), ProjectionError::InvalidEvidence);
+}
+
+// ---------------------------------------------------------------------------
+// The qualification rule in standalone mode (issue #425). A token row records
+// no revision, so it stays a delivery record whatever its operation ID: the
+// keyed revocations SQLite has written since #765 carry a caller UUIDv7, an
+// issuer-bound principal and no revisions, and must keep their delivered
+// bytes. The Connection, local-secret and catalog tables record revisions,
+// so a keyed principal row there is an `authority_event.v1` under the
+// negotiated format, and only there.
+// ---------------------------------------------------------------------------
+
+fn v1_schema() -> jsonschema::Validator {
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../../docs/schemas/authority_event.v1.schema.json"
+    ))
+    .expect("the v1 schema should be JSON");
+    jsonschema::validator_for(&schema).expect("the v1 schema should compile")
+}
+
+fn caller_key(seed: u8) -> String {
+    crate::auth::tokens::test_revoke_operation_id(seed).to_string()
+}
+
+#[test]
+fn a_keyed_principal_revoke_with_null_revisions_stays_a_legacy_record_under_qualified_v1() {
+    use crate::{
+        auth::{
+            change_actor::ChangeActor,
+            tokens::{CreateTokenRequest, TokenStore},
+            SqliteTokenStore,
+        },
+        storage::standalone_authority_events::StandaloneEvidenceAuthority,
+    };
+
+    let directory =
+        std::env::temp_dir().join(format!("greengateway-keyed-revoke-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).expect("scratch directory");
+    let tokens = SqliteTokenStore::open(directory.join("tokens.sqlite")).expect("the store opens");
+    // What the keyed POST route records since #765: a provider-authenticated
+    // principal with a canonical issuer, and the caller's UUIDv7.
+    let actor = ChangeActor::for_test_with_issuer(ACTOR_MARKER, ACTOR_ISSUER_MARKER);
+    let created = tokens
+        .create(
+            CreateTokenRequest {
+                scopes: vec!["admin:connections:read".to_owned()],
+                created_by: ACTOR_MARKER.to_owned(),
+                expires_at: None,
+            },
+            &actor,
+        )
+        .expect("the token issues");
+    let key = crate::auth::tokens::test_revoke_operation_id(11);
+    tokens
+        .revoke_with_operation(&created.record.id, &actor, Some(key))
+        .expect("the token revokes")
+        .expect("the token exists");
+    let rows = tokens
+        .read_after(StandaloneEvidenceSource::ServiceTokenChange, 0, 10)
+        .expect("the evidence reads");
+    let revoke = rows
+        .iter()
+        .find(|row| row.action == "service_token.revoke")
+        .expect("the revoke recorded its evidence");
+    assert_eq!(revoke.operation_id, key.to_string());
+    assert_eq!(revoke.actor_kind.as_deref(), Some("principal"));
+    assert_eq!(revoke.actor_issuer.as_deref(), Some(ACTOR_ISSUER_MARKER));
+    assert_eq!((revoke.prior_version, revoke.new_version), (None, None));
+
+    let keyring = generated_keyring(Uuid::new_v4());
+    for row in &rows {
+        let legacy = project_standalone(row, &keyring, AuthorityEventFormat::DeliveryV1)
+            .expect("the row projects");
+        let negotiated = project_standalone(row, &keyring, AuthorityEventFormat::QualifiedV1)
+            .expect("a #765 row never stalls an opted-in stream");
+        assert!(negotiated.qualified.is_none(), "{}", row.action);
+        assert_eq!(
+            negotiated
+                .wire_json(AuthorityEventFormat::QualifiedV1)
+                .unwrap(),
+            serde_json::to_string(&legacy).unwrap(),
+            "{}: the delivered bytes do not change",
+            row.action
+        );
+    }
+    drop(tokens);
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
+fn a_token_row_with_a_revision_it_should_not_have_stalls() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    for shape in STANDALONE_SHAPES
+        .iter()
+        .filter(|shape| shape.source == StandaloneEvidenceSource::ServiceTokenChange)
+    {
+        for (prior, new) in [(None, Some(1)), (Some(1), Some(2)), (Some(1), None)] {
+            let mut row = evidence(shape);
+            row.operation_id = caller_key(12);
+            row.prior_version = prior;
+            row.new_version = new;
+            for format in [
+                AuthorityEventFormat::DeliveryV1,
+                AuthorityEventFormat::QualifiedV1,
+            ] {
+                assert_eq!(
+                    project_standalone(&row, &keyring, format).expect_err("the row stalls"),
+                    ProjectionError::InvalidEvidence,
+                    "{} {prior:?} {new:?}",
+                    shape.action
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_keyed_principal_row_of_a_revised_source_is_qualified_under_the_negotiated_format_only() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let validator = v1_schema();
+    let subject = keyring
+        .derive(
+            ReferenceDomain::ActorSubject,
+            &[ACTOR_ISSUER_MARKER, ACTOR_MARKER],
+        )
+        .unwrap();
+    let mut sources = Vec::new();
+    for shape in STANDALONE_SHAPES.iter().filter(|shape| {
+        shape.source != StandaloneEvidenceSource::ServiceTokenChange
+            && shape.action != "secret.reencrypt"
+    }) {
+        let action = shape.action;
+        let unkeyed = evidence(shape);
+        let mut row = unkeyed.clone();
+        row.operation_id = caller_key(13);
+
+        let record = project_standalone(&row, &keyring, AuthorityEventFormat::QualifiedV1)
+            .unwrap_or_else(|error| panic!("{action}: a keyed principal row qualifies: {error}"));
+        let wire = record.wire_json(AuthorityEventFormat::QualifiedV1).unwrap();
+        let event: Value = serde_json::from_str(&wire).unwrap();
+        if let Err(error) = validator.validate(&event) {
+            panic!("{action}: the v1 schema must accept {event}: {error}");
+        }
+        assert_eq!(event["schema_version"], "authority_event.v1", "{action}");
+        assert_eq!(event["operation_id"], row.operation_id.as_str(), "{action}");
+        assert_eq!(event["actor"]["subject_ref"], subject.as_str(), "{action}");
+        assert_eq!(event["actor"]["auth_mode"], "bearer_token", "{action}");
+        assert_eq!(event["revision"]["security"], Value::Null, "{action}");
+        let (kind, reference) = if action == "credential.binding_change" {
+            (
+                "credential_binding".to_owned(),
+                keyring
+                    .derive(ReferenceDomain::CredentialBinding, &[CONNECTION_MARKER])
+                    .unwrap()
+                    .as_str()
+                    .to_owned(),
+            )
+        } else {
+            (
+                record.resource.kind.clone(),
+                record.resource.reference.clone(),
+            )
+        };
+        assert_eq!(event["resource"]["kind"], kind.as_str(), "{action}");
+        assert_eq!(event["resource"]["ref"], reference.as_str(), "{action}");
+        for marker in [
+            ACTOR_MARKER,
+            ACTOR_ISSUER_MARKER,
+            CONNECTION_MARKER,
+            SECRET_MARKER,
+        ] {
+            assert!(!wire.contains(marker), "{action}: raw identifier in {wire}");
+        }
+
+        // The default format delivers the same row as before, byte for byte.
+        let legacy = project_standalone(&row, &keyring, AuthorityEventFormat::DeliveryV1)
+            .expect("the row projects");
+        assert!(legacy.qualified.is_none(), "{action}");
+        assert_eq!(
+            record.wire_json(AuthorityEventFormat::DeliveryV1).unwrap(),
+            serde_json::to_string(&legacy).unwrap(),
+            "{action}"
+        );
+
+        // An unkeyed row, or a gateway service token behind a key, keeps
+        // the delivery record under the negotiated format.
+        let mut service_token = row.clone();
+        service_token.actor_kind = Some("service_token".to_owned());
+        service_token.actor_auth_mode = Some("service_token".to_owned());
+        service_token.actor_issuer = None;
+        for kept in [unkeyed, service_token] {
+            let negotiated = project_standalone(&kept, &keyring, AuthorityEventFormat::QualifiedV1)
+                .expect("the row projects");
+            let expected = project_standalone(&kept, &keyring, AuthorityEventFormat::DeliveryV1)
+                .expect("the row projects");
+            assert_eq!(
+                negotiated
+                    .wire_json(AuthorityEventFormat::QualifiedV1)
+                    .unwrap(),
+                serde_json::to_string(&expected).unwrap(),
+                "{action}"
+            );
+        }
+
+        // A key on an actor no writer binds one to stalls the opted-in
+        // stream, and only that stream.
+        let mut issuerless = row.clone();
+        issuerless.actor_issuer = None;
+        assert_eq!(
+            project_standalone(&issuerless, &keyring, AuthorityEventFormat::QualifiedV1)
+                .expect_err("the batch stalls"),
+            ProjectionError::InvalidEvidence,
+            "{action}"
+        );
+        project_standalone(&issuerless, &keyring, AuthorityEventFormat::DeliveryV1)
+            .expect("the default format never stalls on a key");
+        if !sources.contains(&shape.source) {
+            sources.push(shape.source);
+        }
+    }
+    assert_eq!(
+        sources,
+        [
+            StandaloneEvidenceSource::ConnectionChange,
+            StandaloneEvidenceSource::LocalSecretChange,
+            StandaloneEvidenceSource::CatalogChange,
+        ]
+    );
 }
