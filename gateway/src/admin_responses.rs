@@ -690,10 +690,19 @@ pub(super) fn admit_authority_change_for(
 
 // --- keyed authority changes (issue #425) -----------------------------------
 //
-// Every admin change that takes an `Idempotency-Key` follows one contract
-// (docs/authority-evidence.md, "Keyed authority changes"). A handler, in this
-// order:
+// Every admin change that binds an `Idempotency-Key` through these helpers
+// follows one contract (docs/authority-evidence.md, "Keyed authority
+// changes"). The keyed revoke and the keyed preparation predate it and keep
+// their own receipts and conflict answers. A handler, in this order:
 //
+// 0. authorizes the caller for the change and validates the request, as it
+//    does today, before any of the steps below. Admission can raise the
+//    durable contract fence, which is irreversible, fleet-wide and the
+//    rollback cutoff for builds without `caller_operation_keys`; admin
+//    routes are exempt from the data-plane RBAC layer and authorize
+//    themselves, so a handler that asked the gates first would let any
+//    authenticated caller, a service token without admin permission
+//    included, raise the fence with one keyed request answered `403`;
 // 1. binds the header to its request with [`caller_operation`], before it
 //    reads anything: `None` for a request without the header;
 // 2. asks [`admit_keyed_authority_change`]: the evidence gate, then, for a
@@ -705,6 +714,14 @@ pub(super) fn admit_authority_change_for(
 //    the change's own transaction, and answers a `CallerOutcome::Replayed`
 //    with [`operation_receipt`] and a key bound to something else with
 //    [`caller_operation_conflict`].
+//
+// The gates come before the pre-check, an exact retry included, because the
+// pre-check reads the authority: required mode refuses a form it does not
+// admit before anything is read (I4), and a key is answered only while the
+// whole fleet honours keys. Both gates are cheap on a retry: the evidence
+// gate reads configuration only, and once the fence carries the capability
+// the operation gate answers from an unlocked read that takes no exclusive
+// lock, so concurrent keyed requests and retries admit each other.
 //
 // The route must also be listed in `routing::KEYED_ROUTES`; everywhere else
 // the router refuses the header with [`idempotency_key_unsupported`] before
@@ -774,14 +791,33 @@ pub(super) struct KeyedChangeGates<'a> {
     pub(super) client_ip_policy: &'a client_ip::ClientIpPolicy,
 }
 
+/// What a keyed admin change is, for the evidence gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // Named by the operation families that bind keys.
+pub(super) enum KeyedChange {
+    /// A change the evidence gate decides on.
+    Gated(authority_events::required::AuthorityOperation),
+    /// A change that only removes authority, which never asks the evidence
+    /// gate: every form of it stays admitted (owner ruling 4 on issue #425).
+    /// The set is closed ([`Withdrawal`]), and a key bound to any other
+    /// action is not accepted as one.
+    ///
+    /// [`Withdrawal`]: authority_events::required::Withdrawal
+    Withdrawal(authority_events::required::Withdrawal),
+}
+
 /// Admit a keyed admin change, or answer why not. Nothing is read from or
-/// written to the authority before this admits.
+/// written to the authority before this admits. Call it only after the
+/// handler has authorized the caller for the change and validated the
+/// request: admitting a keyed request in cluster mode can raise the durable
+/// contract fence, which never comes down.
 ///
-/// - `operation` is the change's [`AuthorityOperation`] for the evidence
-///   gate, or `None` for a withdrawal (`service_token.revoke`,
-///   `connection.delete`, `secret.delete`), which never asks it: every form
-///   of a withdrawal stays admitted (owner ruling 4 on issue #425). A refusal
-///   is `409 authority_evidence_unsupported`, audited.
+/// - `change` names the change for the evidence gate: a
+///   [`KeyedChange::Gated`] operation asks it, a [`KeyedChange::Withdrawal`]
+///   never does. A refusal is `409 authority_evidence_unsupported`, audited.
+///   A key reserved for a withdrawal's action on a gated change, or for
+///   another action on a withdrawal, is a handler defect: `500`, and
+///   nothing is asked or read.
 /// - A keyed request (`caller` is `Some`) in cluster mode then asks the
 ///   operation gate for [`storage::compatibility::CALLER_OPERATION_KEYS`]:
 ///   the key is honoured only while every live member advertises
@@ -795,13 +831,31 @@ pub(super) struct KeyedChangeGates<'a> {
 #[cfg_attr(not(test), allow(dead_code))] // Called by the operation families that bind keys.
 pub(super) async fn admit_keyed_authority_change(
     gates: &KeyedChangeGates<'_>,
-    operation: Option<authority_events::required::AuthorityOperation>,
+    change: KeyedChange,
     caller: Option<&authority_events::caller_operation::CallerOperation>,
     actor: &auth::change_actor::ChangeActor,
     parts: &http::request::Parts,
     principal: &auth::Principal,
 ) -> ResponseResult<()> {
-    if let Some(operation) = operation {
+    use authority_events::required::Withdrawal;
+
+    if let Some(caller) = caller {
+        let bound_withdrawal = Withdrawal::from_code(caller.action());
+        let consistent = match change {
+            KeyedChange::Gated(_) => bound_withdrawal.is_none(),
+            KeyedChange::Withdrawal(withdrawal) => bound_withdrawal == Some(withdrawal),
+        };
+        if !consistent {
+            tracing::error!(
+                action = caller.action(),
+                "a keyed admin change named a withdrawal its caller key is not bound to, or a gated change bound to a withdrawal; it is refused"
+            );
+            return Err(Box::new(internal_server_error(
+                "the keyed change could not be admitted",
+            )));
+        }
+    }
+    if let KeyedChange::Gated(operation) = change {
         admit_authority_change_for(
             gates.evidence,
             operation,

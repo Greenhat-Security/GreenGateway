@@ -141,6 +141,26 @@ test("a path outside the reviewed table is refused", () => {
     /KEYED_ROUTES in gateway\/src\/routing\.rs honours POST \/v1\{ADMIN_PREFIX\}\/tokens, which no reviewed qualified path names/);
   assert.throws(() => validateInventory(inventory(), (path) => path === routing ? source(path).replace(KEYED_ROUTES_OPEN, "const ROUTES: &[KeyedRoute] = &[") : source(path)),
     /declares no KEYED_ROUTES/);
+  // Every entry the router could honour is read: the fields in either
+  // order, and a block comment hides only what it comments out. An entry the
+  // checker cannot read as two string literals -- a constant route, another
+  // field, an entry that is not a literal -- fails rather than going unseen.
+  const withEntry = (entry) => (path) => path === routing
+    ? source(path).replace(KEYED_ROUTES_OPEN, `${KEYED_ROUTES_OPEN}\n    ${entry}`)
+    : source(path);
+  assert.throws(() => validateInventory(inventory(), withEntry('KeyedRoute { route: "/v1{ADMIN_PREFIX}/tokens", method: "POST" },')),
+    /KEYED_ROUTES in gateway\/src\/routing\.rs honours POST \/v1\{ADMIN_PREFIX\}\/tokens, which no reviewed qualified path names/);
+  validateInventory(inventory(), withEntry('/* KeyedRoute { method: "POST", route: "/v1{ADMIN_PREFIX}/tokens" }, */'));
+  assert.throws(() => validateInventory(inventory(), withEntry('KeyedRoute { method: "POST", route: TOKENS_ROUTE },')),
+    /must name method and route once each as string literals/);
+  assert.throws(() => validateInventory(inventory(), withEntry('KeyedRoute { method: "POST", route: "/v1{ADMIN_PREFIX}/tokens", method: "PUT" },')),
+    /must name method and route once each as string literals/);
+  assert.throws(() => validateInventory(inventory(), withEntry('KeyedRoute { method: "POST" },')),
+    /must name an upper-case method and a route/);
+  assert.throws(() => validateInventory(inventory(), withEntry('TOKEN_ISSUE_ROUTE,')),
+    /holds an entry that is not a KeyedRoute literal: TOKEN_ISSUE_ROUTE/);
+  assert.throws(() => validateInventory(inventory(), withEntry('KeyedRoute { method: "POST", route: concat!("/v1", "{ADMIN_PREFIX}/tokens") },')),
+    /KeyedRoute literal the checker cannot read|not a KeyedRoute literal|string literals/);
 });
 
 test("evidence anchors only in the gateway or the compiler it links", () => {

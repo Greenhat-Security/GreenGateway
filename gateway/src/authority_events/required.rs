@@ -98,6 +98,44 @@ pub(crate) enum AuthorityOperation {
     MutationApprovalRevoke,
 }
 
+/// The changes a remote caller starts that only remove authority, and so
+/// never ask the evidence gate (owner ruling 4 on issue #425): a closed set,
+/// so a keyed handler cannot skip the gate by calling its change a
+/// withdrawal. Each is named by the operation code its caller key is
+/// reserved for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Withdrawal {
+    ServiceTokenRevoke,
+    ConnectionDelete,
+    SecretDelete,
+}
+
+impl Withdrawal {
+    /// Every withdrawal.
+    pub(crate) const ALL: [Self; 3] = [
+        Self::ServiceTokenRevoke,
+        Self::ConnectionDelete,
+        Self::SecretDelete,
+    ];
+
+    /// The operation code: the action a caller key is reserved for and the
+    /// evidence row records.
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::ServiceTokenRevoke => "service_token.revoke",
+            Self::ConnectionDelete => "connection.delete",
+            Self::SecretDelete => "secret.delete",
+        }
+    }
+
+    /// The withdrawal whose operation code is `code`, if any.
+    pub(crate) fn from_code(code: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|withdrawal| withdrawal.code() == code)
+    }
+}
+
 impl From<DocumentAction> for AuthorityOperation {
     fn from(action: DocumentAction) -> Self {
         match action {
@@ -280,7 +318,7 @@ impl KeyedAdmission {
     /// What the refusal says the change needs.
     const fn requirement(self) -> &'static str {
         match self {
-            Self::CallerKey => "with an Idempotency-Key",
+            Self::CallerKey => "with an Idempotency-Key, on a route that honours one",
             Self::IssuerBoundPrincipal => {
                 "from a provider-authenticated principal with a canonical issuer"
             }
@@ -322,10 +360,15 @@ impl EvidenceRefusal {
     pub(crate) fn message(&self) -> String {
         let why = match (self.mode, self.operation) {
             (RequiredMode::CallerKeyRequired, _) => {
-                let requirement = self
-                    .unmet
-                    .unwrap_or(KeyedAdmission::CallerKey)
-                    .requirement();
+                let unmet = self.unmet.unwrap_or(KeyedAdmission::CallerKey);
+                // A preparation's keyed form is another route: adding the
+                // header to the ordinary POST is refused by the router.
+                let requirement = match (unmet, self.operation) {
+                    (KeyedAdmission::CallerKey, AuthorityOperation::MutationApprovalPrepare) => {
+                        "as a keyed preparation, PUT .../tools/{id}/mutation-approvals with an Idempotency-Key"
+                    }
+                    (unmet, _) => unmet.requirement(),
+                };
                 return format!(
                     "AUTHORITY_EVIDENCE_DURABILITY=required refuses {}: {} mode admits it only {requirement}; nothing was changed",
                     self.operation.code(),

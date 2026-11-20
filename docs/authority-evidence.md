@@ -460,10 +460,17 @@ these cases.
 
 ### Keyed authority changes
 
-Every admin change that takes an `Idempotency-Key` follows one contract. Today
-the keyed service-token revoke and the keyed approval preparation take one; each
-other operation family adopts the contract in its own change, and the inventory
-qualifies its rows when it does.
+Every admin change that binds an `Idempotency-Key` through the shared helpers
+in `gateway/src/admin_responses.rs` follows one contract. No route does yet:
+each operation family adopts the contract in its own change, and the inventory
+qualifies its rows when it does. The two routes that take a key today, the
+keyed service-token revoke and the keyed approval preparation, predate the
+contract. They are listed in `KEYED_ROUTES` and follow the first rule below,
+but they keep their own receipts (the preparation answers
+`{operation_id, occurrence_id, prepared_at, expires_at}`), their own conflict
+answers, and their own order of work, and they do not ask the operation gate.
+The generic receipt and `409 caller_operation_conflict` below apply to routes
+that bind keys through the shared helpers.
 
 **A key is honoured or refused, never ignored.** The router keeps a reviewed table
 of the routes that honour a key, `KEYED_ROUTES` in `gateway/src/routing.rs`
@@ -477,6 +484,16 @@ before this change ignored the header. The checker holds `KEYED_ROUTES` and its
 table of reviewed qualified paths (`QUALIFIED_PATHS`) to the same methods and
 routes.
 
+The refusal applies to withdrawals and to the admin session routes too: the
+unkeyed token `DELETE`, Connection and secret deletion, the delegated-token
+purge, `POST .../auth/logout` and `POST .../auth/callback`. A client that
+attaches `Idempotency-Key` to every mutation can therefore not revoke, delete or
+log out until it drops the header from those requests. This is deliberate: a
+key is honoured or refused on every admin mutation, so that once a later change
+makes a withdrawal keyed, no build that serves beside it answers the same key
+differently. The answer is immediate and names the header, so the client can
+retry without it at once.
+
 **A key is honoured only once the whole cluster honours it.** In cluster mode a
 keyed request asks the operation gate for `authority.caller_operation_keys`
 (capability `caller_operation_keys`, schema 36, durable fence; see
@@ -488,7 +505,11 @@ deliver a caller-bound change as `authority_event_delivery.v1` from the
 dispatcher's lease, can no longer start or rejoin. That admission is the
 [rollback cutoff](deployment/postgres.md#the-rollback-cutoff) for such builds.
 The store confirms the same fence inside the change's transaction before it
-reserves the key (`reserve_bound_operation`). The keyed revoke and keyed
+reserves the key (`reserve_bound_operation`). Once the fence carries the
+capability, the gate answers from an unlocked read of the fence and the roster
+and takes no exclusive lock, so keyed requests running at the same time, exact
+retries included, admit each other; only a migrator holding the schema lock
+refuses them (`503 migration_in_progress`). The keyed revoke and keyed
 preparation predate the capability and do not ask the gate.
 
 **The request.** The method and route are the route's own, plus one
@@ -510,15 +531,30 @@ nothing, so it cannot be reconciled by its key: if its response is lost and the
 resource then changes, the retry gets `412`, and the caller reads the resource
 again.
 
-**The order of work.** The handler binds the key (`caller_operation`), asks
-the gates (`admit_keyed_authority_change`), and answers an exact retry from a
-read-only pre-check (`replayed_receipt`, from `read_caller_operation`) before any
-external I/O or post-commit side effect. Inside the one transaction the store
+**The order of work.** The handler first authorizes the caller for the change
+and validates the request, as it does today. Only then does it bind the key
+(`caller_operation`), ask the gates (`admit_keyed_authority_change`), and answer
+an exact retry from a read-only pre-check (`replayed_receipt`, from
+`read_caller_operation`) before any external I/O or post-commit side effect.
+Authorization comes first because admission can raise the durable contract
+fence, which is irreversible, applies to the whole fleet and is the rollback
+cutoff: admin routes authorize themselves, so a handler that asked the gates
+first would let any authenticated caller without the route's permission cut off
+rollback with one keyed request answered `403`. The gates come before the
+pre-check, an exact retry included, because the pre-check reads the authority:
+required mode refuses a form it does not admit before anything is read, and a
+key is answered only while the whole fleet honours keys. Inside the one transaction the store
 then looks the key up, reads the target (a stale ETag is `412`, a no-op rolls
 back), confirms the fence and reserves the key, makes the change, inserts the
 evidence rows under the caller's operation ID, appends to the journal last
 (PostgreSQL), and commits. These helpers are in `gateway/src/admin_responses.rs`;
 `operation_receipt` and `caller_operation_conflict` build the two answers above.
+A handler names its change to the gate as `KeyedChange::Gated(operation)` or,
+for one of the three withdrawals, `KeyedChange::Withdrawal(...)`; a key bound to
+a withdrawal on a gated change, or to anything else on a withdrawal, is refused
+as a handler defect (`500`) before any gate is asked. Each family's tests include
+a keyed request from a caller without the route's permission, which is `403`
+and leaves the contract fence unchanged.
 
 **Required mode.** Under `AUTHORITY_EVIDENCE_DURABILITY=required` a
 `caller_key_required` change is admitted only when all of these hold, checked in
@@ -536,7 +572,13 @@ does not (`KeyedAdmission` in `gateway/src/authority_events/required.rs`):
 The last three are the criteria every qualified path in the inventory records
 (`format`, `durable_sink`, `filesystem`), so the gate now enforces what the
 qualified rows claim. This tightens the keyed preparation: under `required` with
-the log sink, or on a Windows build, it is refused. A change that only removes
+the log sink, or on a Windows build, it is refused. The keyed preparation reads
+its receipt before it asks this gate, as it did before: an exact retry of a
+preparation that already committed is still answered from its receipt after the
+deployment stops meeting the criteria (a format or sink downgrade), because the
+answer changes nothing and is how a caller reconciles a lost response; a new
+preparation is refused. The ordinary preparation `POST` is refused with a
+message that points at the keyed `PUT`. A change that only removes
 authority and that a remote caller starts (token revocation, Connection
 deletion, local-secret deletion) never asks the evidence gate: every form of it
 stays admitted ([Rows admitted without qualification](#rows-admitted-without-qualification)).
@@ -548,8 +590,13 @@ stays admitted ([Rows admitted without qualification](#rows-admitted-without-qua
 sends a key to every mutating method of every admin API route;
 `compatibility_tests::caller_operation_keys_waits_for_every_live_member_and_raises_the_fence`
 and `contract_tests::postgres_audit_tests::a_bound_reservation_below_the_fence_is_refused`
-prove the capability, the fence and the store's check; and
-`authority_evidence_app_tests` proves the helpers.
+prove the capability, the fence and the store's check;
+`contract_tests::postgres_audit_tests::the_caller_key_gate_raises_the_fence_once_and_then_admits_concurrent_keyed_changes`
+proves the chain end to end against PostgreSQL (refused while a live member
+lacks the capability, the first admission raises the fence and the store then
+reserves, later admissions write nothing and admit each other while another
+admission holds the fence row); and `authority_evidence_app_tests` proves the
+helpers.
 
 ## Keyed safe references
 

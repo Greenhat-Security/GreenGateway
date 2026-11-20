@@ -133,7 +133,11 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
         let why = match operation {
             AuthorityOperation::PolicyFileReload => "does not perform it",
             AuthorityOperation::ConfigurationImport => "records evidence for only part of it",
-            AuthorityOperation::MutationApprovalPrepare => "admits it only with an Idempotency-Key",
+            // The ordinary preparation POST refuses a key: the message names
+            // the keyed route instead.
+            AuthorityOperation::MutationApprovalPrepare => {
+                "admits it only as a keyed preparation, PUT .../tools/{id}/mutation-approvals with an Idempotency-Key"
+            }
             _ => "records no durable evidence of it",
         };
         assert_eq!(
@@ -360,9 +364,24 @@ fn a_keyed_request_with_the_log_sink_is_refused_and_the_refusal_names_the_sink()
 /// every form of each in every mode that performs it.
 #[test]
 fn withdrawals_never_ask_the_evidence_gate() {
-    let withdrawals = ["service_token.revoke", "connection.delete", "secret.delete"];
+    let withdrawals = Withdrawal::ALL.map(Withdrawal::code);
+    assert_eq!(
+        withdrawals,
+        ["service_token.revoke", "connection.delete", "secret.delete"]
+    );
     for code in withdrawals {
         assert!(gated_operation(code).is_none(), "{code} is not gated");
+        assert_eq!(
+            Withdrawal::from_code(code).map(Withdrawal::code),
+            Some(code)
+        );
+    }
+    for operation in EVERY_OPERATION {
+        assert_eq!(
+            Withdrawal::from_code(operation.code()),
+            None,
+            "{operation:?}"
+        );
     }
     let inventory = inventory();
     let mut admitted = BTreeSet::new();

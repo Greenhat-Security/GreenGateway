@@ -58,6 +58,10 @@ async fn replica(config: config::Config, pool: &deadpool_postgres::Pool) -> Rout
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(
+    not(unix),
+    ignore = "required mode admits keyed preparation only on a Unix build, where the file sink syncs its directory"
+)]
 async fn postgres_keyed_mutation_prepare_recovers_the_receipt_after_catalog_drift() {
     let Some(admin_dsn) = locator() else {
         eprintln!("skipping: no test database locator; CI runs this test");
@@ -124,12 +128,9 @@ async fn postgres_keyed_mutation_prepare_recovers_the_receipt_after_catalog_drif
     // Required mode admits the keyed preparation only with the synced file
     // sink (issue #425); this replica never starts a dispatcher, so the file
     // is never written.
-    config.authority_events.sink = config::AuthorityEventSinkSetting::File(
-        std::env::temp_dir()
-            .join("issue-757-keyed-prepare-events.jsonl")
-            .to_string_lossy()
-            .into_owned(),
-    );
+    let events = TempDb::new("issue-757-keyed-prepare-events");
+    config.authority_events.sink =
+        config::AuthorityEventSinkSetting::File(events.path.to_string_lossy().into_owned());
     let required = replica(config.clone(), pool).await;
     let body = json!({"arguments":{"id":PRIVATE_ID,"name":PRIVATE_NAME}});
     let raw = body.to_string();
@@ -241,6 +242,25 @@ async fn postgres_keyed_mutation_prepare_recovers_the_receipt_after_catalog_drif
     let (headers, replayed) = assert_response(&fresh, request, &requester, StatusCode::OK).await;
     assert_eq!(headers[header::CACHE_CONTROL], "no-store");
     assert_eq!(replayed, receipt);
+    // A deployment that stops meeting the keyed criteria -- here the log sink
+    // -- still answers an exact retry from its receipt, which changes
+    // nothing, and refuses a new preparation, naming the sink.
+    let mut log_sink = config.clone();
+    log_sink.authority_events.sink = config::AuthorityEventSinkSetting::Log;
+    let log_sink = replica(log_sink, pool).await;
+    let request = keyed_request(&prepare, &requester, Some(&etag), &raw, &[&key]);
+    let (_, log_replay) = assert_response(&log_sink, request, &requester, StatusCode::OK).await;
+    assert_eq!(log_replay, receipt);
+    let unsunk_key = auth::tokens::test_revoke_operation_id(4).to_string();
+    let request = keyed_request(&prepare, &requester, Some(&etag), &raw, &[&unsunk_key]);
+    let (_, refused) = assert_response(&log_sink, request, &requester, StatusCode::CONFLICT).await;
+    assert_eq!(refused["reason"], "authority_evidence_unsupported");
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("AUTHORITY_EVENT_SINK=file")),
+        "{refused}"
+    );
     // A downgrade still permits reconciliation of previous commits. It refuses a new operation.
     config.authority_events.format = config::AuthorityEventFormat::DeliveryV1;
     let downgraded = replica(config, pool).await;

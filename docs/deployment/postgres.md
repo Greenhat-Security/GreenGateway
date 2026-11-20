@@ -844,12 +844,12 @@ The fence is checked at three points, and each one fails closed:
 
 **Raising it.** An operation whose data an older replica would misread, rather than refuse, declares a durable fence. Admitting it is one transaction on the admitting replica, under the pooled session's statement and lock timeouts:
 
-1. Take the migrator's advisory lock as a try-lock. A migration in progress refuses with `migration_in_progress`; a migration that starts later waits for the transaction.
+1. Take the migrator's advisory lock as a shared try-lock. A migration in progress refuses with `migration_in_progress`; a migration that starts later waits for the transaction. Two admissions do not refuse each other.
 2. Lock the fence row `FOR UPDATE`.
 3. Read the ledger, the named backfill and the roster on the database clock under that lock. A ledger this build does not serve refuses with `schema_incompatible`, and a backfill not recorded verified refuses with `backfill_unverified`.
 4. Raise the fence to the operation's capability and minimum schema only if every live member, draining ones included, already meets the raised fence. Otherwise refuse with `capability_not_advertised`.
 
-A heartbeat that was mid-statement when the raise began is waited for and counted; one that arrives later is refused. A raise is audited as `cluster.contract_fence_raised` with the operation, the generation and minimum schema before and after, and the live member count. An admission whose fence already covers the operation writes nothing. The fence records that the operation was activated, not that its write succeeded, and a raise is never undone.
+A heartbeat that was mid-statement when the raise began is waited for and counted; one that arrives later is refused. A raise is audited as `cluster.contract_fence_raised` with the operation, the generation and minimum schema before and after, and the live member count. An admission whose fence already covers the operation writes nothing, and is answered from a read that takes no row lock, so it does not hold up heartbeats or other admissions. The fence records that the operation was activated, not that its write succeeded, and a raise is never undone.
 
 **Backfills.** `greengateway.schema_backfills` records each named backfill as `running`, `verified` (its own verification found nothing left to backfill) or `failed`. An operation that needs one is admitted only once its row says `verified`. A missing row, a running one (including one that was interrupted and never finished) and a failed one all refuse with `backfill_unverified`.
 

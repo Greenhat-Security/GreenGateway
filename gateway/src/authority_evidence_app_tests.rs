@@ -794,7 +794,7 @@ fn a_caller_key_is_bound_to_its_request_or_refused_before_anything_is_read() {
 /// membership.
 async fn admit_keyed(
     evidence: authority_events::required::AuthorityEvidenceGate,
-    operation: Option<authority_events::required::AuthorityOperation>,
+    change: KeyedChange,
     caller: Option<&authority_events::caller_operation::CallerOperation>,
     request: (&audit::AuditLog, &http::request::Parts, &auth::Principal),
 ) -> ResponseResult<()> {
@@ -808,17 +808,20 @@ async fn admit_keyed(
         client_ip_policy: &policy,
     };
     let actor = auth::change_actor::ChangeActor::from_principal(principal);
-    admit_keyed_authority_change(&gates, operation, caller, &actor, parts, principal).await
+    admit_keyed_authority_change(&gates, change, caller, &actor, parts, principal).await
 }
 
 /// `admit_keyed_authority_change` asks the evidence gate with the request's
 /// form, and a withdrawal never asks it. In standalone mode there is no
 /// operation gate to ask; in cluster mode a keyed request with no
 /// membership to ask is refused (`503 roster_unavailable`), never admitted,
-/// and an unkeyed one does not ask.
+/// and an unkeyed one does not ask. A change cannot be called a withdrawal
+/// to skip the evidence gate: a key bound to another action, or a gated
+/// change whose key is bound to a withdrawal, is refused before anything is
+/// asked.
 #[tokio::test]
 async fn a_keyed_change_is_admitted_through_the_evidence_gate_then_the_operation_gate() {
-    use authority_events::required::{AuthorityEvidenceGate, AuthorityOperation};
+    use authority_events::required::{AuthorityEvidenceGate, AuthorityOperation, Withdrawal};
 
     let (audit_log, _capture) = captured_audit();
     let owner = issuer_bound_owner();
@@ -828,6 +831,18 @@ async fn a_keyed_change_is_admitted_through_the_evidence_gate_then_the_operation
     let caller = caller_operation(&parts.headers, &actor, "connection.create", "", "", b"{}")
         .expect("binds")
         .expect("keyed");
+    let delete = caller_operation(
+        &parts.headers,
+        &actor,
+        "connection.delete",
+        "fixture-id",
+        "",
+        b"",
+    )
+    .expect("binds")
+    .expect("keyed");
+    let publish = KeyedChange::Gated(AuthorityOperation::PolicyPublish);
+    let withdrawal = KeyedChange::Withdrawal(Withdrawal::ConnectionDelete);
     let request = (&audit_log, &parts, &owner);
     let required = |backend| {
         AuthorityEvidenceGate::new(config::AuthorityEvidenceDurability::Required, backend)
@@ -835,39 +850,52 @@ async fn a_keyed_change_is_admitted_through_the_evidence_gate_then_the_operation
 
     // Standalone: the gate decides, and nothing else is asked.
     let standalone = required(config::StateBackend::Sqlite);
-    let refused = admit_keyed(
-        standalone,
-        Some(AuthorityOperation::PolicyPublish),
-        Some(&caller),
-        request,
-    )
-    .await
-    .expect_err("standalone mode records no policy evidence");
+    let refused = admit_keyed(standalone, publish, Some(&caller), request)
+        .await
+        .expect_err("standalone mode records no policy evidence");
     assert_refused(*refused, "policy.publish").await;
-    admit_keyed(standalone, None, Some(&caller), request)
+    admit_keyed(standalone, withdrawal, Some(&delete), request)
         .await
         .expect("a withdrawal never asks the evidence gate");
+    admit_keyed(standalone, withdrawal, None, request)
+        .await
+        .expect("an unkeyed withdrawal never asks it either");
     admit_keyed(
         AuthorityEvidenceGate::best_effort(),
-        Some(AuthorityOperation::PolicyPublish),
+        publish,
         Some(&caller),
         request,
     )
     .await
     .expect("best_effort admits");
 
+    // A key bound to `connection.create` is not a withdrawal, and a gated
+    // change cannot carry a withdrawal's key: both are handler defects,
+    // refused even where every gate would admit.
+    for (change, bound) in [(withdrawal, &caller), (publish, &delete)] {
+        let refused = admit_keyed(
+            AuthorityEvidenceGate::best_effort(),
+            change,
+            Some(bound),
+            request,
+        )
+        .await
+        .expect_err("the change and its key disagree");
+        assert_eq!(
+            refused.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{change:?} {}",
+            bound.action()
+        );
+    }
+
     // Cluster mode: an unkeyed change does not ask the operation gate; a
     // keyed one with no membership to ask is refused.
     let cluster = required(config::StateBackend::Postgres);
-    admit_keyed(
-        cluster,
-        Some(AuthorityOperation::PolicyPublish),
-        None,
-        request,
-    )
-    .await
-    .expect("cluster mode admits an unkeyed policy publication");
-    let refused = admit_keyed(cluster, None, Some(&caller), request)
+    admit_keyed(cluster, publish, None, request)
+        .await
+        .expect("cluster mode admits an unkeyed policy publication");
+    let refused = admit_keyed(cluster, withdrawal, Some(&delete), request)
         .await
         .expect_err("a keyed change with no membership to ask is refused");
     assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -944,4 +972,52 @@ async fn the_pre_check_answers_an_exact_retry_with_its_receipt_and_any_other_use
         .await
         .expect_err("a reservation without its evidence refuses");
     assert_eq!(orphan.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// The gate a deployment runs is built from its configuration, and only the
+/// file sink meets the sink criterion: a keyed, issuer-bound preparation
+/// under `qualified_v1` is refused with the log sink or no sink, naming the
+/// sink, and admitted with the file sink on a Unix build (on any other build
+/// it is refused for the filesystem instead).
+#[test]
+fn the_configured_gate_admits_a_keyed_change_only_with_the_file_sink() {
+    use authority_events::required::{
+        AuthorityEvidenceGate, AuthorityOperation, KeyedAdmission, RequestForm,
+    };
+
+    let form = RequestForm::of(
+        true,
+        &auth::change_actor::ChangeActor::from_principal(&issuer_bound_owner()),
+    );
+    assert_eq!(
+        form,
+        RequestForm {
+            keyed: true,
+            issuer_bound_principal: true
+        }
+    );
+    let unmet = |sink: config::AuthorityEventSinkSetting| {
+        let mut config = test_config(Vec::new());
+        config.state_backend = config::StateBackend::Postgres;
+        config.authority_events.durability = config::AuthorityEvidenceDurability::Required;
+        config.authority_events.format = config::AuthorityEventFormat::QualifiedV1;
+        config.authority_events.sink = sink;
+        AuthorityEvidenceGate::from_config(&config)
+            .refusal_for(AuthorityOperation::MutationApprovalPrepare, form)
+            .and_then(|refusal| refusal.unmet())
+    };
+    assert_eq!(
+        unmet(config::AuthorityEventSinkSetting::Log),
+        Some(KeyedAdmission::FileSink)
+    );
+    assert_eq!(
+        unmet(config::AuthorityEventSinkSetting::None),
+        Some(KeyedAdmission::FileSink)
+    );
+    assert_eq!(
+        unmet(config::AuthorityEventSinkSetting::File(
+            "/var/lib/greengateway/authority-events.jsonl".to_owned()
+        )),
+        (!cfg!(unix)).then_some(KeyedAdmission::SyncedFilesystem)
+    );
 }

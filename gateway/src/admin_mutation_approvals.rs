@@ -267,7 +267,13 @@ pub(super) async fn prepare_binding_or_receipt(
     }
     // Required mode admits the keyed preparation only when every keyed
     // criterion holds, the file sink and a Unix build included, and names
-    // the first that does not (issue #425).
+    // the first that does not (issue #425). It is asked after the receipt
+    // read on purpose: an exact retry of a preparation already committed is
+    // answered from its immutable receipt even once the deployment no
+    // longer meets the criteria (a format or sink downgrade), because the
+    // answer changes nothing and is how the caller reconciles a lost
+    // response. Every request that would prepare anything is refused here
+    // before the catalog is resolved or anything is written.
     admit_authority_change_for(
         &state.authority_evidence,
         authority_events::required::AuthorityOperation::MutationApprovalPrepare,

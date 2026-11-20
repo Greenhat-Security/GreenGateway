@@ -7337,10 +7337,20 @@
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::admin_responses::admit_keyed_authority_change#1",
-      "sha256": "3fb4eda2f329e6767e0688f658e52f1df41ad054f10ec81bded733e6277521b8",
+      "scope": "gateway::admin_responses::KeyedChange#1",
+      "sha256": "ef5a81df70eed7444fe6299867da4bced44eca8a1dfe0a65e37d71c41924b9b5",
       "owner": "GreenGateway authority evidence maintainers",
-      "purpose": "Asks the configuration-only evidence gate, then for a keyed cluster request the existing operation gate for caller_operation_keys through ClusterMembership; no caller-selected HTTP authority. Allowed dead outside tests until an operation family binds a key."
+      "purpose": "Names a keyed admin change as gated by the evidence gate or as one of the three closed withdrawals; data only, no transport authority. Allowed dead outside tests until an operation family binds a key."
+    },
+    {
+      "file": "gateway/src/admin_responses.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::admin_responses::admit_keyed_authority_change#1",
+      "sha256": "262392172e189d5e59ffb8047a888ebd9549ffeb948bae3052178523c8d5d19d",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Refuses a keyed change whose named withdrawal and caller key disagree, asks the configuration-only evidence gate for a gated change, then for a keyed cluster request the existing operation gate for caller_operation_keys through ClusterMembership; no caller-selected HTTP authority. Allowed dead outside tests until an operation family binds a key."
     },
     {
       "file": "gateway/src/admin_responses.rs",
@@ -16296,7 +16306,7 @@
       "scope": "gateway::storage::postgres_authority_events::reserve_bound_operation#1",
       "sha256": "dce6b67b47f8c643ccfdcf53c776b8cdcc5bcedf8cf45b6ee0769c2b51f0a9f2",
       "owner": "GreenGateway authority evidence maintainers",
-      "purpose": "Inserts a caller UUID, operation family and binding digest on the existing PostgreSQL transaction, serializing reuse across authority writers; no caller-selected HTTP authority. Allowed dead outside tests until an operation family binds a key."
+      "purpose": "Reads greengateway.contract_fence on the existing PostgreSQL transaction and refuses unless it carries caller_operation_keys at schema 36 or above, then inserts a caller UUID, operation family and binding digest on that transaction, serializing reuse across authority writers; no caller-selected HTTP authority. Allowed dead outside tests until an operation family binds a key."
     },
     {
       "file": "gateway/src/storage/postgres_authority_events.rs",

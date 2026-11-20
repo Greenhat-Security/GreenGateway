@@ -53,7 +53,7 @@
 //!
 //! Schema presence alone never enables an operation.
 //!
-//! The registry ([`OPERATION_REQUIREMENTS`]) holds six operations. The
+//! The registry ([`OPERATION_REQUIREMENTS`]) holds ten operations. The
 //! first (issue #426, PR 2) is committing a policy document in which a role
 //! carries a `description` ([`POLICY_ROLE_DESCRIPTIONS`]). A gateway built
 //! before the field refuses such a document outright -- the role's fields

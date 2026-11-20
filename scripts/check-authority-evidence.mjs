@@ -260,7 +260,37 @@ const QUALIFIED_DELIVERY = { postgres: "journaled_dispatch", standalone: "standa
 // same method and route pairs.
 const ROUTING_PATH = "gateway/src/routing.rs";
 const KEYED_ROUTES_DECLARED = /pub\(super\) const KEYED_ROUTES: &\[KeyedRoute\] = &\[([\s\S]*?)\n\];/;
-const KEYED_ROUTE_ENTRY = /KeyedRoute\s*\{\s*method:\s*"([A-Z]+)",\s*route:\s*"([^"]+)",?\s*\}/g;
+// One `KeyedRoute { ... }` literal; its body may hold string literals, whose
+// route patterns carry braces.
+const KEYED_ROUTE_LITERAL = /KeyedRoute\s*\{((?:[^{}"]|"[^"\\]*")*)\}/g;
+const KEYED_ROUTE_FIELD = /^\s*(method|route)\s*:\s*"([^"\\]*)"\s*$/;
+const withoutBlockComments = (text) => text.replace(/\/\*[\s\S]*?\*\//g, "");
+
+// The (method, route) pairs KEYED_ROUTES honours, read from the table body.
+// Every entry must be a `KeyedRoute` literal naming `method` and `route` once
+// each, in either order, as string literals; anything the checker cannot
+// read this way (a constant, a spread, another field) fails, so no entry the
+// router honours is invisible to the cross-check.
+function keyedRoutes(declared) {
+  const table = withoutBlockComments(declared);
+  const opened = (table.match(/KeyedRoute\s*\{/g) ?? []).length;
+  const literals = [...table.matchAll(KEYED_ROUTE_LITERAL)];
+  check(literals.length === opened, `KEYED_ROUTES in ${ROUTING_PATH} has a KeyedRoute literal the checker cannot read`);
+  const rest = table.replace(KEYED_ROUTE_LITERAL, "").replace(/[\s,]/g, "");
+  check(rest === "", `KEYED_ROUTES in ${ROUTING_PATH} holds an entry that is not a KeyedRoute literal: ${rest.slice(0, 80)}`);
+  return new Set(literals.map(([literal, body]) => {
+    const fields = new Map();
+    for (const part of body.split(",").filter((field) => field.trim() !== "")) {
+      const field = part.match(KEYED_ROUTE_FIELD);
+      check(field !== null && !fields.has(field[1]),
+        `KEYED_ROUTES in ${ROUTING_PATH}: ${literal.replace(/\s+/g, " ")} must name method and route once each as string literals`);
+      fields.set(field[1], field[2]);
+    }
+    check(/^[A-Z]+$/.test(fields.get("method") ?? "") && (fields.get("route") ?? "").startsWith("/"),
+      `KEYED_ROUTES in ${ROUTING_PATH}: ${literal.replace(/\s+/g, " ")} must name an upper-case method and a route`);
+    return `${fields.get("method")} ${fields.get("route")}`;
+  }));
+}
 
 const pathKey = (criteria) => `${criteria?.operation}/${criteria?.storage_mode}`;
 const sameList = (left, right) => left.length === right.length && left.every((value, index) => value === right[index]);
@@ -427,7 +457,7 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
   // a reviewed path. Elsewhere the router refuses the key.
   const declared = withoutLineComments(source(ROUTING_PATH)).match(KEYED_ROUTES_DECLARED);
   check(declared !== null, `${ROUTING_PATH} declares no KEYED_ROUTES table`);
-  const honoured = new Set([...declared[1].matchAll(KEYED_ROUTE_ENTRY)].map(([, method, route]) => `${method} ${route}`));
+  const honoured = keyedRoutes(declared[1]);
   const reviewed = new Set(Object.values(qualifiedPaths).map((criteria) => `${criteria.method} ${criteria.route}`));
   for (const [key, criteria] of Object.entries(qualifiedPaths)) {
     check(honoured.has(`${criteria.method} ${criteria.route}`),
