@@ -292,7 +292,7 @@ holds this table to `diagnostic::ConfigRule`.
 | `AuthorityEventMaterialUnused` | Authority-event material the configured sink never reads. |
 | `AuthorityPseudonymKeysDistinct` | The current and previous pseudonym key aliases naming the same alias. |
 | `AuthorityEvidenceDeliveryRequired` | `AUTHORITY_EVIDENCE_DURABILITY=required` with `AUTHORITY_EVENT_SINK=none`, in either mode: a cluster replica would journal evidence that is never delivered, and a standalone gateway's stores would record evidence that is never delivered. |
-| `AuthorityEvidenceUnsupportedConfiguration` | `AUTHORITY_EVIDENCE_DURABILITY=required` with a setting that enables an authority change the evidence inventory marks unsupported in this mode: `ADMIN_SESSION_MODE=standalone_memory`. |
+| `AuthorityEvidenceUnsupportedConfiguration` | `AUTHORITY_EVIDENCE_DURABILITY=required` with a setting that enables an authority change the evidence inventory marks unsupported in this mode: `ADMIN_SESSION_MODE=standalone_memory`. A configuration these two rules accept is still refused by serving startup, after the compiler and before preflight, until #242 evidences configuration activation (`authority_evidence_activation_unevidenced`). That refusal is an I/O question, not a rule: the compiler accepts the configuration, and so does `ggctl`. |
 | `SourceSelection` | The selected source is unavailable, its selectors are invalid or missing, or an ordinary environment setting would create a competing authority. |
 
 Codes and rules are Rust enums. `ConfigRule::as_str` gives every rule

@@ -630,7 +630,7 @@ Authority evidence and its event delivery.
 
 | Member | Value | Default | Environment mode |
 | --- | --- | --- | --- |
-| `authority_evidence.durability` | `required` or `best_effort` | `"best_effort"` | [`AUTHORITY_EVIDENCE_DURABILITY`](configuration.md#authority_evidence_durability) |
+| `authority_evidence.durability` | `required` or `best_effort` | `"best_effort"` | [`AUTHORITY_EVIDENCE_DURABILITY`](configuration.md#authority_evidence_durability); `required` refuses to start until #242 evidences configuration activation |
 | `authority_evidence.event_sink` | `none`, `log` or `file` | `"none"` | [`AUTHORITY_EVENT_SINK`](configuration.md#authority_event_sink) |
 | `authority_evidence.event_format` | `delivery_v1` or `qualified_v1` | `"delivery_v1"` | [`AUTHORITY_EVENT_FORMAT`](configuration.md#authority_event_format) |
 | `authority_evidence.pseudonym_key_alias` | string | unset | [`AUTHORITY_PSEUDONYM_KEY_ALIAS`](configuration.md#authority_pseudonym_key_alias) |

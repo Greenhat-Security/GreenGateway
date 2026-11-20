@@ -144,7 +144,9 @@ Important standalone and operator boundaries:
   PostgreSQL configuration rejects the local keyring. External secret providers
   own their rotations; a gateway transaction cannot certify an independent
   provider write. Gateway credential **binding** changes are separate rows.
-- Startup configuration activation has no whole-configuration revision ledger.
+- Startup configuration activation has no whole-configuration revision ledger,
+  so `AUTHORITY_EVIDENCE_DURABILITY=required` refuses to start in either mode
+  until #242 provides one ([Required-durability mode](#required-durability-mode)).
   A unified, redacted configuration-export/release operation is not shipped.
   Canonical projections used internally by `import-standalone` are not such
   an export API and contain state that must never enter authority events.
@@ -1085,7 +1087,11 @@ protocol.
 
 `AUTHORITY_EVIDENCE_DURABILITY=required` ([configuration](configuration.md#authority_evidence_durability))
 is the mode PR 4 asks for: it refuses the authority changes a deployment mode cannot
-evidence. Each row states which requests the mode admits. PostgreSQL keyed
+evidence. **Until #242 provides evidence of configuration activation, a gateway in
+this mode refuses to start, in both deployment modes** (owner decision of
+2026-11-19); the rest of this section describes what the mode does once a gateway
+can start in it, and what the tests that build the application directly prove.
+Each row states which requests the mode admits. PostgreSQL keyed
 approval preparation has the complete caller-bound event and its tested delivery
 path. Other rows list their remaining gaps. The default is `best_effort`. The setting is separate from
 `AUDIT_DURABILITY`, whose `required` default covers request decisions only: tying
@@ -1104,10 +1110,9 @@ the operation key and negotiated format before admission.
 | `admitted` | Cluster policy, tools, Connection create, replace and delete, catalogs, token issue and change, JWT revocation, admin sessions and import, and standalone Connection create, replace and delete, local-secret create, rotate, delete and re-encryption, catalog publication and overlays, and token issue and rotate/revoke | Runs it. Its evidence is the row's `record` |
 | `caller_key_required` | PostgreSQL mutation approval preparation | Admits only the issuer-bound keyed PUT with `qualified_v1`. Required mode refuses ordinary POST. |
 | `refused` | Standalone mutation approval preparation and mutation approval review, revocation and consumption in both modes. Standalone policy mutations, policy file reloads, and tools publication (admin API and file reloads) | Refuses it when asked, before anything is written |
-| `refused_at_startup` | Standalone admin sessions (`ADMIN_SESSION_MODE=standalone_memory`) | Refuses to start |
+| `refused_at_startup` | Standalone admin sessions (`ADMIN_SESSION_MODE=standalone_memory`), and configuration activation in both modes | Refuses to start |
 | `unavailable` | Cluster policy file reload and local secrets, standalone JWT revocation and import, configuration export | Nothing to refuse: the mode or the build has no such operation. A gate that is asked anyway refuses it |
 | `outside_gateway` | External secret-provider rotation | Not covered: the provider owns the write and the gateway cannot refuse it |
-| `not_refused` | Configuration activation at startup | Runs it: refusing it would refuse every start. Startup configuration has no durable activation evidence until #242's ledger |
 
 Enforcement:
 
@@ -1119,6 +1124,24 @@ Enforcement:
   `ADMIN_SESSION_MODE=standalone_memory` (rule
   `AuthorityEvidenceUnsupportedConfiguration`). Both problems name
   `AUTHORITY_EVIDENCE_DURABILITY`, so the value-free diagnostics attribute them to it.
+  A configuration the compiler accepts is then refused by serving startup, after
+  the compiler and before preflight: nothing records the activation of the
+  configuration the gateway would serve, so no stage runs (no database connection,
+  migration, membership row, tools seed or listener), and the gateway prints
+  `authority_evidence_activation_unevidenced: AUTHORITY_EVIDENCE_DURABILITY=required
+  refuses configuration.activate: ...`, naming the deployment mode and no configured
+  value, and exits non-zero. The compiler's refusals are reported first.
+  `ActivationProof` in `gateway/src/authority_events/required.rs` has no value: #242
+  lifts the refusal only by giving it a constructor that verifies, inside the
+  activation stage and atomically with it, that a ledger or activation record
+  matches the exact configuration being activated (same digest, same revision),
+  and the inventory checker holds the `configuration_activation` row at
+  `refused_at_startup` until then. Offline commands do not ask: `revoke-jwt` still
+  runs and records its own evidence. Bundle mode stops before this point with
+  `source.mode_unavailable`; bundle serving must pass the same check when it
+  ships. `ggctl validate` and `ggctl doctor` accept a configuration the gateway
+  then refuses to serve, and the Cloudflare Worker refuses the setting before
+  it starts a container (`authority_evidence.activation_unevidenced`).
 - **Admin API.** Each endpoint of a `refused` row asks the gate once the
   caller is authorized. A refusal is `409 {"error":"...","reason":"authority_evidence_unsupported","operation":"<code>"}`,
   naming the inventory operation code and nothing from the request. Every policy
@@ -1160,7 +1183,7 @@ What required mode does not do:
   ([Standalone delivery](#standalone-delivery)). A cluster Connection's version
   history still cascades with the Connection; its create, replace, credential binding
   change (since migration 28) and deletion evidence rows do not.
-- It does not refuse configuration activation, external provider rotation or
+- It does not refuse external provider rotation or
   anything outside the inventory's matrix (status observations, verification and
   last-use updates, cleanup).
 - A standalone gateway in required mode therefore changes its policy and tools only
@@ -1171,7 +1194,7 @@ What required mode does not do:
 
 Tests: `gateway/src/authority_events/required_tests.rs` holds the gate's table to the
 inventory (every `refused` row has a gate that refuses it in that mode, every gate
-agrees with its row, and the only startup refusals are the two above), checks both
+agrees with its row, and the only startup refusals are the three above), checks both
 modes and the refusal's audit event, and holds the evidenced standalone Connection,
 local-secret and catalog rows `admitted` and ungated; `authority_evidence_app_tests.rs`
 drives every refused standalone admin endpoint through the real handlers and asserts
@@ -1181,7 +1204,10 @@ evidence rows; the
 reload helpers in `middleware/rbac_tests.rs` and `tools/definitions.rs` refuse a
 reload and keep the active document; `config_tests.rs`,
 `gateway-config/src/compiler/stage_tests.rs` and `ha.rs` cover the startup rules,
-their diagnostics and the fingerprint.
+their diagnostics and the fingerprint; `bootstrap_tests.rs` shows that serving
+startup refuses required mode in both modes before any stage runs, after the
+compiler's refusals and with a value-free message, and that `best_effort` startup
+runs every stage as before.
 
 ## Verified-TLS storage tests
 

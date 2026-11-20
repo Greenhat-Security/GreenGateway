@@ -258,7 +258,7 @@ test("required mode never admits an unsupported row or waves through a reachable
   assert.equal(byId.connection_delete_standalone, "admitted");
   assert.equal(byId.local_secrets, "admitted");
   assert.equal(byId.catalog_standalone, "admitted");
-  assert.equal(byId.configuration_activation, "not_refused");
+  assert.equal(byId.configuration_activation, "refused_at_startup");
 
   const unknown = inventory();
   unknown.groups[0].required_mode = "ignored";
@@ -267,8 +267,51 @@ test("required mode never admits an unsupported row or waves through a reachable
   admitted.groups.find((group) => group.id === "policy_standalone").required_mode = "admitted";
   assert.throws(() => validateInventory(admitted), /admits an unsupported operation/);
   const waved = inventory();
-  waved.groups.find((group) => group.id === "connection_standalone").required_mode = "not_refused";
+  waved.groups.find((group) => group.id === "connection_standalone").required_mode = "outside_gateway";
   assert.throws(() => validateInventory(waved), /reachable entry point/);
+});
+
+test("not_refused is not a required mode", () => {
+  // Required mode once ran configuration activation unrefused; owner
+  // decision 2 (2026-11-19) made it refuse to start instead, so no row can
+  // be waved through by that value any more, with or without entry points.
+  for (const id of ["external_rotation", "configuration_activation", "connection_standalone"]) {
+    const changed = inventory();
+    changed.groups.find((group) => group.id === id).required_mode = "not_refused";
+    assert.throws(() => validateInventory(changed), /unknown required mode|activation stays refused at startup/, id);
+  }
+  const external = inventory();
+  external.groups.find((group) => group.id === "external_rotation").required_mode = "not_refused";
+  assert.throws(() => validateInventory(external), /external_rotation: unknown required mode/);
+});
+
+test("configuration activation stays refused at startup while the activation proof is uninhabited", () => {
+  const PROOF = { path: "gateway/src/authority_events/required.rs", anchor: "pub(crate) enum ActivationProof {}" };
+  const activation = (value) => value.groups.find((group) => group.id === "configuration_activation");
+  assert.ok(source(PROOF.path).includes(PROOF.anchor), "the proof type is uninhabited on this branch");
+  assert.ok(activation(inventory()).sources.some((ref) => ref.path === PROOF.path && ref.anchor === PROOF.anchor));
+  for (const mode of ["admitted", "refused", "unavailable", "outside_gateway", "caller_key_required"]) {
+    const changed = inventory();
+    activation(changed).required_mode = mode;
+    assert.throws(() => validateInventory(changed), /activation stays refused at startup|unreviewed caller-key admission/, mode);
+  }
+  const supported = inventory();
+  activation(supported).required_durability_supported = true;
+  assert.throws(() => validateInventory(supported), /activation stays refused at startup|unproven durability claim/);
+  // The row must name the proof it waits for ...
+  const unanchored = inventory();
+  activation(unanchored).sources = activation(unanchored).sources.filter((ref) => ref.anchor !== PROOF.anchor);
+  assert.throws(() => validateInventory(unanchored), /must anchor on the uninhabited activation proof/);
+  // ... and moving the activation into another row does not escape the rule.
+  const moved = inventory();
+  const split = { ...structuredClone(activation(moved)), id: "configuration_activation_standalone", modes: ["standalone"], required_mode: "admitted" };
+  activation(moved).modes = ["postgres"];
+  moved.groups.push(split);
+  assert.throws(() => validateInventory(moved), /configuration_activation_standalone: configuration activation stays refused at startup/);
+  // Giving the proof a value (issue #242) breaks the row's anchor, so the
+  // type, the startup check and this row change in one reviewed change.
+  const inhabited = (path) => source(path).replace(PROOF.anchor, "pub(crate) struct ActivationProof { _ledger: () }");
+  assert.throws(() => validateInventory(inventory(), inhabited), /stale source anchor: gateway\/src\/authority_events\/required\.rs :: pub\(crate\) enum ActivationProof \{\}/);
 });
 
 test("export evidence binds an existing configuration revision without inventing a mutation", () => {

@@ -195,7 +195,8 @@ handover and a restarted fleet's first pass.
 
 A deployment without `AUTHORITY_EVENT_SINK` journals and retains events but
 delivers none, so every retained event is undelivered by design
-(`AUTHORITY_EVIDENCE_DURABILITY=required` refuses to start such a replica). The lag rule
+(`AUTHORITY_EVIDENCE_DURABILITY=required` refuses to start such a replica, and until
+#242 evidences configuration activation it refuses to start any replica). The lag rule
 judges delivery only where some scraped replica exports the dispatcher's lease age
 or its failure counter: a configured dispatcher creates one of them on its first
 term or its first failed attempt. A dispatcher that once claimed the cursor and
@@ -489,7 +490,8 @@ Delivery resumes from the persisted cursors after a restart and is at least once
 consumers deduplicate on `(authority_id, event_id)`; each store has its own
 `authority_id`. Unsetting the sink stops delivery and the alerts with it, but the
 evidence keeps accumulating undelivered, and `AUTHORITY_EVIDENCE_DURABILITY=required`
-refuses to start without a sink.
+refuses to start without a sink (and, until #242 evidences configuration activation,
+with one too).
 
 ### Artifact verification failure
 
@@ -582,4 +584,4 @@ no counter, for the reason given.
 | Standalone service-token issue, rotate and revoke | `greengateway_standalone_evidence_failures_total{store="service_tokens"}` | `GreenGatewayStandaloneEvidenceWriteFailures` |
 | Standalone Connection create, replace and delete; local-secret create, rotate, delete and re-encryption batch in the gateway process | `greengateway_standalone_evidence_failures_total{store="connections"}` | `GreenGatewayStandaloneEvidenceWriteFailures` |
 | Local-secret re-encryption by the `connection-secrets reencrypt` command | None: a one-shot command has no metrics endpoint | Gated: the command fails and changes nothing, which its operator sees. |
-| Standalone admin sessions, policy, tools and catalog changes | None: they write no evidence. Sessions are process-local memory, and under `AUTHORITY_EVIDENCE_DURABILITY=required` policy, tools and catalog changes are refused before anything is written ([required-durability mode](../authority-evidence.md#required-durability-mode)) | Gated: there is no evidence write to fail. |
+| Standalone admin sessions, policy, tools and catalog changes | None: they write no evidence. Sessions are process-local memory, and under `AUTHORITY_EVIDENCE_DURABILITY=required` policy, tools and catalog changes are refused before anything is written ([required-durability mode](../authority-evidence.md#required-durability-mode)); until #242 a gateway in that mode does not start at all | Gated: there is no evidence write to fail. |

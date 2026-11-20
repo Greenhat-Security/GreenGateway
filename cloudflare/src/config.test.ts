@@ -132,7 +132,7 @@ describe("buildGreenGatewayContainerEnv", () => {
 
   it("forwards the authority evidence durability mode and its delivery settings", () => {
     const env = buildGreenGatewayContainerEnv({
-      AUTHORITY_EVIDENCE_DURABILITY: "required",
+      AUTHORITY_EVIDENCE_DURABILITY: "best_effort",
       AUTHORITY_EVENT_SINK: "file",
       AUTHORITY_EVENT_FORMAT: "qualified_v1",
       AUTHORITY_EVENT_FILE: "/tmp/greengateway-authority-events.jsonl",
@@ -141,13 +141,28 @@ describe("buildGreenGatewayContainerEnv", () => {
     });
 
     expect(env).toMatchObject({
-      AUTHORITY_EVIDENCE_DURABILITY: "required",
+      AUTHORITY_EVIDENCE_DURABILITY: "best_effort",
       AUTHORITY_EVENT_SINK: "file",
       AUTHORITY_EVENT_FORMAT: "qualified_v1",
       AUTHORITY_EVENT_FILE: "/tmp/greengateway-authority-events.jsonl",
       AUTHORITY_PSEUDONYM_KEY_ALIAS: "pseudonym-current",
       AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS: "pseudonym-previous",
     });
+  });
+
+  it("refuses required authority evidence durability", () => {
+    // The gateway refuses to start under required authority evidence until
+    // configuration activation is evidenced (issue #242), so the Worker
+    // refuses it up front instead of starting a container that exits.
+    expect(() => buildGreenGatewayContainerEnv({
+      AUTHORITY_EVIDENCE_DURABILITY: "required",
+      AUTHORITY_EVENT_SINK: "log",
+      AUTHORITY_PSEUDONYM_KEY_ALIAS: "pseudonym-current",
+    })).toThrow(new Error("authority_evidence.activation_unevidenced: AUTHORITY_EVIDENCE_DURABILITY"));
+    // A value the gateway would refuse as malformed is still forwarded, so
+    // the container reports it as the configuration compiler does.
+    expect(buildGreenGatewayContainerEnv({ AUTHORITY_EVIDENCE_DURABILITY: "Required" }))
+      .toMatchObject({ AUTHORITY_EVIDENCE_DURABILITY: "Required" });
   });
 
   it("forwards bounded login, session, discovery, and NAT64 settings", () => {
