@@ -7133,6 +7133,16 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/admin_tokens.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_tokens::token_change_to_completion#1",
+      "sha256": "eb23f4f3c72ceb4e75beac5bba93d8a99c12f64b85fb4a298a6d16e8cdb4d0e9",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Runs a service-token issue or rotation on its own Tokio task so a client disconnect cannot separate the store commit from its audit event and validator-cache invalidation (issue #425); re-enters the request pins and span. No outbound transport authority."
+    },
+    {
       "file": "gateway/src/main.rs",
       "reasons": [
         "capability-import-or-glob"
