@@ -17,7 +17,7 @@ the caller operation keys of every keyed family
 ([Keyed authority changes](#keyed-authority-changes)) and the closing
 reconciliation of this inventory
 ([Next reviewable slices](#next-reviewable-slices-and-validation-gates)).
-Reviewed source: `78414d3d9b2eb050dc02873176e674458a7d93fa`.
+Reviewed source: `5da986d6c915c15fdd1f6aa2e490c3157ce9bf1c`.
 
 This inventory identifies existing atomic records and the work needed for required
 authority-change evidence. PR 1 added the inventory and the proposed event
@@ -347,24 +347,57 @@ every object boundary. They also reject malformed categories, actor modes,
 timestamps, imprecise numeric revisions and invalid transitions. These schema
 tests alone do not prove runtime redaction. The producer tests of each keyed
 family drive real keyed changes whose inputs carry synthetic sensitive markers
-and inspect what the gateway stores, and for two families what it logs and
-measures too: service tokens and local secrets are checked in stored records,
-receipts, log lines and metrics; Connections, catalogs, and policy, tools and
-policy tests in stored records and receipts only, so log-line and metric-label
-redaction (I5) is proven only for tokens and local secrets. Service tokens:
-`a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext`
-(no plaintext or binding digest in any handler log line) and
-`storage::contract_tests::sqlite_a_failed_token_reservation_is_counted_and_no_secret_reaches_logs_or_metrics`.
-Connections: `the_binding_digest_is_stored_only_in_the_reservation_row`, run
-against both stores, which keeps a marker in every credential reference out of
-the receipts and the evidence rows. Catalogs:
-`a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record`
-(both stores). Local secrets:
-`a_keyed_secret_change_keeps_synthetic_markers_out_of_the_reservation_receipt_evidence_and_file`
-and, through the router,
-`a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`.
-Policy, tools and policy tests:
-`a_keyed_document_commit_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record`.
+and inspect what the gateway stores. Router-level marker tests also capture, while
+the handlers run, every `tracing` log line at every level and every metric, and
+check that no marker or binding digest reaches a log line, a metric name or label,
+an answer or (where the test has it) the audit stream. Their capture
+(`admin_tokens_app_tests::capture_logs_and_metrics_on_every_runtime_thread`)
+covers the test's thread and the runtime's blocking pool, where the SQLite stores
+run, and checks itself before it returns
+(`the_capture_sees_logs_and_metrics_on_the_blocking_pool` pins it). It does not see
+`log`-crate records from dependencies or threads the code spawns itself, such as
+the audit log writer. Log-line and metric-label redaction (I5) is therefore tested
+for each keyed family, for the operations listed here and no others:
+
+- Service tokens: `a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext`
+  (keyed issue and rotation with their retries, conflicts, `403` refusals and a
+  failed reservation, standalone; no plaintext or binding digest in a log line or
+  a metric) and the store test
+  `storage::contract_tests::sqlite_a_failed_token_reservation_is_counted_and_no_secret_reaches_logs_or_metrics`.
+- Local secrets: `a_keyed_secret_change_keeps_synthetic_markers_out_of_the_reservation_receipt_evidence_and_file`
+  and, through the router,
+  `a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
+  (keyed create and rotation with their retries and conflicts, standalone; the
+  values, the label and the digests reach no answer, audit event, log line or
+  metric, and the values reach neither the database file nor its WAL).
+- Connections: `the_binding_digest_is_stored_only_in_the_reservation_row`, run
+  against both stores, for the receipts and evidence rows;
+  `marker_keys::a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
+  (standalone) and
+  `cluster_connection_keys::postgres_keyed_connection_and_catalog_changes_keep_synthetic_markers_out_of_the_logs_and_metrics`
+  (PostgreSQL) for logs, metrics, answers and audit. The credential aliases of
+  bearer, additional-header and TLS client authentication, a delegated issuer,
+  caller assertions and OAuth client credentials are marked. The OAuth
+  client-credentials replacement and the keyed Connection delete are driven in
+  the SQLite form only.
+- Catalogs: `a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record`
+  (both stores), and for logs, metrics, answers and audit
+  `marker_keys::a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
+  (standalone) and the PostgreSQL test above. They drive the OpenAPI
+  registration, refreshes, overlay replacements (one with a marked enum source)
+  and an overlay delete on a credentialed Connection whose secret IDs, file
+  locators and values are markers. One refresh resolves both credentials and
+  sends them to a recording HTTPS upstream the test runs, and one fails after
+  sending them. `catalog.mcp.publish` is not driven.
+- Policy, tools and policy tests:
+  `a_keyed_document_commit_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record`,
+  and for logs, metrics, answers and audit
+  `cluster_document_keys::a_keyed_document_change_keeps_its_digest_and_key_out_of_the_receipt_audit_logs_and_metrics`
+  (PostgreSQL). That test drives `policy.publish`, `tools.publish` and
+  `policy_tests.publish` only. Rule create, update, delete and reorder, rollback
+  and suggestion acceptance share the binding and commit path but are not driven,
+  so they have no log and metric test.
+
 The family sections below describe each.
 
 ### PostgreSQL approval preparation
@@ -883,8 +916,9 @@ consulted),
 `a_keyed_rotation_retry_drops_the_replaced_plaintext_from_the_answering_cache` and
 `an_admitted_token_rotation_finishes_after_its_client_goes_away`; and
 `required_tests::service_token_issue_and_rotation_admit_only_their_keyed_issuer_bound_form_in_both_modes`.
-The replay test also captures every log line the handlers write and finds neither
-plaintext nor a binding digest in them, a failed reservation included, and
+The replay test also captures every log line and metric written on the test's
+thread and the runtime's blocking pool, where the SQLite token store runs, and finds
+neither plaintext nor a binding digest in them, a failed reservation included, and
 `storage::contract_tests::sqlite_a_failed_token_reservation_is_counted_and_no_secret_reaches_logs_or_metrics`
 proves that a reservation the SQLite store cannot write rolls the issue back, is
 counted once on `greengateway_standalone_evidence_failures_total{store="service_tokens"}`,
@@ -1124,7 +1158,9 @@ best_effort and required),
 `an_admitted_secret_change_finishes_after_its_client_goes_away` and
 `a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
 (markers in the value, the label and a conflicting retry's value, checked against
-the answers, the audit events, the logs, the metrics, the SQLite file and its WAL).
+the answers, the audit events, the logs and metrics captured on the test's thread
+and the runtime's blocking pool, where the SQLite store runs, the SQLite file and
+its WAL).
 The one PostgreSQL test,
 `authority_evidence_app_tests::cluster_connection_keys::postgres_keyed_secret_changes_in_cluster_mode_leave_the_fence_alone`,
 proves that a keyed rotation and delete on a cluster replica, once the operation
@@ -2300,32 +2336,15 @@ The family changes recorded these further limits:
   (policy `PUT`, rollback, every rule edit, tools registration and suite write)
   and, for suggestion acceptance and draft publication,
   `required_mode_refuses_the_unkeyed_cluster_acceptance_and_draft_publication_before_reading`.
-- The router-level log capture in the service-token replay test is per thread, so
-  it does not see what the token store logs on the blocking pool; a separate store
-  test driven on its own thread
-  (`sqlite_a_failed_token_reservation_is_counted_and_no_secret_reaches_logs_or_metrics`)
-  covers that.
-- The keyed suggestion acceptance and draft publication tests in
-  `admin_observability_app_tests::cluster_discovery_tests` build their own
-  PostgreSQL pool with TLS disabled, so they run only in the loopback PostgreSQL
-  jobs and not in the verified-TLS shard
-  ([Verified-TLS storage tests](#verified-tls-storage-tests)). Four of them are
-  proof anchors of the qualified `policy_postgres` row for `policy.publish` and
-  `policy.suggestion.accept`:
-  `a_keyed_cluster_draft_publication_reserves_policy_publish_and_replays_its_receipt`,
-  `a_keyed_cluster_acceptance_is_answered_from_its_receipt_once_the_suggestion_is_closed`,
-  `a_keyed_cluster_bound_draft_publication_reserves_the_acceptance_and_replays_its_receipt`
-  and
-  `required_mode_refuses_the_unkeyed_cluster_acceptance_and_draft_publication_before_reading`.
-  The same harness keeps the #835 test of that module off the shard too. The
-  store-level proof of those operations
-  (`storage::postgres_documents`, including
-  `a_keyed_suggestion_acceptance_reserves_inside_the_acceptance_transaction`)
-  does run over verified TLS; what is loopback-only is the handler-level replay
-  and required-mode refusal on the two routes. Until the harness takes its TLS
-  mode from the same environment as `cluster_document_keys`, this leaves the
-  #425 closing item that the verified-TLS shard lists every new individually
-  named test unmet.
+- Log-line and metric-label redaction (I5) is tested only for the operations the
+  router-level marker tests drive
+  ([Authority event v1](#authority-event-v1) lists them). The policy
+  rule create, update, delete and reorder, policy rollback and suggestion
+  acceptance, and `catalog.mcp.publish`, have no log and metric test. The OAuth
+  client-credentials replacement and the keyed Connection delete are driven in
+  the SQLite form only. The capture sees `tracing` events on the runtime's own
+  threads, not `log`-crate records from dependencies or threads the code spawns
+  itself, such as the audit log writer.
 
 ### Rows admitted without qualification
 
@@ -2436,6 +2455,18 @@ disposable PostgreSQL 16, the same pinned image, that accepts TLS and nothing el
 - the whole PostgreSQL Connection store suite (`connections::pg_store`), its create,
   replace, credential binding change, deletion and catalog evidence and the keyed
   Connection contract included;
+- the keyed Connection, catalog and local-secret changes through the handlers of a
+  cluster replica (`authority_evidence_app_tests::cluster_connection_keys::`), the
+  PostgreSQL marker test of Connections and catalogs included;
+- the PostgreSQL mutation-approval tests (`issue_757_mutation_approvals::postgres::`);
+- all 17 tests of `admin_observability_app_tests::cluster_discovery_tests::`, among
+  them the keyed suggestion acceptance and draft publication tests that anchor the
+  `policy_postgres` row for `policy.publish` and `policy.suggestion.accept`
+  (`a_keyed_cluster_draft_publication_reserves_policy_publish_and_replays_its_receipt`,
+  `a_keyed_cluster_acceptance_is_answered_from_its_receipt_once_the_suggestion_is_closed`,
+  `a_keyed_cluster_bound_draft_publication_reserves_the_acceptance_and_replays_its_receipt`,
+  `required_mode_refuses_the_unkeyed_cluster_acceptance_and_draft_publication_before_reading`)
+  and `cluster_accept_after_only_a_security_revision_advance_still_succeeds`;
 - `storage::postgres_documents`, the keyed policy, tools and policy test contract
   included, and `storage::postgres_admin_sessions`;
 - the dispatcher (`authority_events::dispatcher`);
@@ -2489,8 +2520,10 @@ caller-bound principal change delivered as `authority_event.v1` (#827); one gate
 keyed changes, the `KEYED_ROUTES` guard and the `caller_operation_keys` capability
 (#833, with #838); keyed service-token issue and rotation (#836), Connection create,
 replace and delete (#834), catalog publication and overlay changes (#837), local
-secret changes (#839), and cluster policy, tools and policy test changes (#840); and
-the closing reconciliation of this inventory and these docs. Items 1 to 4 below are
+secret changes (#839), and cluster policy, tools and policy test changes (#840); log
+and metric marker tests for Connections, catalogs, and policy, tools and policy
+tests (#842); the suggestion and draft publication handler tests on the
+verified-TLS shard (#843); and the closing reconciliation of this inventory and these docs. Items 1 to 4 below are
 the evidence and delivery slices those changes built on, and say where each gained
 its caller-bound form. Item 5 is what stays open, handed to #242. The limits that remain are listed under
 [Remaining limits](#remaining-limits).

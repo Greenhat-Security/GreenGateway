@@ -1,7 +1,7 @@
 {
   "version": 1,
   "issue": 425,
-  "reviewed_revision": "78414d3d9b2eb050dc02873176e674458a7d93fa",
+  "reviewed_revision": "5da986d6c915c15fdd1f6aa2e490c3157ce9bf1c",
   "storage_modes": [
     "postgres",
     "standalone"
@@ -5028,7 +5028,7 @@
             },
             {
               "path": "gateway/src/admin_tokens_app_tests.rs",
-              "anchor": "async fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
+              "anchor": "fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
             },
             {
               "path": "gateway/src/authority_events/required_tests.rs",
@@ -5217,7 +5217,7 @@
             },
             {
               "path": "gateway/src/admin_tokens_app_tests.rs",
-              "anchor": "async fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
+              "anchor": "fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
             },
             {
               "path": "gateway/src/admin_tokens_app_tests.rs",
@@ -5438,7 +5438,7 @@
             },
             {
               "path": "gateway/src/admin_tokens_app_tests.rs",
-              "anchor": "async fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
+              "anchor": "fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
             },
             {
               "path": "gateway/src/authority_events/required_tests.rs",
@@ -5828,7 +5828,7 @@
             },
             {
               "path": "gateway/src/admin_tokens_app_tests.rs",
-              "anchor": "async fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
+              "anchor": "fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
             },
             {
               "path": "gateway/src/admin_tokens_app_tests.rs",

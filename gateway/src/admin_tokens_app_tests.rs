@@ -1775,261 +1775,277 @@ fn token_changes(capture: &audit::sink::tests::CaptureSink, action: &str) -> usi
 /// request whatever its whitespace or key order; any other use of the key
 /// is `409 caller_operation_conflict`. A caller without the route's
 /// permission is `403` before its key is consulted. The token a receipt
-/// names can be revoked by its ID.
-#[tokio::test]
-async fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext()
-{
-    // Every log line the handlers write, at every level, on this thread
-    // (where the current-thread runtime runs them).
-    let (logs, _logging) = capture_all_logs();
-    let token_db = TempDb::new("keyed-token-replay");
-    let policy = TempPolicyFile::new(&token_policy_document_string());
-    let capture = audit::sink::tests::CaptureSink::new();
-    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
-    let router = keyed_token_router(&token_db, &policy, audit_log, |_| {});
-    let admin = keyed_token_admin(&["superadmin"]);
-    let issue_key = token_key(1);
-    let issue = |body: &str, key: &str| {
-        keyed_token_admin_request(
-            Method::POST,
-            TOKENS_ADMIN_ROUTE,
-            admin.clone(),
-            Some(body.to_owned()),
-            Some(key),
-        )
-    };
-    let body = json!({ "scopes": ["probe-reader"] }).to_string();
+/// names can be revoked by its ID. No plaintext or binding digest reaches a
+/// log line or a metric, captured on the test's thread and on the runtime's
+/// blocking pool, where the SQLite token store runs.
+#[test]
+fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext() {
+    let ((plaintext, rotated_plaintext, digests), logged, rendered) =
+        capture_logs_and_metrics_on_every_runtime_thread(async {
+            let token_db = TempDb::new("keyed-token-replay");
+            let policy = TempPolicyFile::new(&token_policy_document_string());
+            let capture = audit::sink::tests::CaptureSink::new();
+            let audit_log =
+                audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+            let router = keyed_token_router(&token_db, &policy, audit_log, |_| {});
+            let admin = keyed_token_admin(&["superadmin"]);
+            let issue_key = token_key(1);
+            let issue = |body: &str, key: &str| {
+                keyed_token_admin_request(
+                    Method::POST,
+                    TOKENS_ADMIN_ROUTE,
+                    admin.clone(),
+                    Some(body.to_owned()),
+                    Some(key),
+                )
+            };
+            let body = json!({ "scopes": ["probe-reader"] }).to_string();
 
-    let (status, _, created) = token_exchange(&router, issue(&body, &issue_key)).await;
-    assert_eq!(status, StatusCode::CREATED, "{created}");
-    let id = created["token"]["id"].as_str().expect("an ID").to_owned();
-    let plaintext = created["plaintext_token"]
-        .as_str()
-        .expect("the first response carries the plaintext")
-        .to_owned();
+            let (status, _, created) = token_exchange(&router, issue(&body, &issue_key)).await;
+            assert_eq!(status, StatusCode::CREATED, "{created}");
+            let id = created["token"]["id"].as_str().expect("an ID").to_owned();
+            let plaintext = created["plaintext_token"]
+                .as_str()
+                .expect("the first response carries the plaintext")
+                .to_owned();
 
-    // The exact retry, and the same request spelled differently.
-    let reordered = "{ \"expires_at\" : null,\n \"scopes\" : [ \"probe-reader\" ] }";
-    let mut receipts = Vec::new();
-    for retry in [body.as_str(), reordered] {
-        let (status, cache_control, receipt) =
-            token_exchange(&router, issue(retry, &issue_key)).await;
-        assert_eq!(status, StatusCode::OK, "{receipt}");
-        assert_eq!(cache_control.as_deref(), Some("no-store"));
-        receipts.push(receipt);
-    }
-    assert_eq!(receipts[0], receipts[1]);
-    let receipt = &receipts[0];
-    assert_eq!(receipt["operation_id"], json!(issue_key));
-    assert_eq!(receipt["operation"], json!("service_token.issue"));
-    assert_eq!(receipt["resource_id"], json!(id));
-    assert_eq!(receipt["revision"], json!(1));
-    assert_eq!(receipt["secret_returned"], json!(false));
-    assert!(receipt["committed_at"].is_string());
-    assert_eq!(
-        receipt.as_object().expect("an object").len(),
-        6,
-        "{receipt}"
-    );
-    assert!(
-        !receipt.to_string().contains(&plaintext),
-        "never the plaintext"
-    );
+            // The exact retry, and the same request spelled differently.
+            let reordered = "{ \"expires_at\" : null,\n \"scopes\" : [ \"probe-reader\" ] }";
+            let mut receipts = Vec::new();
+            for retry in [body.as_str(), reordered] {
+                let (status, cache_control, receipt) =
+                    token_exchange(&router, issue(retry, &issue_key)).await;
+                assert_eq!(status, StatusCode::OK, "{receipt}");
+                assert_eq!(cache_control.as_deref(), Some("no-store"));
+                receipts.push(receipt);
+            }
+            assert_eq!(receipts[0], receipts[1]);
+            let receipt = &receipts[0];
+            assert_eq!(receipt["operation_id"], json!(issue_key));
+            assert_eq!(receipt["operation"], json!("service_token.issue"));
+            assert_eq!(receipt["resource_id"], json!(id));
+            assert_eq!(receipt["revision"], json!(1));
+            assert_eq!(receipt["secret_returned"], json!(false));
+            assert!(receipt["committed_at"].is_string());
+            assert_eq!(
+                receipt.as_object().expect("an object").len(),
+                6,
+                "{receipt}"
+            );
+            assert!(
+                !receipt.to_string().contains(&plaintext),
+                "never the plaintext"
+            );
 
-    // The same key with another request is a conflict and changes nothing.
-    let (status, _, conflict) = token_exchange(
-        &router,
-        issue(
-            &json!({ "scopes": ["tokens-reader"] }).to_string(),
-            &issue_key,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
-    assert_eq!(conflict["reason"], json!("caller_operation_conflict"));
+            // The same key with another request is a conflict and changes nothing.
+            let (status, _, conflict) = token_exchange(
+                &router,
+                issue(
+                    &json!({ "scopes": ["tokens-reader"] }).to_string(),
+                    &issue_key,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+            assert_eq!(conflict["reason"], json!("caller_operation_conflict"));
 
-    // A keyed rotation, its retry and its conflicts.
-    let rotate_route = format!("{TOKENS_ADMIN_ROUTE}/{id}/rotate");
-    let rotate_key = token_key(2);
-    let rotate = |route: &str, key: &str| {
-        keyed_token_admin_request(Method::POST, route, admin.clone(), None, Some(key))
-    };
-    let (status, _, rotated) = token_exchange(&router, rotate(&rotate_route, &rotate_key)).await;
-    assert_eq!(status, StatusCode::OK, "{rotated}");
-    let rotated_plaintext = rotated["plaintext_token"]
-        .as_str()
-        .expect("the first rotation carries the plaintext")
-        .to_owned();
-    let (status, cache_control, rotation_receipt) =
-        token_exchange(&router, rotate(&rotate_route, &rotate_key)).await;
-    assert_eq!(status, StatusCode::OK, "{rotation_receipt}");
-    assert_eq!(cache_control.as_deref(), Some("no-store"));
-    assert_eq!(rotation_receipt["operation"], json!("service_token.rotate"));
-    assert_eq!(rotation_receipt["resource_id"], json!(id));
-    assert_eq!(rotation_receipt["revision"], json!(2));
-    assert_eq!(rotation_receipt["secret_returned"], json!(false));
-    assert_eq!(rotation_receipt.get("plaintext_token"), None);
-    // The retry rotated nothing again: the first rotation's plaintext is live.
-    let store = auth::SqliteTokenStore::open(&token_db.path).expect("the store opens");
-    assert!(matches!(
-        auth::tokens::TokenStore::verify(&store, &rotated_plaintext).expect("verifies"),
-        auth::tokens::TokenVerification::Valid(_)
-    ));
+            // A keyed rotation, its retry and its conflicts.
+            let rotate_route = format!("{TOKENS_ADMIN_ROUTE}/{id}/rotate");
+            let rotate_key = token_key(2);
+            let rotate = |route: &str, key: &str| {
+                keyed_token_admin_request(Method::POST, route, admin.clone(), None, Some(key))
+            };
+            let (status, _, rotated) =
+                token_exchange(&router, rotate(&rotate_route, &rotate_key)).await;
+            assert_eq!(status, StatusCode::OK, "{rotated}");
+            let rotated_plaintext = rotated["plaintext_token"]
+                .as_str()
+                .expect("the first rotation carries the plaintext")
+                .to_owned();
+            let (status, cache_control, rotation_receipt) =
+                token_exchange(&router, rotate(&rotate_route, &rotate_key)).await;
+            assert_eq!(status, StatusCode::OK, "{rotation_receipt}");
+            assert_eq!(cache_control.as_deref(), Some("no-store"));
+            assert_eq!(rotation_receipt["operation"], json!("service_token.rotate"));
+            assert_eq!(rotation_receipt["resource_id"], json!(id));
+            assert_eq!(rotation_receipt["revision"], json!(2));
+            assert_eq!(rotation_receipt["secret_returned"], json!(false));
+            assert_eq!(rotation_receipt.get("plaintext_token"), None);
+            // The retry rotated nothing again: the first rotation's plaintext is live.
+            let store = auth::SqliteTokenStore::open(&token_db.path).expect("the store opens");
+            assert!(matches!(
+                auth::tokens::TokenStore::verify(&store, &rotated_plaintext).expect("verifies"),
+                auth::tokens::TokenVerification::Valid(_)
+            ));
 
-    let (status, _, other) = token_exchange(
-        &router,
-        token_admin_request(
-            Method::POST,
-            TOKENS_ADMIN_ROUTE,
-            Some(admin.clone()),
-            Some(body.clone()),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-    let other_route = format!(
-        "{TOKENS_ADMIN_ROUTE}/{}/rotate",
-        other["token"]["id"].as_str().expect("an ID")
-    );
-    for (route, key) in [(&other_route, &rotate_key), (&rotate_route, &issue_key)] {
-        let (status, _, conflict) = token_exchange(&router, rotate(route, key)).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{route}: {conflict}");
-        assert_eq!(conflict["reason"], json!("caller_operation_conflict"));
-    }
+            let (status, _, other) = token_exchange(
+                &router,
+                token_admin_request(
+                    Method::POST,
+                    TOKENS_ADMIN_ROUTE,
+                    Some(admin.clone()),
+                    Some(body.clone()),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            let other_route = format!(
+                "{TOKENS_ADMIN_ROUTE}/{}/rotate",
+                other["token"]["id"].as_str().expect("an ID")
+            );
+            for (route, key) in [(&other_route, &rotate_key), (&rotate_route, &issue_key)] {
+                let (status, _, conflict) = token_exchange(&router, rotate(route, key)).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{route}: {conflict}");
+                assert_eq!(conflict["reason"], json!("caller_operation_conflict"));
+            }
 
-    // Authorization comes before the key: a reader is refused `403` with a
-    // key already committed (a handler that consulted the key first would
-    // answer it) and with a new one, and nothing is reserved.
-    let reservations = token_reservations(&token_db.path);
-    let reader = keyed_token_admin(&["tokens-reader", "probe-reader"]);
-    for (request, what) in [
-        (
-            keyed_token_admin_request(
-                Method::POST,
-                TOKENS_ADMIN_ROUTE,
-                reader.clone(),
-                Some(body.clone()),
-                Some(&issue_key),
-            ),
-            "a committed issue key",
-        ),
-        (
-            keyed_token_admin_request(
-                Method::POST,
-                TOKENS_ADMIN_ROUTE,
-                reader.clone(),
-                Some(body.clone()),
-                Some(&token_key(3)),
-            ),
-            "a new issue key",
-        ),
-        (
-            keyed_token_admin_request(
-                Method::POST,
-                &rotate_route,
-                reader.clone(),
-                None,
-                Some(&rotate_key),
-            ),
-            "a committed rotation key",
-        ),
-    ] {
-        let (status, _, refused) = token_exchange(&router, request).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {refused}");
-    }
-    assert_eq!(token_reservations(&token_db.path), reservations);
+            // Authorization comes before the key: a reader is refused `403` with a
+            // key already committed (a handler that consulted the key first would
+            // answer it) and with a new one, and nothing is reserved.
+            let reservations = token_reservations(&token_db.path);
+            let reader = keyed_token_admin(&["tokens-reader", "probe-reader"]);
+            for (request, what) in [
+                (
+                    keyed_token_admin_request(
+                        Method::POST,
+                        TOKENS_ADMIN_ROUTE,
+                        reader.clone(),
+                        Some(body.clone()),
+                        Some(&issue_key),
+                    ),
+                    "a committed issue key",
+                ),
+                (
+                    keyed_token_admin_request(
+                        Method::POST,
+                        TOKENS_ADMIN_ROUTE,
+                        reader.clone(),
+                        Some(body.clone()),
+                        Some(&token_key(3)),
+                    ),
+                    "a new issue key",
+                ),
+                (
+                    keyed_token_admin_request(
+                        Method::POST,
+                        &rotate_route,
+                        reader.clone(),
+                        None,
+                        Some(&rotate_key),
+                    ),
+                    "a committed rotation key",
+                ),
+            ] {
+                let (status, _, refused) = token_exchange(&router, request).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {refused}");
+            }
+            assert_eq!(token_reservations(&token_db.path), reservations);
 
-    // What a caller whose issue response was lost does: revoke the token the
-    // receipt names, by its ID.
-    let (status, _, revoked) = token_exchange(
-        &router,
-        token_admin_request(
-            Method::DELETE,
-            &format!(
-                "{TOKENS_ADMIN_ROUTE}/{}",
-                receipt["resource_id"].as_str().unwrap()
-            ),
-            Some(admin.clone()),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{revoked}");
-    assert!(revoked["revoked_at"].is_string());
-    assert!(matches!(
-        auth::tokens::TokenStore::verify(&store, &rotated_plaintext).expect("verifies"),
-        auth::tokens::TokenVerification::Invalid(auth::tokens::TokenVerificationFailure::Revoked)
-    ));
+            // What a caller whose issue response was lost does: revoke the token the
+            // receipt names, by its ID.
+            let (status, _, revoked) = token_exchange(
+                &router,
+                token_admin_request(
+                    Method::DELETE,
+                    &format!(
+                        "{TOKENS_ADMIN_ROUTE}/{}",
+                        receipt["resource_id"].as_str().unwrap()
+                    ),
+                    Some(admin.clone()),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{revoked}");
+            assert!(revoked["revoked_at"].is_string());
+            assert!(matches!(
+                auth::tokens::TokenStore::verify(&store, &rotated_plaintext).expect("verifies"),
+                auth::tokens::TokenVerification::Invalid(
+                    auth::tokens::TokenVerificationFailure::Revoked
+                )
+            ));
 
-    // One change, one evidence row and one audit event each; the keyed ones
-    // are reserved, exactly.
-    let evidence = token_evidence(&token_db.path);
-    assert_eq!(
-        evidence
-            .iter()
-            .map(|(_, action, _)| action.as_str())
-            .collect::<Vec<_>>(),
-        [
-            "service_token.issue",
-            "service_token.rotate",
-            "service_token.issue",
-            "service_token.revoke"
-        ]
-    );
-    assert_eq!(evidence[0].0, issue_key);
-    assert_eq!(evidence[1].0, rotate_key);
-    let reserved: Vec<_> = token_reservations(&token_db.path)
-        .into_iter()
-        .map(|(id, action, digest)| {
-            assert!(digest.is_some(), "a bound key keeps its digest");
-            (id, action)
-        })
-        .collect();
-    let mut keyed = vec![
-        (issue_key.clone(), "service_token.issue".to_owned()),
-        (rotate_key.clone(), "service_token.rotate".to_owned()),
-    ];
-    keyed.sort();
-    assert_eq!(reserved, keyed);
-    assert_eventually(Duration::from_secs(5), || {
-        token_changes(&capture, "token_revoked") == 1
-    });
-    assert_eq!(token_changes(&capture, "token_created"), 2);
-    assert_eq!(token_changes(&capture, "token_rotated"), 1);
-    let audited = serde_json::to_string(&capture.events()).expect("events serialize");
-    let digests: Vec<String> = token_reservations(&token_db.path)
-        .into_iter()
-        .map(|reservation| reservation.2.expect("a digest"))
-        .collect();
-    for digest in &digests {
-        assert!(!audited.contains(digest), "no digest in the audit stream");
-    }
+            // One change, one evidence row and one audit event each; the keyed ones
+            // are reserved, exactly.
+            let evidence = token_evidence(&token_db.path);
+            assert_eq!(
+                evidence
+                    .iter()
+                    .map(|(_, action, _)| action.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "service_token.issue",
+                    "service_token.rotate",
+                    "service_token.issue",
+                    "service_token.revoke"
+                ]
+            );
+            assert_eq!(evidence[0].0, issue_key);
+            assert_eq!(evidence[1].0, rotate_key);
+            let reserved: Vec<_> = token_reservations(&token_db.path)
+                .into_iter()
+                .map(|(id, action, digest)| {
+                    assert!(digest.is_some(), "a bound key keeps its digest");
+                    (id, action)
+                })
+                .collect();
+            let mut keyed = vec![
+                (issue_key.clone(), "service_token.issue".to_owned()),
+                (rotate_key.clone(), "service_token.rotate".to_owned()),
+            ];
+            keyed.sort();
+            assert_eq!(reserved, keyed);
+            assert_eventually(Duration::from_secs(5), || {
+                token_changes(&capture, "token_revoked") == 1
+            });
+            assert_eq!(token_changes(&capture, "token_created"), 2);
+            assert_eq!(token_changes(&capture, "token_rotated"), 1);
+            let audited = serde_json::to_string(&capture.events()).expect("events serialize");
+            let digests: Vec<String> = token_reservations(&token_db.path)
+                .into_iter()
+                .map(|reservation| reservation.2.expect("a digest"))
+                .collect();
+            for digest in &digests {
+                assert!(!audited.contains(digest), "no digest in the audit stream");
+            }
 
-    // A reservation that cannot be written fails the keyed issue with a
-    // server error and mints nothing (test-only fault injection through a
-    // second connection).
-    rusqlite::Connection::open(&token_db.path)
-        .expect("the database opens")
-        .execute_batch(
-            "CREATE TRIGGER fail_caller_key_reservation \
+            // A reservation that cannot be written fails the keyed issue with a
+            // server error and mints nothing (test-only fault injection through a
+            // second connection).
+            rusqlite::Connection::open(&token_db.path)
+                .expect("the database opens")
+                .execute_batch(
+                    "CREATE TRIGGER fail_caller_key_reservation \
              BEFORE INSERT ON authority_caller_operation_ids \
              BEGIN SELECT RAISE(ABORT, 'injected reservation failure'); END;",
-        )
-        .expect("the fault installs");
-    let (status, _, failed) = token_exchange(&router, issue(&body, &token_key(4))).await;
-    assert!(status.is_server_error(), "{status}: {failed}");
-    assert_eq!(token_evidence(&token_db.path).len(), evidence.len());
+                )
+                .expect("the fault installs");
+            let (status, _, failed) = token_exchange(&router, issue(&body, &token_key(4))).await;
+            assert!(status.is_server_error(), "{status}: {failed}");
+            assert_eq!(token_evidence(&token_db.path).len(), evidence.len());
+            (plaintext, rotated_plaintext, digests)
+        });
 
-    // Neither plaintext nor any binding digest reached a log line: the
-    // keyed issue, rotation, replays, conflicts, refusals and the failed
-    // reservation above all logged through these handlers.
-    let logged = logs.contents();
-    assert!(!logged.is_empty(), "the handlers logged");
+    // Neither plaintext nor any binding digest reached a log line or a
+    // metric: the keyed issue, rotation, replays, conflicts, refusals and the
+    // failed reservation above all logged through these handlers and the
+    // token store. The capture's own self-check lines do not count as the
+    // handlers logging.
+    assert!(
+        logged
+            .lines()
+            .any(|line| !line.contains("capture sentinel on the")),
+        "the handlers logged"
+    );
     for marker in [plaintext.as_str(), rotated_plaintext.as_str()]
         .into_iter()
         .chain(digests.iter().map(String::as_str))
     {
         assert!(!logged.contains(marker), "a secret marker reached the logs");
+        assert!(
+            !rendered.contains(marker),
+            "a secret marker reached the metrics"
+        );
     }
 }
 
@@ -2066,14 +2082,6 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
     }
 }
 
-/// Every level on this thread, so a debug line that carried a plaintext or
-/// a digest would show.
-pub(super) fn capture_all_logs() -> (CapturedLogs, impl Drop) {
-    let logs = CapturedLogs::default();
-    let subscriber = trace_subscriber(logs.clone());
-    (logs, crate::tracing_test_guard(subscriber))
-}
-
 /// Every level, written to `logs`.
 fn trace_subscriber(logs: CapturedLogs) -> impl tracing::Subscriber + Send + Sync + 'static {
     tracing_subscriber::fmt()
@@ -2084,8 +2092,9 @@ fn trace_subscriber(logs: CapturedLogs) -> impl tracing::Subscriber + Send + Syn
         .finish()
 }
 
-/// Runs `test` on a current-thread runtime with [`capture_all_logs`] and a
-/// Prometheus recorder installed on every thread that runtime uses: the
+/// Runs `test` on a current-thread runtime with a log capture at every
+/// level and a Prometheus recorder installed on every thread that runtime
+/// uses: the
 /// test's own thread and each thread of its blocking pool, where the SQLite
 /// stores and the Connection handlers' store calls run (`spawn_blocking`).
 /// A thread-local subscriber or recorder on the test thread alone misses a

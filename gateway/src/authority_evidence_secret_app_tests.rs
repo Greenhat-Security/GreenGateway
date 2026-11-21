@@ -823,7 +823,9 @@ async fn an_admitted_secret_change_finishes_after_its_client_goes_away() {
 /// I5 at the application boundary: markers in every secret-bearing request
 /// field -- the created and rotated values, and the label -- reach no
 /// receipt, conflict answer, audit event, log line or metric, and the values
-/// reach neither the Connections database file nor its WAL. The store rows
+/// reach neither the Connections database file nor its WAL. Logs and metrics
+/// are captured on the test's thread and on the runtime's blocking pool,
+/// where the local-secret store runs. The store rows
 /// (`local_secret_operation_tests`) check the reservation and evidence rows.
 #[test]
 fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics() {
@@ -832,62 +834,56 @@ fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_a
     const CONFLICT_MARKER: &str = "keyed-secret-conflict-marker-5d7e";
     const LABEL_MARKER: &str = "Keyed secret label marker 44b1";
 
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let metrics = recorder.handle();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("the test runtime builds");
-    let (logs, _logging) = super::super::admin_tokens_app_tests::capture_all_logs();
     let connection_db = TempDb::new("keyed-secret-markers");
     let policy = TempPolicyFile::new(&connection_policy_document_string());
     let (audit_log, capture) = captured_audit();
-    let answers = ::metrics::with_local_recorder(&recorder, || {
-        runtime.block_on(async {
-            let router = keyed_connection_router(&connection_db, &policy, audit_log, |_| {});
-            let admin = keyed_admin(&["connections-secret-manager"]);
-            let collection = secret_collection_etag(&router, &admin).await;
-            let create_key = caller_key(83);
-            let create = |value: &str| {
-                keyed_connection_request(
-                    Method::POST,
-                    CONNECTION_SECRETS_ADMIN_ROUTE,
-                    admin.clone(),
-                    Some(secret_create_body(LABEL_MARKER, value)),
-                    Some(&collection),
-                    Some(&create_key),
-                )
-            };
-            let mut answers = Vec::new();
-            let (status, etag, created) = exchange(&router, create(VALUE_MARKER)).await;
-            assert_eq!(status, StatusCode::CREATED, "{created}");
-            let id = created["id"].as_str().expect("an ID").to_owned();
-            for value in [VALUE_MARKER, CONFLICT_MARKER] {
-                answers.push(exchange(&router, create(value)).await.2);
-            }
-            let route = format!("{CONNECTION_SECRETS_ADMIN_ROUTE}/{id}");
-            let rotate_key = caller_key(84);
-            let rotate = |value: &str| {
-                keyed_connection_request(
-                    Method::PUT,
-                    &route,
-                    admin.clone(),
-                    Some(secret_rotate_body(value)),
-                    etag.as_deref(),
-                    Some(&rotate_key),
-                )
-            };
-            // The rotation's own answer is the secret's view, label and all,
-            // for the caller who rotated it; its retries answer from the key.
-            let (status, _, rotated) = exchange(&router, rotate(ROTATED_MARKER)).await;
-            assert_eq!(status, StatusCode::OK, "{rotated}");
-            for value in [ROTATED_MARKER, CONFLICT_MARKER] {
-                answers.push(exchange(&router, rotate(value)).await.2);
-            }
-            assert_eventually(Duration::from_secs(5), || secret_changes(&capture) >= 2);
-            answers
-        })
-    });
+    let (answers, logged, rendered) =
+        super::super::admin_tokens_app_tests::capture_logs_and_metrics_on_every_runtime_thread(
+            async {
+                let router = keyed_connection_router(&connection_db, &policy, audit_log, |_| {});
+                let admin = keyed_admin(&["connections-secret-manager"]);
+                let collection = secret_collection_etag(&router, &admin).await;
+                let create_key = caller_key(83);
+                let create = |value: &str| {
+                    keyed_connection_request(
+                        Method::POST,
+                        CONNECTION_SECRETS_ADMIN_ROUTE,
+                        admin.clone(),
+                        Some(secret_create_body(LABEL_MARKER, value)),
+                        Some(&collection),
+                        Some(&create_key),
+                    )
+                };
+                let mut answers = Vec::new();
+                let (status, etag, created) = exchange(&router, create(VALUE_MARKER)).await;
+                assert_eq!(status, StatusCode::CREATED, "{created}");
+                let id = created["id"].as_str().expect("an ID").to_owned();
+                for value in [VALUE_MARKER, CONFLICT_MARKER] {
+                    answers.push(exchange(&router, create(value)).await.2);
+                }
+                let route = format!("{CONNECTION_SECRETS_ADMIN_ROUTE}/{id}");
+                let rotate_key = caller_key(84);
+                let rotate = |value: &str| {
+                    keyed_connection_request(
+                        Method::PUT,
+                        &route,
+                        admin.clone(),
+                        Some(secret_rotate_body(value)),
+                        etag.as_deref(),
+                        Some(&rotate_key),
+                    )
+                };
+                // The rotation's own answer is the secret's view, label and all,
+                // for the caller who rotated it; its retries answer from the key.
+                let (status, _, rotated) = exchange(&router, rotate(ROTATED_MARKER)).await;
+                assert_eq!(status, StatusCode::OK, "{rotated}");
+                for value in [ROTATED_MARKER, CONFLICT_MARKER] {
+                    answers.push(exchange(&router, rotate(value)).await.2);
+                }
+                assert_eventually(Duration::from_secs(5), || secret_changes(&capture) >= 2);
+                answers
+            },
+        );
     assert_eq!(answers[0]["operation"], json!("secret.create"));
     assert_eq!(
         answers[1]["reason"],
@@ -901,8 +897,6 @@ fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_a
 
     let answered = format!("{answers:?}");
     let audited = format!("{:?}", capture.events());
-    let logged = logs.contents();
-    let rendered = metrics.render();
     for marker in [VALUE_MARKER, ROTATED_MARKER, CONFLICT_MARKER, LABEL_MARKER] {
         assert!(!answered.contains(marker), "{marker} reached an answer");
         assert!(

@@ -742,6 +742,9 @@ fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_
                     exchange(&router, keyed_refresh(&fetched_key, &fetched_etag)).await;
                 assert_eq!(status, StatusCode::OK, "{fetched}");
                 assert_eq!(upstream.take_received(), [resolved_catalog_credentials()]);
+                let fetched_revision = fetched["catalog_revision"]
+                    .as_u64()
+                    .expect("the refresh names its catalog revision");
                 answers.push(fetched);
                 committed.push(bound_digest(
                     &actor,
@@ -788,7 +791,10 @@ fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_
                     &failing,
                 ));
 
-                assert!(catalog_changes_through(&capture, &id, 5) >= 5);
+                // The audit writer delivers in order: wait until it has
+                // delivered the publication of the fetched refresh, the last
+                // this test commits, before the audit stream is searched.
+                assert!(catalog_changes_through(&capture, &id, fetched_revision) >= 5);
                 (answers, digests, committed)
             },
         );
