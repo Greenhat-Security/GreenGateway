@@ -696,6 +696,19 @@ pub(super) const KEYED_ROUTES: &[KeyedRoute] = &[
         method: "PUT",
         route: "/v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals",
     },
+    // Keyed Connection create, replace and delete (issue #425).
+    KeyedRoute {
+        method: "POST",
+        route: "/v1{ADMIN_PREFIX}/connections",
+    },
+    KeyedRoute {
+        method: "PUT",
+        route: "/v1{ADMIN_PREFIX}/connections/{id}",
+    },
+    KeyedRoute {
+        method: "DELETE",
+        route: "/v1{ADMIN_PREFIX}/connections/{id}",
+    },
 ];
 
 /// [`KEYED_ROUTES`] resolved against this router's admin API prefix.
