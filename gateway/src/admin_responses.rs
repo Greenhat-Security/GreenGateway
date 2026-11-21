@@ -725,8 +725,9 @@ pub(super) fn admit_authority_change_for(
 //
 // The route must also be listed in `routing::KEYED_ROUTES`; everywhere else
 // the router refuses the header with [`idempotency_key_unsupported`] before
-// the handler runs. No route binds a key through these helpers yet: each
-// operation family does so in its own change.
+// the handler runs. Connection create, replace and delete bind keys through
+// these helpers (`admin_connections::admit_keyed_connection_change`); each
+// other operation family does so in its own change.
 
 /// The caller key a request carries, bound to that request: `Ok(None)` when
 /// it carries no `Idempotency-Key`. `action` is the operation code the key is
@@ -737,7 +738,6 @@ pub(super) fn admit_authority_change_for(
 /// repeated header is `400`; an actor that cannot own a key -- a principal
 /// without a canonical issuer -- is `403`, as for the keyed revoke. Reads
 /// nothing and writes nothing.
-#[cfg_attr(not(test), allow(dead_code))] // Called by the operation families that bind keys.
 pub(super) fn caller_operation(
     headers: &HeaderMap,
     actor: &auth::change_actor::ChangeActor,
@@ -780,7 +780,6 @@ pub(super) fn caller_operation(
 /// authority-evidence gate, and in cluster mode the replica's membership,
 /// whose operation gate admits `caller_operation_keys`. The audit log and
 /// client-address policy name the request in a refusal's audit event.
-#[cfg_attr(not(test), allow(dead_code))] // Built by the operation families that bind keys.
 pub(super) struct KeyedChangeGates<'a> {
     pub(super) evidence: &'a authority_events::required::AuthorityEvidenceGate,
     /// `None` outside cluster mode. In cluster mode a keyed request with no
@@ -793,7 +792,6 @@ pub(super) struct KeyedChangeGates<'a> {
 
 /// What a keyed admin change is, for the evidence gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // Named by the operation families that bind keys.
 pub(super) enum KeyedChange {
     /// A change the evidence gate decides on.
     Gated(authority_events::required::AuthorityOperation),
@@ -828,7 +826,6 @@ pub(super) enum KeyedChange {
 ///   `cluster.operation_refused`. A request without a key does not ask.
 ///
 /// [`AuthorityOperation`]: authority_events::required::AuthorityOperation
-#[cfg_attr(not(test), allow(dead_code))] // Called by the operation families that bind keys.
 pub(super) async fn admit_keyed_authority_change(
     gates: &KeyedChangeGates<'_>,
     change: KeyedChange,
@@ -918,7 +915,6 @@ pub(super) async fn admit_keyed_authority_change(
 /// anything else, and `503` when either read fails or a reservation has no
 /// evidence row. The answer is advisory: the change's own transaction
 /// decides again.
-#[cfg_attr(not(test), allow(dead_code))] // Called by the operation families that bind keys.
 pub(super) async fn replayed_receipt(
     key: impl std::future::Future<
         Output = Result<
@@ -962,7 +958,6 @@ pub(super) async fn replayed_receipt(
 
 /// An exact retry's answer: `200` with the receipt read from the committed
 /// evidence row, never a secret, a binding digest or a raw request field.
-#[cfg_attr(not(test), allow(dead_code))] // Called by the operation families that bind keys.
 pub(super) fn operation_receipt(
     receipt: &authority_events::caller_operation::OperationReceipt,
 ) -> Response {
@@ -979,7 +974,6 @@ pub(super) const CALLER_OPERATION_CONFLICT_REASON: &str = "caller_operation_conf
 
 /// A key already reserved for another action, another binding, or without a
 /// binding (a keyed revoke or prepare): `409`, and nothing changed.
-#[cfg_attr(not(test), allow(dead_code))] // Called by the operation families that bind keys.
 pub(super) fn caller_operation_conflict() -> Response {
     (
         StatusCode::CONFLICT,

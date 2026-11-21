@@ -201,7 +201,7 @@ export function validateEvent(event) {
 
 // What AUTHORITY_EVIDENCE_DURABILITY=required does with a row (issue #425,
 // PR 4). `admitted` runs it with the atomic record the row describes;
-// `caller_key_required` admits the PostgreSQL qualified prepare only.
+// `caller_key_required` admits only the keyed form on its reviewed paths.
 // `refused` and `refused_at_startup` refuse it when asked or when the
 // configuration enables it; `unavailable` rows cannot run in the mode at
 // all; `outside_gateway` is a provider's write the gateway cannot refuse.
@@ -250,6 +250,43 @@ export const QUALIFIED_PATHS = Object.freeze({
   "mutation_approval.prepare/postgres": {
     operation: "mutation_approval.prepare", storage_mode: "postgres", method: "PUT",
     route: "/v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals", ...KEYED_DELIVERY,
+  },
+  // Keyed Connection create and replace in both modes (issue #425). A
+  // credential binding change is made by the keyed replacement, under its
+  // key, so its path is the replacement's route.
+  "connection.create/postgres": {
+    operation: "connection.create", storage_mode: "postgres", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/connections", ...KEYED_DELIVERY,
+  },
+  "connection.replace/postgres": {
+    operation: "connection.replace", storage_mode: "postgres", method: "PUT",
+    route: "/v1{ADMIN_PREFIX}/connections/{id}", ...KEYED_DELIVERY,
+  },
+  "credential.binding_change/postgres": {
+    operation: "credential.binding_change", storage_mode: "postgres", method: "PUT",
+    route: "/v1{ADMIN_PREFIX}/connections/{id}", ...KEYED_DELIVERY,
+  },
+  "connection.create/standalone": {
+    operation: "connection.create", storage_mode: "standalone", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/connections", ...KEYED_DELIVERY,
+  },
+  "connection.replace/standalone": {
+    operation: "connection.replace", storage_mode: "standalone", method: "PUT",
+    route: "/v1{ADMIN_PREFIX}/connections/{id}", ...KEYED_DELIVERY,
+  },
+  "credential.binding_change/standalone": {
+    operation: "credential.binding_change", storage_mode: "standalone", method: "PUT",
+    route: "/v1{ADMIN_PREFIX}/connections/{id}", ...KEYED_DELIVERY,
+  },
+  // Admitted withdrawal: the containing rows also admit the unkeyed DELETE
+  // and service-token callers, unqualified.
+  "connection.delete/postgres": {
+    operation: "connection.delete", storage_mode: "postgres", method: "DELETE",
+    route: "/v1{ADMIN_PREFIX}/connections/{id}", ...KEYED_DELIVERY,
+  },
+  "connection.delete/standalone": {
+    operation: "connection.delete", storage_mode: "standalone", method: "DELETE",
+    route: "/v1{ADMIN_PREFIX}/connections/{id}", ...KEYED_DELIVERY,
   },
 });
 // The dispatcher that delivers a qualified pair in each mode.

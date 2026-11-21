@@ -992,3 +992,182 @@ fn every_source_reads_in_the_shared_shape() {
         && row.actor_issuer.as_deref() == Some(ACTOR_ISSUER_MARKER)
         && row.actor_kind.as_deref() == Some("principal")));
 }
+
+/// A keyed Connection create, a credential-changing keyed replace and a
+/// keyed delete (issue #425), committed by the standalone store, are
+/// delivered through the file sink under the negotiated format as closed
+/// `authority_event.v1` events: the replacement's two events share its
+/// caller key and the binding change names a `credential_binding` resource.
+/// A crash after the sink accepted and before the cursor advance redelivers
+/// the same records byte for byte. No identifier, actor, issuer or credential
+/// alias reaches the file.
+#[tokio::test]
+async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit(
+) {
+    use crate::authority_events::caller_operation::{
+        test_caller_key, CallerOperation, CallerOperationBinding, CallerOutcome,
+    };
+    use crate::config::AuthorityEventFormat;
+
+    const ALIAS_MARKER: &str = "standalone-keyed-alias-marker";
+    let scratch = Scratch::new("keyed-connections");
+    let path = scratch.path("connections.sqlite");
+    let connections = SqliteConnectionStore::open(&path).expect("the Connections store opens");
+    let actor = actor();
+    let http = |secret_id: &str| -> ConnectionWrite {
+        serde_json::from_value(json!({
+            "display_name": CONNECTION_NAME_MARKER,
+            "enabled": false,
+            "kind": "http_api",
+            "endpoint": {"base_url": format!("https://{CONNECTION_HOST_MARKER}"), "base_path": "/v1"},
+            "authentication": {"type": "static_bearer", "secret_id": secret_id},
+            "tls": {}
+        }))
+        .expect("the candidate should deserialize")
+    };
+    let bind = |seed: u8, action: &'static str, target: &str, precondition: &str, body: &[u8]| {
+        CallerOperation::bind(
+            test_caller_key(seed),
+            &CallerOperationBinding {
+                action,
+                actor: &actor,
+                target,
+                precondition,
+                request: body,
+            },
+        )
+        .expect("the key binds")
+    };
+    let first = http(ALIAS_MARKER);
+    let create = bind(
+        51,
+        "connection.create",
+        "",
+        "",
+        &serde_json::to_vec(&first).unwrap(),
+    );
+    let CallerOutcome::Committed(created) = connections
+        .create_with_operation(first, &actor, Some(&create))
+        .expect("the keyed create commits")
+    else {
+        panic!("the keyed create commits");
+    };
+    let rebound = http("standalone-keyed-alias-next");
+    let replace = bind(
+        52,
+        "connection.replace",
+        created.id.as_str(),
+        created.etag().as_str(),
+        &serde_json::to_vec(&rebound).unwrap(),
+    );
+    let CallerOutcome::Committed(updated) = connections
+        .replace_with_operation(
+            &created.id,
+            &created.etag(),
+            rebound,
+            &actor,
+            Some(&replace),
+        )
+        .expect("the keyed replace commits")
+    else {
+        panic!("the keyed replace commits");
+    };
+    let delete = bind(
+        53,
+        "connection.delete",
+        updated.id.as_str(),
+        updated.etag().as_str(),
+        b"",
+    );
+    connections
+        .delete_with_operation(&updated.id, &updated.etag(), &actor, Some(&delete))
+        .expect("the keyed delete commits");
+    let material = generated_key_hex();
+    let events = scratch.path("keyed.jsonl");
+    let sink = FileSink::new(events.clone(), AuthorityEventFormat::QualifiedV1);
+    let stop = CancellationToken::new();
+
+    let crashing: Arc<dyn StandaloneEvidenceAuthority> = Arc::new(CrashingAdvance {
+        inner: connections,
+        crash: AtomicBool::new(true),
+    });
+    let mut crashed = 0;
+    for mut lane in lanes_for(&crashing, &material).await {
+        // Only the Connection table has rows; its advance fails after the
+        // sink accepted them.
+        match lane.step(&sink, 100, &stop).await {
+            Err(StepError::Cursor(_)) => crashed += 1,
+            Ok(_) => {}
+            other => panic!("only the cursor advance fails: {other:?}"),
+        }
+    }
+    assert_eq!(
+        crashed, 1,
+        "the Connection lane crashed before its cursor moved"
+    );
+    // The process dies here.
+    drop(crashing);
+    assert_eq!(cursor(&path, StandaloneEvidenceSource::ConnectionChange), 0);
+
+    let restarted: Arc<dyn StandaloneEvidenceAuthority> =
+        Arc::new(SqliteConnectionStore::open(&path).expect("the Connections store reopens"));
+    for mut lane in lanes_for(&restarted, &material).await {
+        lane.deliver_until_caught_up(&sink, test_config(100), &stop)
+            .await
+            .expect("delivery succeeds");
+    }
+    assert_eq!(cursor(&path, StandaloneEvidenceSource::ConnectionChange), 4);
+
+    let contents = std::fs::read_to_string(&events).expect("the event file reads");
+    let lines: Vec<&str> = contents.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), 8);
+    assert_eq!(
+        &lines[..4],
+        &lines[4..],
+        "recovery must redeliver byte-identical records"
+    );
+    let delivered: Vec<serde_json::Value> = lines[..4]
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("every line is JSON"))
+        .collect();
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/schemas/authority_event.v1.schema.json"
+    ))
+    .expect("the schema parses");
+    let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
+    for event in &delivered {
+        assert_eq!(event["schema_version"], "authority_event.v1", "{event}");
+        validator.validate(event).expect("a closed v1 event");
+    }
+    let operations: Vec<&str> = delivered
+        .iter()
+        .map(|event| event["operation"].as_str().expect("an operation"))
+        .collect();
+    assert_eq!(
+        operations,
+        [
+            "connection.create",
+            "connection.replace",
+            "credential.binding_change",
+            "connection.delete"
+        ]
+    );
+    assert_eq!(delivered[0]["operation_id"], create.id().to_string());
+    assert_eq!(delivered[1]["operation_id"], replace.id().to_string());
+    assert_eq!(delivered[2]["operation_id"], replace.id().to_string());
+    assert_eq!(delivered[3]["operation_id"], delete.id().to_string());
+    assert_eq!(delivered[2]["resource"]["kind"], "credential_binding");
+    assert_eq!(delivered[1]["resource"]["kind"], "connection");
+    let created_id = created.id.to_string();
+    for marker in [
+        ACTOR_MARKER,
+        ACTOR_ISSUER_MARKER,
+        CONNECTION_NAME_MARKER,
+        CONNECTION_HOST_MARKER,
+        ALIAS_MARKER,
+        created_id.as_str(),
+        create.binding_digest(),
+    ] {
+        assert!(!contents.contains(marker), "{marker} reached the file");
+    }
+}

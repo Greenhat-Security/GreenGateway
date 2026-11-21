@@ -55,14 +55,18 @@ pub(crate) const REFUSAL_REASON: &str = "authority_evidence_unsupported";
 /// An authority change some deployment mode cannot evidence, named by its
 /// operation code in the evidence inventory.
 ///
-/// Only changes some deployment mode refuses are listed. An operation every
-/// mode that performs it records in its own transaction never asks:
-/// Connection create, replace and delete, local-secret changes and
-/// re-encryption, managed catalog publication and overlay writes and
-/// removals (the standalone Connections database's own evidence tables),
-/// service-token issue, rotation and revocation, and JWT revocation. The
-/// inventory test holds that rule too: an operation no gate asks about must
-/// be `admitted` or `unavailable` wherever its row says.
+/// Only changes some deployment mode refuses, or admits only in their keyed
+/// form, are listed. An operation every mode that performs it records in its
+/// own transaction, and that no change has bound to a caller key yet, never
+/// asks: local-secret changes and re-encryption, managed catalog publication
+/// and overlay writes and removals (the standalone Connections database's
+/// own evidence tables), service-token issue, rotation and revocation, and
+/// JWT revocation. The inventory test holds that rule too: an operation no
+/// gate asks about must be `admitted` or `unavailable` wherever its row says.
+/// Connection create and replace are listed since they bind caller keys
+/// (issue #425): both modes admit only their keyed form under `required`. A
+/// `credential.binding_change` is never asked on its own: it is part of the
+/// `connection.replace` that makes it, under the same caller key.
 ///
 /// The withdrawals a remote caller starts -- `service_token.revoke`,
 /// `connection.delete` and `secret.delete` -- are never listed, and no
@@ -96,6 +100,12 @@ pub(crate) enum AuthorityOperation {
     MutationApprovalConsume,
     MutationApprovalReview,
     MutationApprovalRevoke,
+    /// A managed Connection created through the admin API.
+    ConnectionCreate,
+    /// A managed Connection's specification replaced through the admin API,
+    /// with the `credential.binding_change` it makes when it advances the
+    /// credential revision.
+    ConnectionReplace,
 }
 
 /// The changes a remote caller starts that only remove authority, and so
@@ -205,6 +215,8 @@ impl AuthorityOperation {
             Self::MutationApprovalPrepare => "mutation_approval.prepare",
             Self::MutationApprovalReview => "mutation_approval.review",
             Self::MutationApprovalRevoke => "mutation_approval.revoke",
+            Self::ConnectionCreate => "connection.create",
+            Self::ConnectionReplace => "connection.replace",
         }
     }
 
@@ -220,12 +232,16 @@ impl AuthorityOperation {
     /// Connections database records catalog and overlay publication in its
     /// own transaction, so those operations are not listed.) The offline
     /// import is refused in cluster mode because it records evidence for
-    /// only two of its sections.
+    /// only two of its sections. Connection create and replace bind a caller
+    /// key in both modes (issue #425): the change, its evidence and its key's
+    /// reservation commit in one transaction of the mode's own store, so
+    /// both admit their keyed form.
     pub(crate) const fn required_mode(self, backend: StateBackend) -> RequiredMode {
         match backend {
             StateBackend::Postgres => match self {
                 Self::PolicyFileReload => RequiredMode::Unavailable,
                 Self::MutationApprovalPrepare => RequiredMode::CallerKeyRequired,
+                Self::ConnectionCreate | Self::ConnectionReplace => RequiredMode::CallerKeyRequired,
                 Self::MutationApprovalConsume
                 | Self::MutationApprovalReview
                 | Self::MutationApprovalRevoke
@@ -244,6 +260,7 @@ impl AuthorityOperation {
                 // `import-standalone` imports into PostgreSQL; a standalone
                 // configuration is only its source.
                 Self::ConfigurationImport => RequiredMode::Unavailable,
+                Self::ConnectionCreate | Self::ConnectionReplace => RequiredMode::CallerKeyRequired,
                 _ => RequiredMode::Refused,
             },
         }

@@ -31,6 +31,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
+use crate::authority_events::caller_operation::{
+    CallerKeyReservation, CallerKeyState, CallerOperation, CallerOutcome, OperationReceipt,
+};
 use crate::storage::{
     postgres_policy,
     postgres_tool_names::{self, ToolNameReservationError},
@@ -378,9 +381,31 @@ impl PostgresConnectionStore {
         actor: &crate::auth::change_actor::ChangeActor,
         collection: Option<super::store::CollectionCheck<'_>>,
     ) -> Result<StoredConnection, ConnectionStoreError> {
+        super::store::committed(
+            self.create_with_operation(candidate, actor, collection, None)
+                .await,
+        )
+    }
+
+    /// [`Self::create`] under a caller key (issue #425): inside the one
+    /// transaction the key is looked up first (an exact retry of a committed
+    /// create is answered with its receipt and changes nothing; a key bound
+    /// to anything else is a conflict), then the collection is checked, the
+    /// key is reserved with its binding digest once the contract fence is
+    /// confirmed to carry `caller_operation_keys`, and the change, its
+    /// evidence under the caller's key and its journal entry commit with it.
+    pub async fn create_with_operation(
+        &self,
+        candidate: ConnectionWrite,
+        actor: &crate::auth::change_actor::ChangeActor,
+        collection: Option<super::store::CollectionCheck<'_>>,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<StoredConnection>, ConnectionStoreError> {
         validate_evidence_actor(actor)?;
-        // One logical operation, minted once per call (see `delete`).
-        let operation_id = uuid::Uuid::new_v4();
+        super::store::ensure_caller_action(caller, EVIDENCE_ACTION_CREATE)?;
+        // One logical operation: the caller's key, or one minted once per
+        // call (see `delete`).
+        let operation_id = caller.map_or_else(uuid::Uuid::new_v4, CallerOperation::id);
         let candidate = validate_candidate(candidate)?;
         let spec_json =
             serde_json::to_string(&candidate).map_err(|source| ConnectionStoreError::Json {
@@ -401,7 +426,10 @@ impl PostgresConnectionStore {
         // transaction back explicitly, releasing row locks immediately and
         // returning a clean connection to the pool instead of leaving an
         // aborted transaction on it.
-        let outcome: Result<StoredConnection, ConnectionStoreError> = async {
+        let outcome: Result<CallerOutcome<StoredConnection>, ConnectionStoreError> = async {
+            if let Some(receipt) = keyed_receipt(&client, caller, OPERATION_CREATE).await? {
+                return Ok(CallerOutcome::Replayed(receipt));
+            }
             // The cross-replica half of the caller's `If-Match`: re-derive
             // the collection ETag from the authority's records, under the
             // singleton lock every mutation takes, so two replicas that
@@ -430,6 +458,12 @@ impl PostgresConnectionStore {
             ensure_binding_capacity(&client, None, 0, binding_count(&candidate)).await?;
             ensure_token_exchange_secret_exclusive_in(&client, None, &candidate, OPERATION_CREATE)
                 .await?;
+            // The key is reserved after this store's own lock and before the
+            // shared revision and the journal state row (the lock order of
+            // `reserve_bound_operation`).
+            if let Some(receipt) = reserve_caller_key(&client, caller, OPERATION_CREATE).await? {
+                return Ok(CallerOutcome::Replayed(receipt));
+            }
             client
                 .execute(
                     r#"
@@ -490,25 +524,16 @@ impl PostgresConnectionStore {
                 },
             )
             .await?;
-            Ok(StoredConnection {
+            Ok(CallerOutcome::Committed(StoredConnection {
                 id: id.clone(),
                 write: candidate.clone(),
                 revisions,
                 created_at: now.clone(),
                 updated_at: now.clone(),
-            })
+            }))
         }
         .await;
-        match outcome {
-            Ok(stored) => {
-                commit(&client, OPERATION_CREATE).await?;
-                Ok(stored)
-            }
-            Err(error) => {
-                let _ = client.batch_execute("ROLLBACK").await;
-                Err(error)
-            }
-        }
+        finish_keyed(&client, OPERATION_CREATE, outcome).await
     }
 
     /// Replace a connection's specification on behalf of `actor` under its
@@ -527,10 +552,29 @@ impl PostgresConnectionStore {
         candidate: ConnectionWrite,
         actor: &crate::auth::change_actor::ChangeActor,
     ) -> Result<StoredConnection, ConnectionStoreError> {
+        super::store::committed(
+            self.replace_with_operation(id, expected, candidate, actor, None)
+                .await,
+        )
+    }
+
+    /// [`Self::replace`] under a caller key, in the order
+    /// [`Self::create_with_operation`] describes. An identical replacement
+    /// is answered before the key is reserved: it changes nothing, records
+    /// nothing and reserves nothing.
+    pub async fn replace_with_operation(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        candidate: ConnectionWrite,
+        actor: &crate::auth::change_actor::ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<StoredConnection>, ConnectionStoreError> {
         validate_evidence_actor(actor)?;
-        // One logical operation, minted once per call: both rows a
-        // credential-changing replacement writes carry it.
-        let operation_id = uuid::Uuid::new_v4();
+        super::store::ensure_caller_action(caller, EVIDENCE_ACTION_REPLACE)?;
+        // One logical operation, the caller's key or minted once per call:
+        // both rows a credential-changing replacement writes carry it.
+        let operation_id = caller.map_or_else(uuid::Uuid::new_v4, CallerOperation::id);
         let candidate = validate_candidate(candidate)?;
         let spec_json =
             serde_json::to_string(&candidate).map_err(|source| ConnectionStoreError::Json {
@@ -545,7 +589,10 @@ impl PostgresConnectionStore {
             .await
             .map_err(|_| pg_unavailable(OPERATION_REPLACE))?;
         begin_mutation(&client, OPERATION_REPLACE).await?;
-        let outcome: Result<StoredConnection, ConnectionStoreError> = async {
+        let outcome: Result<CallerOutcome<StoredConnection>, ConnectionStoreError> = async {
+            if let Some(receipt) = keyed_receipt(&client, caller, OPERATION_REPLACE).await? {
+                return Ok(CallerOutcome::Replayed(receipt));
+            }
             let current = load_record_for_update(&client, id, OPERATION_REPLACE)
                 .await?
                 .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?;
@@ -553,7 +600,7 @@ impl PostgresConnectionStore {
             ensure_etag(id, expected, &current)?;
             require_approval_enrollment_fence(&client, &candidate, OPERATION_REPLACE).await?;
             if current.write == candidate {
-                return Ok(current);
+                return Ok(CallerOutcome::Committed(current));
             }
             if managed_catalog_kind_changed(&current, &candidate) {
                 let managed_tool_count_row = client
@@ -604,6 +651,9 @@ impl PostgresConnectionStore {
             )
             .await?;
             let revisions = replacement_revisions(id, &current, &candidate)?;
+            if let Some(receipt) = reserve_caller_key(&client, caller, OPERATION_REPLACE).await? {
+                return Ok(CallerOutcome::Replayed(receipt));
+            }
             client
                 .execute(
                     r#"
@@ -688,25 +738,16 @@ impl PostgresConnectionStore {
                 )
                 .await?;
             }
-            Ok(StoredConnection {
+            Ok(CallerOutcome::Committed(StoredConnection {
                 id: id.clone(),
                 write: candidate,
                 revisions,
                 created_at: current.created_at,
                 updated_at: now.clone(),
-            })
+            }))
         }
         .await;
-        match outcome {
-            Ok(stored) => {
-                commit(&client, OPERATION_REPLACE).await?;
-                Ok(stored)
-            }
-            Err(error) => {
-                let _ = client.batch_execute("ROLLBACK").await;
-                Err(error)
-            }
-        }
+        finish_keyed(&client, OPERATION_REPLACE, outcome).await
     }
 
     /// Delete a connection under its etag compare-and-swap. A connection
@@ -724,17 +765,35 @@ impl PostgresConnectionStore {
         expected: &ConnectionEtag,
         actor: &crate::auth::change_actor::ChangeActor,
     ) -> Result<(), ConnectionStoreError> {
+        super::store::committed(self.delete_with_operation(id, expected, actor, None).await)
+    }
+
+    /// [`Self::delete`] under a caller key, in the order
+    /// [`Self::create_with_operation`] describes. A committed keyed delete
+    /// is answered from its evidence row, which outlives the record.
+    pub async fn delete_with_operation(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        actor: &crate::auth::change_actor::ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<()>, ConnectionStoreError> {
         validate_evidence_actor(actor)?;
-        // One logical operation, minted once per call: every evidence row
-        // this transaction writes carries it, and nothing regenerates it.
-        let operation_id = uuid::Uuid::new_v4();
+        super::store::ensure_caller_action(caller, EVIDENCE_ACTION_DELETE)?;
+        // One logical operation, the caller's key or minted once per call:
+        // every evidence row this transaction writes carries it, and nothing
+        // regenerates it.
+        let operation_id = caller.map_or_else(uuid::Uuid::new_v4, CallerOperation::id);
         let client = self
             .pool
             .get()
             .await
             .map_err(|_| pg_unavailable(OPERATION_DELETE))?;
         begin_mutation(&client, OPERATION_DELETE).await?;
-        let outcome: Result<(), ConnectionStoreError> = async {
+        let outcome: Result<CallerOutcome<()>, ConnectionStoreError> = async {
+            if let Some(receipt) = keyed_receipt(&client, caller, OPERATION_DELETE).await? {
+                return Ok(CallerOutcome::Replayed(receipt));
+            }
             let current = load_record_for_update(&client, id, OPERATION_DELETE)
                 .await?
                 .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?;
@@ -753,6 +812,9 @@ impl PostgresConnectionStore {
                     id: id.to_string(),
                     count: usize::try_from(dependency_count).unwrap_or(usize::MAX),
                 });
+            }
+            if let Some(receipt) = reserve_caller_key(&client, caller, OPERATION_DELETE).await? {
+                return Ok(CallerOutcome::Replayed(receipt));
             }
             // The outbox row precedes the cascade delete: version 0 marks a
             // deletion (specification versions start at 1). The version
@@ -796,19 +858,191 @@ impl PostgresConnectionStore {
                 )
                 .await
                 .map_err(|error| pg_error(OPERATION_DELETE, error))?;
-            Ok(())
+            Ok(CallerOutcome::Committed(()))
         }
         .await;
-        match outcome {
-            Ok(()) => {
-                commit(&client, OPERATION_DELETE).await?;
-                Ok(())
-            }
-            Err(error) => {
-                let _ = client.batch_execute("ROLLBACK").await;
-                Err(error)
-            }
+        finish_keyed(&client, OPERATION_DELETE, outcome).await
+    }
+
+    /// What the reservation table says about `caller`'s key: the read-only
+    /// pre-check a handler asks before any external work (issue #425).
+    /// Advisory: the change's own transaction decides again.
+    pub(crate) async fn caller_operation_state(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<CallerKeyState, crate::storage::RepositoryError> {
+        let client = self.pool.get().await.map_err(|_| {
+            crate::storage::RepositoryError::new(
+                crate::storage::RepositoryErrorKind::Unavailable,
+                OPERATION_CALLER_OPERATION,
+            )
+        })?;
+        crate::storage::postgres_authority_events::read_caller_operation(&client, caller).await
+    }
+
+    /// The receipt of the Connection change `caller`'s key committed, read
+    /// from its evidence row, or `None` when there is none.
+    pub(crate) async fn caller_operation_receipt(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<Option<OperationReceipt>, crate::storage::RepositoryError> {
+        let unavailable = || {
+            crate::storage::RepositoryError::new(
+                crate::storage::RepositoryErrorKind::Unavailable,
+                OPERATION_CALLER_OPERATION,
+            )
+        };
+        let client = self.pool.get().await.map_err(|_| unavailable())?;
+        connection_operation_receipt(&client, caller)
+            .await
+            .map_err(|_| unavailable())
+    }
+}
+
+const OPERATION_CALLER_OPERATION: &str = "connection_caller_operation";
+
+/// Commit a keyed change's transaction, or roll it back: an exact retry
+/// answered from its receipt wrote nothing and rolls back explicitly, as
+/// every failure does.
+async fn finish_keyed<T>(
+    client: &deadpool_postgres::Object,
+    operation: &'static str,
+    outcome: Result<CallerOutcome<T>, ConnectionStoreError>,
+) -> Result<CallerOutcome<T>, ConnectionStoreError> {
+    match outcome {
+        Ok(CallerOutcome::Committed(value)) => {
+            commit(client, operation).await?;
+            Ok(CallerOutcome::Committed(value))
         }
+        Ok(CallerOutcome::Replayed(receipt)) => {
+            let _ = client.batch_execute("ROLLBACK").await;
+            Ok(CallerOutcome::Replayed(receipt))
+        }
+        Err(error) => {
+            let _ = client.batch_execute("ROLLBACK").await;
+            Err(error)
+        }
+    }
+}
+
+/// The receipt of the Connection change `caller`'s key committed: its
+/// evidence row for the key's action (a replacement's `connection.replace`
+/// row, not its credential row), never anything from the request.
+async fn connection_operation_receipt(
+    client: &tokio_postgres::Client,
+    caller: &CallerOperation,
+) -> Result<Option<OperationReceipt>, ConnectionStoreError> {
+    let row = client
+        .query_opt(
+            "SELECT connection_id::text, prior_version, new_version, \
+                    to_char(committed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
+             FROM greengateway.connection_change_evidence \
+             WHERE operation_id = $1::text::uuid AND action = $2",
+            &[&caller.id().to_string(), &caller.action()],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_CALLER_OPERATION, error))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let prior: Option<i64> = scalar(&row, 1, OPERATION_CALLER_OPERATION)?;
+    let new: Option<i64> = scalar(&row, 2, OPERATION_CALLER_OPERATION)?;
+    Ok(Some(OperationReceipt {
+        operation_id: caller.id().to_string(),
+        operation: caller.action().to_owned(),
+        resource_id: scalar(&row, 0, OPERATION_CALLER_OPERATION)?,
+        // A deletion has no successor: its prior revision.
+        revision: new.or(prior),
+        committed_at: scalar(&row, 3, OPERATION_CALLER_OPERATION)?,
+    }))
+}
+
+/// A reservation's store error, as this store reports it: a fence below
+/// `caller_operation_keys` or an unreachable table is unavailable (`503`),
+/// never a conflict or a validation problem.
+fn reservation_failure(
+    operation: &'static str,
+    error: &crate::storage::RepositoryError,
+) -> ConnectionStoreError {
+    tracing::warn!(
+        operation,
+        kind = ?error.kind(),
+        "a Connection change's caller key could not be read or reserved; nothing was changed"
+    );
+    ConnectionStoreError::Unavailable {
+        operation: OPERATION_CALLER_OPERATION,
+    }
+}
+
+/// Step 1 of a keyed change, after this store's serializing lock: the key's
+/// reservation judged against this request. `None` for no key or an unused
+/// one; the receipt for an exact retry of a committed change; a conflict for
+/// a key reserved for anything else. A reservation without its evidence row
+/// is refused as unavailable.
+async fn keyed_receipt(
+    client: &deadpool_postgres::Object,
+    caller: Option<&CallerOperation>,
+    operation: &'static str,
+) -> Result<Option<OperationReceipt>, ConnectionStoreError> {
+    let Some(caller) = caller else {
+        return Ok(None);
+    };
+    let state = crate::storage::postgres_authority_events::read_caller_operation(client, caller)
+        .await
+        .map_err(|error| reservation_failure(operation, &error))?;
+    match state {
+        CallerKeyState::Unused => Ok(None),
+        CallerKeyState::OtherBinding => Err(ConnectionStoreError::CallerOperationConflict),
+        CallerKeyState::SameBinding => committed_receipt(client, caller).await.map(Some),
+    }
+}
+
+/// The committed receipt of an exact retry, or unavailable when the
+/// reservation has no evidence row.
+async fn committed_receipt(
+    client: &deadpool_postgres::Object,
+    caller: &CallerOperation,
+) -> Result<OperationReceipt, ConnectionStoreError> {
+    connection_operation_receipt(client, caller)
+        .await?
+        .ok_or_else(|| {
+            tracing::error!(
+                "a caller operation is reserved without its Connection evidence row; the change is refused"
+            );
+            ConnectionStoreError::Unavailable {
+                operation: OPERATION_CALLER_OPERATION,
+            }
+        })
+}
+
+/// Step 3 of a keyed change: reserve the key with its binding digest in the
+/// change's transaction once the contract fence is confirmed to carry
+/// `caller_operation_keys`. A writer that committed the same key in the
+/// meantime is answered as step 1 answers it.
+async fn reserve_caller_key(
+    client: &deadpool_postgres::Object,
+    caller: Option<&CallerOperation>,
+    operation: &'static str,
+) -> Result<Option<OperationReceipt>, ConnectionStoreError> {
+    let Some(caller) = caller else {
+        return Ok(None);
+    };
+    // A reservation that cannot be written -- the table unreachable, or the
+    // fence found below `caller_operation_keys` after the operation gate
+    // admitted the key -- rolls the change back like a failed evidence
+    // insert, and is counted with them (I2). A conflict is an answer, not a
+    // failure.
+    let reservation =
+        crate::storage::postgres_authority_events::reserve_bound_operation(client, caller)
+            .await
+            .map_err(|error| {
+                crate::storage::postgres_authority_events::record_evidence_failure();
+                reservation_failure(operation, &error)
+            })?;
+    match reservation {
+        CallerKeyReservation::Reserved => Ok(None),
+        CallerKeyReservation::OtherBinding => Err(ConnectionStoreError::CallerOperationConflict),
+        CallerKeyReservation::SameBinding => committed_receipt(client, caller).await.map(Some),
     }
 }
 
