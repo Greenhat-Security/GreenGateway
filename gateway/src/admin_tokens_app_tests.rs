@@ -2070,13 +2070,51 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
 /// a digest would show.
 pub(super) fn capture_all_logs() -> (CapturedLogs, impl Drop) {
     let logs = CapturedLogs::default();
-    let subscriber = tracing_subscriber::fmt()
+    let subscriber = trace_subscriber(logs.clone());
+    (logs, crate::tracing_test_guard(subscriber))
+}
+
+/// Every level, written to `logs`.
+fn trace_subscriber(logs: CapturedLogs) -> impl tracing::Subscriber + Send + Sync + 'static {
+    tracing_subscriber::fmt()
         .with_ansi(false)
         .without_time()
         .with_max_level(tracing::Level::TRACE)
-        .with_writer(logs.clone())
-        .finish();
-    (logs, crate::tracing_test_guard(subscriber))
+        .with_writer(logs)
+        .finish()
+}
+
+/// Runs `test` on a current-thread runtime with [`capture_all_logs`] and a
+/// Prometheus recorder installed on every thread that runtime uses: the
+/// test's own thread and each thread of its blocking pool, where the SQLite
+/// stores and the Connection handlers' store calls run (`spawn_blocking`).
+/// A thread-local subscriber or recorder on the test thread alone misses a
+/// log line or a metric emitted there. Returns `test`'s output, every
+/// captured log line and the metrics rendered after the runtime has ended.
+pub(super) fn capture_logs_and_metrics_on_every_runtime_thread<T>(
+    test: impl std::future::Future<Output = T>,
+) -> (T, String, String) {
+    let (logs, _logging) = capture_all_logs();
+    // Leaked so that each blocking-pool thread can keep it as its default
+    // recorder for the rest of the thread's life.
+    let recorder: &'static metrics_exporter_prometheus::PrometheusRecorder =
+        Box::leak(Box::new(PrometheusBuilder::new().build_recorder()));
+    let pool_logs = logs.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .on_thread_start(move || {
+            // Both stay installed until the thread ends, which is no later
+            // than the runtime's shutdown below.
+            std::mem::forget(tracing::subscriber::set_default(trace_subscriber(
+                pool_logs.clone(),
+            )));
+            std::mem::forget(::metrics::set_default_local_recorder(recorder));
+        })
+        .build()
+        .expect("the test runtime builds");
+    let output = ::metrics::with_local_recorder(recorder, || runtime.block_on(test));
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    (output, logs.contents(), recorder.handle().render())
 }
 
 /// I4 end to end: under `required`, the unkeyed issue and rotation are

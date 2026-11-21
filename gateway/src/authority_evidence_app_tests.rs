@@ -3695,6 +3695,437 @@ mod cluster_connection_keys {
             fence.generation + 1
         );
     }
+
+    /// Installs a test-only trigger that refuses every insert into
+    /// `greengateway.{table}`.
+    async fn fail_inserts_into(pool: &deadpool_postgres::Pool, table: &str) {
+        pool.get()
+            .await
+            .unwrap()
+            .batch_execute(&format!(
+                "CREATE FUNCTION greengateway.fail_{table}() \
+                 RETURNS trigger LANGUAGE plpgsql AS $$ \
+                 BEGIN RAISE EXCEPTION 'injected {table} failure'; END; $$; \
+                 CREATE TRIGGER fail_{table} BEFORE INSERT ON greengateway.{table} \
+                 FOR EACH ROW EXECUTE FUNCTION greengateway.fail_{table}();"
+            ))
+            .await
+            .expect("the failure trigger installs");
+    }
+
+    /// Removes what [`fail_inserts_into`] installed.
+    async fn admit_inserts_into(pool: &deadpool_postgres::Pool, table: &str) {
+        pool.get()
+            .await
+            .unwrap()
+            .batch_execute(&format!(
+                "DROP TRIGGER fail_{table} ON greengateway.{table}; \
+                 DROP FUNCTION greengateway.fail_{table}();"
+            ))
+            .await
+            .expect("the failure trigger drops");
+    }
+
+    /// I5 for the Connection and catalog families on a PostgreSQL-backed
+    /// cluster replica, the form of
+    /// `marker_keys::a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
+    /// and its catalog sibling that runs against the PostgreSQL store: the
+    /// same marked requests (a keyed create naming a marker in each bearer
+    /// credential reference, a keyed replacement to a delegated-issuer body
+    /// naming its client secret and signing key aliases, a keyed OpenAPI
+    /// registration and a keyed overlay replacement with marked free text),
+    /// each with its exact retry and a conflicting retry, then a keyed create
+    /// whose caller key cannot be reserved and a keyed overlay replacement
+    /// whose catalog evidence row cannot be inserted. No marker and no
+    /// binding digest reaches a log line at any level, the rendered metrics,
+    /// a receipt, or a conflict or failure answer. The failed catalog
+    /// evidence insert is counted on
+    /// `greengateway_authority_event_evidence_failures_total` in the same
+    /// rendering, so the capture saw the store's metrics. Connection IDs and
+    /// caller keys are not secrets and are not searched for; each receipt
+    /// names its key to its caller by design.
+    #[test]
+    fn postgres_keyed_connection_and_catalog_changes_keep_synthetic_markers_out_of_the_logs_and_metrics(
+    ) {
+        use super::marker_keys::{
+            bound_digest, delegated_connection_body, marked_connection_body,
+            marked_overlay_document, DELEGATED_MARKERS, OVERLAY_MARKERS, REFERENCE_MARKERS,
+            SUFFIXES,
+        };
+        let (outcome, logged, rendered) =
+            super::super::admin_tokens_app_tests::capture_logs_and_metrics_on_every_runtime_thread(
+                async {
+                    let Some(admin_dsn) = locator() else {
+                        eprintln!("skipping: no test database locator; CI runs this test");
+                        return None;
+                    };
+                    let database =
+                        storage::contract_tests::postgres_audit_tests::create_test_database(
+                            &admin_dsn,
+                        )
+                        .await;
+                    let foundation = test_pool(&database.dsn).await;
+                    let pool = foundation.pool();
+                    storage::migrations::apply_missing_for_startup(pool, &test_settings())
+                        .await
+                        .unwrap();
+                    let (router, earlier) = keyed_replica(pool).await;
+                    stale(pool, earlier).await;
+                    let roles: Vec<&str> = std::iter::once("connections-superadmin")
+                        .chain(CATALOG_ROLES.iter().copied())
+                        .collect();
+                    let admin = signed_token_with_issuer("operator", &roles, CLUSTER_ISSUER);
+                    let actor = auth::change_actor::ChangeActor::for_test_with_issuer(
+                        "operator",
+                        CLUSTER_ISSUER,
+                    );
+                    let mut answers = Vec::new();
+                    let mut committed = Vec::new();
+                    let mut refused = Vec::new();
+
+                    // A Connection create, its retries.
+                    let collection = collection_etag(&router, &admin).await;
+                    let create_key = caller_key(110);
+                    let marked = marked_connection_body(SUFFIXES[0]);
+                    let conflicting = marked_connection_body(SUFFIXES[1]);
+                    let mut statuses = Vec::new();
+                    let mut created = None;
+                    for body in [&marked, &marked, &conflicting] {
+                        let (status, headers, answer) = call(
+                            &router,
+                            Method::POST,
+                            CONNECTIONS_ADMIN_ROUTE,
+                            &admin,
+                            Some(body.clone()),
+                            Some(&collection),
+                            Some(&create_key),
+                        )
+                        .await;
+                        statuses.push(status);
+                        if created.is_none() {
+                            created = Some((answer, headers));
+                        } else {
+                            answers.push(answer);
+                        }
+                    }
+                    assert_eq!(
+                        statuses,
+                        [StatusCode::CREATED, StatusCode::OK, StatusCode::CONFLICT],
+                        "{answers:?}"
+                    );
+                    let (created, headers) = created.expect("the create answered");
+                    let id = created["id"].as_str().expect("an ID").to_owned();
+                    let etag = headers[header::ETAG].to_str().unwrap().to_owned();
+                    committed.push(bound_digest(
+                        &actor,
+                        &create_key,
+                        "connection.create",
+                        "",
+                        &collection,
+                        &marked,
+                    ));
+                    refused.push(bound_digest(
+                        &actor,
+                        &create_key,
+                        "connection.create",
+                        "",
+                        &collection,
+                        &conflicting,
+                    ));
+
+                    // A replacement to a delegated-issuer body, its retries.
+                    let route = format!("{CONNECTIONS_ADMIN_ROUTE}/{id}");
+                    let replace_key = caller_key(111);
+                    let delegated = delegated_connection_body(SUFFIXES[0]);
+                    let conflicting = delegated_connection_body(SUFFIXES[1]);
+                    let mut statuses = Vec::new();
+                    for (index, body) in [&delegated, &delegated, &conflicting]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let (status, _, answer) = call(
+                            &router,
+                            Method::PUT,
+                            &route,
+                            &admin,
+                            Some(body.clone()),
+                            Some(&etag),
+                            Some(&replace_key),
+                        )
+                        .await;
+                        statuses.push(status);
+                        if index > 0 {
+                            answers.push(answer);
+                        }
+                    }
+                    assert_eq!(
+                        statuses,
+                        [StatusCode::OK, StatusCode::OK, StatusCode::CONFLICT],
+                        "{answers:?}"
+                    );
+                    committed.push(bound_digest(
+                        &actor,
+                        &replace_key,
+                        "connection.replace",
+                        &id,
+                        &etag,
+                        &delegated,
+                    ));
+                    refused.push(bound_digest(
+                        &actor,
+                        &replace_key,
+                        "connection.replace",
+                        &id,
+                        &etag,
+                        &conflicting,
+                    ));
+
+                    // An OpenAPI registration, its retry, its key on the
+                    // refresh route.
+                    let collection = collection_etag(&router, &admin).await;
+                    let (status, headers, managed) = call(
+                        &router,
+                        Method::POST,
+                        CONNECTIONS_ADMIN_ROUTE,
+                        &admin,
+                        Some(managed_openapi_connection_body("Marked cluster catalog")),
+                        Some(&collection),
+                        None,
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::CREATED, "{managed}");
+                    let catalog_id = managed["id"].as_str().unwrap().to_owned();
+                    let catalog_etag = headers[header::ETAG].to_str().unwrap().to_owned();
+                    let (status, _, preview) = call(
+                        &router,
+                        Method::POST,
+                        &format!("{CONNECTIONS_ADMIN_ROUTE}/{catalog_id}/openapi/preview"),
+                        &admin,
+                        Some(json!({ "spec": widget_openapi_spec() }).to_string()),
+                        None,
+                        None,
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::OK, "{preview}");
+                    let confirmations: Vec<Value> = preview["security_confirmations"]
+                        .as_array()
+                        .expect("the preview lists security confirmations")
+                        .iter()
+                        .filter(|confirmation| confirmation["tool_name"] == json!("createWidget"))
+                        .cloned()
+                        .collect();
+                    let registration = json!({
+                        "spec": widget_openapi_spec(),
+                        "spec_digest": preview["spec_digest"],
+                        "expected_spec_revision": preview["spec_revision"],
+                        "expected_catalog_revision": preview["catalog_revision"],
+                        "selected_tool_names": ["createWidget"],
+                        "security_confirmations": confirmations,
+                    })
+                    .to_string();
+                    let register_key = caller_key(112);
+                    let mut statuses = Vec::new();
+                    for (index, catalog_call) in [
+                        CatalogCall::Register,
+                        CatalogCall::Register,
+                        CatalogCall::Refresh,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let (method, uri) = catalog_call.route(&catalog_id);
+                        let body = matches!(catalog_call, CatalogCall::Register)
+                            .then(|| registration.clone());
+                        let (status, _, answer) = call(
+                            &router,
+                            method,
+                            &uri,
+                            &admin,
+                            body,
+                            Some(&catalog_etag),
+                            Some(&register_key),
+                        )
+                        .await;
+                        statuses.push(status);
+                        if index > 0 {
+                            answers.push(answer);
+                        }
+                    }
+                    assert_eq!(
+                        statuses,
+                        [StatusCode::CREATED, StatusCode::OK, StatusCode::CONFLICT],
+                        "{answers:?}"
+                    );
+                    committed.push(bound_digest(
+                        &actor,
+                        &register_key,
+                        "catalog.openapi.publish",
+                        &catalog_id,
+                        &catalog_etag,
+                        &registration,
+                    ));
+
+                    // An overlay replacement, its retries.
+                    let overlay_route = format!("{CONNECTIONS_ADMIN_ROUTE}/{catalog_id}/overlay");
+                    let overlay_etag = |router: Router, admin: String, route: String| async move {
+                        let (status, headers, overlay) =
+                            call(&router, Method::GET, &route, &admin, None, None, None).await;
+                        assert_eq!(status, StatusCode::OK, "{overlay}");
+                        headers[header::ETAG].to_str().unwrap().to_owned()
+                    };
+                    let overlay =
+                        overlay_etag(router.clone(), admin.clone(), overlay_route.clone()).await;
+                    let put_key = caller_key(113);
+                    let marked = marked_overlay_document(SUFFIXES[0]);
+                    let conflicting = marked_overlay_document(SUFFIXES[1]);
+                    let mut statuses = Vec::new();
+                    for (index, document) in
+                        [&marked, &marked, &conflicting].into_iter().enumerate()
+                    {
+                        let (status, _, answer) = call(
+                            &router,
+                            Method::PUT,
+                            &overlay_route,
+                            &admin,
+                            Some(document.clone()),
+                            Some(&overlay),
+                            Some(&put_key),
+                        )
+                        .await;
+                        statuses.push(status);
+                        if index > 0 {
+                            answers.push(answer);
+                        }
+                    }
+                    assert_eq!(
+                        statuses,
+                        [StatusCode::OK, StatusCode::OK, StatusCode::CONFLICT],
+                        "{answers:?}"
+                    );
+                    for (document, digests) in
+                        [(&marked, &mut committed), (&conflicting, &mut refused)]
+                    {
+                        digests.push(bound_digest(
+                            &actor,
+                            &put_key,
+                            "catalog.overlay.replace",
+                            &catalog_id,
+                            &overlay,
+                            document,
+                        ));
+                    }
+
+                    // Test-only fault injection: a create whose key cannot
+                    // be reserved, then an overlay replacement whose catalog
+                    // evidence cannot be inserted.
+                    fail_inserts_into(pool, "authority_caller_operation_ids").await;
+                    let collection = collection_etag(&router, &admin).await;
+                    let failed_key = caller_key(114);
+                    let failing = marked_connection_body(SUFFIXES[2]);
+                    let (status, _, failed) = call(
+                        &router,
+                        Method::POST,
+                        CONNECTIONS_ADMIN_ROUTE,
+                        &admin,
+                        Some(failing.clone()),
+                        Some(&collection),
+                        Some(&failed_key),
+                    )
+                    .await;
+                    assert!(status.is_server_error(), "{status}: {failed}");
+                    answers.push(failed);
+                    refused.push(bound_digest(
+                        &actor,
+                        &failed_key,
+                        "connection.create",
+                        "",
+                        &collection,
+                        &failing,
+                    ));
+                    admit_inserts_into(pool, "authority_caller_operation_ids").await;
+                    fail_inserts_into(pool, "catalog_change_evidence").await;
+                    let overlay =
+                        overlay_etag(router.clone(), admin.clone(), overlay_route.clone()).await;
+                    let failed_key = caller_key(115);
+                    let failing = marked_overlay_document(SUFFIXES[2]);
+                    let (status, _, failed) = call(
+                        &router,
+                        Method::PUT,
+                        &overlay_route,
+                        &admin,
+                        Some(failing.clone()),
+                        Some(&overlay),
+                        Some(&failed_key),
+                    )
+                    .await;
+                    assert!(status.is_server_error(), "{status}: {failed}");
+                    answers.push(failed);
+                    refused.push(bound_digest(
+                        &actor,
+                        &failed_key,
+                        "catalog.overlay.replace",
+                        &catalog_id,
+                        &overlay,
+                        &failing,
+                    ));
+
+                    let mut stored: Vec<String> = pool
+                        .get()
+                        .await
+                        .unwrap()
+                        .query(
+                            "SELECT binding_digest FROM greengateway.authority_caller_operation_ids",
+                            &[],
+                        )
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(|row| row.get::<_, Option<String>>(0).expect("a bound digest"))
+                        .collect();
+                    stored.sort();
+                    Some((answers, committed, refused, stored))
+                },
+            );
+        let Some((answers, mut committed, refused, stored)) = outcome else {
+            return;
+        };
+
+        // The digests computed here are the ones the handlers bound: each
+        // committed key's reservation holds the one computed for its request.
+        committed.sort();
+        assert_eq!(stored, committed);
+
+        assert!(!logged.is_empty(), "the handlers' log lines were captured");
+        let failures = format!(
+            "{} ",
+            crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL
+        );
+        assert!(
+            rendered
+                .lines()
+                .filter_map(|line| line.strip_prefix(failures.as_str()))
+                .any(|count| count != "0"),
+            "the failed catalog evidence insert was counted where the capture saw it"
+        );
+        let answered = format!("{answers:?}");
+        let markers = SUFFIXES.iter().flat_map(|suffix| {
+            REFERENCE_MARKERS
+                .iter()
+                .chain(DELEGATED_MARKERS.iter())
+                .chain(OVERLAY_MARKERS.iter())
+                .map(move |marker| format!("{marker}{suffix}"))
+        });
+        for marker in markers {
+            assert!(!answered.contains(&marker), "{marker} reached an answer");
+            assert!(!logged.contains(&marker), "{marker} reached the logs");
+            assert!(!rendered.contains(&marker), "{marker} reached the metrics");
+        }
+        for digest in committed.iter().chain(&refused) {
+            assert!(!answered.contains(digest), "a digest reached an answer");
+            assert!(!logged.contains(digest), "a digest reached the logs");
+            assert!(!rendered.contains(digest), "a digest reached the metrics");
+        }
+    }
 }
 
 /// Keyed service-token issue and rotation in cluster mode, through the admin
@@ -4120,3 +4551,8 @@ mod cluster_token_keys {
         assert_eq!(read_fence().await, raised, "the fence was raised once");
     }
 }
+
+/// Synthetic markers and binding digests kept out of the logs and metrics of
+/// keyed Connection and catalog changes (issue #425).
+#[path = "authority_evidence_marker_app_tests.rs"]
+mod marker_keys;

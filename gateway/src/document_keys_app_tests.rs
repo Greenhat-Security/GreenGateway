@@ -920,4 +920,308 @@ mod cluster_document_keys {
         assert_eq!(document_evidence_count(pool).await, evidence);
         assert!(document_reservations(pool).await.is_empty());
     }
+
+    /// The binding digest the document handlers compute for a keyed change
+    /// of the whole document by `actor` (`admit_keyed_document_change`):
+    /// the action, the actor, no target, the precondition headers as
+    /// `name: value` lines and the canonical JSON body.
+    fn document_digest(
+        actor: &auth::change_actor::ChangeActor,
+        key: &str,
+        action: &'static str,
+        precondition: (&str, &str),
+        body: &str,
+    ) -> String {
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", key.parse().expect("the key is a header"));
+        caller_operation(
+            &headers,
+            actor,
+            action,
+            "",
+            &format!("{}: {}\n", precondition.0, precondition.1),
+            &canonical_connection_request(body.as_bytes()).expect("the body is JSON"),
+        )
+        .expect("the key binds")
+        .expect("the request is keyed")
+        .binding_digest()
+        .to_owned()
+    }
+
+    /// Every binding digest reserved for a document action.
+    async fn document_digests(pool: &deadpool_postgres::Pool) -> Vec<String> {
+        let mut digests: Vec<String> = pool
+            .get()
+            .await
+            .unwrap()
+            .query(
+                "SELECT binding_digest FROM greengateway.authority_caller_operation_ids \
+                 WHERE action LIKE 'policy%' OR action LIKE 'tools.%'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<_, Option<String>>(0).expect("a bound digest"))
+            .collect();
+        digests.sort();
+        digests
+    }
+
+    /// I5 for the policy, tools and policy test family through the real
+    /// handlers of a cluster replica: a keyed policy publication, tools
+    /// registration and policy test suite publication, each with its exact
+    /// retry and a conflicting retry under its key, and a keyed policy
+    /// publication whose evidence row cannot be inserted. These documents
+    /// carry no secret value (a policy, an inline OpenAPI specification, a
+    /// suite of test cases), so what must stay out is what the key binds
+    /// them with: no binding digest and no caller key reaches a log line at
+    /// any level or the rendered metrics, and no digest reaches a receipt, a
+    /// conflict or failure answer, or the audit stream. The receipts name
+    /// their keys to the caller by design. The documents are not searched
+    /// for: the audit stream and the logs may name a rule or a tool, which
+    /// is configuration, not a secret.
+    #[test]
+    fn a_keyed_document_change_keeps_its_digest_and_key_out_of_the_receipt_audit_logs_and_metrics()
+    {
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let (outcome, logged, rendered) =
+            super::super::admin_tokens_app_tests::capture_logs_and_metrics_on_every_runtime_thread(
+                async {
+                    let (_database, foundation) = database().await?;
+                    let pool = foundation.pool();
+                    let (router, _) = keyed_replica(pool, false, audit_log, |_| {}).await;
+                    let admin =
+                        signed_token_with_issuer("operator", &["policy-admin"], CLUSTER_ISSUER);
+                    let actor = auth::change_actor::ChangeActor::for_test_with_issuer(
+                        "operator",
+                        CLUSTER_ISSUER,
+                    );
+                    let mut answers = Vec::new();
+                    let mut computed = Vec::new();
+                    let keys: Vec<String> = (60..64).map(caller_key).collect();
+
+                    // The policy itself.
+                    let policy = cluster_policy("marked").to_string();
+                    let publish = |key: &str, body: &str, etag: &str| {
+                        let (key, body, etag) = (key.to_owned(), body.to_owned(), etag.to_owned());
+                        let router = router.clone();
+                        let admin = admin.clone();
+                        async move {
+                            call(
+                                &router,
+                                Method::PUT,
+                                POLICY_ADMIN_ROUTE,
+                                &admin,
+                                Some(body),
+                                &[("if-match", &etag)],
+                                Some(&key),
+                            )
+                            .await
+                        }
+                    };
+                    let etag = policy_etag(&router, &admin).await;
+                    let (status, _, published) = publish(&keys[0], &policy, &etag).await;
+                    assert!(status.is_success(), "{status}: {published}");
+                    let (status, _, receipt) = publish(&keys[0], &policy, &etag).await;
+                    assert_eq!(status, StatusCode::OK, "{receipt}");
+                    answers.push(receipt);
+                    let fresh = policy_etag(&router, &admin).await;
+                    let (status, _, conflict) = publish(&keys[0], &policy, &fresh).await;
+                    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+                    answers.push(conflict);
+                    for etag in [&etag, &fresh] {
+                        computed.push(document_digest(
+                            &actor,
+                            &keys[0],
+                            "policy.publish",
+                            ("if-match", etag),
+                            &policy,
+                        ));
+                    }
+
+                    // The tools document.
+                    let tools = storage::PostgresToolStore::new(pool.clone());
+                    let tools_etag = storage::ToolControlPlane::active_tools(&tools)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .etag;
+                    let registration = json!({
+                        "spec": widget_openapi_spec(),
+                        "selected_tool_names": ["createWidget"]
+                    })
+                    .to_string();
+                    let register = |etag: &str| {
+                        let (key, body, etag) =
+                            (keys[1].clone(), registration.clone(), etag.to_owned());
+                        let router = router.clone();
+                        let admin = admin.clone();
+                        async move {
+                            call(
+                                &router,
+                                Method::POST,
+                                TOOLS_OPENAPI_REGISTER_ADMIN_ROUTE,
+                                &admin,
+                                Some(body),
+                                &[("if-match", &etag)],
+                                Some(&key),
+                            )
+                            .await
+                        }
+                    };
+                    let (status, _, registered) = register(&tools_etag).await;
+                    assert_eq!(status, StatusCode::CREATED, "{registered}");
+                    let (status, _, receipt) = register(&tools_etag).await;
+                    assert_eq!(status, StatusCode::OK, "{receipt}");
+                    answers.push(receipt);
+                    let registered_etag = storage::ToolControlPlane::active_tools(&tools)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .etag;
+                    let (status, _, conflict) = register(&registered_etag).await;
+                    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+                    answers.push(conflict);
+                    for etag in [&tools_etag, &registered_etag] {
+                        computed.push(document_digest(
+                            &actor,
+                            &keys[1],
+                            "tools.publish",
+                            ("if-match", etag),
+                            &registration,
+                        ));
+                    }
+
+                    // The stored policy test suite.
+                    let suite = suite_document();
+                    let other_suite = suite.replace("anonymous-is-allowed", "anonymous-again");
+                    let store_suite = |body: &str| {
+                        let (key, body) = (keys[2].clone(), body.to_owned());
+                        let router = router.clone();
+                        let admin = admin.clone();
+                        async move {
+                            call(
+                                &router,
+                                Method::PUT,
+                                POLICY_TESTS_ADMIN_ROUTE,
+                                &admin,
+                                Some(body),
+                                &[("if-none-match", "*")],
+                                Some(&key),
+                            )
+                            .await
+                        }
+                    };
+                    let (status, _, stored) = store_suite(&suite).await;
+                    assert_eq!(status, StatusCode::CREATED, "{stored}");
+                    let (status, _, receipt) = store_suite(&suite).await;
+                    assert_eq!(status, StatusCode::OK, "{receipt}");
+                    answers.push(receipt);
+                    let (status, _, conflict) = store_suite(&other_suite).await;
+                    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+                    answers.push(conflict);
+                    for body in [&suite, &other_suite] {
+                        computed.push(document_digest(
+                            &actor,
+                            &keys[2],
+                            "policy_tests.publish",
+                            ("if-none-match", "*"),
+                            body,
+                        ));
+                    }
+
+                    // Test-only fault injection: a publication whose evidence
+                    // row cannot be inserted.
+                    let client = pool.get().await.unwrap();
+                    client
+                        .batch_execute(
+                            r#"
+                            CREATE FUNCTION greengateway.fail_document_change_evidence()
+                            RETURNS trigger LANGUAGE plpgsql AS $$
+                            BEGIN
+                                RAISE EXCEPTION 'injected evidence failure';
+                            END;
+                            $$;
+                            CREATE TRIGGER fail_document_change_evidence
+                            BEFORE INSERT ON greengateway.document_change_evidence
+                            FOR EACH ROW EXECUTE FUNCTION greengateway.fail_document_change_evidence();
+                            "#,
+                        )
+                        .await
+                        .expect("the failure trigger installs");
+                    let failing = cluster_policy("failed").to_string();
+                    let etag = policy_etag(&router, &admin).await;
+                    let (status, _, failed) = publish(&keys[3], &failing, &etag).await;
+                    assert!(status.is_server_error(), "{status}: {failed}");
+                    answers.push(failed);
+                    computed.push(document_digest(
+                        &actor,
+                        &keys[3],
+                        "policy.publish",
+                        ("if-match", &etag),
+                        &failing,
+                    ));
+                    client
+                        .batch_execute(
+                            "DROP TRIGGER fail_document_change_evidence \
+                             ON greengateway.document_change_evidence; \
+                             DROP FUNCTION greengateway.fail_document_change_evidence();",
+                        )
+                        .await
+                        .expect("the failure trigger drops");
+                    // Retried once the fault is gone, the failed request
+                    // commits: its reservation holds the digest it was bound by.
+                    let (status, _, retried) = publish(&keys[3], &failing, &etag).await;
+                    assert!(status.is_success(), "{status}: {retried}");
+
+                    assert_eventually(Duration::from_secs(5), || {
+                        events_of(&capture, audit::event::POLICY_CHANGED) >= 2
+                    });
+                    let stored = document_digests(pool).await;
+                    Some((answers, keys, computed, stored))
+                },
+            );
+        let Some((answers, keys, computed, stored)) = outcome else {
+            return;
+        };
+
+        // The digests computed here are the ones the handlers bound: each
+        // committed request's reservation holds the one computed for it.
+        let mut committed = vec![
+            computed[0].clone(),
+            computed[2].clone(),
+            computed[4].clone(),
+            computed[6].clone(),
+        ];
+        committed.sort();
+        assert_eq!(stored, committed);
+
+        assert!(!logged.is_empty(), "the handlers' log lines were captured");
+        assert!(
+            rendered.lines().any(|line| line
+                == format!(
+                    "{} 1",
+                    crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL
+                )),
+            "the failed evidence insert was counted where the capture saw it"
+        );
+        let answered = format!("{answers:?}");
+        let audited = format!("{:?}", capture.events());
+        for digest in &computed {
+            assert!(!answered.contains(digest), "a digest reached an answer");
+            assert!(
+                !audited.contains(digest),
+                "a digest reached the audit stream"
+            );
+            assert!(!logged.contains(digest), "a digest reached the logs");
+            assert!(!rendered.contains(digest), "a digest reached the metrics");
+        }
+        for key in &keys {
+            assert!(!logged.contains(key), "a caller key reached the logs");
+            assert!(!rendered.contains(key), "a caller key reached the metrics");
+        }
+    }
 }
