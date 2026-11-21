@@ -18133,6 +18133,169 @@ pub(crate) mod postgres_audit_tests {
         }
         assert_eq!(paged, postgres_suggestions);
     }
+
+    /// A generation context against the policy ETag `"sha256:<c x 64>"`.
+    fn binding_context(
+        etag_digit: char,
+    ) -> crate::discovery::suggestion_binding::SuggestionGenerationContext {
+        crate::discovery::suggestion_binding::SuggestionGenerationContext::new(
+            format!("\"sha256:{}\"", etag_digit.to_string().repeat(64)),
+            None,
+            Some(format!("sha256:{}", "d".repeat(64))),
+            true,
+            &json!({
+                "gateway_build": "1.0.0",
+                "evaluator": {},
+                "configuration": "sha256:configuration",
+                "egress": "sha256:egress",
+                "tools": "sha256:tools",
+                "connections": "\"connections:0\"",
+            }),
+        )
+        .expect("the context is canonical")
+    }
+
+    /// Generation rebinds an open row by one conditional upsert (issue
+    /// #243, item 19): a run against the same inputs writes nothing, a run
+    /// against a changed policy rebinds every open row once, two replicas
+    /// running that at once rebind each row exactly once between them
+    /// (the batch is identity-sorted, so they cannot deadlock), and a
+    /// transition that read the revision before the rebind loses to it.
+    #[tokio::test]
+    async fn postgres_regeneration_rebinds_open_suggestions_by_compare_and_set() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let events = generation_events();
+        let policy = contract_policy("rebind");
+        let config = RuleSuggestionConfig {
+            baseline_window_hours: 876_000,
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let audit_store = Arc::new(PostgresAuditEventStore::new(
+            pool.clone(),
+            Some(ingest_identity()),
+        ));
+        audit_store
+            .insert_events(&events)
+            .await
+            .expect("the PostgreSQL audit store ingests");
+        seed_postgres_discovery_fixture(&pool).await;
+        let engine = |audit_store: Arc<PostgresAuditEventStore>| {
+            ClusterRuleSuggestionEngine::new(
+                Arc::new(PostgresDiscoveryReadStore::new(pool.clone())),
+                audit_store,
+                PostgresDiscoveryLifecycleStore::new(pool.clone()),
+                config,
+            )
+        };
+        let replica_a = engine(Arc::clone(&audit_store));
+        let replica_b = engine(audit_store);
+
+        let first = replica_a
+            .generate_bound(&policy, &binding_context('a'))
+            .await
+            .expect("the first run generates");
+        assert_eq!(first.inserted_count, 5, "{first:?}");
+        let generated = replica_a
+            .list_suggestions()
+            .await
+            .expect("suggestions list");
+        assert!(generated.iter().all(|suggestion| suggestion
+            .generation
+            .as_ref()
+            .is_some_and(|binding| binding.policy_etag == binding_context('a').policy_etag)));
+
+        let unchanged = replica_b
+            .generate_bound(&policy, &binding_context('a'))
+            .await
+            .expect("an unchanged run generates");
+        assert_eq!((unchanged.inserted_count, unchanged.rebound_count), (0, 0));
+        assert_eq!(
+            replica_a
+                .list_suggestions()
+                .await
+                .expect("suggestions list"),
+            generated
+        );
+
+        // One row leaves `open`; it is never rebound.
+        let dismissed_id = generated[0].id.clone();
+        let from_open = crate::discovery::lifecycle::TransitionPrecondition::from_state(
+            crate::discovery::suggestions::RuleSuggestionLifecycleState::Open,
+        );
+        replica_a
+            .transition_suggestion(
+                &dismissed_id,
+                crate::discovery::suggestions::RuleSuggestionLifecycleState::Dismissed,
+                Some("admin"),
+                from_open,
+            )
+            .await
+            .expect("the dismissal applies");
+        let dismissed_before = replica_a
+            .get_suggestion(&dismissed_id)
+            .await
+            .expect("the row reads")
+            .expect("the row exists");
+
+        let context_b = binding_context('b');
+        let (left, right) = tokio::join!(
+            replica_a.generate_bound(&policy, &context_b),
+            replica_b.generate_bound(&policy, &context_b),
+        );
+        let left = left.expect("replica a regenerates");
+        let right = right.expect("replica b regenerates");
+        assert_eq!(left.inserted_count + right.inserted_count, 0);
+        assert_eq!(
+            left.rebound_count + right.rebound_count,
+            4,
+            "each open row is rebound exactly once: {left:?} {right:?}"
+        );
+        let after = replica_a
+            .list_suggestions()
+            .await
+            .expect("suggestions list");
+        for suggestion in &after {
+            if suggestion.id == dismissed_id {
+                assert_eq!(suggestion, &dismissed_before);
+                continue;
+            }
+            assert_eq!(suggestion.revision, 2, "{suggestion:?}");
+            assert_eq!(
+                suggestion
+                    .generation
+                    .as_ref()
+                    .map(|binding| binding.policy_etag.as_str()),
+                Some(context_b.policy_etag.as_str())
+            );
+        }
+
+        // A transition that read revision 1 loses to the rebind.
+        let rebound_id = after
+            .iter()
+            .find(|suggestion| suggestion.id != dismissed_id)
+            .map(|suggestion| suggestion.id.clone())
+            .expect("an open row");
+        match replica_b
+            .transition_suggestion(
+                &rebound_id,
+                crate::discovery::suggestions::RuleSuggestionLifecycleState::Dismissed,
+                Some("admin"),
+                from_open.with_revision(Some(1)),
+            )
+            .await
+            .expect("the transition answers")
+        {
+            crate::discovery::lifecycle::TransitionOutcome::Refused(refused) => {
+                assert_eq!(refused.current.revision, 2);
+            }
+            other => panic!("the stale revision must be refused: {other:?}"),
+        }
+    }
 }
 
 fn contract_policy(id: &str) -> Policy {

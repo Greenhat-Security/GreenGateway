@@ -760,6 +760,7 @@ jobs:
             storage::contract_tests::postgres_audit_tests::extending_a_jwt_revocation_records_exactly_one_more_evidence_row
             storage::contract_tests::postgres_audit_tests::revoke_and_rotate_race_never_leaves_a_live_plaintext
             storage::contract_tests::postgres_audit_tests::an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction
+            storage::contract_tests::postgres_audit_tests::postgres_regeneration_rebinds_open_suggestions_by_compare_and_set
             storage::contract_tests::postgres_audit_tests::a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity
             storage::contract_tests::postgres_audit_tests::postgres_caller_operation_reservation_contract
             storage::contract_tests::postgres_audit_tests::postgres_a_rolled_back_transaction_leaves_no_reservation
@@ -787,6 +788,7 @@ jobs:
             storage::migrations::tests::migration_twenty_nine_adds_the_suite_and_widens_document_evidence
             storage::migrations::tests::migration_thirty_two_journals_document_and_catalog_evidence_and_aligns_the_actor
             storage::migrations::tests::migration_thirty_six_keeps_existing_reservations_and_requires_a_binding_for_new_actions
+            storage::migrations::tests::migration_thirty_seven_adds_unbound_suggestion_bindings_and_backfills_nothing
             tests::admin_tokens_app_tests::admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_postgres
           )
           listed="$(cargo test -p gateway --locked --bin gateway -- --list 2>/dev/null)"

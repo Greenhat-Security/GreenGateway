@@ -18,4 +18,7 @@ pub mod path_template;
 pub mod projector;
 pub mod query;
 pub mod signals;
+/// What a discovery suggestion was generated against, and its freshness
+/// (issue #243, checklist item 19).
+pub mod suggestion_binding;
 pub mod suggestions;

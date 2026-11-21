@@ -1,4 +1,8 @@
-import type { ProposedRule, RuleSuggestion } from '../../../lib/suggestions';
+import {
+  KNOWN_FRESHNESS_REASONS,
+  type ProposedRule,
+  type RuleSuggestion,
+} from '../../../lib/suggestions';
 import { isJsonObject, type JsonObject } from '../model';
 
 // What the Studio knows about a listed suggestion beyond the row the
@@ -211,11 +215,121 @@ export function routingFacts(rule: ProposedRule): RoutingFacts {
   return { label: dispatch.kind, detail: 'A routing binding this view does not describe.' };
 }
 
-// A suggestion is as of its generation run. The gateway keeps no policy
-// revision, resource snapshot or generator version with it, so nothing here
-// can say it still fits the live policy; opening it in a draft checks that.
+const FRESHNESS_REASON_TEXT: Readonly<Record<(typeof KNOWN_FRESHNESS_REASONS)[number], string>> = {
+  policy_changed: 'the live policy changed',
+  generator_changed: 'the suggestion generator changed',
+  evidence_schema_changed: 'the evidence schema changed',
+  configuration_changed: 'the gateway configuration changed',
+  tools_changed: 'the registered tools changed',
+  connections_changed: 'the Connections changed',
+  egress_changed: 'the egress controls changed',
+  evaluator_changed: 'the policy evaluator changed',
+  gateway_build_changed: 'the gateway build changed',
+  resource_snapshot_incomplete: 'not every policy resource could be read',
+  rule_already_live: 'the live policy already holds this rule',
+  binding_not_recorded: 'no binding was recorded',
+  policy_unavailable: 'the live policy could not be read',
+};
+
+// One freshness reason code in words. A code this view does not know is
+// shown as unrecognised, with the code, never dropped.
+export function freshnessReasonText(code: string): string {
+  return (KNOWN_FRESHNESS_REASONS as readonly string[]).includes(code)
+    ? FRESHNESS_REASON_TEXT[code as (typeof KNOWN_FRESHNESS_REASONS)[number]]
+    : `unrecognised reason (${code})`;
+}
+
+const REBIND_ADVICE =
+  'Review in draft re-checks it against the live policy and current routing; regenerating suggestions refreshes its binding. Accepting it directly is refused until then.';
+
+// Whether an open suggestion is still bound to the live policy and
+// resources, as the gateway computed it for this listing (issue #243, item
+// 19). The badge colour repeats the text; it never carries the meaning alone.
+export function freshnessLabels(suggestion: RuleSuggestion): StateLabel[] {
+  const freshness = suggestion.freshness;
+  if (suggestion.state !== 'open' || freshness === null || freshness.status === null) {
+    return [];
+  }
+  const reasons = freshness.reasons.map(freshnessReasonText).join('; ');
+  switch (freshness.status) {
+    case 'current':
+      return [{ text: 'Current', badge: 'success', detail: null }];
+    case 'stale':
+      return [
+        {
+          text: `Stale: ${reasons || 'the gateway gave no reason'}`,
+          badge: 'warning',
+          detail: `The policy or resources it was generated against have changed. ${REBIND_ADVICE}`,
+        },
+      ];
+    case 'superseded':
+      return [
+        {
+          text: 'Superseded: rule already live',
+          badge: 'warning',
+          detail:
+            'The live policy already holds the rule this suggestion proposes, so opening it in a draft would add nothing and accepting it would add the rule twice. Dismiss it.',
+        },
+      ];
+    case 'unbound':
+      return [
+        {
+          text: 'Unbound: generated before this gateway recorded bindings',
+          badge: 'warning',
+          detail: `The gateway recorded no binding for it. ${REBIND_ADVICE}`,
+        },
+      ];
+    case 'unknown':
+      return [
+        {
+          text: `Freshness unknown: ${reasons || 'the gateway could not judge it'}`,
+          badge: 'warning',
+          detail: 'The gateway could not read the live policy for this listing. Reload to judge it again.',
+        },
+      ];
+  }
+}
+
+// The freshness fact of the definition list: what the suggestion was
+// generated against and whether that still holds.
 export function freshnessText(suggestion: RuleSuggestion): string {
-  return `Generated ${suggestion.created_at} and not recomputed since. Opening it in a draft checks it against the live policy and current routing.`;
+  const generated = `Generated ${suggestion.created_at}.`;
+  const freshness = suggestion.freshness;
+  if (suggestion.state !== 'open') {
+    return `${generated} Freshness applies only to an open suggestion.`;
+  }
+  if (freshness === null || freshness.status === null) {
+    return `${generated} The gateway did not report its freshness here; opening it in a draft checks it against the live policy and current routing.`;
+  }
+  if (freshness.status === 'current') {
+    return `${generated} Still bound to the live policy and the policy resources it was generated against.`;
+  }
+  return `${generated} ${freshnessLabels(suggestion)[0]?.text ?? ''}.`;
+}
+
+export type GenerationFacts = Readonly<{
+  generator: string;
+  evidenceSchema: string;
+  evidenceCutoff: string;
+  resourceSnapshot: string;
+}>;
+
+// What the run that wrote or last rebound the suggestion recorded, or that
+// it recorded nothing.
+export function generationFacts(suggestion: RuleSuggestion): GenerationFacts {
+  const generation = suggestion.generation;
+  if (generation === null) {
+    const none = 'Not recorded: generated before this gateway recorded bindings.';
+    return { generator: none, evidenceSchema: none, evidenceCutoff: none, resourceSnapshot: none };
+  }
+  return {
+    generator: generation.generator_version,
+    evidenceSchema: generation.evidence_schema_version,
+    evidenceCutoff: `${generation.evidence_cutoff}: evidence was read from the run that started then; the evidence window above names the span.`,
+    resourceSnapshot: `${generation.resource_snapshot_digest ?? 'no digest'}, ${
+      generation.resource_snapshot_complete ? 'complete' : 'incomplete'
+    }`,
+  };
 }
 
 export function principalText(rule: ProposedRule): string {

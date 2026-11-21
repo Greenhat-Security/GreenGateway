@@ -493,6 +493,159 @@ pub(super) fn drafted_suggestion_rule(
     rule
 }
 
+/// The live state a suggestion's generation binding is compared with
+/// (issue #243, item 19): the policy ETag the caller read from the
+/// authority, and the policy resources as they are now. The cluster
+/// security revision is left out of the comparison (owner ruling 3).
+pub(super) fn live_generation_state(
+    policy_etag: &str,
+    rbac_state: &middleware::rbac::RbacState,
+) -> discovery::suggestion_binding::LiveGenerationState {
+    let snapshot =
+        rbac::policy_resources::PolicyResourceSnapshot::of(&rbac_state.policy_resource_view());
+    discovery::suggestion_binding::LiveGenerationState::new(
+        policy_etag.to_owned(),
+        snapshot.is_complete(),
+        &snapshot.binding_components(),
+    )
+}
+
+/// What a generation run binds its suggestions to: the authoritative policy
+/// it filtered against and the policy resources as they are now. `None`
+/// when the resource components have no canonical form; the run then writes
+/// its suggestions unbound, which never reads as current.
+fn suggestion_generation_context(
+    policy: &rbac::Policy,
+    policy_etag: String,
+    rbac_state: &middleware::rbac::RbacState,
+) -> ResponseResult<Option<discovery::suggestion_binding::SuggestionGenerationContext>> {
+    let semantic_digest = policy_semantic_digest(policy)?;
+    let snapshot =
+        rbac::policy_resources::PolicyResourceSnapshot::of(&rbac_state.policy_resource_view());
+    Ok(
+        discovery::suggestion_binding::SuggestionGenerationContext::new(
+            policy_etag,
+            semantic_digest,
+            snapshot.digest().map(str::to_owned),
+            snapshot.is_complete(),
+            &snapshot.binding_components(),
+        ),
+    )
+}
+
+/// The live policy's rules by meaning, normalised once per request, to ask
+/// whether a suggestion's rule is already live.
+pub(super) fn live_rule_semantics(policy: &rbac::Policy) -> Vec<rbac::Rule> {
+    policy.rules.iter().map(rule_semantics).collect()
+}
+
+/// Whether `rule` is among `live_rules` (from [`live_rule_semantics`]) by
+/// meaning, under any id.
+pub(super) fn rule_is_live(live_rules: &[rbac::Rule], rule: &rbac::Rule) -> bool {
+    let rule = rule_semantics(rule);
+    live_rules.contains(&rule)
+}
+
+/// The freshness a listing reports for `suggestion`: none for a row that is
+/// not open, otherwise its binding against `live`. `superseded` here uses
+/// the stored proposal (as drafting would take it); the accept route's
+/// check, against the rule it is about to install, is the authoritative one.
+pub(super) fn listed_suggestion_freshness(
+    suggestion: &discovery::suggestions::RuleSuggestion,
+    live: Option<&(
+        discovery::suggestion_binding::LiveGenerationState,
+        Vec<rbac::Rule>,
+    )>,
+) -> discovery::suggestion_binding::SuggestionFreshness {
+    if suggestion.state != discovery::suggestions::RuleSuggestionLifecycleState::Open {
+        return discovery::suggestion_binding::SuggestionFreshness::not_open();
+    }
+    let rule_live = live.is_some_and(|(_, live_rules)| {
+        rule_is_live(
+            live_rules,
+            &drafted_suggestion_rule(suggestion, suggestion.proposed_rule.clone()),
+        )
+    });
+    discovery::suggestion_binding::suggestion_freshness(
+        suggestion.generation.as_ref(),
+        live.map(|(state, _)| state),
+        rule_live,
+    )
+}
+
+/// One listed suggestion and its freshness.
+#[derive(Serialize)]
+struct ListedRuleSuggestion<'a> {
+    #[serde(flatten)]
+    suggestion: &'a discovery::suggestions::RuleSuggestion,
+    freshness: discovery::suggestion_binding::SuggestionFreshness,
+}
+
+#[derive(Serialize)]
+struct ListedRuleSuggestionPage<'a> {
+    suggestions: Vec<ListedRuleSuggestion<'a>>,
+    next_cursor: Option<&'a str>,
+}
+
+/// The reason a refused acceptance names for each freshness status that is
+/// not `current` (owner ruling 2 of 2026-11-20).
+fn generation_refusal_reason(
+    status: Option<discovery::suggestion_binding::FreshnessStatus>,
+) -> (&'static str, &'static str) {
+    use discovery::suggestion_binding::FreshnessStatus;
+    match status {
+        Some(FreshnessStatus::Unbound) => (
+            "suggestion_binding_unrecorded",
+            "suggestion was generated before this gateway recorded what it was generated against; regenerate suggestions, or review it in a draft",
+        ),
+        Some(FreshnessStatus::Superseded) => (
+            "suggestion_rule_already_present",
+            "the live policy already holds the rule this suggestion proposes",
+        ),
+        _ => (
+            "suggestion_binding_stale",
+            "the policy or resources this suggestion was generated against have changed; regenerate suggestions, or review it in a draft",
+        ),
+    }
+}
+
+/// `409` unless `suggestion` is bound to the live state the acceptance is
+/// about to commit against (owner ruling 2): `current_etag` is the ETag the
+/// commit compares and swaps, `before_policy` the policy it reads, and
+/// `rule` the rule it installs. Reads only; nothing is written on a
+/// refusal.
+pub(super) fn require_current_generation(
+    suggestion: &discovery::suggestions::RuleSuggestion,
+    current_etag: &str,
+    before_policy: &rbac::Policy,
+    rule: &rbac::Rule,
+    rbac_state: &middleware::rbac::RbacState,
+) -> ResponseResult<()> {
+    let live = live_generation_state(current_etag, rbac_state);
+    let rule_live = rule_is_live(&live_rule_semantics(before_policy), rule);
+    let freshness = discovery::suggestion_binding::suggestion_freshness(
+        suggestion.generation.as_ref(),
+        Some(&live),
+        rule_live,
+    );
+    if freshness.is_current() {
+        return Ok(());
+    }
+    let (reason, error) = generation_refusal_reason(freshness.status);
+    Err(Box::new(
+        (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": error,
+                "reason": reason,
+                "freshness": freshness,
+                "suggestion": suggestion,
+            })),
+        )
+            .into_response(),
+    ))
+}
+
 pub(super) async fn rule_suggestions_list_endpoint(
     State(state): State<SuggestionsAdminState>,
     principal: Option<Extension<auth::Principal>>,
@@ -503,11 +656,11 @@ pub(super) async fn rule_suggestions_list_endpoint(
     let Some(Extension(principal)) = principal else {
         return unauthorized();
     };
-    if let Err(error) =
-        authorized_suggestions_state(&state, &principal, ADMIN_SUGGESTIONS_READ_PERMISSION)
-    {
-        return suggestions_admin_authz_error_response(error);
-    }
+    let rbac_state =
+        match authorized_suggestions_state(&state, &principal, ADMIN_SUGGESTIONS_READ_PERMISSION) {
+            Ok(rbac_state) => rbac_state,
+            Err(error) => return suggestions_admin_authz_error_response(error),
+        };
 
     let Some(suggestion_engine) = state.suggestion_engine.as_ref() else {
         return suggestions_discovery_not_configured();
@@ -535,7 +688,31 @@ pub(super) async fn rule_suggestions_list_endpoint(
         }
     };
 
-    (StatusCode::OK, Json(suggestions_page)).into_response()
+    // Freshness is computed here, on every read, never stored (issue #243,
+    // item 19): the live policy and resources are read once per page. An
+    // authority that cannot be read still serves the list, every open row
+    // `unknown`. Only status and reason codes reach the reader, never the
+    // live ETag or any policy content.
+    let live = match authoritative_policy_and_etag(&state.policy, rbac_state).await {
+        Ok((policy, etag)) => Some((
+            live_generation_state(&etag, rbac_state),
+            live_rule_semantics(&policy),
+        )),
+        Err(_) => None,
+    };
+    let page = ListedRuleSuggestionPage {
+        suggestions: suggestions_page
+            .suggestions
+            .iter()
+            .map(|suggestion| ListedRuleSuggestion {
+                suggestion,
+                freshness: listed_suggestion_freshness(suggestion, live.as_ref()),
+            })
+            .collect(),
+        next_cursor: suggestions_page.next_cursor.as_deref(),
+    };
+
+    (StatusCode::OK, Json(page)).into_response()
 }
 
 pub(super) async fn rule_suggestions_generate_endpoint(
@@ -561,18 +738,44 @@ pub(super) async fn rule_suggestions_generate_endpoint(
         return suggestions_discovery_not_configured();
     };
     // The authority's policy, not this replica's snapshot: generation
-    // filters candidates the policy already covers, and a suggestion minted
-    // against a stale snapshot is never re-evaluated (see
-    // [`authoritative_policy`]).
-    let policy = match authoritative_policy(&state.policy, rbac_state).await {
-        Ok(policy) => policy,
+    // filters candidates the policy already covers, and every suggestion
+    // records the ETag of the policy it was judged against (issue #243,
+    // item 19; see [`authoritative_policy`]).
+    let (policy, policy_etag) = match authoritative_policy_and_etag(&state.policy, rbac_state).await
+    {
+        Ok(view) => view,
+        Err(response) => return *response,
+    };
+    let context = match suggestion_generation_context(&policy, policy_etag, rbac_state) {
+        Ok(Some(context)) => context,
+        Ok(None) => {
+            tracing::error!("the policy resource snapshot has no canonical form");
+            return internal_server_error("suggestion generation failed");
+        }
         Err(response) => return *response,
     };
 
     // Suggestion generation scans the audit and discovery stores: the
     // standalone handle runs that on the blocking pool, the cluster handle
-    // awaits PostgreSQL; neither sits on the executor.
-    let generation = match suggestion_engine.generate(policy).await {
+    // awaits PostgreSQL; neither sits on the executor. The scans run before
+    // the suggestion lifecycle lock is taken.
+    let planned = match suggestion_engine.plan_generation(policy, context).await {
+        Ok(planned) => planned,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to generate rule suggestions");
+            return internal_server_error("suggestion generation failed");
+        }
+    };
+    // Generation now rebinds open rows, so its writes wait for an in-flight
+    // acceptance and settle any an earlier request or process left pending
+    // (issue #243): a rebind can never land between a standalone
+    // acceptance's policy write and its transition. The lock is held only
+    // for the writes.
+    let _lifecycle = match reconciled_suggestion_lifecycle(&state).await {
+        Ok(lifecycle) => lifecycle,
+        Err(response) => return *response,
+    };
+    let generation = match suggestion_engine.persist_generation(planned).await {
         Ok(run) => run,
         Err(err) => {
             tracing::error!(error = %err, "failed to generate rule suggestions");
@@ -640,6 +843,9 @@ pub(super) async fn rule_suggestion_accept_endpoint(
         Ok(reviewed) => reviewed,
         Err(refusal) => return *refusal.response,
     };
+    // Shadow first on every path: a signal-derived proposal to deny is
+    // installed as `shadow`, as a review draft would take it.
+    let proposed_rule = drafted_suggestion_rule(&suggestion, proposed_rule);
 
     let policy_write_guard = rbac_state.policy_write_guard().await;
     let prepared =
@@ -649,6 +855,18 @@ pub(super) async fn rule_suggestion_accept_endpoint(
             Ok(prepared) => prepared,
             Err(response) => return *response,
         };
+    // A stale, unbound or superseded suggestion is refused with 409 before
+    // anything is written (owner ruling 2 of 2026-11-20), judged against
+    // the ETag the commit compares and swaps.
+    if let Err(response) = require_current_generation(
+        &suggestion,
+        &prepared.current_etag,
+        &prepared.before_policy,
+        &prepared.created_rule,
+        rbac_state,
+    ) {
+        return *response;
+    }
     let committed = commit_suggestion_acceptance(
         SuggestionAcceptContext {
             state: &state,

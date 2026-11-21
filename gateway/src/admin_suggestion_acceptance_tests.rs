@@ -264,6 +264,7 @@ async fn an_acceptance_clears_the_intent_it_records_before_the_policy_write() {
     );
     let policy = TempPolicyFile::new(&suggestions_policy_document_string());
     let (router, _capture) = gateway(&discovery_db.path, &policy);
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
 
     let accepted = accept(&router, "sug-clean", &live_etag(&router).await).await;
     assert_eq!(accepted.status(), StatusCode::CREATED);
@@ -295,6 +296,7 @@ async fn an_acceptance_that_dies_before_its_policy_write_leaves_the_suggestion_o
     );
     let policy = TempPolicyFile::new(&suggestions_policy_document_string());
     let (router, _capture) = gateway(&discovery_db.path, &policy);
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
     let disk_before = fs::read_to_string(&policy.path).expect("policy file should read");
 
     acceptance_crash::arm("sug-crash-intent", AcceptanceBoundary::IntentRecorded);
@@ -339,6 +341,7 @@ async fn an_acceptance_that_dies_after_its_policy_write_is_accepted_at_restart()
     );
     let policy = TempPolicyFile::new(&suggestions_policy_document_string());
     let (router, _capture) = gateway(&discovery_db.path, &policy);
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
 
     acceptance_crash::arm("sug-crash-commit", AcceptanceBoundary::PolicyCommitted);
     let crashed = accept(&router, "sug-crash-commit", &live_etag(&router).await).await;
@@ -392,6 +395,7 @@ async fn the_next_suggestion_request_settles_an_acceptance_the_running_process_l
     );
     let policy = TempPolicyFile::new(&suggestions_policy_document_string());
     let (router, _capture) = gateway(&discovery_db.path, &policy);
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
 
     acceptance_crash::arm("sug-crash-live", AcceptanceBoundary::PolicyCommitted);
     let crashed = accept(&router, "sug-crash-live", &live_etag(&router).await).await;
@@ -442,6 +446,7 @@ async fn committed_history_settles_an_acceptance_whose_file_was_replaced() {
     );
     let policy = TempPolicyFile::new(&suggestions_policy_document_string());
     let (router, _capture) = gateway(&discovery_db.path, &policy);
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
 
     acceptance_crash::arm("sug-crash-history", AcceptanceBoundary::PolicyCommitted);
     let crashed = accept(&router, "sug-crash-history", &live_etag(&router).await).await;
@@ -860,4 +865,678 @@ async fn a_bound_publication_that_dies_at_either_boundary_never_splits_the_rule_
     )
     .await;
     assert_eq!(json_body(read).await["state"], "open");
+}
+
+// ---------------------------------------------------------------------
+// Generation bindings and freshness on the accept, draft and list routes
+// (issue #243, checklist item 19; owner rulings 2 and 3 of 2026-11-20).
+// ---------------------------------------------------------------------
+
+/// Replace the live policy with one that also has an unrelated role: a
+/// policy change that touches no suggestion. Returns the new ETag.
+async fn change_policy(router: &Router) -> String {
+    let current = send(
+        router,
+        admin_request(
+            Method::GET,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["policy-reader"])),
+            None,
+            &[],
+        ),
+    )
+    .await;
+    assert_eq!(current.status(), StatusCode::OK);
+    let etag = policy_etag_header(&current);
+    let mut document = json_body(current).await;
+    document["roles"]["unrelated-role"] = json!({ "permissions": [] });
+    let replaced = send(
+        router,
+        admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["policy-writer"])),
+            Some(document),
+            &[("if-match", &etag)],
+        ),
+    )
+    .await;
+    assert_eq!(replaced.status(), StatusCode::OK);
+    let replaced_etag = policy_etag_header(&replaced);
+    assert_ne!(replaced_etag, etag);
+    replaced_etag
+}
+
+async fn accept_with(router: &Router, suggestion_id: &str, headers: &[(&str, &str)]) -> Response {
+    send(
+        router,
+        admin_request(
+            Method::POST,
+            &format!("{SUGGESTIONS_ADMIN_ROUTE}/{suggestion_id}/accept"),
+            reviewer(),
+            None,
+            headers,
+        ),
+    )
+    .await
+}
+
+async fn listed(router: &Router, principal: &[&str]) -> Value {
+    suggestions_json(
+        router,
+        "/v1/admin/suggestions",
+        Some(test_principal(principal)),
+    )
+    .await
+}
+
+fn listed_row<'a>(page: &'a Value, id: &str) -> &'a Value {
+    page["suggestions"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == id))
+        .unwrap_or_else(|| panic!("{id} is listed: {page}"))
+}
+
+#[tokio::test]
+async fn suggestion_list_reports_server_computed_freshness() {
+    let discovery_db = TempDb::new("freshness-list");
+    create_rule_suggestion_schema(&discovery_db.path);
+    seed_suggestion(
+        &discovery_db.path,
+        "sug-bound",
+        "/bound/{id}",
+        "allow",
+        None,
+    );
+    let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+    let (router, _capture) = gateway(&discovery_db.path, &policy);
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
+    // Seeded after the fixture ran: no binding was recorded for it.
+    seed_suggestion(
+        &discovery_db.path,
+        "sug-unbound",
+        "/unbound/{id}",
+        "allow",
+        None,
+    );
+    seed_suggestion(&discovery_db.path, "sug-done", "/done/{id}", "allow", None);
+    let dismissed = send(
+        &router,
+        admin_request(
+            Method::POST,
+            &format!("{SUGGESTIONS_ADMIN_ROUTE}/sug-done/dismiss"),
+            Some(test_principal(&["suggestions-writer"])),
+            None,
+            &[],
+        ),
+    )
+    .await;
+    assert_eq!(dismissed.status(), StatusCode::OK);
+
+    let page = listed(&router, &["suggestions-reader"]).await;
+    let bound = listed_row(&page, "sug-bound");
+    assert_eq!(
+        bound["freshness"],
+        json!({ "status": "current", "reasons": [] })
+    );
+    assert_eq!(
+        bound["generation"]["generator_version"],
+        json!("rule-suggestions.v1")
+    );
+    assert_eq!(
+        bound["generation"]["evidence_schema_version"],
+        json!("rule-suggestion-evidence.v1")
+    );
+    assert_eq!(
+        bound["generation"]["evidence_cutoff"],
+        json!("2024-06-01T00:00:00Z")
+    );
+    assert_eq!(
+        bound["generation"]["resource_snapshot_complete"],
+        json!(true)
+    );
+    assert!(bound["generation"]["resource_snapshot_digest"]
+        .as_str()
+        .is_some_and(|digest| digest.starts_with("sha256:")));
+    let unbound = listed_row(&page, "sug-unbound");
+    assert_eq!(unbound["generation"], Value::Null);
+    assert_eq!(
+        unbound["freshness"],
+        json!({ "status": "unbound", "reasons": ["binding_not_recorded"] })
+    );
+    // A row that is not open has no freshness; its state says what it is.
+    assert_eq!(
+        listed_row(&page, "sug-done")["freshness"],
+        json!({ "status": null, "reasons": [] })
+    );
+
+    // A policy change makes the bound row stale, and says why.
+    change_policy(&router).await;
+    let page = listed(&router, &["suggestions-reader"]).await;
+    assert_eq!(
+        listed_row(&page, "sug-bound")["freshness"],
+        json!({ "status": "stale", "reasons": ["policy_changed"] })
+    );
+}
+
+#[tokio::test]
+async fn freshness_never_reveals_the_live_policy_etag_to_a_suggestions_reader_without_policy_read()
+{
+    let discovery_db = TempDb::new("freshness-privacy");
+    create_rule_suggestion_schema(&discovery_db.path);
+    seed_suggestion(
+        &discovery_db.path,
+        "sug-private",
+        "/private/{id}",
+        "allow",
+        None,
+    );
+    let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+    let (router, _capture) = gateway(&discovery_db.path, &policy);
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
+    let live = live_etag(&router).await;
+    let live_digest = live
+        .trim_matches('"')
+        .trim_start_matches("sha256:")
+        .to_owned();
+    let context = current_generation_context(&router).await;
+
+    // The `current` case is the one where the stored binding equals the
+    // live state, so it is the one that could leak it.
+    let page = listed(&router, &["suggestions-reader"]).await;
+    assert_eq!(
+        listed_row(&page, "sug-private")["freshness"]["status"],
+        json!("current")
+    );
+    let text = page.to_string();
+    assert!(!text.contains(&live_digest), "the live ETag leaked: {text}");
+    assert!(
+        !text.contains(&context.resource_components),
+        "the resource components leaked: {text}"
+    );
+    if let Some(semantic) = &context.policy_semantic_digest {
+        assert!(!text.contains(semantic.as_str()), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn accept_refuses_a_stale_binding_with_409_and_writes_nothing() {
+    let discovery_db = TempDb::new("accept-stale-binding");
+    create_rule_suggestion_schema(&discovery_db.path);
+    seed_suggestion(
+        &discovery_db.path,
+        "sug-stale",
+        "/stale/{id}",
+        "allow",
+        None,
+    );
+    let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+    let (router, capture) = gateway(&discovery_db.path, &policy);
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
+    let changed = change_policy(&router).await;
+    let disk_before = fs::read(&policy.path).expect("policy file should read");
+    // The policy change's own event, once it has arrived.
+    assert_eventually(Duration::from_secs(1), || {
+        events_of(&capture, audit::event::POLICY_CHANGED).len() == 1
+    });
+    let changes_before = 1;
+
+    let (status, body) = refusal(accept(&router, "sug-stale", &changed).await).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["reason"], "suggestion_binding_stale");
+    assert_eq!(
+        body["freshness"],
+        json!({ "status": "stale", "reasons": ["policy_changed"] })
+    );
+    assert_eq!(body["suggestion"]["id"], "sug-stale");
+    assert_eq!(body["suggestion"]["state"], "open");
+
+    // Nothing was written: not the policy, not the suggestion, no intent,
+    // no event.
+    assert_eq!(
+        fs::read(&policy.path).expect("policy file should read"),
+        disk_before
+    );
+    assert_eq!(live_etag(&router).await, changed);
+    assert_eq!(
+        stored_suggestion(&discovery_db.path, "sug-stale"),
+        ("open".to_owned(), 1, None)
+    );
+    assert!(stored_intents(&discovery_db.path).is_empty());
+    // Long enough for an event the refusal emitted to have arrived.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        events_of(&capture, audit::event::POLICY_CHANGED).len(),
+        changes_before
+    );
+    assert!(events_of(&capture, audit::event::SUGGESTION_LIFECYCLE_CHANGED).is_empty());
+}
+
+#[tokio::test]
+async fn accept_refuses_an_unbound_suggestion_while_review_in_draft_still_opens_it() {
+    let discovery_db = TempDb::new("accept-unbound");
+    create_rule_suggestion_schema(&discovery_db.path);
+    seed_suggestion(
+        &discovery_db.path,
+        "sug-unbound",
+        "/unbound/{id}",
+        "allow",
+        None,
+    );
+    let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+    let (router, _capture) = gateway(&discovery_db.path, &policy);
+
+    let (status, body) =
+        refusal(accept(&router, "sug-unbound", &live_etag(&router).await).await).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["reason"], "suggestion_binding_unrecorded");
+    assert_eq!(
+        body["freshness"],
+        json!({ "status": "unbound", "reasons": ["binding_not_recorded"] })
+    );
+    assert_eq!(rules_for(&policy, "/unbound/{id}"), 0);
+    assert_eq!(
+        stored_suggestion(&discovery_db.path, "sug-unbound"),
+        ("open".to_owned(), 1, None)
+    );
+
+    // Review in draft is the way through: drafting re-checks the proposal
+    // against the live policy, and says the binding was not recorded.
+    let opened = send(
+        &router,
+        admin_request(
+            Method::POST,
+            &format!("{SUGGESTIONS_ADMIN_ROUTE}/sug-unbound/draft"),
+            reviewer(),
+            None,
+            &[("if-match", &live_etag(&router).await)],
+        ),
+    )
+    .await;
+    assert_eq!(opened.status(), StatusCode::CREATED);
+    assert_eq!(
+        json_body(opened).await["freshness"],
+        json!({ "status": "unbound", "reasons": ["binding_not_recorded"] })
+    );
+}
+
+#[tokio::test]
+async fn accept_refuses_a_suggestion_whose_rule_is_already_live() {
+    let discovery_db = TempDb::new("accept-superseded");
+    create_rule_suggestion_schema(&discovery_db.path);
+    seed_suggestion(&discovery_db.path, "sug-live", "/live/{id}", "allow", None);
+    let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+    let (router, _capture) = gateway(&discovery_db.path, &policy);
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
+
+    // The same rule goes live without the suggestion: its draft is
+    // published unbound, so the suggestion stays open.
+    let (draft_id, draft_etag, _rule) = open_in_draft(&router, "sug-live").await;
+    let published = publish(
+        &router,
+        reviewer(),
+        (&draft_id, &draft_etag),
+        &live_etag(&router).await,
+        None,
+    )
+    .await;
+    assert_eq!(published.status(), StatusCode::OK);
+    assert_eq!(rules_for(&policy, "/live/{id}"), 1);
+
+    // The listing judges the stored proposal, which this seeded row holds
+    // without the dispatch review recomputes, so it reports only that the
+    // policy changed; the accept route judges the rule it would install.
+    let page = listed(&router, &["suggestions-reader"]).await;
+    assert_eq!(
+        listed_row(&page, "sug-live")["freshness"]["status"],
+        json!("stale")
+    );
+    let (status, body) =
+        refusal(accept(&router, "sug-live", &live_etag(&router).await).await).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["reason"], "suggestion_rule_already_present");
+    assert_eq!(body["freshness"]["status"], "superseded");
+    assert_eq!(rules_for(&policy, "/live/{id}"), 1, "never a second copy");
+}
+
+#[tokio::test]
+async fn accept_installs_a_signal_derived_deny_as_shadow() {
+    let discovery_db = TempDb::new("accept-shadow-first");
+    create_rule_suggestion_schema(&discovery_db.path);
+    seed_suggestion(
+        &discovery_db.path,
+        "sug-deny",
+        "/deny/{id}",
+        "deny",
+        Some("sig-deny"),
+    );
+    let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+    let (router, _capture) = gateway(&discovery_db.path, &policy);
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
+
+    let accepted = accept(&router, "sug-deny", &live_etag(&router).await).await;
+    assert_eq!(accepted.status(), StatusCode::CREATED);
+    assert_eq!(json_body(accepted).await["rule"]["action"], "shadow");
+    let document: Value =
+        serde_json::from_str(&fs::read_to_string(&policy.path).expect("policy file should read"))
+            .expect("policy file should parse");
+    assert_eq!(document["rules"][0]["action"], "shadow");
+}
+
+#[tokio::test]
+async fn a_repeated_accept_of_an_accepted_suggestion_is_409_not_open_whatever_its_preconditions_and_writes_nothing(
+) {
+    let discovery_db = TempDb::new("accept-repeat");
+    create_rule_suggestion_schema(&discovery_db.path);
+    seed_suggestion(
+        &discovery_db.path,
+        "sug-repeat",
+        "/repeat/{id}",
+        "allow",
+        None,
+    );
+    let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+    let (router, capture) = gateway(&discovery_db.path, &policy);
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
+    let original = live_etag(&router).await;
+    let accepted = accept(&router, "sug-repeat", &original).await;
+    assert_eq!(accepted.status(), StatusCode::CREATED);
+    let after = live_etag(&router).await;
+    let disk_after = fs::read(&policy.path).expect("policy file should read");
+    // The acceptance's own events, once they have arrived.
+    assert_eventually(Duration::from_secs(1), || {
+        events_of(&capture, audit::event::POLICY_CHANGED).len() == 1
+            && events_of(&capture, audit::event::SUGGESTION_LIFECYCLE_CHANGED).len() == 1
+    });
+    let changes_after = 1;
+    let transitions_after = 1;
+
+    for headers in [
+        vec![("if-match", original.as_str())],
+        vec![("if-match", after.as_str())],
+        vec![
+            ("if-match", after.as_str()),
+            (SUGGESTION_REVISION_HEADER, "1"),
+        ],
+        vec![],
+    ] {
+        let (status, body) = refusal(accept_with(&router, "sug-repeat", &headers).await).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{headers:?}");
+        assert_eq!(body["reason"], "suggestion_not_open", "{headers:?}");
+        assert_eq!(body["suggestion"]["state"], "accepted", "{headers:?}");
+        assert_eq!(body["suggestion"]["revision"], 2, "{headers:?}");
+        assert_eq!(
+            body["suggestion"]["transitioned_by"], "user-123",
+            "{headers:?}"
+        );
+    }
+    // Long enough for an event a repeat emitted to have arrived.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(rules_for(&policy, "/repeat/{id}"), 1);
+    assert_eq!(
+        fs::read(&policy.path).expect("policy file should read"),
+        disk_after
+    );
+    assert_eq!(live_etag(&router).await, after);
+    assert!(stored_intents(&discovery_db.path).is_empty());
+    assert_eq!(
+        events_of(&capture, audit::event::POLICY_CHANGED).len(),
+        changes_after
+    );
+    assert_eq!(
+        events_of(&capture, audit::event::SUGGESTION_LIFECYCLE_CHANGED).len(),
+        transitions_after
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_accept_while_its_intent_is_pending_settles_it_and_answers_not_open() {
+    let discovery_db = TempDb::new("accept-repeat-pending");
+    create_rule_suggestion_schema(&discovery_db.path);
+    seed_suggestion(
+        &discovery_db.path,
+        "sug-pending",
+        "/pending/{id}",
+        "allow",
+        None,
+    );
+    let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+    let (router, _capture) = gateway(&discovery_db.path, &policy);
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
+
+    acceptance_crash::arm("sug-pending", AcceptanceBoundary::PolicyCommitted);
+    let crashed = accept(&router, "sug-pending", &live_etag(&router).await).await;
+    assert_eq!(crashed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(stored_intents(&discovery_db.path).len(), 1);
+
+    // The repeat settles the pending intent first, then answers from the
+    // row as it now stands: accepted, the rule installed once.
+    let (status, body) =
+        refusal(accept(&router, "sug-pending", &live_etag(&router).await).await).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["reason"], "suggestion_not_open");
+    assert_eq!(body["suggestion"]["state"], "accepted");
+    assert!(stored_intents(&discovery_db.path).is_empty());
+    assert_eq!(rules_for(&policy, "/pending/{id}"), 1);
+}
+
+#[tokio::test]
+async fn the_binding_check_runs_after_the_policy_precondition_and_before_any_write() {
+    let discovery_db = TempDb::new("accept-binding-precedence");
+    create_rule_suggestion_schema(&discovery_db.path);
+    seed_suggestion(
+        &discovery_db.path,
+        "sug-order",
+        "/order/{id}",
+        "allow",
+        None,
+    );
+    let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+    let (router, _capture) = gateway(&discovery_db.path, &policy);
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
+    let original = live_etag(&router).await;
+    let changed = change_policy(&router).await;
+
+    // A stale If-Match and a stale binding: the policy precondition
+    // answers first.
+    let stale_both = accept(&router, "sug-order", &original).await;
+    assert_eq!(stale_both.status(), StatusCode::PRECONDITION_FAILED);
+    // No If-Match at all: still the precondition's answer.
+    let missing = accept_with(&router, "sug-order", &[]).await;
+    assert_eq!(missing.status(), StatusCode::PRECONDITION_REQUIRED);
+    // A current If-Match and a stale binding: the binding's 409.
+    let (status, body) = refusal(accept(&router, "sug-order", &changed).await).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["reason"], "suggestion_binding_stale");
+    // The suggestion's own revision precedes both.
+    let (status, body) = refusal(
+        accept_with(
+            &router,
+            "sug-order",
+            &[("if-match", &original), (SUGGESTION_REVISION_HEADER, "7")],
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["reason"], "suggestion_revision_mismatch");
+    assert_eq!(rules_for(&policy, "/order/{id}"), 0);
+    assert_eq!(
+        stored_suggestion(&discovery_db.path, "sug-order"),
+        ("open".to_owned(), 1, None)
+    );
+}
+
+#[tokio::test]
+async fn drafting_reports_generation_freshness_and_audits_codes_only() {
+    let discovery_db = TempDb::new("draft-freshness");
+    create_rule_suggestion_schema(&discovery_db.path);
+    seed_suggestion(
+        &discovery_db.path,
+        "sug-drafted",
+        "/drafted/{id}",
+        "allow",
+        None,
+    );
+    let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+    let (router, capture) = gateway(&discovery_db.path, &policy);
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
+    change_policy(&router).await;
+
+    // A stale suggestion still opens: drafting is the review that
+    // re-checks it, and the answer says what changed.
+    let opened = send(
+        &router,
+        admin_request(
+            Method::POST,
+            &format!("{SUGGESTIONS_ADMIN_ROUTE}/sug-drafted/draft"),
+            reviewer(),
+            None,
+            &[("if-match", &live_etag(&router).await)],
+        ),
+    )
+    .await;
+    assert_eq!(opened.status(), StatusCode::CREATED);
+    let opened = json_body(opened).await;
+    assert_eq!(
+        opened["freshness"],
+        json!({ "status": "stale", "reasons": ["policy_changed"] })
+    );
+    assert_eq!(
+        opened["suggestion"]["generation"]["generator_version"],
+        "rule-suggestions.v1"
+    );
+
+    assert_eventually(Duration::from_secs(1), || {
+        !events_of(&capture, audit::event::POLICY_SUGGESTION_DRAFTED).is_empty()
+    });
+    let drafted = events_of(&capture, audit::event::POLICY_SUGGESTION_DRAFTED);
+    assert_eq!(drafted[0]["generation_freshness"], "stale");
+    assert_eq!(
+        drafted[0]["generation_freshness_reasons"],
+        json!(["policy_changed"])
+    );
+    // Codes only: no policy content, path or principal joins the event.
+    let mut keys = drafted[0]
+        .as_object()
+        .expect("the payload is an object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "base_etag",
+            "candidate_etag",
+            "draft_created",
+            "draft_id",
+            "draft_revision",
+            "generation_freshness",
+            "generation_freshness_reasons",
+            "position",
+            "rule_id",
+            "suggestion_id",
+            "suggestion_revision",
+            "suggestion_type",
+        ]
+    );
+    let text = drafted[0].to_string();
+    assert!(!text.contains("/drafted/"), "{text}");
+    assert!(!text.contains("review-reader"), "{text}");
+}
+
+#[tokio::test]
+async fn a_publication_bound_to_a_revision_that_regeneration_moved_is_refused_as_stale_and_writes_nothing(
+) {
+    let discovery_db = TempDb::new("publish-after-rebind");
+    create_rule_suggestion_schema(&discovery_db.path);
+    seed_suggestion(
+        &discovery_db.path,
+        "sug-moved",
+        "/moved/{id}",
+        "allow",
+        None,
+    );
+    let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+    let (router, _capture) = gateway(&discovery_db.path, &policy);
+    let (draft_id, draft_etag, _rule) = open_in_draft(&router, "sug-moved").await;
+
+    // A rebind moves the revision the draft's publication names: here the
+    // generation fixture binds the unbound row, as a run would.
+    let connection = Connection::open(&discovery_db.path).expect("discovery database should open");
+    connection
+        .execute(
+            "UPDATE discovery_rule_suggestions SET revision = revision + 1 WHERE id = 'sug-moved'",
+            [],
+        )
+        .expect("the rebind's revision move should apply");
+    drop(connection);
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
+    let disk_before = fs::read(&policy.path).expect("policy file should read");
+
+    let (status, body) = refusal(
+        publish(
+            &router,
+            reviewer(),
+            (&draft_id, &draft_etag),
+            &live_etag(&router).await,
+            binding("sug-moved", 1),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["reason"], "suggestion_stale");
+    assert_eq!(
+        fs::read(&policy.path).expect("policy file should read"),
+        disk_before
+    );
+    assert_eq!(
+        stored_suggestion(&discovery_db.path, "sug-moved"),
+        ("open".to_owned(), 2, None)
+    );
+}
+
+#[tokio::test]
+async fn generation_settles_a_pending_acceptance_before_it_writes() {
+    let discovery_db = TempDb::new("generation-settles-intent");
+    create_rule_suggestion_schema(&discovery_db.path);
+    seed_suggestion(
+        &discovery_db.path,
+        "sug-inflight",
+        "/inflight/{id}",
+        "allow",
+        None,
+    );
+    let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+    let (router, _capture) = gateway(&discovery_db.path, &policy);
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
+
+    acceptance_crash::arm("sug-inflight", AcceptanceBoundary::PolicyCommitted);
+    let crashed = accept(&router, "sug-inflight", &live_etag(&router).await).await;
+    assert_eq!(crashed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(stored_intents(&discovery_db.path).len(), 1);
+
+    // Generation now rebinds rows, so its writes take the lifecycle lock,
+    // which settles the acceptance first: the policy commit and the
+    // transition both stand, and nothing rebinds the row in between.
+    let generated = send(
+        &router,
+        admin_request(
+            Method::POST,
+            &format!("{SUGGESTIONS_ADMIN_ROUTE}/generate"),
+            Some(test_principal(&["suggestions-writer"])),
+            None,
+            &[],
+        ),
+    )
+    .await;
+    assert_eq!(generated.status(), StatusCode::OK);
+    assert!(stored_intents(&discovery_db.path).is_empty());
+    assert_eq!(
+        stored_suggestion(&discovery_db.path, "sug-inflight"),
+        ("accepted".to_owned(), 2, Some("user-123".to_owned()))
+    );
+    assert_eq!(rules_for(&policy, "/inflight/{id}"), 1);
 }

@@ -24,6 +24,9 @@ use crate::{
         lifecycle::{self, TransitionOutcome, TransitionPrecondition, TransitionRefused},
         query::{DiscoveryQueryError, DiscoveryQueryStore, ObservedEndpoint},
         signals::{self, Signal, SignalLifecycleState, SignalListFilters},
+        suggestion_binding::{
+            StoredGenerationBinding, SuggestionGenerationBinding, SuggestionGenerationContext,
+        },
     },
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
     policy_eval::{
@@ -67,7 +70,16 @@ CREATE TABLE IF NOT EXISTS discovery_rule_suggestions (
     transitioned_at TEXT,
     transitioned_by TEXT,
     source_signal_id TEXT,
-    revision INTEGER NOT NULL DEFAULT 1
+    revision INTEGER NOT NULL DEFAULT 1,
+    generator_version TEXT,
+    evidence_schema_version TEXT,
+    evidence_cutoff TEXT,
+    evidence_digest TEXT,
+    binding_policy_etag TEXT,
+    binding_policy_semantic_digest TEXT,
+    binding_resource_snapshot_digest TEXT,
+    binding_resource_snapshot_complete INTEGER,
+    binding_resource_components TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_discovery_rule_suggestions_identity
@@ -97,8 +109,34 @@ CREATE TABLE IF NOT EXISTS discovery_suggestion_acceptance_intents (
 /// pass failed; the bound keeps a pass's work fixed regardless.
 const MAX_ACCEPTANCE_INTENTS_PER_PASS: i64 = 64;
 
-const INSERT_RULE_SUGGESTION_SQL: &str = r#"
-INSERT OR IGNORE INTO discovery_rule_suggestions (
+/// The generation-binding columns (issue #243, item 19), added in place to
+/// a file that predates them; nullable, so a row an older binary writes is
+/// simply unbound.
+const RULE_SUGGESTION_BINDING_COLUMNS: [(&str, &str); 9] = [
+    ("generator_version", "TEXT"),
+    ("evidence_schema_version", "TEXT"),
+    ("evidence_cutoff", "TEXT"),
+    ("evidence_digest", "TEXT"),
+    ("binding_policy_etag", "TEXT"),
+    ("binding_policy_semantic_digest", "TEXT"),
+    ("binding_resource_snapshot_digest", "TEXT"),
+    ("binding_resource_snapshot_complete", "INTEGER"),
+    ("binding_resource_components", "TEXT"),
+];
+
+/// Insert a planned suggestion, or rebind the open row that already has its
+/// identity (issue #243, item 19). A rebind happens only when the row is
+/// open and either has no complete binding or was bound to different
+/// freshness inputs (the policy ETag, the generator or evidence schema
+/// version, the resource components or their completeness) or proposes a
+/// different rule; the evidence, rationale and cutoff are refreshed with it
+/// and never trigger it on their own, so regenerating over moving traffic
+/// against an unchanged policy and resources writes nothing. A planned row
+/// without a binding never overwrites one. Accepted and dismissed rows are
+/// never touched. `RETURNING id` names the planned id for an insert, the
+/// existing id for a rebind, and nothing when the statement changed nothing.
+const UPSERT_RULE_SUGGESTION_SQL: &str = r#"
+INSERT INTO discovery_rule_suggestions (
     id,
     suggestion_type,
     method,
@@ -112,8 +150,52 @@ INSERT OR IGNORE INTO discovery_rule_suggestions (
     updated_at,
     transitioned_at,
     transitioned_by,
-    source_signal_id
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, NULL, NULL, ?11)
+    source_signal_id,
+    generator_version,
+    evidence_schema_version,
+    evidence_cutoff,
+    evidence_digest,
+    binding_policy_etag,
+    binding_policy_semantic_digest,
+    binding_resource_snapshot_digest,
+    binding_resource_snapshot_complete,
+    binding_resource_components
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, NULL, NULL, ?11,
+          ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+ON CONFLICT (suggestion_type, method, path_pattern, principal_key) DO UPDATE SET
+    proposed_rule_json = excluded.proposed_rule_json,
+    rationale = excluded.rationale,
+    evidence_json = excluded.evidence_json,
+    updated_at = excluded.created_at,
+    generator_version = excluded.generator_version,
+    evidence_schema_version = excluded.evidence_schema_version,
+    evidence_cutoff = excluded.evidence_cutoff,
+    evidence_digest = excluded.evidence_digest,
+    binding_policy_etag = excluded.binding_policy_etag,
+    binding_policy_semantic_digest = excluded.binding_policy_semantic_digest,
+    binding_resource_snapshot_digest = excluded.binding_resource_snapshot_digest,
+    binding_resource_snapshot_complete = excluded.binding_resource_snapshot_complete,
+    binding_resource_components = excluded.binding_resource_components,
+    revision = discovery_rule_suggestions.revision + 1
+WHERE discovery_rule_suggestions.state = 'open'
+  AND excluded.generator_version IS NOT NULL
+  AND (
+    discovery_rule_suggestions.generator_version IS NULL
+    OR discovery_rule_suggestions.evidence_schema_version IS NULL
+    OR discovery_rule_suggestions.evidence_cutoff IS NULL
+    OR discovery_rule_suggestions.evidence_digest IS NULL
+    OR discovery_rule_suggestions.binding_policy_etag IS NULL
+    OR discovery_rule_suggestions.binding_resource_snapshot_complete IS NULL
+    OR discovery_rule_suggestions.binding_resource_components IS NULL
+    OR discovery_rule_suggestions.binding_policy_etag IS NOT excluded.binding_policy_etag
+    OR discovery_rule_suggestions.generator_version IS NOT excluded.generator_version
+    OR discovery_rule_suggestions.evidence_schema_version IS NOT excluded.evidence_schema_version
+    OR discovery_rule_suggestions.binding_resource_components IS NOT excluded.binding_resource_components
+    OR discovery_rule_suggestions.binding_resource_snapshot_complete
+        IS NOT excluded.binding_resource_snapshot_complete
+    OR discovery_rule_suggestions.proposed_rule_json IS NOT excluded.proposed_rule_json
+  )
+RETURNING id
 "#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,8 +261,13 @@ pub struct RuleSuggestion {
     pub source_signal_id: Option<String>,
     /// The row's revision (issue #241, PR 12): 1 when generated,
     /// incremented by every lifecycle transition; the expected value a
-    /// conditional transition can require.
+    /// conditional transition can require. Also incremented by every
+    /// rebind of an open row (issue #243, item 19).
     pub revision: i64,
+    /// What the run that wrote or last rebound this row judged it against
+    /// (issue #243, item 19); `None` for a row written before bindings were
+    /// recorded, or whose stored binding is incomplete or malformed.
+    pub generation: Option<SuggestionGenerationBinding>,
 }
 
 impl RuleSuggestion {
@@ -283,6 +370,9 @@ pub struct RuleSuggestionListFilters {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct RuleSuggestionRun {
     pub inserted_count: usize,
+    /// Open rows this run produced again and rebound to its inputs, each at
+    /// a new revision (issue #243, item 19).
+    pub rebound_count: usize,
     pub baseline: BaselineSuggestionRun,
     pub anomaly: AnomalySuggestionRun,
 }
@@ -418,11 +508,16 @@ impl RuleSuggestionEngine {
         self
     }
 
-    /// One explicit generation run: gather the two inputs (the observed
+    /// Plan one explicit generation run: gather the two inputs (the observed
     /// endpoints and the audit role/endpoint matrix, plus the open signals),
-    /// plan through the backend-neutral [`SuggestionPlanner`], and persist
-    /// with `INSERT OR IGNORE` so re-running changes nothing.
-    pub fn generate(&self, policy: &Policy) -> Result<RuleSuggestionRun, RuleSuggestionError> {
+    /// plan through the backend-neutral [`SuggestionPlanner`], and bind
+    /// every candidate to `context` and the run's start. Writes nothing; see
+    /// [`Self::persist`].
+    pub(crate) fn plan(
+        &self,
+        policy: &Policy,
+        context: &SuggestionGenerationContext,
+    ) -> Result<PlannedSuggestionRun, RuleSuggestionError> {
         let created_at = utc_timestamp_rfc3339();
         let mut run = RuleSuggestionRun::default();
         let observed_endpoints = self.discovery_store.observed_endpoints()?;
@@ -459,9 +554,47 @@ impl RuleSuggestionEngine {
             &mut run.anomaly,
         )?);
 
-        let inserted = self.suggestion_store.insert_suggestions(&suggestions)?;
-        run.inserted_count = inserted.len();
+        Ok(PlannedSuggestionRun::bound(
+            run,
+            suggestions,
+            context,
+            &created_at,
+        ))
+    }
+
+    /// Persist a planned run: insert new suggestions and rebind the open
+    /// rows it produced again whose freshness inputs or proposal changed
+    /// (see [`UPSERT_RULE_SUGGESTION_SQL`]).
+    pub(crate) fn persist(
+        &self,
+        planned: PlannedSuggestionRun,
+    ) -> Result<RuleSuggestionRun, RuleSuggestionError> {
+        let PlannedSuggestionRun {
+            mut run,
+            suggestions,
+        } = planned;
+        let persisted = self.suggestion_store.persist_suggestions(&suggestions)?;
+        run.inserted_count = persisted.inserted.len();
+        run.rebound_count = persisted.rebound;
         Ok(run)
+    }
+
+    /// Plan and persist in one call, bound to a fixed test context: for
+    /// tests about what generation proposes rather than what it binds.
+    #[cfg(test)]
+    pub fn generate(&self, policy: &Policy) -> Result<RuleSuggestionRun, RuleSuggestionError> {
+        self.generate_bound(policy, &SuggestionGenerationContext::for_tests())
+    }
+
+    /// Plan and persist in one call.
+    #[cfg(test)]
+    pub fn generate_bound(
+        &self,
+        policy: &Policy,
+        context: &SuggestionGenerationContext,
+    ) -> Result<RuleSuggestionRun, RuleSuggestionError> {
+        let planned = self.plan(policy, context)?;
+        self.persist(planned)
     }
 
     pub fn list_suggestions(&self) -> Result<Vec<RuleSuggestion>, RuleSuggestionError> {
@@ -1009,14 +1142,36 @@ impl SuggestionEngineHandle {
         }
     }
 
-    pub async fn generate(&self, policy: Policy) -> Result<RuleSuggestionRun, RuleSuggestionError> {
+    /// Plan a generation run bound to `context`; writes nothing. The
+    /// caller takes the suggestion lifecycle lock only for
+    /// [`Self::persist_generation`], so the scans never hold it.
+    pub(crate) async fn plan_generation(
+        &self,
+        policy: Policy,
+        context: SuggestionGenerationContext,
+    ) -> Result<PlannedSuggestionRun, RuleSuggestionError> {
         match self {
             Self::Standalone(engine) => {
                 let engine = Arc::clone(engine);
-                blocking(move || engine.generate(&policy)).await
+                blocking(move || engine.plan(&policy, &context)).await
             }
             #[cfg(feature = "postgres")]
-            Self::Cluster(engine) => engine.generate(&policy).await,
+            Self::Cluster(engine) => engine.plan(&policy, &context).await,
+        }
+    }
+
+    /// Persist a planned run: insert and rebind (issue #243, item 19).
+    pub(crate) async fn persist_generation(
+        &self,
+        planned: PlannedSuggestionRun,
+    ) -> Result<RuleSuggestionRun, RuleSuggestionError> {
+        match self {
+            Self::Standalone(engine) => {
+                let engine = Arc::clone(engine);
+                blocking(move || engine.persist(planned)).await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Cluster(engine) => engine.persist(planned).await,
         }
     }
 
@@ -1354,6 +1509,10 @@ pub(crate) struct NewRuleSuggestion {
     pub(crate) state: RuleSuggestionLifecycleState,
     pub(crate) created_at: String,
     pub(crate) source_signal_id: Option<String>,
+    /// What the run bound this suggestion to; `None` until
+    /// [`PlannedSuggestionRun::bound`] binds it, or when its evidence has
+    /// no canonical form.
+    pub(crate) generation: Option<SuggestionGenerationBinding>,
 }
 
 impl NewRuleSuggestion {
@@ -1380,6 +1539,7 @@ impl NewRuleSuggestion {
             state: RuleSuggestionLifecycleState::Open,
             created_at: created_at.into(),
             source_signal_id,
+            generation: None,
         })
     }
 
@@ -1402,8 +1562,68 @@ impl NewRuleSuggestion {
             transitioned_by: None,
             source_signal_id: self.source_signal_id.clone(),
             revision: 1,
+            generation: self.generation.clone(),
         }
     }
+
+    /// The identity a store keeps one row per.
+    pub(crate) fn identity(&self) -> (&str, &str, &str, &str) {
+        (
+            &self.suggestion_type,
+            &self.method,
+            &self.path_pattern,
+            &self.principal_key,
+        )
+    }
+}
+
+/// A planned generation run: its counts so far, and the suggestions to
+/// persist, each bound to the run's inputs, one per identity in identity
+/// order (the order both stores write in).
+pub(crate) struct PlannedSuggestionRun {
+    pub(crate) run: RuleSuggestionRun,
+    pub(crate) suggestions: Vec<NewRuleSuggestion>,
+}
+
+impl PlannedSuggestionRun {
+    /// Bind every planned suggestion to `context` and the run's start, keep
+    /// the first suggestion of each identity (what a store would keep), and
+    /// sort by identity.
+    pub(crate) fn bound(
+        run: RuleSuggestionRun,
+        suggestions: Vec<NewRuleSuggestion>,
+        context: &SuggestionGenerationContext,
+        evidence_cutoff: &str,
+    ) -> Self {
+        let mut seen = BTreeSet::new();
+        let mut kept = Vec::with_capacity(suggestions.len());
+        for mut suggestion in suggestions {
+            let identity = suggestion.identity();
+            let key = (
+                identity.0.to_owned(),
+                identity.1.to_owned(),
+                identity.2.to_owned(),
+                identity.3.to_owned(),
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            suggestion.generation = context.binding_for(evidence_cutoff, &suggestion.evidence);
+            kept.push(suggestion);
+        }
+        kept.sort_by(|left, right| left.identity().cmp(&right.identity()));
+        Self {
+            run,
+            suggestions: kept,
+        }
+    }
+}
+
+/// What persisting a planned run wrote: the suggestions inserted, as they
+/// read back, and how many open rows were rebound.
+pub(crate) struct PersistedSuggestions {
+    pub(crate) inserted: Vec<RuleSuggestion>,
+    pub(crate) rebound: usize,
 }
 
 struct RuleSuggestionStore {
@@ -1429,58 +1649,81 @@ impl RuleSuggestionStore {
         })
     }
 
-    fn insert_suggestions(
+    /// Insert each planned suggestion or rebind its open row, in one
+    /// transaction (see [`UPSERT_RULE_SUGGESTION_SQL`]).
+    fn persist_suggestions(
         &self,
         suggestions: &[NewRuleSuggestion],
-    ) -> Result<Vec<RuleSuggestion>, RuleSuggestionError> {
-        let connection = self.connection_guard();
-        let mut statement = connection
-            .prepare_cached(INSERT_RULE_SUGGESTION_SQL)
-            .map_err(|source| RuleSuggestionError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-        let mut inserted_suggestions = Vec::new();
-
-        for suggestion in suggestions {
-            let proposed_rule_json =
-                serde_json::to_string(&suggestion.proposed_rule).map_err(|source| {
-                    RuleSuggestionError::Json {
-                        context: "proposed rule",
-                        source,
+    ) -> Result<PersistedSuggestions, RuleSuggestionError> {
+        let mut connection = self.connection_guard();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| self.sqlite_error(source))?;
+        let mut persisted = PersistedSuggestions {
+            inserted: Vec::new(),
+            rebound: 0,
+        };
+        {
+            let mut statement = transaction
+                .prepare_cached(UPSERT_RULE_SUGGESTION_SQL)
+                .map_err(|source| self.sqlite_error(source))?;
+            for suggestion in suggestions {
+                let proposed_rule_json =
+                    serde_json::to_string(&suggestion.proposed_rule).map_err(|source| {
+                        RuleSuggestionError::Json {
+                            context: "proposed rule",
+                            source,
+                        }
+                    })?;
+                let evidence_json =
+                    serde_json::to_string(&suggestion.evidence).map_err(|source| {
+                        RuleSuggestionError::Json {
+                            context: "evidence",
+                            source,
+                        }
+                    })?;
+                let binding = StoredGenerationBinding::of(suggestion.generation.as_ref());
+                let written = statement
+                    .query_row(
+                        params![
+                            suggestion.id.as_str(),
+                            suggestion.suggestion_type.as_str(),
+                            suggestion.method.as_str(),
+                            suggestion.path_pattern.as_str(),
+                            suggestion.principal_key.as_str(),
+                            proposed_rule_json.as_str(),
+                            suggestion.rationale.as_str(),
+                            evidence_json.as_str(),
+                            suggestion.state.as_str(),
+                            suggestion.created_at.as_str(),
+                            suggestion.source_signal_id.as_deref(),
+                            binding.generator_version,
+                            binding.evidence_schema_version,
+                            binding.evidence_cutoff,
+                            binding.evidence_digest,
+                            binding.policy_etag,
+                            binding.policy_semantic_digest,
+                            binding.resource_snapshot_digest,
+                            binding.resource_snapshot_complete,
+                            binding.resource_components,
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|source| self.sqlite_error(source))?;
+                match written {
+                    Some(id) if id == suggestion.id => {
+                        persisted.inserted.push(suggestion.as_suggestion());
                     }
-                })?;
-            let evidence_json = serde_json::to_string(&suggestion.evidence).map_err(|source| {
-                RuleSuggestionError::Json {
-                    context: "evidence",
-                    source,
+                    Some(_) => persisted.rebound += 1,
+                    None => {}
                 }
-            })?;
-            let inserted = statement
-                .execute(params![
-                    suggestion.id.as_str(),
-                    suggestion.suggestion_type.as_str(),
-                    suggestion.method.as_str(),
-                    suggestion.path_pattern.as_str(),
-                    suggestion.principal_key.as_str(),
-                    proposed_rule_json.as_str(),
-                    suggestion.rationale.as_str(),
-                    evidence_json.as_str(),
-                    suggestion.state.as_str(),
-                    suggestion.created_at.as_str(),
-                    suggestion.source_signal_id.as_deref(),
-                ])
-                .map_err(|source| RuleSuggestionError::Sqlite {
-                    path: self.path.clone(),
-                    source,
-                })?;
-
-            if inserted > 0 {
-                inserted_suggestions.push(suggestion.as_suggestion());
             }
         }
-
-        Ok(inserted_suggestions)
+        transaction
+            .commit()
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(persisted)
     }
 
     fn list_suggestions(&self) -> Result<Vec<RuleSuggestion>, RuleSuggestionError> {
@@ -1842,13 +2085,17 @@ pub(crate) struct RawRuleSuggestion {
     pub(crate) transitioned_by: Option<String>,
     pub(crate) source_signal_id: Option<String>,
     pub(crate) revision: i64,
+    pub(crate) generation: StoredGenerationBinding,
 }
 
 /// The suggestion columns every read selects, in the order
 /// `RawRuleSuggestion` reads them; identical on both backends.
 pub(crate) const RULE_SUGGESTION_COLUMNS: &str = "id, suggestion_type, method, path_pattern, \
      principal_key, proposed_rule_json, rationale, evidence_json, state, created_at, updated_at, \
-     transitioned_at, transitioned_by, source_signal_id, revision";
+     transitioned_at, transitioned_by, source_signal_id, revision, generator_version, \
+     evidence_schema_version, evidence_cutoff, evidence_digest, binding_policy_etag, \
+     binding_policy_semantic_digest, binding_resource_snapshot_digest, \
+     binding_resource_snapshot_complete, binding_resource_components";
 
 impl RawRuleSuggestion {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -1868,6 +2115,20 @@ impl RawRuleSuggestion {
             transitioned_by: row.get(12)?,
             source_signal_id: row.get(13)?,
             revision: row.get(14)?,
+            // A binding column that does not read as its type is a
+            // malformed binding, which reads as none rather than failing
+            // the row.
+            generation: StoredGenerationBinding {
+                generator_version: row.get(15).ok().flatten(),
+                evidence_schema_version: row.get(16).ok().flatten(),
+                evidence_cutoff: row.get(17).ok().flatten(),
+                evidence_digest: row.get(18).ok().flatten(),
+                policy_etag: row.get(19).ok().flatten(),
+                policy_semantic_digest: row.get(20).ok().flatten(),
+                resource_snapshot_digest: row.get(21).ok().flatten(),
+                resource_snapshot_complete: row.get(22).ok().flatten(),
+                resource_components: row.get(23).ok().flatten(),
+            },
         })
     }
 
@@ -1907,6 +2168,7 @@ impl RawRuleSuggestion {
             transitioned_by: self.transitioned_by,
             source_signal_id: self.source_signal_id,
             revision: self.revision,
+            generation: self.generation.decode(),
         })
     }
 }
@@ -1932,6 +2194,14 @@ pub fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
         "revision",
         "INTEGER NOT NULL DEFAULT 1",
     )?;
+    for (column, column_type) in RULE_SUGGESTION_BINDING_COLUMNS {
+        lifecycle::ensure_sqlite_column(
+            connection,
+            "discovery_rule_suggestions",
+            column,
+            column_type,
+        )?;
+    }
 
     let transitioned_at = utc_timestamp_rfc3339();
     connection.execute(
@@ -3625,6 +3895,340 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// A generation context against the policy ETag `"sha256:<c x 64>"`
+    /// and a fixed set of resource components.
+    fn binding_context(etag_digit: char) -> SuggestionGenerationContext {
+        SuggestionGenerationContext::new(
+            format!("\"sha256:{}\"", etag_digit.to_string().repeat(64)),
+            None,
+            Some(format!("sha256:{}", "d".repeat(64))),
+            true,
+            &json!({
+                "gateway_build": "1.0.0",
+                "evaluator": {},
+                "configuration": "sha256:configuration",
+                "egress": "sha256:egress",
+                "tools": "sha256:tools",
+                "connections": "\"connections:0\"",
+            }),
+        )
+        .expect("the context is canonical")
+    }
+
+    /// One observed endpoint per path and one billing-reader call to each.
+    fn seed_bound_generation_fixture(name: &str, paths: &[&str]) -> (TempDb, TempDb) {
+        let discovery_db = TempDb::new(&format!("{name}-discovery"));
+        let audit_db = TempDb::new(&format!("{name}-audit"));
+        create_audit_schema(&audit_db.path);
+        for (index, path) in paths.iter().enumerate() {
+            seed_discovery_endpoint(&discovery_db.path, "GET", &format!("{path}/{{id}}"));
+            insert_observation_event(
+                &audit_db.path,
+                SeedObservationEvent {
+                    event_id: &format!("{name}-{index}"),
+                    timestamp: "2024-06-01T12:00:00Z",
+                    actor_user_id: "alice",
+                    roles: &["billing-reader"],
+                    method: "GET",
+                    request_path: &format!("{path}/7"),
+                    status: 200,
+                    policy_decision: Some("allowed"),
+                },
+            );
+        }
+        (discovery_db, audit_db)
+    }
+
+    #[test]
+    fn generation_records_the_binding_it_ran_against() {
+        let (discovery_db, audit_db) = seed_bound_generation_fixture("bound", &["/invoices"]);
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
+        let context = binding_context('a');
+        let run = engine
+            .generate_bound(&empty_policy(), &context)
+            .expect("generation should succeed");
+        assert_eq!(run.inserted_count, 1);
+        assert_eq!(run.rebound_count, 0);
+
+        let suggestions = engine.list_suggestions().expect("suggestions should query");
+        let binding = suggestions[0]
+            .generation
+            .clone()
+            .expect("a generated suggestion is bound");
+        assert_eq!(
+            binding.generator_version,
+            crate::discovery::suggestion_binding::RULE_SUGGESTION_GENERATOR_VERSION
+        );
+        assert_eq!(
+            binding.evidence_schema_version,
+            crate::discovery::suggestion_binding::RULE_SUGGESTION_EVIDENCE_SCHEMA_VERSION
+        );
+        assert_eq!(binding.policy_etag, context.policy_etag);
+        assert_eq!(binding.resource_components, context.resource_components);
+        assert_eq!(
+            binding.resource_snapshot_digest,
+            context.resource_snapshot_digest
+        );
+        assert!(binding.resource_snapshot_complete);
+        // The cutoff is the run's start, which is also the evidence window's
+        // end and the row's creation time.
+        assert_eq!(binding.evidence_cutoff, suggestions[0].created_at);
+        assert_eq!(
+            Some(binding.evidence_digest),
+            crate::discovery::suggestion_binding::evidence_digest(&suggestions[0].evidence)
+        );
+    }
+
+    #[test]
+    fn regeneration_rebinds_an_open_row_once_and_bumps_its_revision() {
+        let (discovery_db, audit_db) = seed_bound_generation_fixture("rebind", &["/invoices"]);
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
+        engine
+            .generate_bound(&empty_policy(), &binding_context('a'))
+            .expect("generation should succeed");
+        let first = engine.list_suggestions().expect("suggestions should query");
+
+        // The policy changed: the open row is rebound to it, once.
+        let rebound = engine
+            .generate_bound(&empty_policy(), &binding_context('b'))
+            .expect("regeneration should succeed");
+        assert_eq!(rebound.inserted_count, 0);
+        assert_eq!(rebound.rebound_count, 1);
+        let second = engine.list_suggestions().expect("suggestions should query");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].id, first[0].id);
+        assert_eq!(second[0].revision, 2);
+        assert_eq!(second[0].created_at, first[0].created_at);
+        assert_eq!(
+            second[0]
+                .generation
+                .as_ref()
+                .map(|binding| binding.policy_etag.clone()),
+            Some(binding_context('b').policy_etag)
+        );
+
+        let again = engine
+            .generate_bound(&empty_policy(), &binding_context('b'))
+            .expect("regeneration should succeed");
+        assert_eq!(again.rebound_count, 0);
+        assert_eq!(
+            engine.list_suggestions().expect("suggestions should query"),
+            second
+        );
+    }
+
+    #[test]
+    fn regeneration_under_an_unchanged_policy_and_resources_writes_nothing_even_when_traffic_moved()
+    {
+        let (discovery_db, audit_db) = seed_bound_generation_fixture("traffic", &["/invoices"]);
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
+        let context = binding_context('a');
+        engine
+            .generate_bound(&empty_policy(), &context)
+            .expect("generation should succeed");
+        let first = engine.list_suggestions().expect("suggestions should query");
+
+        // More traffic: the evidence a run would compute now differs (its
+        // counts and window end), but the policy and resources do not.
+        insert_observation_event(
+            &audit_db.path,
+            SeedObservationEvent {
+                event_id: "traffic-later",
+                timestamp: "2024-06-02T12:00:00Z",
+                actor_user_id: "bob",
+                roles: &["billing-reader"],
+                method: "GET",
+                request_path: "/invoices/8",
+                status: 200,
+                policy_decision: Some("allowed"),
+            },
+        );
+        let run = engine
+            .generate_bound(&empty_policy(), &context)
+            .expect("regeneration should succeed");
+        assert_eq!(run.inserted_count, 0);
+        assert_eq!(run.rebound_count, 0);
+        let after = engine.list_suggestions().expect("suggestions should query");
+        // The row keeps the evidence and cutoff of the run that bound it.
+        assert_eq!(after, first);
+        assert_eq!(after[0].revision, 1);
+    }
+
+    #[test]
+    fn regeneration_never_rebinds_accepted_or_dismissed_rows() {
+        let (discovery_db, audit_db) =
+            seed_bound_generation_fixture("terminal", &["/invoices", "/orders", "/refunds"]);
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
+        engine
+            .generate_bound(&empty_policy(), &binding_context('a'))
+            .expect("generation should succeed");
+        let generated = engine.list_suggestions().expect("suggestions should query");
+        assert_eq!(generated.len(), 3);
+        let id_of = |path: &str| {
+            generated
+                .iter()
+                .find(|suggestion| suggestion.path_pattern == path)
+                .map(|suggestion| suggestion.id.clone())
+                .expect("the suggestion exists")
+        };
+        let from_open = TransitionPrecondition::from_state(RuleSuggestionLifecycleState::Open);
+        for (path, state) in [
+            ("/invoices/{id}", RuleSuggestionLifecycleState::Accepted),
+            ("/orders/{id}", RuleSuggestionLifecycleState::Dismissed),
+        ] {
+            assert!(matches!(
+                engine
+                    .transition_suggestion(&id_of(path), state, Some("admin"), from_open)
+                    .expect("the transition should apply"),
+                TransitionOutcome::Applied(_)
+            ));
+        }
+        let before = engine.list_suggestions().expect("suggestions should query");
+
+        let run = engine
+            .generate_bound(&empty_policy(), &binding_context('b'))
+            .expect("regeneration should succeed");
+        assert_eq!(run.inserted_count, 0);
+        assert_eq!(run.rebound_count, 1, "only the open row is rebound");
+        let after = engine.list_suggestions().expect("suggestions should query");
+        for terminal in ["/invoices/{id}", "/orders/{id}"] {
+            let find = |rows: &[RuleSuggestion]| {
+                rows.iter()
+                    .find(|row| row.path_pattern == terminal)
+                    .cloned()
+                    .expect("the row exists")
+            };
+            assert_eq!(find(&after), find(&before), "{terminal}");
+        }
+    }
+
+    #[test]
+    fn a_rebind_moves_the_revision_an_acceptance_must_name() {
+        let (discovery_db, audit_db) = seed_bound_generation_fixture("rebind-cas", &["/invoices"]);
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
+        engine
+            .generate_bound(&empty_policy(), &binding_context('a'))
+            .expect("generation should succeed");
+        let id = engine.list_suggestions().expect("suggestions should query")[0]
+            .id
+            .clone();
+        engine
+            .generate_bound(&empty_policy(), &binding_context('b'))
+            .expect("regeneration should succeed");
+
+        // An acceptance that read revision 1 loses to the rebind.
+        let read_before_rebind =
+            TransitionPrecondition::from_state(RuleSuggestionLifecycleState::Open)
+                .with_revision(Some(1));
+        match engine
+            .transition_suggestion(
+                &id,
+                RuleSuggestionLifecycleState::Accepted,
+                Some("admin"),
+                read_before_rebind,
+            )
+            .expect("the transition should answer")
+        {
+            TransitionOutcome::Refused(refused) => {
+                assert_eq!(refused.current.state, RuleSuggestionLifecycleState::Open);
+                assert_eq!(refused.current.revision, 2);
+            }
+            other => panic!("the stale revision must be refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opening_a_database_from_before_bindings_adds_the_columns_and_leaves_rows_unbound() {
+        let discovery_db = TempDb::new("pre-binding-file");
+        {
+            let connection =
+                Connection::open(&discovery_db.path).expect("discovery database should open");
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE discovery_rule_suggestions (
+                        id TEXT PRIMARY KEY,
+                        suggestion_type TEXT NOT NULL,
+                        method TEXT NOT NULL,
+                        path_pattern TEXT NOT NULL,
+                        principal_key TEXT NOT NULL,
+                        proposed_rule_json TEXT NOT NULL,
+                        rationale TEXT NOT NULL,
+                        evidence_json TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        transitioned_at TEXT,
+                        transitioned_by TEXT,
+                        source_signal_id TEXT,
+                        revision INTEGER NOT NULL DEFAULT 1
+                    );
+                    "#,
+                )
+                .expect("the pre-binding table should create");
+            insert_stored_baseline(&connection, "old", &["provider:test"], &["bearer_token"]);
+        }
+
+        let engine = suggestion_engine(&discovery_db.path, None);
+        let suggestions = engine.list_suggestions().expect("suggestions should query");
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].id, "old");
+        assert_eq!(suggestions[0].revision, 1);
+        assert_eq!(suggestions[0].generation, None);
+
+        let connection =
+            Connection::open(&discovery_db.path).expect("discovery database should open");
+        let mut statement = connection
+            .prepare("PRAGMA table_info(discovery_rule_suggestions)")
+            .expect("table info should prepare");
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("table info should read")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("table info should decode");
+        for (column, _) in RULE_SUGGESTION_BINDING_COLUMNS {
+            assert!(columns.iter().any(|name| name == column), "{column}");
+        }
+    }
+
+    #[test]
+    fn a_partial_or_malformed_stored_binding_reads_as_unbound() {
+        let (discovery_db, audit_db) =
+            seed_bound_generation_fixture("malformed", &["/invoices", "/orders"]);
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
+        engine
+            .generate_bound(&empty_policy(), &binding_context('a'))
+            .expect("generation should succeed");
+        let connection =
+            Connection::open(&discovery_db.path).expect("discovery database should open");
+        connection
+            .execute(
+                "UPDATE discovery_rule_suggestions SET evidence_digest = NULL
+                 WHERE path_pattern = '/invoices/{id}'",
+                [],
+            )
+            .expect("the binding should be damaged");
+        connection
+            .execute(
+                "UPDATE discovery_rule_suggestions SET binding_resource_snapshot_complete = 'yes'
+                 WHERE path_pattern = '/orders/{id}'",
+                [],
+            )
+            .expect("the binding should be damaged");
+
+        // Neither row fails the listing or reads as bound.
+        let suggestions = engine.list_suggestions().expect("suggestions should query");
+        assert_eq!(suggestions.len(), 2);
+        assert!(suggestions
+            .iter()
+            .all(|suggestion| suggestion.generation.is_none()));
+        // A later run rebinds both: a damaged binding is no binding.
+        let run = engine
+            .generate_bound(&empty_policy(), &binding_context('a'))
+            .expect("regeneration should succeed");
+        assert_eq!(run.rebound_count, 2, "{run:?}");
     }
 
     #[test]

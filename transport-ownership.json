@@ -10161,7 +10161,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::discovery::suggestions::impl  RawRuleSuggestion::from_row#1",
-      "sha256": "0f0b0e897fbf2ba5e80b63c5ed8fbe7f0343a327a11dbd020511dba1372845cc",
+      "sha256": "b263d1ae5f7553ba14f2b96cba5d46a9652b6ce6ffb90ba7994cc56a80733e8a",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -13736,7 +13736,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery_lifecycle::raw_suggestion#1",
-      "sha256": "ab5d51bf74521bc17451477bd03edd4c43893a07ca1901be004d66904ca1c2fc",
+      "sha256": "b76613d1a9e18b3e9719ecc32511993633eb360486625290aee611054c8db10d",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

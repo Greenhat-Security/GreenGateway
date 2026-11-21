@@ -4596,6 +4596,255 @@ async fn suggestions_admin_generate_is_explicit_and_list_does_not_refresh() {
     assert_eq!(suggestion_ids(&refreshed).len(), 2);
 }
 
+/// Generate from two observed callers and return the open suggestions'
+/// ids by path and method: `(GET, POST)`.
+async fn generate_two_bound_suggestions(router: &Router) -> (String, String) {
+    let generated = router
+        .clone()
+        .oneshot(suggestions_admin_request(
+            Method::POST,
+            "/v1/admin/suggestions/generate",
+            Some(test_principal(&["suggestions-writer"])),
+            None,
+            None,
+        ))
+        .await
+        .expect("suggestion generation request should complete");
+    assert_eq!(generated.status(), StatusCode::OK);
+    let generated = json_body(generated).await;
+    assert_eq!(generated["inserted_count"], json!(2), "{generated}");
+    assert_eq!(generated["rebound_count"], json!(0), "{generated}");
+    let page = suggestions_json(
+        router,
+        "/v1/admin/suggestions?state=open",
+        Some(test_principal(&["suggestions-reader"])),
+    )
+    .await;
+    let id_of = |method: &str| {
+        page["suggestions"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["method"] == method))
+            .and_then(|row| row["id"].as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| panic!("a {method} suggestion: {page}"))
+    };
+    for row in page["suggestions"].as_array().expect("rows") {
+        assert_eq!(
+            row["freshness"],
+            json!({ "status": "current", "reasons": [] }),
+            "{page}"
+        );
+    }
+    (id_of("GET"), id_of("POST"))
+}
+
+async fn regenerate(router: &Router) -> Value {
+    let regenerated = router
+        .clone()
+        .oneshot(suggestions_admin_request(
+            Method::POST,
+            "/v1/admin/suggestions/generate",
+            Some(test_principal(&["suggestions-writer"])),
+            None,
+            None,
+        ))
+        .await
+        .expect("suggestion generation request should complete");
+    assert_eq!(regenerated.status(), StatusCode::OK);
+    json_body(regenerated).await
+}
+
+fn seed_two_generated_callers(discovery_path: &PathBuf, audit_path: &PathBuf) {
+    seed_suggestion_generation_observation(
+        discovery_path,
+        audit_path,
+        "reader",
+        "GET",
+        "/bound/{id}",
+        "reader",
+        "2024-06-01T12:00:00Z",
+    );
+    seed_suggestion_generation_observation(
+        discovery_path,
+        audit_path,
+        "writer",
+        "POST",
+        "/bound/{id}",
+        "writer",
+        "2024-06-01T12:01:00Z",
+    );
+}
+
+fn listed_freshness(page: &Value, id: &str) -> Value {
+    page["suggestions"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == id))
+        .map(|row| row["freshness"].clone())
+        .unwrap_or_else(|| panic!("{id} is listed: {page}"))
+}
+
+#[tokio::test]
+async fn a_policy_change_marks_listed_suggestions_stale_and_regeneration_makes_them_current() {
+    let discovery_db = TempDb::new("suggestions-rebind-discovery");
+    let audit_db = TempDb::new("suggestions-rebind-audit");
+    seed_two_generated_callers(&discovery_db.path, &audit_db.path);
+    let (router, _policy) =
+        suggestions_admin_router(Some(&discovery_db.path), Some(&audit_db.path));
+    let (reader, writer) = generate_two_bound_suggestions(&router).await;
+
+    // Regenerating against the same policy and resources writes nothing,
+    // even though the run's own window end moved.
+    let unchanged = regenerate(&router).await;
+    assert_eq!(unchanged["inserted_count"], json!(0), "{unchanged}");
+    assert_eq!(unchanged["rebound_count"], json!(0), "{unchanged}");
+
+    // Accepting one suggestion is a policy change: the other becomes
+    // stale until a run rebinds it.
+    let etag = suggestions_policy_etag(&router).await;
+    let accepted = router
+        .clone()
+        .oneshot(suggestions_admin_request(
+            Method::POST,
+            &format!("/v1/admin/suggestions/{reader}/accept"),
+            Some(test_principal(&["suggestions-policy-writer"])),
+            None,
+            Some(&etag),
+        ))
+        .await
+        .expect("accept request should complete");
+    assert_eq!(accepted.status(), StatusCode::CREATED);
+    let page = suggestions_json(
+        &router,
+        "/v1/admin/suggestions",
+        Some(test_principal(&["suggestions-reader"])),
+    )
+    .await;
+    assert_eq!(
+        listed_freshness(&page, &writer),
+        json!({ "status": "stale", "reasons": ["policy_changed"] })
+    );
+    assert_eq!(
+        listed_freshness(&page, &reader),
+        json!({ "status": null, "reasons": [] })
+    );
+    let etag = suggestions_policy_etag(&router).await;
+    let refused = router
+        .clone()
+        .oneshot(suggestions_admin_request(
+            Method::POST,
+            &format!("/v1/admin/suggestions/{writer}/accept"),
+            Some(test_principal(&["suggestions-policy-writer"])),
+            None,
+            Some(&etag),
+        ))
+        .await
+        .expect("accept request should complete");
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(refused).await["reason"],
+        json!("suggestion_binding_stale")
+    );
+
+    // A run rebinds the open row once, at a new revision; the accepted one
+    // is never touched.
+    let rebound = regenerate(&router).await;
+    assert_eq!(rebound["inserted_count"], json!(0), "{rebound}");
+    assert_eq!(rebound["rebound_count"], json!(1), "{rebound}");
+    let page = suggestions_json(
+        &router,
+        "/v1/admin/suggestions",
+        Some(test_principal(&["suggestions-reader"])),
+    )
+    .await;
+    assert_eq!(
+        listed_freshness(&page, &writer),
+        json!({ "status": "current", "reasons": [] })
+    );
+    let writer_row = page["suggestions"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == writer.as_str()))
+        .cloned()
+        .expect("the writer row");
+    assert_eq!(writer_row["revision"], json!(2));
+    let mut request = suggestions_admin_request(
+        Method::POST,
+        &format!("/v1/admin/suggestions/{writer}/accept"),
+        Some(test_principal(&["suggestions-policy-writer"])),
+        None,
+        Some(&etag),
+    );
+    request.headers_mut().insert(
+        SUGGESTION_REVISION_HEADER,
+        http::HeaderValue::from_static("2"),
+    );
+    let accepted = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("accept request should complete");
+    assert_eq!(accepted.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn a_generated_suggestion_whose_rule_went_live_is_listed_as_superseded() {
+    let discovery_db = TempDb::new("suggestions-superseded-discovery");
+    let audit_db = TempDb::new("suggestions-superseded-audit");
+    seed_two_generated_callers(&discovery_db.path, &audit_db.path);
+    let (router, _policy) =
+        suggestions_admin_router(Some(&discovery_db.path), Some(&audit_db.path));
+    let (reader, _writer) = generate_two_bound_suggestions(&router).await;
+
+    // The rule goes live through a draft published without binding the
+    // suggestion, so the suggestion stays open.
+    let etag = suggestions_policy_etag(&router).await;
+    let opened = router
+        .clone()
+        .oneshot(suggestions_admin_request(
+            Method::POST,
+            &format!("/v1/admin/suggestions/{reader}/draft"),
+            Some(test_principal(&["suggestions-policy-writer"])),
+            None,
+            Some(&etag),
+        ))
+        .await
+        .expect("draft request should complete");
+    assert_eq!(opened.status(), StatusCode::CREATED);
+    let draft_etag = policy_etag_header(&opened);
+    let opened = json_body(opened).await;
+    let draft_id = opened["draft"]["draft_id"]
+        .as_str()
+        .expect("the draft names its id")
+        .to_owned();
+    let mut publish = suggestions_admin_request(
+        Method::POST,
+        &format!("{POLICY_DRAFTS_ADMIN_ROUTE}/{draft_id}/publish"),
+        Some(test_principal(&["suggestions-policy-writer"])),
+        None,
+        Some(&etag),
+    );
+    publish.headers_mut().insert(
+        POLICY_DRAFT_ETAG_HEADER,
+        http::HeaderValue::from_str(&draft_etag).expect("the draft ETag is a header value"),
+    );
+    let published = router
+        .clone()
+        .oneshot(publish)
+        .await
+        .expect("publish request should complete");
+    assert_eq!(published.status(), StatusCode::OK);
+
+    let page = suggestions_json(
+        &router,
+        "/v1/admin/suggestions?state=open",
+        Some(test_principal(&["suggestions-reader"])),
+    )
+    .await;
+    assert_eq!(
+        listed_freshness(&page, &reader),
+        json!({ "status": "superseded", "reasons": ["rule_already_live"] })
+    );
+}
+
 #[tokio::test]
 async fn suggestions_admin_accept_creates_real_rule_requires_both_permissions_and_audits() {
     let discovery_db = TempDb::new("suggestions-accept");
@@ -4623,6 +4872,8 @@ async fn suggestions_admin_accept_creates_real_rule_requires_both_permissions_an
     let policy = TempPolicyFile::new(&suggestions_policy_document_string());
     let router =
         suggestions_admin_router_with_policy(Some(&discovery_db.path), None, &policy, audit_log);
+
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
 
     let current_etag = suggestions_policy_etag(&router).await;
 
@@ -4850,6 +5101,7 @@ async fn suggestions_admin_accepts_mcp_tool_rule_with_http_fallback_configured()
         test_audit_event_sender(),
     )
     .expect("app should build");
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
     let etag = suggestions_policy_etag(&router).await;
 
     let accepted = router
@@ -4901,6 +5153,7 @@ async fn accepted_contextless_suggestion_does_not_authorize_new_path_upstream_af
         &policy,
         test_audit_log(),
     );
+    bind_seeded_suggestions(&accepting_router, &discovery_db.path).await;
     let etag = suggestions_policy_etag(&accepting_router).await;
 
     let accepted = accepting_router
@@ -5017,6 +5270,7 @@ async fn accepted_legacy_suggestion_does_not_authorize_same_origin_path_route_af
         test_audit_event_sender(),
     )
     .expect("gateway should start with the legacy fallback");
+    bind_seeded_suggestions(&accepting_router, &discovery_db.path).await;
     let etag = suggestions_policy_etag(&accepting_router).await;
 
     let accepted = accepting_router
@@ -5497,6 +5751,7 @@ async fn a_suggestion_acceptance_must_pass_the_required_policy_tests() {
             .await
             .expect("suite PUT should complete");
         assert_eq!(stored.status(), StatusCode::CREATED);
+        bind_seeded_suggestions(&router, &discovery_db.path).await;
         let etag = suggestions_policy_etag(&router).await;
 
         let accepted = router
@@ -8568,8 +8823,12 @@ mod cluster_discovery_tests {
 
         let capture = audit::sink::tests::CaptureSink::new();
         let audit_log = audit::AuditLog::new(Arc::new(capture.clone()));
+        // Wired with policy resources, as production wires every replica:
+        // a suggestion is bound to them, and is current only against a
+        // complete resource snapshot (issue #243, item 19).
         let rbac_state =
-            middleware::rbac::RbacState::new(policy, Vec::new(), false, audit_log.clone());
+            middleware::rbac::RbacState::new(policy, Vec::new(), false, audit_log.clone())
+                .with_policy_resources(test_policy_resource_sources());
         // Startup installs the authority's revision; without it the
         // handler's snapshot is unkeyed.
         rbac_state
@@ -9847,19 +10106,132 @@ mod cluster_discovery_tests {
             "a rolled-back acceptance must emit no lifecycle event"
         );
 
-        // The suggestion is still acceptable: retrying against the
-        // current ETag commits both halves.
-        let retried = harness
+        // The suggestion was generated against the policy the interfering
+        // commit replaced, so it is now stale (issue #243, item 19): a
+        // retry against the current ETag is refused and writes nothing.
+        let stale = harness
             .router
             .clone()
             .oneshot(accept_request(&id, Some(&interfering.etag), Some("1")))
+            .await
+            .expect("retry should complete");
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let stale = json_body(stale).await;
+        assert_eq!(stale["reason"], json!("suggestion_binding_stale"));
+        assert_eq!(stale["freshness"]["reasons"], json!(["policy_changed"]));
+        assert_eq!(
+            acceptance_footprint(&harness.policy_store, &pool, &id)
+                .await
+                .rule_count,
+            0
+        );
+
+        // Regeneration rebinds it to the current policy, at a new
+        // revision; accepting that revision commits both halves.
+        let regenerated = harness
+            .router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                SUGGESTIONS_GENERATE_ADMIN_ROUTE,
+                Some(test_principal(&["suggestions-writer"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("generate request should complete");
+        assert_eq!(regenerated.status(), StatusCode::OK);
+        let regenerated = json_body(regenerated).await;
+        assert_eq!(regenerated["inserted_count"], json!(0), "{regenerated}");
+        assert_eq!(regenerated["rebound_count"], json!(1), "{regenerated}");
+        let retried = harness
+            .router
+            .clone()
+            .oneshot(accept_request(&id, Some(&interfering.etag), Some("2")))
             .await
             .expect("retry should complete");
         assert_eq!(retried.status(), StatusCode::CREATED);
         let retried = acceptance_footprint(&harness.policy_store, &pool, &id).await;
         assert_eq!(retried.rule_count, 1);
         assert_eq!(retried.suggestion_state, "accepted");
-        assert_eq!(retried.suggestion_revision, 2);
+        assert_eq!(retried.suggestion_revision, 3);
+    }
+
+    /// Owner ruling 3 of 2026-11-20, end to end in cluster mode: an
+    /// unrelated security change (a JWT revocation) advances the shared
+    /// security revision, and this replica installs it, with the policy
+    /// and its resources unchanged. The suggestion stays current, and the
+    /// acceptance commits.
+    #[tokio::test]
+    async fn cluster_accept_after_only_a_security_revision_advance_still_succeeds() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database.dsn).await;
+        let audit_store = cluster_audit_store(&pool).await;
+        seed_baseline_generation_fixture(&pool, &audit_store).await;
+        let harness = cluster_suggestions_harness(&pool, audit_store).await;
+        let id = generate_one_suggestion(&harness.router).await;
+        let before = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+
+        let revoked = crate::storage::postgres_jwt_revocations::PostgresJwtRevocationStore::new(
+            pool.clone(),
+            "deploy-ruling-three",
+            "https://issuer.example.test",
+        )
+        .revoke(
+            "jti-unrelated",
+            None,
+            &crate::auth::change_actor::ChangeActor::for_test("operator"),
+        )
+        .await
+        .expect("the revocation commits");
+        let crate::storage::postgres_jwt_revocations::JwtRevocationOutcome::Revoked {
+            security_revision,
+        } = revoked
+        else {
+            panic!("a new jti is revoked");
+        };
+        assert!(security_revision > before.security_revision);
+        let active = PolicyControlPlane::active(harness.policy_store.as_ref())
+            .await
+            .expect("active reads")
+            .expect("a policy is active");
+        assert_eq!(active.etag, before.active_etag, "the policy did not change");
+        harness
+            .rbac_state
+            .install_revision_snapshot(active.policy, security_revision)
+            .await
+            .expect("the advanced revision installs");
+        assert_eq!(
+            harness.rbac_state.snapshot_security_revision(),
+            security_revision
+        );
+
+        let listed = suggestions_json(
+            &harness.router,
+            "/v1/admin/suggestions?state=open",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        assert_eq!(
+            listed["suggestions"][0]["freshness"],
+            json!({ "status": "current", "reasons": [] }),
+            "{listed}"
+        );
+        let accepted = harness
+            .router
+            .clone()
+            .oneshot(accept_request(&id, Some(&before.active_etag), Some("1")))
+            .await
+            .expect("accept request should complete");
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+        let after = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+        assert_eq!(after.rule_count, 1);
+        assert_eq!(after.suggestion_state, "accepted");
+        assert_eq!(after.security_revision, security_revision + 1);
     }
 
     /// Open `id` in a new draft against `policy_etag`: `(draft_id,

@@ -21,11 +21,12 @@ Check this table against your deployment before scheduling anything. Every secti
 | `principals_and_service_tokens` | service-token **hashes** with their prefixes and timestamps. The plaintext never existed on disk and is not reconstructable |
 | `validation` | per-table row counts and logical SHA-256 checksums for both sides, a read-only constraint pass, active ETags, the projector checkpoint, and proof that the excluded runtime tables are empty |
 
-Three consequences you must plan around:
+Four consequences you must plan around:
 
 - **Service tokens keep working, and that is a security fact as well as a convenience.** The hashes cross, so every token the standalone deployment issued still authenticates against the cluster. If the cutover is also the moment you wanted to rotate credentials, rotate them deliberately afterwards — the import will not do it for you, and a token you meant to retire is now live on the new authority.
 - **Discovery history crosses, so signals do not re-fire.** The detector windows come across with the aggregates precisely so the first projector run does not re-raise your whole endpoint inventory as new. Learner template groups are the exception: standalone never persisted them, so they cross as nothing and the cluster relearns them exactly as a standalone restart would. The report counts that as `0` rather than hiding it.
 - **Timestamps are truncated to microseconds.** The source keeps RFC 3339 text; the target's columns are `timestamptz`, which holds microseconds. Policy-history, audit and service-token instants are therefore truncated at the write rather than silently rounded by a cast. This is stated so that a sub-microsecond difference is never mistaken for a lost row.
+- **Rule suggestions cross without their generation bindings.** A standalone binding names the standalone deployment's configuration and resources, so it would read as stale in the cluster anyway; the import writes none, and every imported suggestion reads as unbound (issue #243, item 19). Its accept route refuses it with `409 suggestion_binding_unrecorded` until a generation run rebinds it, so run `POST /v1{ADMIN_PREFIX}/suggestions/generate` after the cutover, and draft or dismiss the ones the run does not produce again.
 
 The **principal directory is never imported**: cluster mode has no principal directory, so there is no destination for it — no migration creates the table, and `PRINCIPAL_SQLITE_PATH` is refused in cluster mode. It is a projection of authenticated traffic, and that traffic *is* imported, with the audit log. The report names the source file it left behind (`source.principal_file`, `source.principal_present`, `principal_directory_rows_imported: 0`) so you see it rather than discover it missing afterwards.
 

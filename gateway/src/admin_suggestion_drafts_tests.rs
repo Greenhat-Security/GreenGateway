@@ -298,6 +298,10 @@ async fn a_suggestion_opens_as_an_inactive_draft_pinned_to_the_live_policy() {
             "candidate_etag": draft["candidate_etag"],
             "rule_id": rule["id"],
             "position": 0,
+            // Seeded without a binding, so drafting reports it unbound:
+            // codes only, never policy content.
+            "generation_freshness": "unbound",
+            "generation_freshness_reasons": ["binding_not_recorded"],
         })]
     );
     assert!(events_of(&capture, audit::event::POLICY_CHANGED).is_empty());

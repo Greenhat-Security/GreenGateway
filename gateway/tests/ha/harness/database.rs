@@ -84,6 +84,8 @@ pub const SEED_POLICY_DOCUMENT: &str = r#"{"default_action":"allow","enforcement
 pub const SEEDED_OBSERVATION_TIMESTAMP: &str = "2020-01-01T00:00:00Z";
 /// When a seeded suggestion was raised: after the classification above.
 pub const SEEDED_SUGGESTION_TIMESTAMP: &str = "2020-01-02T00:00:00Z";
+/// The evidence a seeded suggestion carries.
+pub const SEEDED_SUGGESTION_EVIDENCE: &str = r#"{"source":"ha-harness"}"#;
 
 /// The deployment's initial tools document, seeded only for suites that
 /// write or execute tools. Same round-trip rule as the policy: exactly the
@@ -774,13 +776,71 @@ impl Database {
                     &"harness",
                     &rule_json,
                     &"seeded by the #241 release-gate harness",
-                    &r#"{"source":"ha-harness"}"#,
+                    &SEEDED_SUGGESTION_EVIDENCE,
                     &SEEDED_SUGGESTION_TIMESTAMP,
                 ],
             )
             .await
             .unwrap_or_else(|error| panic!("the harness suggestion seed failed: {error}"));
         id
+    }
+
+    /// Record on a seeded suggestion the generation binding a run on this
+    /// deployment would record now (issue #243, item 19): this build's
+    /// generator and evidence schema versions, the seed time as the
+    /// evidence cutoff, the live policy ETag the caller read, and the
+    /// resource snapshot `POST .../policy/validate` reported, its
+    /// components without the cluster security revision. The evidence
+    /// digest is a SHA-256 of the seeded evidence text: freshness never
+    /// compares it, and the harness cannot compute the gateway's canonical
+    /// form. Without a binding, the accept route refuses the row as unbound
+    /// (owner ruling 2 of 2026-11-20).
+    pub async fn bind_rule_suggestion(
+        &self,
+        id: &str,
+        policy_etag: &str,
+        resource_snapshot: &serde_json::Value,
+    ) {
+        use sha2::Digest as _;
+        let mut components = resource_snapshot["components"].clone();
+        if let Some(components) = components.as_object_mut() {
+            components.remove("security_revision");
+        }
+        let components = components.to_string();
+        let evidence_digest = format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(SEEDED_SUGGESTION_EVIDENCE.as_bytes()))
+        );
+        let snapshot_digest = resource_snapshot["digest"].as_str().map(str::to_owned);
+        let complete = resource_snapshot["complete"].as_bool();
+        let client = self
+            .run_pool
+            .get()
+            .await
+            .expect("harness run-database connection should establish");
+        let bound = client
+            .execute(
+                "UPDATE greengateway.discovery_rule_suggestions SET \
+                   generator_version = 'rule-suggestions.v1', \
+                   evidence_schema_version = 'rule-suggestion-evidence.v1', \
+                   evidence_cutoff = $2, evidence_digest = $3, binding_policy_etag = $4, \
+                   binding_resource_snapshot_digest = $5, \
+                   binding_resource_snapshot_complete = $6, \
+                   binding_resource_components = $7 \
+                 WHERE id = $1",
+                &[
+                    &id,
+                    &SEEDED_SUGGESTION_TIMESTAMP,
+                    &evidence_digest,
+                    &policy_etag,
+                    &snapshot_digest,
+                    &complete,
+                    &components,
+                ],
+            )
+            .await
+            .unwrap_or_else(|error| panic!("the harness suggestion binding failed: {error}"));
+        assert_eq!(bound, 1, "the seeded suggestion exists");
     }
 
     // ------------------------------------------------------------------

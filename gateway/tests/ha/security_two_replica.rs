@@ -920,6 +920,7 @@ async fn wait_until_credential(
 // ---------------------------------------------------------------------
 
 const POLICY_ROUTE: &str = "/v1/admin/policy";
+const POLICY_VALIDATE_ROUTE: &str = "/v1/admin/policy/validate";
 const CONNECTIONS_ROUTE: &str = "/v1/admin/connections";
 const TOOLS_REGISTER_ROUTE: &str = "/v1/admin/tools/openapi/register";
 /// The Connection collection's own precondition, published beside the
@@ -1892,6 +1893,56 @@ async fn concurrent_suggestion_acceptance_yields_one_rule_and_one_transition() {
             }),
         )
         .await;
+
+    // A seeded row carries no generation binding, and the accept route
+    // refuses an unbound suggestion (issue #243, item 19). Bind it to what
+    // this deployment serves now, as a generation run would: the live
+    // policy ETag, and the resource snapshot a validation reports.
+    let (status, _, live_policy) =
+        send_settled(|| cluster.get("a", POLICY_ROUTE).bearer(&admin)).await;
+    assert_eq!(status, 200);
+    let (status, _, validated) = send_settled(|| {
+        cluster
+            .post("a", POLICY_VALIDATE_ROUTE)
+            .bearer(&admin)
+            .json(&live_policy)
+    })
+    .await;
+    assert_eq!(status, 200, "{validated}");
+    assert_eq!(
+        validated["resource_snapshot"]["complete"],
+        json!(true),
+        "a cluster replica reads every policy resource: {validated}"
+    );
+    cluster
+        .database
+        .bind_rule_suggestion(
+            &suggestion_id,
+            &cluster.seed_policy_etag,
+            &validated["resource_snapshot"],
+        )
+        .await;
+
+    // Both replicas judge the binding the same way: the same policy, the
+    // same resources, and a security revision they do not compare.
+    for replica in ["a", "b"] {
+        let (status, _, listed) = send_settled(|| {
+            cluster
+                .get(replica, "/v1/admin/suggestions?state=open")
+                .bearer(&admin)
+        })
+        .await;
+        assert_eq!(status, 200);
+        let row = listed["suggestions"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["id"] == suggestion_id.as_str()))
+            .unwrap_or_else(|| panic!("replica {replica} lists the suggestion: {listed}"));
+        assert_eq!(
+            row["freshness"],
+            json!({ "status": "current", "reasons": [] }),
+            "replica {replica}: {listed}"
+        );
+    }
 
     // Accepting installs a policy RULE, so it carries the policy's own
     // precondition: both replicas race with the same `If-Match`, and the

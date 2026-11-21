@@ -37,6 +37,13 @@ const MAX_FIELD_LENGTH = 1_024;
 const MAX_TIMESTAMP_LENGTH = 64;
 const MAX_CURSOR_LENGTH = 1_024;
 const MAX_LIST_ENTRIES = 64;
+const MAX_VERSION_LENGTH = 64;
+const MAX_FRESHNESS_REASONS = 16;
+const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+const REASON_CODE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+// The text an unrecognised reason code is kept as when it is not even a
+// well-formed code.
+export const UNRECOGNISED_FRESHNESS_REASON = 'unrecognised';
 
 export type RuleSuggestionState = 'open' | 'dismissed' | 'accepted';
 
@@ -67,6 +74,46 @@ export type ProposedRule = Readonly<{
   document: Readonly<Record<string, unknown>>;
 }>;
 
+// What the run that wrote or last rebound a suggestion judged it against
+// (issue #243, item 19), as the gateway reports it. The policy ETag and
+// resource components it compares are kept server-side.
+export type SuggestionGeneration = Readonly<{
+  generator_version: string;
+  evidence_schema_version: string;
+  evidence_cutoff: string;
+  evidence_digest: string;
+  resource_snapshot_digest: string | null;
+  resource_snapshot_complete: boolean;
+}>;
+
+export type FreshnessStatus = 'current' | 'stale' | 'superseded' | 'unbound' | 'unknown';
+
+// The reason codes this view describes in words. Any other code is kept and
+// shown as unrecognised, never dropped.
+export const KNOWN_FRESHNESS_REASONS = [
+  'policy_changed',
+  'generator_changed',
+  'evidence_schema_changed',
+  'configuration_changed',
+  'tools_changed',
+  'connections_changed',
+  'egress_changed',
+  'evaluator_changed',
+  'gateway_build_changed',
+  'resource_snapshot_incomplete',
+  'rule_already_live',
+  'binding_not_recorded',
+  'policy_unavailable',
+] as const;
+
+// Whether an open suggestion is still bound to the live policy and
+// resources, computed by the gateway on every read. `status` is null for a
+// suggestion that is not open.
+export type SuggestionFreshness = Readonly<{
+  status: FreshnessStatus | null;
+  reasons: readonly string[];
+}>;
+
 export type RuleSuggestion = Readonly<{
   id: string;
   suggestion_type: string;
@@ -83,6 +130,9 @@ export type RuleSuggestion = Readonly<{
   transitioned_by: string | null;
   revision: number;
   source_signal_id: string | null;
+  generation: SuggestionGeneration | null;
+  // As the listing reports it; null where a route does not.
+  freshness: SuggestionFreshness | null;
 }>;
 
 export type RuleSuggestionPage = Readonly<{
@@ -99,6 +149,8 @@ export type SuggestionDraftOpening = Readonly<{
   suggestion: RuleSuggestion;
   rule: ProposedRule;
   position: number;
+  // The suggestion's freshness when it was drafted.
+  freshness: SuggestionFreshness | null;
 }>;
 
 // Where a suggestion's rule goes: a new draft copied from the live policy,
@@ -216,9 +268,11 @@ export async function openSuggestionInDraft(request: {
   }
   const suggestion = projectSuggestion(body.suggestion);
   const rule = projectProposedRule(body.rule);
+  const freshness = projectFreshness(body.freshness);
   if (
     suggestion === null ||
     rule === null ||
+    freshness === undefined ||
     !isCount(body.position) ||
     (response.status !== 200 && response.status !== 201)
   ) {
@@ -230,6 +284,7 @@ export async function openSuggestionInDraft(request: {
     suggestion,
     rule,
     position: body.position,
+    freshness,
   };
 }
 
@@ -331,7 +386,9 @@ export function projectSuggestion(value: unknown): RuleSuggestion | null {
     return null;
   }
   const rule = projectProposedRule(value.proposed_rule);
-  if (rule === null) {
+  const generation = projectGeneration(value.generation);
+  const freshness = projectFreshness(value.freshness);
+  if (rule === null || generation === undefined || freshness === undefined) {
     return null;
   }
   return {
@@ -350,6 +407,75 @@ export function projectSuggestion(value: unknown): RuleSuggestion | null {
     transitioned_by: typeof value.transitioned_by === 'string' ? value.transitioned_by : null,
     revision: value.revision,
     source_signal_id: typeof value.source_signal_id === 'string' ? value.source_signal_id : null,
+    generation,
+    freshness,
+  };
+}
+
+// A suggestion's generation binding: null when the gateway recorded none,
+// undefined (an invalid response) when what it sent is malformed.
+export function projectGeneration(value: unknown): SuggestionGeneration | null | undefined {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (
+    !isJsonObject(value) ||
+    !isBoundedString(value.generator_version, MAX_VERSION_LENGTH) ||
+    !isBoundedString(value.evidence_schema_version, MAX_VERSION_LENGTH) ||
+    !isBoundedString(value.evidence_cutoff, MAX_TIMESTAMP_LENGTH) ||
+    typeof value.evidence_digest !== 'string' ||
+    !DIGEST_PATTERN.test(value.evidence_digest) ||
+    !(
+      value.resource_snapshot_digest === null ||
+      value.resource_snapshot_digest === undefined ||
+      (typeof value.resource_snapshot_digest === 'string' &&
+        DIGEST_PATTERN.test(value.resource_snapshot_digest))
+    ) ||
+    typeof value.resource_snapshot_complete !== 'boolean'
+  ) {
+    return undefined;
+  }
+  return {
+    generator_version: value.generator_version,
+    evidence_schema_version: value.evidence_schema_version,
+    evidence_cutoff: value.evidence_cutoff,
+    evidence_digest: value.evidence_digest,
+    resource_snapshot_digest:
+      typeof value.resource_snapshot_digest === 'string' ? value.resource_snapshot_digest : null,
+    resource_snapshot_complete: value.resource_snapshot_complete,
+  };
+}
+
+// A suggestion's freshness: null when the route reports none, undefined (an
+// invalid response) when what it sent is malformed. A reason code this view
+// does not know is kept, and one that is not even a code is kept as
+// `unrecognised`.
+export function projectFreshness(value: unknown): SuggestionFreshness | null | undefined {
+  if (value === undefined) {
+    return null;
+  }
+  if (
+    !isJsonObject(value) ||
+    !(
+      value.status === null ||
+      value.status === 'current' ||
+      value.status === 'stale' ||
+      value.status === 'superseded' ||
+      value.status === 'unbound' ||
+      value.status === 'unknown'
+    ) ||
+    !Array.isArray(value.reasons) ||
+    value.reasons.length > MAX_FRESHNESS_REASONS
+  ) {
+    return undefined;
+  }
+  return {
+    status: value.status,
+    reasons: value.reasons.map((reason) =>
+      typeof reason === 'string' && REASON_CODE_PATTERN.test(reason)
+        ? reason
+        : UNRECOGNISED_FRESHNESS_REASON,
+    ),
   };
 }
 

@@ -8,13 +8,16 @@
 //! - **The same row, the same decoding.** The row is read through the same
 //!   `RawRuleSuggestion` the SQLite store uses, in the same column order, so
 //!   a suggestion decodes identically whichever backend stored it.
-//! - **Generation is idempotent by the same identity.** `insert_suggestions`
+//! - **Generation is idempotent by the same identity.** `persist_suggestions`
 //!   is `INSERT ... ON CONFLICT (suggestion_type, method, path_pattern,
-//!   principal_key) DO NOTHING`, the SQLite store's `INSERT OR IGNORE` over
-//!   the same unique index: re-running generation inserts nothing new, and
-//!   two replicas generating at once cannot double-insert a target. The
-//!   batch is sorted by that identity before it is sent, so concurrent
-//!   batches take their uniqueness waits in one order and cannot deadlock.
+//!   principal_key) DO UPDATE ... WHERE`, the SQLite store's upsert over the
+//!   same unique index: re-running generation against unchanged inputs
+//!   writes nothing, an open row is rebound (revision + 1) only when the
+//!   policy, resources, generator or proposal it was bound to changed
+//!   (issue #243, item 19), and two replicas generating at once cannot
+//!   double-insert a target. The batch is sorted by that identity before it
+//!   is sent, so concurrent batches take their row locks in one order and
+//!   cannot deadlock.
 //! - **Listing orders and pages as SQLite does.** The page order is the
 //!   SQLite store's (`created_at` as an instant, then `id` bytewise) and
 //!   the cursor format is shared, so a page cursor means the same thing on
@@ -64,10 +67,11 @@ use tokio_postgres::{types::FromSql, Row};
 use crate::discovery::{
     lifecycle::{TransitionOutcome, TransitionPrecondition, TransitionRefused},
     query::{decode_cursor, encode_cursor, query_limit, utc_timestamp_rfc3339},
+    suggestion_binding::StoredGenerationBinding,
     suggestions::{
-        NewRuleSuggestion, RawRuleSuggestion, RuleSuggestion, RuleSuggestionCursor,
-        RuleSuggestionError, RuleSuggestionLifecycleState, RuleSuggestionListFilters,
-        RuleSuggestionListPage, RULE_SUGGESTION_COLUMNS,
+        NewRuleSuggestion, PersistedSuggestions, RawRuleSuggestion, RuleSuggestion,
+        RuleSuggestionCursor, RuleSuggestionError, RuleSuggestionLifecycleState,
+        RuleSuggestionListFilters, RuleSuggestionListPage, RULE_SUGGESTION_COLUMNS,
     },
 };
 
@@ -85,20 +89,75 @@ const OPERATION_GET_SUGGESTION: &str = "discovery_get_suggestion";
 const OPERATION_TRANSITION_SUGGESTION: &str = "discovery_transition_suggestion";
 const OPERATION_ACCEPT_SUGGESTION: &str = "discovery_accept_suggestion";
 
-const INSERT_SUGGESTIONS_SQL: &str = r#"
-INSERT INTO greengateway.discovery_rule_suggestions (
+/// Insert a generation run's suggestions and rebind the open rows it
+/// produced again (issue #243, item 19), in one statement over a batch
+/// sorted by identity, so two replicas generating at once take their row
+/// locks in one order and cannot deadlock. The SQLite store's upsert, with
+/// the same trigger: an open row is rebound only when it has no complete
+/// binding or was bound to different freshness inputs (the policy ETag,
+/// the generator or evidence schema version, the resource components or
+/// their completeness) or proposes a different rule. The evidence,
+/// rationale and cutoff are refreshed with a rebind and never trigger one.
+/// Accepted and dismissed rows are never touched, and a planned row
+/// without a binding never overwrites one. `RETURNING id` names the
+/// planned id for an insert and the existing id for a rebind.
+const UPSERT_SUGGESTIONS_SQL: &str = r#"
+INSERT INTO greengateway.discovery_rule_suggestions AS t (
     id, suggestion_type, method, path_pattern, principal_key, proposed_rule_json,
     rationale, evidence_json, state, created_at, updated_at, transitioned_at,
-    transitioned_by, source_signal_id
+    transitioned_by, source_signal_id, generator_version, evidence_schema_version,
+    evidence_cutoff, evidence_digest, binding_policy_etag, binding_policy_semantic_digest,
+    binding_resource_snapshot_digest, binding_resource_snapshot_complete,
+    binding_resource_components
 )
 SELECT id, suggestion_type, method, path_pattern, principal_key, proposed_rule_json,
-       rationale, evidence_json, state, created_at, created_at, NULL, NULL, source_signal_id
+       rationale, evidence_json, state, created_at, created_at, NULL, NULL, source_signal_id,
+       generator_version, evidence_schema_version, evidence_cutoff, evidence_digest,
+       binding_policy_etag, binding_policy_semantic_digest, binding_resource_snapshot_digest,
+       binding_resource_snapshot_complete, binding_resource_components
 FROM UNNEST(
     $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
-    $7::text[], $8::text[], $9::text[], $10::text[], $11::text[]
+    $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[],
+    $13::text[], $14::text[], $15::text[], $16::text[], $17::text[], $18::text[],
+    $19::boolean[], $20::text[]
 ) AS batch(id, suggestion_type, method, path_pattern, principal_key, proposed_rule_json,
-           rationale, evidence_json, state, created_at, source_signal_id)
-ON CONFLICT (suggestion_type, method, path_pattern, principal_key) DO NOTHING
+           rationale, evidence_json, state, created_at, source_signal_id, generator_version,
+           evidence_schema_version, evidence_cutoff, evidence_digest, binding_policy_etag,
+           binding_policy_semantic_digest, binding_resource_snapshot_digest,
+           binding_resource_snapshot_complete, binding_resource_components)
+ON CONFLICT (suggestion_type, method, path_pattern, principal_key) DO UPDATE SET
+    proposed_rule_json = EXCLUDED.proposed_rule_json,
+    rationale = EXCLUDED.rationale,
+    evidence_json = EXCLUDED.evidence_json,
+    updated_at = EXCLUDED.created_at,
+    generator_version = EXCLUDED.generator_version,
+    evidence_schema_version = EXCLUDED.evidence_schema_version,
+    evidence_cutoff = EXCLUDED.evidence_cutoff,
+    evidence_digest = EXCLUDED.evidence_digest,
+    binding_policy_etag = EXCLUDED.binding_policy_etag,
+    binding_policy_semantic_digest = EXCLUDED.binding_policy_semantic_digest,
+    binding_resource_snapshot_digest = EXCLUDED.binding_resource_snapshot_digest,
+    binding_resource_snapshot_complete = EXCLUDED.binding_resource_snapshot_complete,
+    binding_resource_components = EXCLUDED.binding_resource_components,
+    revision = t.revision + 1
+WHERE t.state = 'open'
+  AND EXCLUDED.generator_version IS NOT NULL
+  AND (
+    t.generator_version IS NULL
+    OR t.evidence_schema_version IS NULL
+    OR t.evidence_cutoff IS NULL
+    OR t.evidence_digest IS NULL
+    OR t.binding_policy_etag IS NULL
+    OR t.binding_resource_snapshot_complete IS NULL
+    OR t.binding_resource_components IS NULL
+    OR t.binding_policy_etag IS DISTINCT FROM EXCLUDED.binding_policy_etag
+    OR t.generator_version IS DISTINCT FROM EXCLUDED.generator_version
+    OR t.evidence_schema_version IS DISTINCT FROM EXCLUDED.evidence_schema_version
+    OR t.binding_resource_components IS DISTINCT FROM EXCLUDED.binding_resource_components
+    OR t.binding_resource_snapshot_complete
+        IS DISTINCT FROM EXCLUDED.binding_resource_snapshot_complete
+    OR t.proposed_rule_json IS DISTINCT FROM EXCLUDED.proposed_rule_json
+  )
 RETURNING id
 "#;
 
@@ -252,45 +311,48 @@ impl PostgresDiscoveryLifecycleStore {
         }
     }
 
-    /// Persist a generation run's suggestions, skipping every target that
-    /// already has a row (open, accepted, or dismissed); returns the ones
-    /// actually inserted, as they now read back. One statement for the
-    /// whole batch, sorted by identity (see the module documentation).
-    pub async fn insert_suggestions(
+    /// Persist a generation run's suggestions: insert new targets and
+    /// rebind the open rows whose freshness inputs or proposal changed
+    /// (see [`UPSERT_SUGGESTIONS_SQL`]). One statement for the whole batch,
+    /// sorted and deduplicated by identity (see the module documentation).
+    pub async fn persist_suggestions(
         &self,
         suggestions: &[NewRuleSuggestion],
-    ) -> Result<Vec<RuleSuggestion>, RuleSuggestionError> {
+    ) -> Result<PersistedSuggestions, RuleSuggestionError> {
         let operation = OPERATION_INSERT_SUGGESTIONS;
         if suggestions.is_empty() {
-            return Ok(Vec::new());
+            return Ok(PersistedSuggestions {
+                inserted: Vec::new(),
+                rebound: 0,
+            });
         }
         let mut ordered = suggestions.iter().collect::<Vec<_>>();
-        ordered.sort_by(|left, right| {
-            (
-                &left.suggestion_type,
-                &left.method,
-                &left.path_pattern,
-                &left.principal_key,
-            )
-                .cmp(&(
-                    &right.suggestion_type,
-                    &right.method,
-                    &right.path_pattern,
-                    &right.principal_key,
-                ))
-        });
+        ordered.sort_by(|left, right| left.identity().cmp(&right.identity()));
+        // `ON CONFLICT DO UPDATE` may not touch one row twice in a
+        // statement; the planner already keeps one suggestion per identity.
+        ordered.dedup_by(|right, left| left.identity() == right.identity());
 
-        let mut ids = Vec::with_capacity(ordered.len());
-        let mut suggestion_types = Vec::with_capacity(ordered.len());
-        let mut methods = Vec::with_capacity(ordered.len());
-        let mut path_patterns = Vec::with_capacity(ordered.len());
-        let mut principal_keys = Vec::with_capacity(ordered.len());
-        let mut proposed_rules = Vec::with_capacity(ordered.len());
-        let mut rationales = Vec::with_capacity(ordered.len());
-        let mut evidences = Vec::with_capacity(ordered.len());
-        let mut states = Vec::with_capacity(ordered.len());
-        let mut created_ats = Vec::with_capacity(ordered.len());
-        let mut source_signal_ids: Vec<Option<&str>> = Vec::with_capacity(ordered.len());
+        let len = ordered.len();
+        let mut ids = Vec::with_capacity(len);
+        let mut suggestion_types = Vec::with_capacity(len);
+        let mut methods = Vec::with_capacity(len);
+        let mut path_patterns = Vec::with_capacity(len);
+        let mut principal_keys = Vec::with_capacity(len);
+        let mut proposed_rules = Vec::with_capacity(len);
+        let mut rationales = Vec::with_capacity(len);
+        let mut evidences = Vec::with_capacity(len);
+        let mut states = Vec::with_capacity(len);
+        let mut created_ats = Vec::with_capacity(len);
+        let mut source_signal_ids: Vec<Option<&str>> = Vec::with_capacity(len);
+        let mut generator_versions: Vec<Option<String>> = Vec::with_capacity(len);
+        let mut evidence_schema_versions: Vec<Option<String>> = Vec::with_capacity(len);
+        let mut evidence_cutoffs: Vec<Option<String>> = Vec::with_capacity(len);
+        let mut evidence_digests: Vec<Option<String>> = Vec::with_capacity(len);
+        let mut policy_etags: Vec<Option<String>> = Vec::with_capacity(len);
+        let mut policy_semantic_digests: Vec<Option<String>> = Vec::with_capacity(len);
+        let mut snapshot_digests: Vec<Option<String>> = Vec::with_capacity(len);
+        let mut snapshot_completes: Vec<Option<bool>> = Vec::with_capacity(len);
+        let mut components: Vec<Option<String>> = Vec::with_capacity(len);
         for suggestion in &ordered {
             ids.push(suggestion.id.as_str());
             suggestion_types.push(suggestion.suggestion_type.as_str());
@@ -315,12 +377,22 @@ impl PostgresDiscoveryLifecycleStore {
             states.push(suggestion.state.as_str());
             created_ats.push(suggestion.created_at.as_str());
             source_signal_ids.push(suggestion.source_signal_id.as_deref());
+            let binding = StoredGenerationBinding::of(suggestion.generation.as_ref());
+            generator_versions.push(binding.generator_version);
+            evidence_schema_versions.push(binding.evidence_schema_version);
+            evidence_cutoffs.push(binding.evidence_cutoff);
+            evidence_digests.push(binding.evidence_digest);
+            policy_etags.push(binding.policy_etag);
+            policy_semantic_digests.push(binding.policy_semantic_digest);
+            snapshot_digests.push(binding.resource_snapshot_digest);
+            snapshot_completes.push(binding.resource_snapshot_complete);
+            components.push(binding.resource_components);
         }
 
         let client = self.client().await?;
         let rows = client
             .query(
-                INSERT_SUGGESTIONS_SQL,
+                UPSERT_SUGGESTIONS_SQL,
                 &[
                     &ids,
                     &suggestion_types,
@@ -333,19 +405,32 @@ impl PostgresDiscoveryLifecycleStore {
                     &states,
                     &created_ats,
                     &source_signal_ids,
+                    &generator_versions,
+                    &evidence_schema_versions,
+                    &evidence_cutoffs,
+                    &evidence_digests,
+                    &policy_etags,
+                    &policy_semantic_digests,
+                    &snapshot_digests,
+                    &snapshot_completes,
+                    &components,
                 ],
             )
             .await
             .map_err(|error| classify_query(error, operation))?;
-        let mut inserted_ids = std::collections::HashSet::with_capacity(rows.len());
+        let mut written_ids = std::collections::HashSet::with_capacity(rows.len());
         for row in &rows {
-            inserted_ids.insert(column::<String>(row, 0, operation)?);
+            written_ids.insert(column::<String>(row, 0, operation)?);
         }
-        Ok(ordered
-            .into_iter()
-            .filter(|suggestion| inserted_ids.contains(&suggestion.id))
-            .map(NewRuleSuggestion::as_suggestion)
-            .collect())
+        let inserted = ordered
+            .iter()
+            .filter(|suggestion| written_ids.contains(&suggestion.id))
+            .map(|suggestion| suggestion.as_suggestion())
+            .collect::<Vec<_>>();
+        Ok(PersistedSuggestions {
+            rebound: rows.len().saturating_sub(inserted.len()),
+            inserted,
+        })
     }
 
     /// Every suggestion, newest first: the unpaged list.
@@ -726,6 +811,19 @@ fn raw_suggestion(
         transitioned_by: column(row, 12, operation)?,
         source_signal_id: column(row, 13, operation)?,
         revision: column(row, 14, operation)?,
+        // A binding column that does not decode is a malformed binding,
+        // which reads as none rather than failing the row.
+        generation: StoredGenerationBinding {
+            generator_version: row.try_get(15).ok().flatten(),
+            evidence_schema_version: row.try_get(16).ok().flatten(),
+            evidence_cutoff: row.try_get(17).ok().flatten(),
+            evidence_digest: row.try_get(18).ok().flatten(),
+            policy_etag: row.try_get(19).ok().flatten(),
+            policy_semantic_digest: row.try_get(20).ok().flatten(),
+            resource_snapshot_digest: row.try_get(21).ok().flatten(),
+            resource_snapshot_complete: row.try_get(22).ok().flatten(),
+            resource_components: row.try_get(23).ok().flatten(),
+        },
     })
 }
 
