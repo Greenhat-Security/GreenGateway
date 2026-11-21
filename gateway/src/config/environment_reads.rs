@@ -109,7 +109,7 @@ const ENVIRONMENT_READS: &[EnvironmentRead] = &[
         file: "src/admin_observability_app_tests.rs",
         names: ReadNames::Fixed(&["GATEWAY_TEST_POSTGRES_URL_FILE"]),
         purpose: ReadPurpose::TestHarness,
-        reads: 2,
+        reads: 1,
     },
     EnvironmentRead {
         file: "src/admin_policy_app_tests.rs",
