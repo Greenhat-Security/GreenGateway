@@ -1007,9 +1007,23 @@ no caller key.
   rotated again or deleted, the value of the replayed change no longer exists and
   cannot be compared, so the receipt is returned as it is; its `revision` shows
   that it is no longer current. Nothing derived from either value is stored.
+  The comparison does tell whoever holds both the key and the same principal
+  (actor kind, issuer, subject and auth mode are bound) whether a value they
+  send equals the stored one, `200` or `409`, for as long as the secret stays at
+  that revision. The key is not secret (it is the `operation_id` of the receipt
+  and of the delivered record), so this matters for a shared automation identity
+  and a low-entropy value; a replay and a replay conflict record no audit event.
 - **Order of work.** Each handler authorizes the caller
-  (`admin:connections:secrets:write`) and validates the body (its JSON, and the
-  purpose and value of a create or rotation) before it binds the key
+  (`admin:connections:secrets:write`) and first answers a gateway without a
+  local-secret store, keyed or not, as it always has: a create is judged by its
+  collection `If-Match` and is then `503`, and a rotation or delete is judged by
+  its `If-Match` alone (`428`, `400`, or `412` since there is no stored secret to
+  match). The routes are mounted on every
+  cluster replica, which never has a store, so this comes before any key is
+  bound or gate asked: a keyed request there never raises the contract fence
+  for an operation the replica cannot perform. Then the handler validates the
+  body (its JSON, and the purpose and value of a create or rotation) and binds
+  the key
   through `caller_operation()`, asks the evidence gate (as `secret.create` or
   `secret.rotate`; a delete is a withdrawal and never asks it) and answers an exact
   retry from the read-only pre-check. All of this happens before `If-Match` is
@@ -1039,7 +1053,8 @@ no caller key.
 - **Required mode.** Create and rotation are `caller_key_required`: only the keyed
   request of an issuer-bound principal with `qualified_v1`, the file sink and a
   Unix build is admitted, and every other form, service-token callers included,
-  is `409 authority_evidence_unsupported` before anything is read or written.
+  is `409 authority_evidence_unsupported` before anything is written or a key
+  is read (a rotation has read the stored secret's metadata by then).
   Deletion is admitted in every form. The admin UI sends no key, so under
   `required` it can delete a local secret but not create or rotate one (#242
   tracks adding keys to it).
@@ -1073,11 +1088,18 @@ file sink and redelivers them byte for byte. Through the admin handlers,
 `required_mode_admits_every_form_of_secret_delete`,
 `a_keyed_secret_change_that_is_forbidden_or_malformed_reserves_nothing` (`403`,
 `400` and `428`, each leaving no reservation),
+`a_keyed_secret_change_without_a_local_secret_store_is_answered_like_the_unkeyed_one`
+(no keyring: keyed answers as unkeyed, the precondition before `503`, under
+best_effort and required),
 `an_admitted_secret_change_finishes_after_its_client_goes_away` and
 `a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
 (markers in the value, the label and a conflicting retry's value, checked against
 the answers, the audit events, the logs, the metrics, the SQLite file and its WAL).
-There are no PostgreSQL tests in this family.
+The one PostgreSQL test,
+`authority_evidence_app_tests::cluster_connection_keys::postgres_keyed_secret_changes_in_cluster_mode_leave_the_fence_alone`,
+proves that a keyed rotation and delete on a cluster replica, once the operation
+gate would raise the fence, answer as their unkeyed forms, leave the contract
+fence unchanged and reserve nothing.
 
 ## Keyed safe references
 

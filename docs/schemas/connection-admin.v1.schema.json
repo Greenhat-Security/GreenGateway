@@ -1745,7 +1745,7 @@
       }
     },
     "OperationReceipt": {
-      "description": "What an exact retry of a keyed Connection create, replace or delete, of a keyed catalog publication or overlay change, or of a keyed local-secret create, rotation or delete, is answered with (issue #425): read from the committed evidence row, never a secret value, a label, a credential alias, a specification, an overlay or a binding digest. revision is the Connection's revision after the change, or the revision a deletion removed; for a catalog operation it is the catalog revision the publication made; for a local secret it is the secret's version after the create or rotation, or the version a deletion removed, and resource_id is the secret ID.",
+      "description": "What an exact retry of a keyed Connection create, replace or delete, of a keyed catalog publication or overlay change, or of a keyed local-secret create, rotation or delete, is answered with (issue #425): read from the committed evidence row, never a secret value, a label, a credential alias other than the resource's own ID, a specification, an overlay or a binding digest. revision is the Connection's revision after the change, or the revision a deletion removed; for a catalog operation it is the catalog revision the publication made; for a local secret it is the secret's version after the create or rotation, or the version a deletion removed, and resource_id is the secret ID the caller addressed or was answered with.",
       "type": "object",
       "additionalProperties": false,
       "required": [

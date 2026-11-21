@@ -1378,16 +1378,7 @@ fn operation_id_for(caller: Option<&CallerOperation>) -> String {
 
 /// The ETag the admin API gives the secret `id` at `version`.
 fn item_etag(id: &str, version: u64) -> String {
-    super::admin::secret_metadata_etag(&SecretAliasMetadata {
-        id: id.to_owned(),
-        label: String::new(),
-        provider: SecretProviderKind::LocalEncrypted,
-        configured: true,
-        purpose: None,
-        pinned: false,
-        version: Some(version),
-        rotated_at: None,
-    })
+    super::admin::secret_item_etag(id, version)
 }
 
 /// Whether two values are equal, in time that depends only on their

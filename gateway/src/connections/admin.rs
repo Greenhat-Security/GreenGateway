@@ -167,11 +167,15 @@ impl SafeSecretAliasView {
 }
 
 pub fn secret_metadata_etag(metadata: &SecretAliasMetadata) -> String {
-    format!(
-        "\"connection-secret:{}:v{}\"",
-        metadata.id,
-        metadata.version.unwrap_or_default()
-    )
+    secret_item_etag(&metadata.id, metadata.version.unwrap_or_default())
+}
+
+/// The item ETag of the secret `id` at `version`: what
+/// [`secret_metadata_etag`] hands out, and what the local-secret store
+/// compares a rotation's or a deletion's `If-Match` with inside its
+/// transaction (issue #425). One function, so the two cannot drift apart.
+pub fn secret_item_etag(id: &str, version: u64) -> String {
+    format!("\"connection-secret:{id}:v{version}\"")
 }
 
 pub fn secret_collection_etag(metadata: &[SecretAliasMetadata]) -> String {

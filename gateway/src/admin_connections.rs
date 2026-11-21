@@ -113,7 +113,24 @@ async fn connection_secret_create(state: ConnectionAdminState, request: AxumRequ
         };
     }
     if !state.control_plane.is_local_secret_manager_configured() {
-        return connection_secret_store_not_configured();
+        // As before caller keys, keyed or not: the collection precondition,
+        // then `503`. No key is bound and no gate asked (issue #425).
+        let current_collection_etag = connections::admin::secret_collection_etag(
+            &state.control_plane.secret_alias_metadata(),
+        );
+        return match if_match_matches(&parts.headers, &current_collection_etag) {
+            Ok(true) => connection_secret_store_not_configured(),
+            Ok(false) => with_connection_secret_collection_etag(
+                precondition_failed(
+                    "If-Match does not match the current connection-secret collection ETag",
+                ),
+                &current_collection_etag,
+            ),
+            Err(error) => with_connection_secret_collection_etag(
+                if_match_error_response(error),
+                &current_collection_etag,
+            ),
+        };
     }
 
     let body =
@@ -135,6 +152,16 @@ async fn connection_secret_create(state: ConnectionAdminState, request: AxumRequ
         Ok(secret) => secret,
         Err(_) => return connection_secret_validation_error(),
     };
+
+    // The collection as it stood before the key is judged, as a rotation
+    // and a delete read the stored secret first. When a first request with
+    // the same key commits after this read -- even after the pre-check
+    // below answered `Unused` -- the retry's `If-Match` still matches this
+    // snapshot, so the retry reaches the store, which judges the key before
+    // the collection and answers from the receipt, instead of this handler
+    // answering `412` (plan P8: the store's judgement is authoritative).
+    let current_collection_etag =
+        connections::admin::secret_collection_etag(&state.control_plane.secret_alias_metadata());
 
     // Authorized and validated: bind the caller key, ask the gate, and
     // judge the key before the collection precondition, which a committed
@@ -158,9 +185,6 @@ async fn connection_secret_create(state: ConnectionAdminState, request: AxumRequ
     };
     let retry = caller.as_ref().is_some_and(|keyed| keyed.retry);
     if !retry {
-        let current_collection_etag = connections::admin::secret_collection_etag(
-            &state.control_plane.secret_alias_metadata(),
-        );
         match if_match_matches(&parts.headers, &current_collection_etag) {
             Ok(true) => {}
             Ok(false) => {
@@ -335,6 +359,31 @@ fn current_local_secret(
     }
 }
 
+/// The answer to a rotation or delete on a gateway with no local-secret
+/// store -- every cluster replica, and a standalone one without a keyring --
+/// decided before the body is read and before a caller key is bound or any
+/// gate is asked (issue #425). Such a gateway cannot perform the change, so
+/// a keyed request must not raise the cluster's caller-key contract fence or
+/// be judged by the evidence gate: keyed or not, it is answered as before
+/// keys existed, `428`/`400`/`412` from the `If-Match` precondition (there
+/// is no stored secret to match), or `503` should one be listed anyway.
+/// `None` when the store is configured.
+fn without_local_secret_manager(
+    state: &ConnectionAdminState,
+    headers: &HeaderMap,
+    current: Option<&connections::secret::SecretAliasMetadata>,
+) -> Option<Response> {
+    if state.control_plane.is_local_secret_manager_configured() {
+        return None;
+    }
+    Some(
+        match connection_secret_item_precondition(state, headers, current) {
+            Ok(()) => connection_secret_store_not_configured(),
+            Err(response) => *response,
+        },
+    )
+}
+
 pub(super) async fn connection_secret_rotate_endpoint(
     State(state): State<ConnectionAdminState>,
     Path(raw_id): Path<String>,
@@ -380,6 +429,9 @@ async fn connection_secret_rotate(
         Ok(current) => current,
         Err(response) => return *response,
     };
+    if let Some(response) = without_local_secret_manager(&state, &parts.headers, current.as_ref()) {
+        return response;
+    }
     let body =
         match read_connection_secret_body(body, connection_secret_admin_body_limit(&state)).await {
             Ok(body) => body,
@@ -579,6 +631,9 @@ async fn connection_secret_delete(
         Ok(current) => current,
         Err(response) => return *response,
     };
+    if let Some(response) = without_local_secret_manager(&state, &parts.headers, current.as_ref()) {
+        return response;
+    }
     let body = match read_connection_secret_body(body, state.max_body_size.min(1024)).await {
         Ok(body) => body,
         Err(response) => return *response,
@@ -749,9 +804,14 @@ struct KeyedSecretOperation {
 /// (empty for a create), the `If-Match` value and the label and purpose
 /// ([`connections::local_secret::SecretChangeBinding`]), never the secret
 /// value; the evidence gate (create and rotate) is asked; and the
-/// reservation table is read. A key bound to anything else is `409`. Local
-/// secrets have no cluster mode, so the operation gate is never asked.
-/// `Ok(None)` is an unkeyed request the gate admitted.
+/// reservation table is read. A key bound to anything else is `409`.
+/// Local secrets exist only on a standalone gateway with a keyring: every
+/// handler answers a gateway without a local-secret store before it gets
+/// here (`connection_secret_store_not_configured` for a create,
+/// [`without_local_secret_manager`] for a rotation or delete), and this
+/// function refuses one again before anything is bound, so the operation
+/// gate is never asked and a cluster's contract fence never moves for a
+/// local secret. `Ok(None)` is an unkeyed request the gate admitted.
 #[allow(clippy::too_many_arguments)]
 async fn admit_keyed_secret_change(
     state: &ConnectionAdminState,
@@ -763,6 +823,9 @@ async fn admit_keyed_secret_change(
     label: Option<&str>,
     purpose: Option<connections::secret::SecretPurpose>,
 ) -> ResponseResult<Option<KeyedSecretOperation>> {
+    if !state.control_plane.is_local_secret_manager_configured() {
+        return Err(Box::new(connection_secret_store_not_configured()));
+    }
     let caller = if parts.headers.contains_key("idempotency-key") {
         let if_match = if_match_precondition(&parts.headers)?;
         let binding = connections::local_secret::SecretChangeBinding {

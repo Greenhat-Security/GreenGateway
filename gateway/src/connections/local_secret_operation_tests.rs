@@ -63,6 +63,25 @@ fn etag(metadata: &SecretAliasMetadata) -> String {
     super::super::admin::secret_metadata_etag(metadata)
 }
 
+/// The ETag the store compares a rotation's or a deletion's `If-Match` with
+/// is the one the admin API hands out for the same secret, whatever its
+/// label, purpose and rotation time.
+#[test]
+fn the_store_compares_the_item_etag_the_admin_api_hands_out() {
+    let metadata = SecretAliasMetadata {
+        id: "local-secret-etag".to_owned(),
+        label: "A labelled secret".to_owned(),
+        provider: SecretProviderKind::LocalEncrypted,
+        configured: true,
+        purpose: Some(SecretPurpose::StaticBearer),
+        pinned: true,
+        version: Some(7),
+        rotated_at: Some("2026-11-21T00:00:00Z".to_owned()),
+    };
+    assert_eq!(item_etag("local-secret-etag", 7), etag(&metadata));
+    assert_ne!(item_etag("local-secret-etag", 6), etag(&metadata));
+}
+
 fn create_key(seed: u8, actor: &ChangeActor, label: &str) -> CallerOperation {
     SecretChangeBinding {
         action: EVIDENCE_ACTION_CREATE,

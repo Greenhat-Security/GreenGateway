@@ -1,8 +1,11 @@
 //! Keyed local-secret changes through the real admin handlers (issue #425,
 //! plan P8): the application rows of the family's test matrix. Local
 //! secrets exist only in standalone mode (cluster mode rejects a local
-//! secret keyring), so there is no PostgreSQL row and no contract fence:
-//! the operation gate is never asked for them.
+//! secret keyring). A gateway without a local-secret store answers a keyed
+//! rotation or delete as it answers the unkeyed one, before any key is
+//! bound or gate asked: the standalone row is here, and the cluster row,
+//! which proves the contract fence never moves for one, is
+//! `cluster_connection_keys::postgres_keyed_secret_changes_in_cluster_mode_leave_the_fence_alone`.
 
 use super::*;
 
@@ -317,8 +320,9 @@ async fn required_mode_refuses_the_unkeyed_secret_create_and_rotate_and_admits_t
 }
 
 /// The rest of the gate: required mode refuses a keyed local-secret create
-/// by a gateway service token, under `delivery_v1`, or with the log sink,
-/// and each refusal names the criterion; nothing is written or reserved.
+/// and a keyed rotation by a gateway service token, under `delivery_v1`, or
+/// with the log sink, and each refusal names the operation and the
+/// criterion; nothing is written or reserved.
 #[tokio::test]
 async fn required_mode_refuses_a_keyed_secret_change_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink(
 ) {
@@ -337,6 +341,16 @@ async fn required_mode_refuses_a_keyed_secret_change_by_a_service_token_or_under
             _ => keyed_admin(&["connections-secret-manager"]),
         };
         let connection_db = TempDb::new("keyed-secret-refused");
+        let best_effort =
+            keyed_connection_router(&connection_db, &policy, test_audit_log(), |_| {});
+        let (id, etag) = create_unkeyed(
+            &best_effort,
+            &keyed_admin(&["connections-secret-manager"]),
+            "Refused rotation",
+            "stored-value",
+        )
+        .await;
+        drop(best_effort);
         let router = keyed_connection_router(&connection_db, &policy, test_audit_log(), |config| {
             qualified_required(config, &events);
             match case {
@@ -348,27 +362,51 @@ async fn required_mode_refuses_a_keyed_secret_change_by_a_service_token_or_under
             }
         });
         let collection = secret_collection_etag(&router, &principal).await;
-        let (status, _, refused) = exchange(
-            &router,
-            keyed_connection_request(
-                Method::POST,
-                CONNECTION_SECRETS_ADMIN_ROUTE,
-                principal,
-                Some(secret_create_body("Refused secret", "refused-value")),
-                Some(&collection),
-                Some(&caller_key(76)),
+        let item = format!("{CONNECTION_SECRETS_ADMIN_ROUTE}/{id}");
+        for (operation, request) in [
+            (
+                "secret.create",
+                keyed_connection_request(
+                    Method::POST,
+                    CONNECTION_SECRETS_ADMIN_ROUTE,
+                    principal.clone(),
+                    Some(secret_create_body("Refused secret", "refused-value")),
+                    Some(&collection),
+                    Some(&caller_key(76)),
+                ),
             ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{case}: {refused}");
+            (
+                "secret.rotate",
+                keyed_connection_request(
+                    Method::PUT,
+                    &item,
+                    principal.clone(),
+                    Some(secret_rotate_body("refused-rotation")),
+                    Some(&etag),
+                    Some(&caller_key(75)),
+                ),
+            ),
+        ] {
+            let (status, _, refused) = exchange(&router, request).await;
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "{case} {operation}: {refused}"
+            );
+            assert_eq!(
+                refused["error"],
+                json!(format!(
+                    "AUTHORITY_EVIDENCE_DURABILITY=required refuses {operation}: standalone mode admits it only {requirement}; nothing was changed"
+                )),
+                "{case} {operation}"
+            );
+        }
+        // Only the setup's unkeyed create left evidence.
         assert_eq!(
-            refused["error"],
-            json!(format!(
-                "AUTHORITY_EVIDENCE_DURABILITY=required refuses secret.create: standalone mode admits it only {requirement}; nothing was changed"
-            )),
+            secret_evidence(&connection_db.path),
+            ["secret.create"],
             "{case}"
         );
-        assert!(secret_evidence(&connection_db.path).is_empty(), "{case}");
         assert!(
             secret_reservations(&connection_db.path).is_empty(),
             "{case}"
@@ -439,8 +477,10 @@ async fn required_mode_admits_every_form_of_secret_delete() {
 /// request `400` (or `428` without `If-Match`); none asks a gate, reads the
 /// key or reserves anything. The key below was first committed by an
 /// authorized caller with another label, so a handler that bound and
-/// pre-checked the key first would answer `409` instead. Local secrets have
-/// no cluster mode, so there is no contract fence to leave unchanged.
+/// pre-checked the key first would answer `409` instead. A gateway with a
+/// local-secret store is never a cluster replica, so there is no contract
+/// fence here; the cluster row, where the routes are mounted without a
+/// store, is `cluster_connection_keys::postgres_keyed_secret_changes_in_cluster_mode_leave_the_fence_alone`.
 #[tokio::test]
 async fn a_keyed_secret_change_that_is_forbidden_or_malformed_reserves_nothing() {
     let connection_db = TempDb::new("keyed-secret-forbidden");
@@ -592,6 +632,114 @@ async fn a_keyed_secret_change_that_is_forbidden_or_malformed_reserves_nothing()
     }
     assert_eq!(refused_operations(&capture, 1), ["secret.create"]);
     assert_eq!(secret_reservations(&connection_db.path).len(), 1);
+}
+
+/// A standalone gateway with no local-secret keyring cannot create, rotate
+/// or delete a local secret, so a keyed request is answered exactly as the
+/// unkeyed one, under best_effort and required alike, and as before caller
+/// keys: a rotation or delete `412` with an `If-Match` (there is no stored
+/// secret to match) and `428` without, never the `503` of an unavailable
+/// store; a create `412` with a stale collection `If-Match`, `428` without,
+/// and `503` only once its precondition holds. No evidence gate refuses it
+/// and no key is read or reserved.
+#[tokio::test]
+async fn a_keyed_secret_change_without_a_local_secret_store_is_answered_like_the_unkeyed_one() {
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let events = TempDb::new("keyed-secret-no-store-events");
+    let admin = keyed_admin(&["connections-secret-manager"]);
+    let item = format!("{CONNECTION_SECRETS_ADMIN_ROUTE}/never-stored");
+    let stale = "\"connection-secret:never-stored:v1\"";
+    for required in [false, true] {
+        let connection_db = TempDb::new("keyed-secret-no-store");
+        let (audit_log, capture) = captured_audit();
+        let router = keyed_connection_router(&connection_db, &policy, audit_log, |config| {
+            config.connection_local_secret_keyring = Vec::new();
+            if required {
+                qualified_required(config, &events);
+                config.authority_events.sink = config::AuthorityEventSinkSetting::Log;
+            }
+        });
+        let collection = secret_collection_etag(&router, &admin).await;
+        let create = Some(secret_create_body("Never stored", "never-stored-value"));
+        let rotate = Some(secret_rotate_body("never-stored-value"));
+        for (method, route, body, if_match, expected) in [
+            (
+                Method::PUT,
+                item.as_str(),
+                rotate.clone(),
+                Some(stale),
+                StatusCode::PRECONDITION_FAILED,
+            ),
+            (
+                Method::PUT,
+                item.as_str(),
+                rotate,
+                None,
+                StatusCode::PRECONDITION_REQUIRED,
+            ),
+            (
+                Method::DELETE,
+                item.as_str(),
+                None,
+                Some(stale),
+                StatusCode::PRECONDITION_FAILED,
+            ),
+            (
+                Method::DELETE,
+                item.as_str(),
+                None,
+                None,
+                StatusCode::PRECONDITION_REQUIRED,
+            ),
+            (
+                Method::POST,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                create.clone(),
+                Some(stale),
+                StatusCode::PRECONDITION_FAILED,
+            ),
+            (
+                Method::POST,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                create.clone(),
+                None,
+                StatusCode::PRECONDITION_REQUIRED,
+            ),
+            (
+                Method::POST,
+                CONNECTION_SECRETS_ADMIN_ROUTE,
+                create,
+                Some(collection.as_str()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let mut answers = Vec::new();
+            for key in [None, Some(caller_key(81))] {
+                let (status, _, answer) = exchange(
+                    &router,
+                    keyed_connection_request(
+                        method.clone(),
+                        route,
+                        admin.clone(),
+                        body.clone(),
+                        if_match,
+                        key.as_deref(),
+                    ),
+                )
+                .await;
+                answers.push((status, answer));
+            }
+            let case = format!("required={required} {method} If-Match={if_match:?}");
+            assert_eq!(answers[0].0, expected, "{case}: {:?}", answers[0].1);
+            assert_eq!(answers[1], answers[0], "{case}");
+        }
+        assert!(secret_reservations(&connection_db.path).is_empty());
+        assert!(secret_evidence(&connection_db.path).is_empty());
+        assert!(capture
+            .events()
+            .iter()
+            .all(|event| event.event_type != audit::event::AUTHORITY_EVIDENCE_OPERATION_REFUSED));
+    }
 }
 
 /// A local-secret change runs to completion once admitted, even when its
