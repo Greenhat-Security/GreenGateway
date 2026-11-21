@@ -2027,6 +2027,91 @@ async fn an_admitted_connection_change_finishes_after_its_client_goes_away() {
 /// Keyed Connection changes in cluster mode, through the admin handlers of a
 /// PostgreSQL-backed replica with a real roster (issue #425). The verified-TLS
 /// CI shard selects this module by its prefix.
+/// A keyed replacement of a Connection that is no longer in the snapshot is
+/// validated as a replacement before its key is admitted (issue #425):
+/// admission can raise the cluster's contract fence on its first use, so an
+/// invalid body must be refused first. Under required mode with the log
+/// sink, where admission refuses every keyed replacement, an invalid body is
+/// `400` and a valid one reaches admission and is refused there; neither
+/// reserves anything.
+#[tokio::test]
+async fn a_keyed_replacement_of_a_missing_connection_is_validated_before_admission() {
+    let connection_db = TempDb::new("keyed-connection-missing-replace");
+    let events = TempDb::new("keyed-connection-missing-replace-events");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let admin = keyed_admin(&["connections-superadmin"]);
+    let best_effort = keyed_connection_router(&connection_db, &policy, test_audit_log(), |_| {});
+    let collection_etag = connection_collection_etag(&best_effort).await;
+    let (status, etag, created) = exchange(
+        &best_effort,
+        keyed_connection_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            admin.clone(),
+            Some(plain_connection_body("Missing API")),
+            Some(&collection_etag),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let route = format!(
+        "{CONNECTIONS_ADMIN_ROUTE}/{}",
+        created["id"].as_str().expect("an ID")
+    );
+    let etag = etag.expect("an ETag");
+    let (status, _, deleted) = exchange(
+        &best_effort,
+        keyed_connection_request(
+            Method::DELETE,
+            &route,
+            admin.clone(),
+            None,
+            Some(&etag),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    drop(best_effort);
+    let router = keyed_connection_router(&connection_db, &policy, test_audit_log(), |config| {
+        qualified_required(config, &events);
+        config.authority_events.sink = config::AuthorityEventSinkSetting::Log;
+    });
+
+    let mut invalid: Value =
+        serde_json::from_str(&plain_connection_body("Missing API")).expect("the body parses");
+    invalid["endpoint"]["base_url"] = json!("not a URL");
+    let (status, _, refused) = exchange(
+        &router,
+        keyed_connection_request(
+            Method::PUT,
+            &route,
+            admin.clone(),
+            Some(invalid.to_string()),
+            Some(&etag),
+            Some(&caller_key(90)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    let (status, _, refused) = exchange(
+        &router,
+        keyed_connection_request(
+            Method::PUT,
+            &route,
+            admin.clone(),
+            Some(plain_connection_body("Missing API")),
+            Some(&etag),
+            Some(&caller_key(91)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["reason"], json!("authority_evidence_unsupported"));
+    assert!(standalone_reservations(&connection_db.path).is_empty());
+}
+
 #[cfg(feature = "postgres")]
 mod cluster_connection_keys {
     use super::*;
