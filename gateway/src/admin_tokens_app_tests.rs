@@ -1779,6 +1779,9 @@ fn token_changes(capture: &audit::sink::tests::CaptureSink, action: &str) -> usi
 #[tokio::test]
 async fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext()
 {
+    // Every log line the handlers write, at every level, on this thread
+    // (where the current-thread runtime runs them).
+    let (logs, _logging) = capture_all_logs();
     let token_db = TempDb::new("keyed-token-replay");
     let policy = TempPolicyFile::new(&token_policy_document_string());
     let capture = audit::sink::tests::CaptureSink::new();
@@ -1994,10 +1997,86 @@ async fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_ret
     assert_eq!(token_changes(&capture, "token_created"), 2);
     assert_eq!(token_changes(&capture, "token_rotated"), 1);
     let audited = serde_json::to_string(&capture.events()).expect("events serialize");
-    for reservation in token_reservations(&token_db.path) {
-        let digest = reservation.2.expect("a digest");
-        assert!(!audited.contains(&digest), "no digest in the audit stream");
+    let digests: Vec<String> = token_reservations(&token_db.path)
+        .into_iter()
+        .map(|reservation| reservation.2.expect("a digest"))
+        .collect();
+    for digest in &digests {
+        assert!(!audited.contains(digest), "no digest in the audit stream");
     }
+
+    // A reservation that cannot be written fails the keyed issue with a
+    // server error and mints nothing (test-only fault injection through a
+    // second connection).
+    rusqlite::Connection::open(&token_db.path)
+        .expect("the database opens")
+        .execute_batch(
+            "CREATE TRIGGER fail_caller_key_reservation \
+             BEFORE INSERT ON authority_caller_operation_ids \
+             BEGIN SELECT RAISE(ABORT, 'injected reservation failure'); END;",
+        )
+        .expect("the fault installs");
+    let (status, _, failed) = token_exchange(&router, issue(&body, &token_key(4))).await;
+    assert!(status.is_server_error(), "{status}: {failed}");
+    assert_eq!(token_evidence(&token_db.path).len(), evidence.len());
+
+    // Neither plaintext nor any binding digest reached a log line: the
+    // keyed issue, rotation, replays, conflicts, refusals and the failed
+    // reservation above all logged through these handlers.
+    let logged = logs.contents();
+    assert!(!logged.is_empty(), "the handlers logged");
+    for marker in [plaintext.as_str(), rotated_plaintext.as_str()]
+        .into_iter()
+        .chain(digests.iter().map(String::as_str))
+    {
+        assert!(!logged.contains(marker), "a secret marker reached the logs");
+    }
+}
+
+#[derive(Clone, Default)]
+struct CapturedLogs {
+    buffer: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl CapturedLogs {
+    fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.buffer.lock().expect("captured logs lock")).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.buffer
+            .lock()
+            .map_err(|_| std::io::Error::other("captured logs lock poisoned"))?
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = CapturedLogs;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Every level on this thread, so a debug line that carried a plaintext or
+/// a digest would show.
+fn capture_all_logs() -> (CapturedLogs, impl Drop) {
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(logs.clone())
+        .finish();
+    (logs, crate::tracing_test_guard(subscriber))
 }
 
 /// I4 end to end: under `required`, the unkeyed issue and rotation are
@@ -2202,4 +2281,231 @@ async fn required_mode_admits_every_form_of_token_revocation() {
         .map(|(_, _, token)| token)
         .collect();
     assert_eq!(revoked, ids);
+}
+
+/// A standalone token router over `token_db` that authenticates bearer
+/// tokens, service tokens included, and caches their verification for a
+/// minute, so that only an invalidation can withdraw a cached plaintext.
+fn bearer_token_router(
+    token_db: &TempDb,
+    policy: &TempPolicyFile,
+    audit_log: audit::AuditLog,
+) -> Router {
+    let mut config = test_config(Vec::new());
+    config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+    config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+    config.service_token_cache_ttl_ms = 60_000;
+    config.rbac_exempt_paths.push(TOKENS_ADMIN_ROUTE.to_owned());
+    config.rate_limit_write_burst = 1_000;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    app(
+        config,
+        recorder.handle(),
+        audit_log,
+        test_audit_event_sender(),
+    )
+    .expect("app should build")
+}
+
+/// A service token that may rotate itself: it carries `token-admin` and the
+/// `probe-reader` role the probe route needs.
+fn self_rotating_token(token_db: &TempDb) -> auth::tokens::CreatedToken {
+    auth::tokens::SqliteTokenStore::open(&token_db.path)
+        .expect("token store should open")
+        .create(
+            auth::tokens::CreateTokenRequest {
+                scopes: vec!["token-admin".to_owned(), "probe-reader".to_owned()],
+                created_by: "bootstrap-admin".to_owned(),
+                expires_at: None,
+            },
+            &auth::change_actor::ChangeActor::for_test("bootstrap-admin"),
+        )
+        .expect("service token should create")
+}
+
+/// A keyed rotation of `id` authenticated by the bearer `plaintext`.
+fn keyed_bearer_rotation(id: &str, plaintext: &str, key: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(format!("{TOKENS_ADMIN_ROUTE}/{id}/rotate"))
+        .header(header::AUTHORIZATION, format!("Bearer {plaintext}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("idempotency-key", key)
+        .body(Body::empty())
+        .expect("rotate request should build")
+}
+
+/// An exact retry of a keyed rotation is answered from its receipt and
+/// rotates nothing again, but it still drops the replaced plaintext from the
+/// answering process's validator cache. Here a second process sharing the
+/// token file cached the plaintext before the first one rotated it: before
+/// the retry it still accepts the replaced plaintext (its cache outlives the
+/// rotation), and after the retry it refuses it.
+#[tokio::test]
+async fn a_keyed_rotation_retry_drops_the_replaced_plaintext_from_the_answering_cache() {
+    let token_db = TempDb::new("keyed-token-replay-cache");
+    let created = self_rotating_token(&token_db);
+    let policy = TempPolicyFile::new(&service_token_policy_document());
+    let first = bearer_token_router(&token_db, &policy, test_audit_log());
+    let second = bearer_token_router(&token_db, &policy, test_audit_log());
+    let replaced = created.plaintext_token.clone();
+    assert_eq!(
+        authenticated_principal_probe(&second, &replaced)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let key = token_key(50);
+    let (status, _, rotated) = token_exchange(
+        &first,
+        keyed_bearer_rotation(&created.record.id, &replaced, &key),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rotated}");
+    let current = rotated["plaintext_token"]
+        .as_str()
+        .expect("the first rotation carries the plaintext")
+        .to_owned();
+    assert_eq!(
+        authenticated_principal_probe(&second, &replaced)
+            .await
+            .status(),
+        StatusCode::OK,
+        "the second process still holds the replaced plaintext in its cache"
+    );
+
+    let (status, _, receipt) = token_exchange(
+        &second,
+        keyed_bearer_rotation(&created.record.id, &current, &key),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["operation"], json!("service_token.rotate"));
+    assert_eq!(receipt["secret_returned"], json!(false));
+    assert_eq!(
+        authenticated_principal_probe(&second, &replaced)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED,
+        "the retry dropped the replaced plaintext from the answering cache"
+    );
+    assert_eq!(
+        authenticated_principal_probe(&second, &current)
+            .await
+            .status(),
+        StatusCode::OK,
+        "the retry rotated nothing again"
+    );
+}
+
+/// A keyed rotation runs to completion once admitted, even when its client
+/// goes away while the store is committing it: its audit event is emitted
+/// and this process stops accepting the replaced plaintext from its cache,
+/// though nobody waited for the response. Before the rotation ran on its own
+/// task, the dropped handler left both undone, and the keyed retry, answered
+/// from the receipt, repeats no audit event.
+#[tokio::test]
+async fn an_admitted_token_rotation_finishes_after_its_client_goes_away() {
+    let token_db = TempDb::new("keyed-token-abandoned");
+    let created = self_rotating_token(&token_db);
+    let policy = TempPolicyFile::new(&service_token_policy_document());
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = bearer_token_router(&token_db, &policy, audit_log);
+    let replaced = created.plaintext_token.clone();
+    assert_eq!(
+        authenticated_principal_probe(&router, &replaced)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let path = token_db.path.clone();
+    super::authority_evidence_app_tests::abandon_once_committed(
+        &router,
+        keyed_bearer_rotation(&created.record.id, &replaced, &token_key(51)),
+        move || {
+            token_evidence(&path)
+                .iter()
+                .any(|(_, action, _)| action == "service_token.rotate")
+        },
+    )
+    .await;
+
+    let started = Instant::now();
+    loop {
+        let refused = authenticated_principal_probe(&router, &replaced)
+            .await
+            .status()
+            == StatusCode::UNAUTHORIZED;
+        if (refused && token_changes(&capture, "token_rotated") == 1)
+            || started.elapsed() > Duration::from_secs(5)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        authenticated_principal_probe(&router, &replaced)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED,
+        "the rotation dropped the replaced plaintext from this process's cache"
+    );
+    assert_eq!(
+        token_changes(&capture, "token_rotated"),
+        1,
+        "the rotation was audited once, though nobody waited for its response"
+    );
+}
+
+/// Under `required`, a request is validated and the evidence gate asked
+/// before anything is read or admitted: a malformed `expires_at` is `400`
+/// (keyed or not, never `409 authority_evidence_unsupported`), and an
+/// unkeyed rotation is refused before the token is read, so an unknown
+/// token is `409`, not `404`.
+#[tokio::test]
+async fn required_mode_validates_an_issue_and_refuses_an_unkeyed_rotation_before_reading_the_token()
+{
+    let token_db = TempDb::new("keyed-token-required-order");
+    let events = TempDb::new("keyed-token-required-order-events");
+    let policy = TempPolicyFile::new(&token_policy_document_string());
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = keyed_token_router(&token_db, &policy, audit_log, |config| {
+        keyed_token_required(config, &events)
+    });
+    let admin = keyed_token_admin(&["superadmin"]);
+    let malformed = json!({ "scopes": ["probe-reader"], "expires_at": "not-a-time" }).to_string();
+    for key in [None, Some(token_key(60))] {
+        let (status, _, refused) = token_exchange(
+            &router,
+            keyed_token_admin_request(
+                Method::POST,
+                TOKENS_ADMIN_ROUTE,
+                admin.clone(),
+                Some(malformed.clone()),
+                key.as_deref(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{key:?}: {refused}");
+    }
+    let (status, _, refused) = token_exchange(
+        &router,
+        keyed_token_admin_request(
+            Method::POST,
+            &format!("{TOKENS_ADMIN_ROUTE}/token_unknown/rotate"),
+            admin,
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["reason"], json!("authority_evidence_unsupported"));
+    assert_eq!(refused["operation"], json!("service_token.rotate"));
+    assert!(token_evidence(&token_db.path).is_empty());
+    assert!(token_reservations(&token_db.path).is_empty());
 }

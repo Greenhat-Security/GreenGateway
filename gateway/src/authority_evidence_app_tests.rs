@@ -1823,7 +1823,7 @@ async fn required_mode_authorizes_a_connection_change_before_it_asks_the_evidenc
 /// the store, then drop it: what a client that disconnects at that moment
 /// leaves behind. The store's own transaction keeps running when a handler's
 /// future is dropped (SQLite runs it on the blocking pool).
-async fn abandon_once_committed(
+pub(super) async fn abandon_once_committed(
     router: &Router,
     request: Request<Body>,
     committed: impl Fn() -> bool,
@@ -2490,5 +2490,429 @@ mod cluster_connection_keys {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+}
+
+/// Keyed service-token issue and rotation in cluster mode, through the admin
+/// handlers of a PostgreSQL-backed replica with a real roster (issue #425,
+/// plan P5). The verified-TLS CI shard selects this module by its prefix.
+#[cfg(feature = "postgres")]
+mod cluster_token_keys {
+    use super::*;
+    use storage::postgres::test_support::{locator, test_pool, test_settings};
+    use storage::{
+        MemberRegistration, PolicyControlPlane, PostgresMembershipStore, ToolControlPlane,
+    };
+
+    const CLUSTER_ISSUER: &str = "https://cluster-token-keys.example.test";
+    const DEPLOYMENT: &str = "deploy-cluster-token-keys";
+
+    /// A cluster replica over `pool` that serves service tokens from the
+    /// authority and whose operation gate asks `membership`.
+    async fn replica(
+        config: config::Config,
+        pool: &deadpool_postgres::Pool,
+        membership: Arc<cluster_membership::ClusterMembership>,
+    ) -> Router {
+        let policy = Arc::new(storage::PostgresPolicyStore::new(pool.clone()));
+        let tools = Arc::new(storage::PostgresToolStore::new(pool.clone()));
+        let connections = Arc::new(
+            connections::pg_store::PostgresConnectionStore::new(
+                pool.clone(),
+                connections::model::MAX_CONNECTIONS,
+            )
+            .unwrap(),
+        );
+        let revision = connections.state_revision().await.unwrap();
+        let records = connections.list().await.unwrap();
+        let (openapi_catalogs, openapi_overlays) =
+            connections.openapi_catalogs_with_overlays().await.unwrap();
+        let boot = Arc::new(connections::managed_store::ClusterConnectionsBoot {
+            mcp_catalogs: connections.mcp_catalogs().await.unwrap(),
+            openapi_catalogs,
+            openapi_inventory_catalogs: connections.openapi_inventory_catalogs().await.unwrap(),
+            openapi_overlays,
+            enum_source_values: std::sync::Mutex::new(Some(
+                connections.enum_source_values().await.unwrap(),
+            )),
+        });
+        let service_tokens = Arc::new(storage::PostgresServiceTokenStore::new(pool.clone()));
+        let service_token_revision = service_tokens.state_revision().await.unwrap();
+        let app = gateway_app_with_process_started_at_and_overrides(
+            config,
+            PrometheusBuilder::new().build_recorder().handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+            Instant::now(),
+            GatewayAppBuildOverrides {
+                pg_policy: Some(ClusterPolicySeed {
+                    active: policy.active().await.unwrap().unwrap(),
+                    store: policy,
+                }),
+                pg_tools: Some(ClusterToolsSeed {
+                    active: tools.active_tools().await.unwrap().unwrap(),
+                    store: tools,
+                }),
+                pg_connections: Some(ClusterConnectionsSeed {
+                    store: connections,
+                    records,
+                    boot,
+                    revision,
+                }),
+                pg_service_tokens: Some(ClusterServiceTokenSeed {
+                    store: service_tokens,
+                    revision: service_token_revision,
+                    pool: pool.clone(),
+                    deployment_id: DEPLOYMENT.to_owned(),
+                }),
+                pg_membership: Some(membership),
+                disable_proxy_health_checks: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        match app.http {
+            GatewayApp::Unified(router) => router,
+            GatewayApp::Split { .. } => panic!("expected a unified test router"),
+        }
+    }
+
+    /// One token admin `POST` with a bearer token and an optional caller
+    /// key: its status and JSON body.
+    async fn call(
+        router: &Router,
+        uri: &str,
+        token: &str,
+        body: Option<String>,
+        key: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut request = connection_admin_request(Method::POST, uri, None, body, None, false);
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        if let Some(key) = key {
+            request
+                .headers_mut()
+                .insert("idempotency-key", key.parse().unwrap());
+        }
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        (status, json_body(response).await)
+    }
+
+    async fn token_reservations(pool: &deadpool_postgres::Pool) -> Vec<(String, String)> {
+        pool.get()
+            .await
+            .unwrap()
+            .query(
+                "SELECT operation_id::text, action FROM greengateway.authority_caller_operation_ids \
+                 WHERE action LIKE 'service_token.%' ORDER BY operation_id",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
+    /// The service tokens and the token evidence rows the authority holds.
+    async fn token_rows(pool: &deadpool_postgres::Pool) -> (i64, i64) {
+        let client = pool.get().await.unwrap();
+        let tokens: i64 = client
+            .query_one("SELECT count(*) FROM greengateway.service_tokens", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let evidence: i64 = client
+            .query_one(
+                "SELECT count(*) FROM greengateway.service_token_change_evidence",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        (tokens, evidence)
+    }
+
+    /// The keyed token routes in cluster mode, end to end:
+    ///
+    /// - while a live member lacks `caller_operation_keys`, a keyed issue and
+    ///   a keyed rotation are `409 capability_not_advertised`, mint nothing,
+    ///   record nothing and reserve nothing, and the unkeyed forms still
+    ///   commit;
+    /// - once that member is stale, so that the operation gate would admit a
+    ///   key and raise the contract fence, a keyed issue or rotation from a
+    ///   caller without `admin:tokens:write`, or from a writer who may not
+    ///   delegate the token's scopes, is still `403`, a keyed issue with a
+    ///   malformed `expires_at` is `400`, and the fence is unchanged byte for
+    ///   byte: authorization and validation come before admission;
+    /// - the first authorized keyed issue raises the fence once, and exact
+    ///   retries of the issue and of a keyed rotation are answered from
+    ///   their receipts with `secret_returned: false` and no plaintext.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_keyed_token_changes_wait_for_the_fleet_and_authorize_and_validate_before_the_fence(
+    ) {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database =
+            storage::contract_tests::postgres_audit_tests::create_test_database(&admin_dsn).await;
+        let foundation = test_pool(&database.dsn).await;
+        let pool = foundation.pool();
+        storage::migrations::apply_missing_for_startup(pool, &test_settings())
+            .await
+            .unwrap();
+        storage::postgres_authority_events::PostgresAuthorityEventStore::new(pool.clone())
+            .configure_capacity(100)
+            .await
+            .unwrap();
+        // The requests carry real bearer tokens through the HTTP policy
+        // layer, which answers a route no rule names with the policy's
+        // default action. Allow it there, as the Connection replica test
+        // does, so that every 403 below is the token handler's own.
+        let mut document: Value = serde_json::from_str(&token_policy_document_string()).unwrap();
+        document["default_action"] = json!("allow");
+        let policy = rbac::Policy::validate_json_value(document).unwrap();
+        storage::PostgresPolicyStore::new(pool.clone())
+            .commit(storage::PolicyCommitRequest {
+                precondition: storage::PolicyCommitPrecondition::Initialize,
+                candidate: &policy,
+                change: storage::DocumentChange::test_policy("installer"),
+                diff_summary: &json!({}),
+            })
+            .await
+            .unwrap();
+        storage::PostgresToolStore::new(pool.clone())
+            .seed_empty_document()
+            .await
+            .unwrap();
+
+        let membership = cluster_membership::ClusterMembership::new(
+            PostgresMembershipStore::new(
+                pool.clone(),
+                DEPLOYMENT,
+                crate::ha::InstanceIdentity::generate(),
+            ),
+            MemberRegistration {
+                binary_version: env!("CARGO_PKG_VERSION").to_owned(),
+                schema_version: storage::migrations::schema_version_range(),
+                document_version: cluster_membership::DOCUMENT_VERSION_RANGE,
+                fingerprint: "b".repeat(64),
+                capabilities: storage::compatibility::BINARY_CAPABILITIES.to_vec(),
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        );
+        membership.register_boot().await.expect("boot row");
+        // A live member built before caller keys.
+        let earlier = uuid::Uuid::new_v4();
+        pool.get()
+            .await
+            .unwrap()
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint,
+                      capabilities)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, '1.0.1', 18, 18, 0, 0,
+                         repeat('b', 64), 'operation_requirements,policy_role_descriptions')",
+                &[
+                    &DEPLOYMENT,
+                    &earlier.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                ],
+            )
+            .await
+            .expect("an earlier member row inserts");
+
+        let mut config = test_config(Vec::new());
+        config.state_backend = config::StateBackend::Postgres;
+        config.deployment_id = Some(DEPLOYMENT.into());
+        configure_test_jwt_provider(&mut config, spawn_test_jwks_server().await);
+        config.auth_providers[0].issuer = Some(CLUSTER_ISSUER.into());
+        // The test JWKS server listens on loopback.
+        config.egress_allowed_hosts = vec!["127.0.0.1".into()];
+        config.egress_deny_private_ips = false;
+        config.rate_limit_write_burst = 1000;
+        config.rate_limit_write_rps = 1000.0;
+        let router = replica(config, pool, membership).await;
+        let admin = signed_token_with_issuer("operator", &["superadmin"], CLUSTER_ISSUER);
+        let reader = signed_token_with_issuer("reader", &["tokens-reader"], CLUSTER_ISSUER);
+        // Holds `admin:tokens:write` but not the `probe-reader` role the
+        // tokens below carry, so it may not delegate their scopes.
+        let writer = signed_token_with_issuer("writer", &["tokens-writer"], CLUSTER_ISSUER);
+        let read_fence = || async move {
+            storage::read_contract_fence(pool)
+                .await
+                .expect("the fence reads")
+        };
+        let fence = read_fence().await;
+        let key = |seed: u8| caller_key(seed);
+        let body = json!({ "scopes": ["probe-reader"] }).to_string();
+
+        // A live member lacks the capability: every keyed form waits, the
+        // unkeyed forms commit.
+        let (status, refused) = call(
+            &router,
+            TOKENS_ADMIN_ROUTE,
+            &admin,
+            Some(body.clone()),
+            Some(&key(110)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["reason"], json!("capability_not_advertised"));
+        assert_eq!(token_rows(pool).await, (0, 0));
+        let (status, created) = call(
+            &router,
+            TOKENS_ADMIN_ROUTE,
+            &admin,
+            Some(body.clone()),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let unkeyed_rotate = format!(
+            "{TOKENS_ADMIN_ROUTE}/{}/rotate",
+            created["token"]["id"].as_str().expect("an ID")
+        );
+        let (status, refused) = call(&router, &unkeyed_rotate, &admin, None, Some(&key(111))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["reason"], json!("capability_not_advertised"));
+        let (status, rotated) = call(&router, &unkeyed_rotate, &admin, None, None).await;
+        assert_eq!(status, StatusCode::OK, "{rotated}");
+        assert_eq!(token_rows(pool).await, (1, 2));
+        assert!(token_reservations(pool).await.is_empty());
+        assert_eq!(read_fence().await, fence, "a refused key raises nothing");
+
+        // The lacking member goes stale: the gate would now admit a key and
+        // raise the fence. A request the handler refuses is still refused
+        // first, and the fence does not move.
+        let updated = pool
+            .get()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE greengateway.cluster_members
+                 SET last_heartbeat_at = now() - make_interval(secs => 60)
+                 WHERE instance_id = $1::text::uuid",
+                &[&earlier.to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated, 1);
+        let malformed =
+            json!({ "scopes": ["probe-reader"], "expires_at": "not-a-time" }).to_string();
+        let refusals = [
+            (
+                TOKENS_ADMIN_ROUTE,
+                &reader,
+                Some(body.clone()),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                unkeyed_rotate.as_str(),
+                &reader,
+                None,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                TOKENS_ADMIN_ROUTE,
+                &writer,
+                Some(body.clone()),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                unkeyed_rotate.as_str(),
+                &writer,
+                None,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                TOKENS_ADMIN_ROUTE,
+                &admin,
+                Some(malformed),
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+        for (seed, (uri, token, body, expected)) in (112..).zip(refusals) {
+            let (status, refused) = call(&router, uri, token, body, Some(&key(seed))).await;
+            assert_eq!(status, expected, "{uri}: {refused}");
+        }
+        assert_eq!(
+            read_fence().await,
+            fence,
+            "a forbidden or malformed keyed request leaves the contract fence unchanged"
+        );
+        assert!(token_reservations(pool).await.is_empty());
+        assert_eq!(token_rows(pool).await, (1, 2));
+
+        // The first authorized keyed change raises the fence once; exact
+        // retries are answered from their receipts, never with a plaintext.
+        let issue_key = key(120);
+        let (status, issued) = call(
+            &router,
+            TOKENS_ADMIN_ROUTE,
+            &admin,
+            Some(body.clone()),
+            Some(&issue_key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{issued}");
+        let raised = read_fence().await;
+        assert_eq!(raised.generation, fence.generation + 1);
+        assert!(
+            raised.capabilities.contains("caller_operation_keys"),
+            "{raised:?}"
+        );
+        let id = issued["token"]["id"].as_str().expect("an ID").to_owned();
+        let plaintext = issued["plaintext_token"]
+            .as_str()
+            .expect("the first response carries the plaintext")
+            .to_owned();
+        let (status, receipt) = call(
+            &router,
+            TOKENS_ADMIN_ROUTE,
+            &admin,
+            Some(body.clone()),
+            Some(&issue_key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(receipt["operation"], json!("service_token.issue"));
+        assert_eq!(receipt["operation_id"], json!(issue_key));
+        assert_eq!(receipt["resource_id"], json!(id));
+        assert_eq!(receipt["revision"], json!(1));
+        assert_eq!(receipt["secret_returned"], json!(false));
+        assert!(!receipt.to_string().contains(&plaintext));
+
+        let rotate_key = key(121);
+        let rotate = format!("{TOKENS_ADMIN_ROUTE}/{id}/rotate");
+        let (status, rotated) = call(&router, &rotate, &admin, None, Some(&rotate_key)).await;
+        assert_eq!(status, StatusCode::OK, "{rotated}");
+        let rotated_plaintext = rotated["plaintext_token"]
+            .as_str()
+            .expect("the first rotation carries the plaintext")
+            .to_owned();
+        let (status, receipt) = call(&router, &rotate, &admin, None, Some(&rotate_key)).await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(receipt["operation"], json!("service_token.rotate"));
+        assert_eq!(receipt["resource_id"], json!(id));
+        assert_eq!(receipt["revision"], json!(2));
+        assert_eq!(receipt["secret_returned"], json!(false));
+        assert!(!receipt.to_string().contains(&rotated_plaintext));
+
+        let mut expected = vec![
+            (issue_key.clone(), "service_token.issue".to_owned()),
+            (rotate_key.clone(), "service_token.rotate".to_owned()),
+        ];
+        expected.sort();
+        assert_eq!(token_reservations(pool).await, expected);
+        assert_eq!(token_rows(pool).await, (2, 4));
+        assert_eq!(read_fence().await, raised, "the fence was raised once");
     }
 }

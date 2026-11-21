@@ -236,11 +236,16 @@ or replace that changed the binding, which is how a consumer joins the two.
 The binding identifier, secret IDs and locators stay out of the record. Its
 `authority_event_delivery.v1` form still names the Connection, as before.
 
-A standalone token row records no revision, and v1 requires one, so it keeps
+A standalone token row is judged by its `revised` marker (plan P5). A revised
+row carries the token's revision (an issue NULL to 1, a rotation or revocation
+one step up) and follows the caller-bound rule above. A row with `revised = 0`
+records no revision, and v1 requires one, so it carries nulls and keeps
 `authority_event_delivery.v1` whatever its operation ID. That includes the keyed
-revocations SQLite has recorded since #765, whose delivered bytes do not change.
-A token row that records a revision is out of shape and stalls. A standalone
-re-encryption batch, which no caller starts, also keeps its delivery record.
+revocations SQLite recorded since #765 before the token table recorded
+revisions, whose delivered bytes do not change. A revised row without a valid
+transition, or a row with `revised = 0` that records a revision, is out of shape
+and stalls. A standalone re-encryption batch, which no caller starts, also keeps
+its delivery record.
 
 Both keyed paths support durable delivery through the file sink on a Unix
 filesystem that honors file and directory sync, using shared
@@ -443,7 +448,17 @@ log line or a metric.
   take NULL revisions and `revised = 0` and stay legacy delivery records; but it
   does not advance `service_tokens.revision` when it rotates or revokes, so after
   such a rollback the next revised row of that token can name a prior revision
-  older than the token's real history. Nothing is backfilled or rewritten.
+  older than the token's real history. Nothing is backfilled or rewritten. An
+  older build serving the file also delivers it: its evidence query reads no
+  revision, so every row this build wrote that is not yet delivered, keyed
+  principal issues, rotations and revocations included, goes out as an unrevised
+  `authority_event_delivery.v1` record instead of `authority_event.v1`. Let
+  standalone delivery catch up
+  (`greengateway_standalone_authority_event_undelivered{store="service_tokens"}`
+  at 0) before rolling back; a
+  roll-back between the sink accepting a batch and the cursor commit delivers the
+  same `(authority_id, event_id)` in both forms, and a consumer that deduplicates
+  on that pair keeps whichever arrived first.
 - Each SQLite file is its own authority, so a key is unique within one file, as
   consumers deduplicate events on `(authority_id, event_id)`: the token database
   and a separate Connections database each accept a key once.
@@ -744,10 +759,16 @@ qualifications.
   takes a precondition, so the `If-Match` field of the binding is empty. A token
   request holds no secret: the plaintext does not exist until the store mints it.
 - **Order of work.** The handler authorizes the caller (`admin:tokens:write`), checks
-  the scope bounds and the caller's delegation authority over the scopes (for a
-  rotation, the stored token's scopes, which it reads to do so), then binds the key,
-  asks the gates (as `service_token.issue` or `service_token.rotate`) and answers an
-  exact retry from the read-only pre-check. Inside the store's one transaction
+  the scope bounds and the caller's delegation authority over the scopes, and for an
+  issue validates `expires_at` and the creator's length, so a malformed request is
+  `400` before anything is admitted. A rotation reads the stored token's scopes for
+  the delegation check, so it asks the evidence gate first: that gate reads
+  configuration only and cannot raise the fence, and required mode refuses a form it
+  does not admit before anything is read. Then the handler binds the key, asks the
+  gates (as `service_token.issue` or `service_token.rotate`) and answers an exact
+  retry from the read-only pre-check. Once past the router, the issue or rotation
+  runs on a task of its own, as a Connection change does, so it finishes, audit event
+  and cache invalidation included, when its client goes away. Inside the store's one transaction
   (PostgreSQL after its `service_token_state_revision` lock, SQLite under
   `IMMEDIATE`) the key is looked up first, then a rotation reads its token (an
   unknown token is `404` and a revoked one `409`, and neither reserves anything),
@@ -760,9 +781,12 @@ qualifications.
   `{operation_id, operation, resource_id, revision, committed_at, secret_returned}`,
   where `resource_id` is the token ID, `revision` the token's revision after the
   change and `secret_returned` always `false`. The plaintext is never stored, so a
-  retry cannot return it, and it repeats no change, no audit event and no cache
-  invalidation. A rotation's retry is answered whatever happened to the token
-  since. Any other use of the key is `409 caller_operation_conflict`.
+  retry cannot return it, and it repeats no change and no audit event. A rotation's
+  retry still drops the replaced plaintext from the answering process's validator
+  cache, which is idempotent: a first attempt committed by another process sharing
+  the token file may have left it cached there. A rotation's retry is answered
+  whatever happened to the token since. Any other use of the key is
+  `409 caller_operation_conflict`.
 - **A lost response.** If the first response was lost, a live token exists whose
   plaintext nobody holds, and which may have been seen in transit. The caller
   revokes it by the ID in the receipt (`DELETE .../tokens/{id}` or the keyed
@@ -777,7 +801,8 @@ qualifications.
   revisions and `revised = 0` and are delivered as the unrevised
   `authority_event_delivery.v1` records they always were. Every row this build
   writes has `revised = 1` and a transition (issue NULL to 1, rotation and
-  revocation one step up), so under `qualified_v1` a keyed principal issue,
+  revocation one step up), and the table's CHECK refuses a revised row without its
+  action's transition, as PostgreSQL migration 27 does, so under `qualified_v1` a keyed principal issue,
   rotation or revocation in the token database is delivered as `authority_event.v1`
   ([Standalone delivery](#standalone-delivery)).
 - **Required mode.** Issue and rotation are `caller_key_required` in both modes: only
@@ -816,9 +841,31 @@ proves the open-time columns. Through the router, `admin_tokens_app_tests`:
 consulted),
 `required_mode_refuses_the_unkeyed_token_issue_and_rotation_and_admits_the_keyed_principal`
 (Unix),
-`required_mode_refuses_a_keyed_token_issue_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink`
-and `required_mode_admits_every_form_of_token_revocation`; and
+`required_mode_refuses_a_keyed_token_issue_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink`,
+`required_mode_admits_every_form_of_token_revocation`,
+`required_mode_validates_an_issue_and_refuses_an_unkeyed_rotation_before_reading_the_token`,
+`a_keyed_rotation_retry_drops_the_replaced_plaintext_from_the_answering_cache` and
+`an_admitted_token_rotation_finishes_after_its_client_goes_away`; and
 `required_tests::service_token_issue_and_rotation_admit_only_their_keyed_issuer_bound_form_in_both_modes`.
+The replay test also captures every log line the handlers write and finds neither
+plaintext nor a binding digest in them, a failed reservation included, and
+`storage::contract_tests::sqlite_a_failed_token_reservation_is_counted_and_no_secret_reaches_logs_or_metrics`
+proves that a reservation the SQLite store cannot write rolls the issue back, is
+counted once on `greengateway_standalone_evidence_failures_total{store="service_tokens"}`,
+and leaves no plaintext or digest in the store's log lines or the rendered metrics; the
+PostgreSQL fence test counts its refused reservations on
+`greengateway_authority_event_evidence_failures_total`. The race contract runs its two
+writers through two handles (in SQLite, two connections to one file) and includes two
+attempts of one keyed rotation. In cluster mode, against PostgreSQL and a real roster,
+`authority_evidence_app_tests::cluster_token_keys::postgres_keyed_token_changes_wait_for_the_fleet_and_authorize_and_validate_before_the_fence`
+proves that a keyed issue and rotation are `409 capability_not_advertised` and reserve
+nothing while a live member lacks `caller_operation_keys` (the unkeyed forms still
+commit); that once the lacking member is stale a keyed issue or rotation from a caller
+without `admin:tokens:write`, or from a writer the delegation check refuses, is `403`,
+and a keyed issue with a malformed `expires_at` is `400`, all leaving `contract_fence`
+unchanged; and that the first keyed issue then raises the fence once and the exact
+retries of the issue and of a keyed rotation are answered from their receipts with
+`secret_returned: false`.
 
 ## Keyed safe references
 
@@ -1836,7 +1883,9 @@ disposable PostgreSQL 16, the same pinned image, that accepts TLS and nothing el
   `a_failed_jwt_evidence_insert_rolls_back_the_revoke`,
   `repeating_an_effective_jwt_revoke_records_no_second_evidence_row`,
   `extending_a_jwt_revocation_records_exactly_one_more_evidence_row`), the keyed
-  service-token issue and rotation (`postgres_audit_tests::keyed_token_changes::`), the suggestion acceptance's
+  service-token issue and rotation (`postgres_audit_tests::keyed_token_changes::`, and
+  through the handlers of a cluster replica
+  `authority_evidence_app_tests::cluster_token_keys::`), the suggestion acceptance's
   document evidence (`an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction`)
   and `a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity`;
 - the whole PostgreSQL Connection store suite (`connections::pg_store`), its create,

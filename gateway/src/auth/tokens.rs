@@ -158,7 +158,12 @@ const SERVICE_TOKEN_REVISION_COLUMNS: [(&str, &str); 1] = [(
 /// version fence that would keep an older binary away), so delivery reads
 /// such a row as the unrevised legacy record it is. Every row this build
 /// writes has `revised = 1` and a revision transition: an issue NULL to 1,
-/// a rotation or revocation one step up. The last CHECK holds the pairing.
+/// a rotation or revocation one step up. The last CHECK holds that pairing
+/// for each action exactly as standalone delivery projects it (an issue is a
+/// create, anything else an advance), so the table refuses a revised row
+/// delivery would stall on; PostgreSQL migration 27 ties the NULL prior to
+/// the issue the same way. SQLite cannot change a column's CHECK in place,
+/// so it is complete from the start.
 const CHANGE_EVIDENCE_REVISION_COLUMNS: [(&str, &str); 3] = [
     (
         "prior_version",
@@ -172,8 +177,10 @@ const CHANGE_EVIDENCE_REVISION_COLUMNS: [(&str, &str); 3] = [
         "revised",
         r#"INTEGER NOT NULL DEFAULT 0 CHECK (revised IN (0, 1)) CHECK (
     (revised = 0 AND prior_version IS NULL AND new_version IS NULL)
-    OR (revised = 1 AND new_version IS NOT NULL
-        AND (prior_version IS NULL OR new_version > prior_version))
+    OR (revised = 1 AND action = 'service_token.issue'
+        AND prior_version IS NULL AND new_version = 1)
+    OR (revised = 1 AND action <> 'service_token.issue'
+        AND prior_version IS NOT NULL AND new_version > prior_version)
 )"#,
     ),
 ];
@@ -3108,21 +3115,32 @@ mod tests {
         drop(SqliteTokenStore::open(&db.path).expect("the store reopens"));
         assert_eq!(revisions(&db.path), expected);
 
-        // The table holds the pairing: a revised row must carry its
-        // revision, and a legacy row none.
+        // The table holds the pairing, per action as delivery projects it: a
+        // revised row must carry its action's transition (an issue NULL to
+        // 1, anything else one step up from a prior revision), and a legacy
+        // row none.
         let connection = Connection::open(&db.path).expect("database should open");
-        for (prior, new, revised) in [(None, None, 1), (Some(2), Some(2), 1), (None, Some(1), 0)] {
+        for (action, prior, new, revised) in [
+            ("service_token.rotate", None, None, 1),
+            ("service_token.rotate", Some(2), Some(2), 1),
+            ("service_token.rotate", None, Some(1), 0),
+            ("service_token.rotate", None, Some(2), 1),
+            ("service_token.revoke", None, Some(3), 1),
+            ("service_token.issue", None, Some(2), 1),
+            ("service_token.issue", Some(1), Some(2), 1),
+        ] {
             assert!(
                 connection
                     .execute(
                         "INSERT INTO service_token_change_evidence \
                              (event_id, operation_id, actor_user_id, action, token_id, \
                               committed_at, prior_version, new_version, revised) \
-                         VALUES (?1, ?2, 'fixture', 'service_token.rotate', ?3, \
-                                 '2026-10-01T00:00:09Z', ?4, ?5, ?6)",
+                         VALUES (?1, ?2, 'fixture', ?3, ?4, \
+                                 '2026-10-01T00:00:09Z', ?5, ?6, ?7)",
                         params![
                             uuid::Uuid::new_v4().to_string(),
                             uuid::Uuid::new_v4().to_string(),
+                            action,
                             id,
                             prior,
                             new,
@@ -3130,7 +3148,7 @@ mod tests {
                         ],
                     )
                     .is_err(),
-                "{prior:?} {new:?} {revised}"
+                "{action} {prior:?} {new:?} {revised}"
             );
         }
     }

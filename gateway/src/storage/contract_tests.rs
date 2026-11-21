@@ -1623,10 +1623,15 @@ async fn service_token_caller_operation_contract(
 }
 
 /// Competing writers under caller keys: two attempts of one keyed issue
-/// commit one token, the other answered from its receipt; and a keyed
-/// rotation racing a keyed revoke never leaves a live plaintext.
+/// commit one token, the other answered from its receipt; so do two
+/// attempts of one keyed rotation, which advance the token's revision once;
+/// and a keyed rotation racing a keyed revoke never leaves a live plaintext.
+/// The two halves of each race go through `store` and `other`, which may be
+/// two handles on one database (in SQLite, two connections to one file, so
+/// that the database decides each race, not a lock in this process).
 async fn service_token_caller_operation_race_contract(
     store: &dyn ServiceTokenStore,
+    other: &dyn ServiceTokenStore,
     database: &dyn KeyedTokenDatabase,
 ) {
     use crate::authority_events::caller_operation::CallerOutcome;
@@ -1642,7 +1647,7 @@ async fn service_token_caller_operation_race_contract(
     let tokens_before = database.token_rows().await;
     let (left, right) = tokio::join!(
         store.create_with_operation(keyed_token_request(&["read"]), &owner, Some(&issue)),
-        store.create_with_operation(keyed_token_request(&["read"]), &owner, Some(&issue)),
+        other.create_with_operation(keyed_token_request(&["read"]), &owner, Some(&issue)),
     );
     let outcomes = [
         left.expect("one attempt answers"),
@@ -1669,6 +1674,54 @@ async fn service_token_caller_operation_race_contract(
     );
     assert_eq!(database.token_rows().await, tokens_before + 1);
 
+    // Two attempts of one keyed rotation: one commits, the other is answered
+    // with its receipt, naming the same token and revision.
+    let token = store
+        .create(keyed_token_request(&["read"]), &owner)
+        .await
+        .expect("an unkeyed issue commits")
+        .record
+        .id;
+    let rotation = token_operation(52, "service_token.rotate", &owner, &token, b"");
+    let (left, right) = tokio::join!(
+        store.rotate_with_operation(&token, &owner, Some(&rotation)),
+        other.rotate_with_operation(&token, &owner, Some(&rotation)),
+    );
+    let outcomes = [
+        left.expect("one attempt answers")
+            .expect("the token exists"),
+        right
+            .expect("the other attempt answers")
+            .expect("the token exists"),
+    ];
+    let committed = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, CallerOutcome::Committed(_)))
+        .count();
+    assert_eq!(committed, 1, "exactly one attempt rotates");
+    let receipt = outcomes
+        .iter()
+        .find_map(|outcome| match outcome {
+            CallerOutcome::Replayed(receipt) => Some(receipt),
+            CallerOutcome::Committed(_) => None,
+        })
+        .expect("the other is answered with its receipt");
+    assert_eq!(receipt.operation_id, rotation.id().to_string());
+    assert_eq!(receipt.resource_id, token);
+    assert_eq!(
+        receipt.revision,
+        Some(2),
+        "the rotation advanced the revision once"
+    );
+    let rotations: Vec<_> = database
+        .evidence()
+        .await
+        .into_iter()
+        .filter(|row| row.token_id == token && row.action == "service_token.rotate")
+        .map(|row| (row.prior_version, row.new_version))
+        .collect();
+    assert_eq!(rotations, [(Some(1), Some(2))]);
+
     for round in 0..4_u8 {
         let token = store
             .create(keyed_token_request(&["read"]), &owner)
@@ -1679,7 +1732,7 @@ async fn service_token_caller_operation_race_contract(
         let rotation = token_operation(60 + round, "service_token.rotate", &owner, &token, b"");
         let (rotated, revoked) = tokio::join!(
             store.rotate_with_operation(&token, &owner, Some(&rotation)),
-            store.revoke_with_operation(&token, &owner, Some(test_caller_key(70 + round))),
+            other.revoke_with_operation(&token, &owner, Some(test_caller_key(70 + round))),
         );
         assert!(revoked
             .expect("the revoke commits")
@@ -1906,8 +1959,13 @@ async fn sqlite_service_token_caller_operation_contract() {
 async fn sqlite_keyed_token_writers_racing_commit_one_change_and_never_leave_a_live_plaintext() {
     let db = TempDb::new("token-caller-operation-race");
     let store = SqliteTokenStore::open(&db.path).expect("token store should open");
+    // A second store on the same file, with its own connection: each race
+    // is decided by SQLite's write lock (IMMEDIATE), the loser reading the
+    // winner's reservation inside its own transaction.
+    let other = SqliteTokenStore::open(&db.path).expect("a second token store should open");
     service_token_caller_operation_race_contract(
         &store,
+        &other,
         &SqliteKeyedTokenDatabase {
             path: db.path.clone(),
         },
@@ -1927,6 +1985,194 @@ async fn sqlite_a_failed_evidence_insert_rolls_back_the_keyed_issue_and_rotation
         },
     )
     .await;
+}
+
+/// I2 and I5 for the SQLite token store, driven on this thread so that its
+/// log lines and metrics are captured: a reservation that cannot be written
+/// rolls the keyed issue back and is counted once on
+/// `greengateway_standalone_evidence_failures_total{store="service_tokens"}`,
+/// an unkeyed issue counts nothing, and no issued or rotated plaintext and
+/// no binding digest appears in a log line or in the rendered metrics after
+/// a keyed issue, a keyed rotation, their replays, a conflict and the failed
+/// reservation.
+#[test]
+fn sqlite_a_failed_token_reservation_is_counted_and_no_secret_reaches_logs_or_metrics() {
+    use crate::auth::tokens::{TokenStore, TokenStoreError};
+    use crate::authority_events::caller_operation::CallerOutcome;
+
+    let logs = SharedLogBuffer::default();
+    let _logging = crate::tracing_test_guard(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(logs.clone())
+            .finish(),
+    );
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics = recorder.handle();
+    let _recording = ::metrics::set_default_local_recorder(&recorder);
+    let failures = || {
+        metrics
+            .render()
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!(
+                    "{}{{store=\"service_tokens\"}} ",
+                    crate::metrics::STANDALONE_EVIDENCE_FAILURES_TOTAL
+                ))
+            })
+            .map(|line| line.rsplit(' ').next().unwrap_or_default().to_owned())
+    };
+
+    let db = TempDb::new("token-caller-operation-reservation-fault");
+    let store = SqliteTokenStore::open(&db.path).expect("token store should open");
+    let owner = ChangeActor::for_test_with_issuer("operator", "https://one.example.test");
+    let body = br#"{"expires_at":null,"scopes":["read"]}"#;
+    let issue = token_operation(101, "service_token.issue", &owner, "", body);
+    let CallerOutcome::Committed(issued) = TokenStore::create_with_operation(
+        &store,
+        keyed_token_request(&["read"]),
+        &owner,
+        Some(&issue),
+    )
+    .expect("the keyed issue commits") else {
+        panic!("a first issue commits");
+    };
+    let id = issued.record.id.clone();
+    let rotation = token_operation(102, "service_token.rotate", &owner, &id, b"");
+    let Some(CallerOutcome::Committed(rotated)) =
+        TokenStore::rotate_with_operation(&store, &id, &owner, Some(&rotation))
+            .expect("the keyed rotation commits")
+    else {
+        panic!("a first rotation commits");
+    };
+    assert!(matches!(
+        TokenStore::create_with_operation(
+            &store,
+            keyed_token_request(&["read"]),
+            &owner,
+            Some(&issue)
+        ),
+        Ok(CallerOutcome::Replayed(_))
+    ));
+    assert!(matches!(
+        TokenStore::rotate_with_operation(&store, &id, &owner, Some(&rotation)),
+        Ok(Some(CallerOutcome::Replayed(_)))
+    ));
+    let other_body = token_operation(
+        101,
+        "service_token.issue",
+        &owner,
+        "",
+        br#"{"expires_at":null,"scopes":["write"]}"#,
+    );
+    assert!(matches!(
+        TokenStore::create_with_operation(
+            &store,
+            keyed_token_request(&["write"]),
+            &owner,
+            Some(&other_body)
+        ),
+        Err(TokenStoreError::CallerOperationConflict)
+    ));
+    assert_eq!(failures(), None, "nothing failed yet");
+
+    // Test-only fault injection through a second connection.
+    rusqlite::Connection::open(&db.path)
+        .expect("the token database opens")
+        .execute_batch(
+            "CREATE TRIGGER fail_caller_key_reservation \
+             BEFORE INSERT ON authority_caller_operation_ids \
+             BEGIN SELECT RAISE(ABORT, 'injected reservation failure'); END;",
+        )
+        .expect("the fault installs");
+    let database = SqliteKeyedTokenDatabase {
+        path: db.path.clone(),
+    };
+    // Reads the tables only; the store above is driven synchronously.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime builds");
+    let tokens = runtime.block_on(database.token_rows());
+    let refused = token_operation(103, "service_token.issue", &owner, "", body);
+    assert!(
+        TokenStore::create_with_operation(
+            &store,
+            keyed_token_request(&["read"]),
+            &owner,
+            Some(&refused)
+        )
+        .is_err(),
+        "an issue whose key cannot be reserved fails"
+    );
+    assert_eq!(failures().as_deref(), Some("1"));
+    assert_eq!(
+        runtime.block_on(database.token_rows()),
+        tokens,
+        "the issue rolled back"
+    );
+    TokenStore::create(&store, keyed_token_request(&["read"]), &owner)
+        .expect("an unkeyed issue reserves nothing and commits");
+    assert_eq!(
+        failures().as_deref(),
+        Some("1"),
+        "an unkeyed issue counts nothing"
+    );
+
+    let digests: Vec<String> = runtime
+        .block_on(database.reservations())
+        .into_iter()
+        .filter_map(|(_, _, digest)| digest)
+        .collect();
+    assert_eq!(digests.len(), 2);
+    let logged = logs.contents();
+    let rendered = metrics.render();
+    for marker in [
+        issued.plaintext_token.as_str(),
+        rotated.plaintext_token.as_str(),
+    ]
+    .into_iter()
+    .chain(digests.iter().map(String::as_str))
+    {
+        assert!(!logged.contains(marker), "a secret marker reached the logs");
+        assert!(
+            !rendered.contains(marker),
+            "a secret marker reached the metrics"
+        );
+    }
+}
+
+/// Log lines captured from a `tracing` subscriber, for marker checks.
+#[derive(Clone, Default)]
+struct SharedLogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl SharedLogBuffer {
+    fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("log buffer lock")).into_owned()
+    }
+}
+
+impl std::io::Write for SharedLogBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::other("log buffer lock poisoned"))?
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogBuffer {
+    type Writer = SharedLogBuffer;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9055,7 +9301,8 @@ pub(crate) mod postgres_audit_tests {
             let _guard = DATABASE.lock().await;
             let database = create_test_database(&admin_dsn).await;
             let (store, tables) = fenced_store(&database).await;
-            super::super::service_token_caller_operation_race_contract(&*store, &tables).await;
+            super::super::service_token_caller_operation_race_contract(&*store, &*store, &tables)
+                .await;
         }
 
         #[tokio::test]
@@ -9168,6 +9415,12 @@ pub(crate) mod postgres_audit_tests {
                 .expect("an unkeyed issue commits")
                 .record
                 .id;
+            // The recorder is this thread's, and the test's current-thread
+            // runtime runs the store on this thread.
+            let recorder = crate::audit::sink::tests::CountingRecorder::default();
+            let _recording = ::metrics::set_default_local_recorder(&recorder);
+            let evidence_failures =
+                || recorder.count(crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL, &[]);
             let issue = super::super::token_operation(
                 93,
                 "service_token.issue",
@@ -9195,11 +9448,15 @@ pub(crate) mod postgres_audit_tests {
             assert!(tables.reservations().await.is_empty());
             assert_eq!(tables.token_rows().await, 1);
             assert_eq!(tables.evidence().await.len(), 1);
+            // Each reservation that could not be written is counted with the
+            // evidence write failures (I2).
+            assert_eq!(evidence_failures(), 2);
             store
                 .rotate(&id, &owner)
                 .await
                 .expect("the unkeyed rotation commits")
                 .expect("the token exists");
+            assert_eq!(evidence_failures(), 2, "an unkeyed change reserves nothing");
         }
     }
 
