@@ -828,6 +828,185 @@ async fn negotiated_file_sink_redelivers_qualified_revocation_and_legacy_records
     }
 }
 
+/// A keyed issue and rotation committed by the PostgreSQL token store under
+/// caller keys (issue #425, plan P5) reach a negotiated file sink as
+/// schema-valid `authority_event.v1` events with the token's revisions, and
+/// a crash after the sink accepted them and before the cursor commit
+/// redelivers them byte for byte. Neither the token, the actor, a plaintext
+/// nor a binding digest reaches the file.
+#[tokio::test]
+async fn a_keyed_token_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit() {
+    use crate::authority_events::caller_operation::{
+        test_caller_key, CallerOperation, CallerOperationBinding, CallerOutcome,
+    };
+    use crate::config::{AuthorityEventFormat, AuthorityEventSinkSetting};
+
+    let (_guard, database) = database_or_skip!();
+    let pool = migrated_pool(&database).await;
+    // As the operation gate's first admission of a keyed change leaves it.
+    let requirement = &crate::storage::compatibility::CALLER_OPERATION_KEYS;
+    pool.get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE greengateway.contract_fence
+             SET generation = generation + 1,
+                 minimum_schema = GREATEST(minimum_schema, $1),
+                 capabilities = $2,
+                 raised_at = now(),
+                 raised_by = 'fixture.keyed_token_change'
+             WHERE singleton",
+            &[
+                &requirement.minimum_schema,
+                &requirement.capability.as_str(),
+            ],
+        )
+        .await
+        .unwrap();
+    let producers = Producers::new(&pool);
+    let actor = ChangeActor::for_test_with_issuer("keyed-token-admin", ACTOR_ISSUER);
+    let bind = |seed: u8, action: &'static str, target: &str, request: &[u8]| {
+        CallerOperation::bind(
+            test_caller_key(seed),
+            &CallerOperationBinding {
+                action,
+                actor: &actor,
+                target,
+                precondition: "",
+                request,
+            },
+        )
+        .unwrap()
+    };
+    let issue = bind(21, "service_token.issue", "", b"{\"scopes\":[\"reader\"]}");
+    let created = match producers
+        .tokens
+        .create_with_operation(
+            CreateTokenRequest {
+                scopes: vec!["admin:tokens:read".to_owned()],
+                created_by: "keyed-token-admin".to_owned(),
+                expires_at: None,
+            },
+            &actor,
+            Some(&issue),
+        )
+        .await
+        .unwrap()
+    {
+        CallerOutcome::Committed(created) => created,
+        CallerOutcome::Replayed(receipt) => panic!("a first attempt commits: {receipt:?}"),
+    };
+    let token = created.record.id.clone();
+    let rotation = bind(22, "service_token.rotate", &token, b"");
+    let rotated = match producers
+        .tokens
+        .rotate_with_operation(&token, &actor, Some(&rotation))
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        CallerOutcome::Committed(rotated) => rotated,
+        CallerOutcome::Replayed(receipt) => panic!("a first attempt commits: {receipt:?}"),
+    };
+
+    let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
+    let keyring = keyring_for(&store).await;
+    let path = std::env::temp_dir().join(format!("gg-keyed-token-{}.jsonl", Uuid::new_v4()));
+    let setting = AuthorityEventSinkSetting::File(path.to_str().unwrap().to_owned());
+    let sink =
+        crate::authority_events::sink::configured_sink(&setting, AuthorityEventFormat::QualifiedV1)
+            .await
+            .unwrap()
+            .unwrap();
+    let mut first = DispatcherTerm::begin(
+        store.clone(),
+        sink.clone(),
+        keyring.clone(),
+        test_config(10),
+        1,
+        Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    assert!(first.fill().await.unwrap());
+    first.offer().await.unwrap();
+    // The process dies here: no cursor commit.
+    drop(first);
+    assert_eq!(store.stats().await.unwrap().cursor, Some(0));
+    let mut successor = DispatcherTerm::begin(
+        store.clone(),
+        sink,
+        keyring.clone(),
+        test_config(10),
+        2,
+        Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        successor
+            .deliver_until_caught_up(&CancellationToken::new())
+            .await
+            .unwrap(),
+        Some(2)
+    );
+
+    let contents = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let lines: Vec<_> = contents.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), 4);
+    assert_eq!(
+        &lines[..2],
+        &lines[2..],
+        "recovery must redeliver byte-identical events"
+    );
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/schemas/authority_event.v1.schema.json"
+    ))
+    .unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let subject = keyring
+        .derive(
+            ReferenceDomain::ActorSubject,
+            &[ACTOR_ISSUER, actor.subject()],
+        )
+        .unwrap();
+    for (line, (operation, key, before, after)) in lines.iter().zip([
+        (
+            "service_token.issue",
+            issue.id(),
+            serde_json::Value::Null,
+            serde_json::json!("1"),
+        ),
+        (
+            "service_token.rotate",
+            rotation.id(),
+            serde_json::json!("1"),
+            serde_json::json!("2"),
+        ),
+    ]) {
+        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+        validator.validate(&event).unwrap();
+        assert_eq!(event["schema_version"], "authority_event.v1");
+        assert_eq!(event["operation"], operation);
+        assert_eq!(event["operation_id"], key.to_string());
+        assert_eq!(event["actor"]["subject_ref"], subject.as_str());
+        assert_eq!(event["revision"]["before"], before, "{operation}");
+        assert_eq!(event["revision"]["after"], after, "{operation}");
+    }
+    for marker in [
+        token.as_str(),
+        actor.subject(),
+        ACTOR_ISSUER,
+        created.plaintext_token.as_str(),
+        rotated.plaintext_token.as_str(),
+        issue.binding_digest(),
+        rotation.binding_digest(),
+    ] {
+        assert!(!contents.contains(marker), "a raw value reached the stream");
+    }
+}
+
 #[tokio::test]
 async fn a_crash_between_acceptance_and_the_cursor_commit_redelivers_identical_records() {
     let (_guard, database) = database_or_skip!();

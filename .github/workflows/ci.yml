@@ -768,9 +768,11 @@ jobs:
             storage::contract_tests::postgres_audit_tests::postgres_two_transactions_racing_one_key_reserve_it_once
             storage::contract_tests::postgres_audit_tests::a_bound_reservation_below_the_fence_is_refused
             storage::contract_tests::postgres_audit_tests::the_caller_key_gate_raises_the_fence_once_and_then_admits_concurrent_keyed_changes
+            storage::contract_tests::postgres_audit_tests::keyed_token_changes::
             connections::pg_store::tests::
             tests::issue_757_mutation_approvals::postgres::
             tests::authority_evidence_app_tests::cluster_connection_keys::
+            tests::authority_evidence_app_tests::cluster_token_keys::
             storage::postgres_documents::tests::
             storage::postgres_admin_sessions::tests::
             authority_events::dispatcher::tests::
