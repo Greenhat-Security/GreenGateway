@@ -33,7 +33,7 @@ ALTER TABLE greengateway.discovery_rule_suggestions
     ADD COLUMN binding_resource_components text;
 
 ALTER TABLE greengateway.discovery_rule_suggestions
-    ADD CONSTRAINT discovery_rule_suggestions_binding_complete_check CHECK (
+    ADD CONSTRAINT discovery_rule_suggestions_binding_check CHECK (
         (generator_version IS NULL
             AND evidence_schema_version IS NULL
             AND evidence_cutoff IS NULL
@@ -50,19 +50,19 @@ ALTER TABLE greengateway.discovery_rule_suggestions
             AND binding_policy_etag IS NOT NULL
             AND binding_resource_snapshot_complete IS NOT NULL
             AND binding_resource_components IS NOT NULL)) NOT VALID,
-    ADD CONSTRAINT discovery_rule_suggestions_generator_version_check CHECK (
+    ADD CONSTRAINT discovery_rule_suggestions_generator_check CHECK (
         octet_length(generator_version) BETWEEN 1 AND 64) NOT VALID,
-    ADD CONSTRAINT discovery_rule_suggestions_evidence_schema_version_check CHECK (
+    ADD CONSTRAINT discovery_rule_suggestions_evidence_schema_check CHECK (
         octet_length(evidence_schema_version) BETWEEN 1 AND 64) NOT VALID,
-    ADD CONSTRAINT discovery_rule_suggestions_evidence_cutoff_check CHECK (
+    ADD CONSTRAINT discovery_rule_suggestions_cutoff_check CHECK (
         octet_length(evidence_cutoff) BETWEEN 1 AND 64) NOT VALID,
     ADD CONSTRAINT discovery_rule_suggestions_evidence_digest_check CHECK (
         evidence_digest ~ '^sha256:[0-9a-f]{64}$') NOT VALID,
-    ADD CONSTRAINT discovery_rule_suggestions_binding_policy_etag_check CHECK (
+    ADD CONSTRAINT discovery_rule_suggestions_policy_etag_check CHECK (
         binding_policy_etag ~ '^"sha256:[0-9a-f]{64}"$') NOT VALID,
-    ADD CONSTRAINT discovery_rule_suggestions_binding_policy_semantic_digest_check CHECK (
+    ADD CONSTRAINT discovery_rule_suggestions_semantic_digest_check CHECK (
         binding_policy_semantic_digest ~ '^sha256:[0-9a-f]{64}$') NOT VALID,
-    ADD CONSTRAINT discovery_rule_suggestions_binding_resource_snapshot_digest_check CHECK (
+    ADD CONSTRAINT discovery_rule_suggestions_snapshot_digest_check CHECK (
         binding_resource_snapshot_digest ~ '^sha256:[0-9a-f]{64}$') NOT VALID,
-    ADD CONSTRAINT discovery_rule_suggestions_binding_resource_components_check CHECK (
+    ADD CONSTRAINT discovery_rule_suggestions_components_check CHECK (
         octet_length(binding_resource_components) BETWEEN 2 AND 4096) NOT VALID;

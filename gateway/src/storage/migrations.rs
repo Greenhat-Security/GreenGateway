@@ -426,7 +426,7 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
             include_str!("migrations/0037_rule_suggestion_bindings.sql"),
         )
         .finalize()
-        .with_pinned_checksum("4b3dd666f5e9e9da147faab6e7faab62ed590583562fedda1eb85f2246a6e17e"),
+        .with_pinned_checksum("be12cdb646c63275cdc768c0d3d44aed97c7859e58dde406b1ab3ed51d8d5c90"),
     ]
 });
 
@@ -2712,6 +2712,13 @@ mod tests {
                  DROP TABLE greengateway.mutation_approval_prepare_evidence; \
                  DROP TABLE greengateway.authority_caller_operation_ids; \
                  DROP TABLE greengateway.connection_mutation_approvals; \
+                 ALTER TABLE greengateway.discovery_rule_suggestions \
+                     DROP COLUMN generator_version, DROP COLUMN evidence_schema_version, \
+                     DROP COLUMN evidence_cutoff, DROP COLUMN evidence_digest, \
+                     DROP COLUMN binding_policy_etag, DROP COLUMN binding_policy_semantic_digest, \
+                     DROP COLUMN binding_resource_snapshot_digest, \
+                     DROP COLUMN binding_resource_snapshot_complete, \
+                     DROP COLUMN binding_resource_components; \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await
@@ -5010,15 +5017,15 @@ mod tests {
                 .map(|(name, _)| name.as_str())
                 .collect::<Vec<_>>(),
             [
-                "discovery_rule_suggestions_binding_complete_check",
-                "discovery_rule_suggestions_binding_policy_etag_check",
-                "discovery_rule_suggestions_binding_policy_semantic_digest_check",
-                "discovery_rule_suggestions_binding_resource_components_check",
-                "discovery_rule_suggestions_binding_resource_snapshot_digest_check",
-                "discovery_rule_suggestions_evidence_cutoff_check",
+                "discovery_rule_suggestions_binding_check",
+                "discovery_rule_suggestions_components_check",
+                "discovery_rule_suggestions_cutoff_check",
                 "discovery_rule_suggestions_evidence_digest_check",
-                "discovery_rule_suggestions_evidence_schema_version_check",
-                "discovery_rule_suggestions_generator_version_check",
+                "discovery_rule_suggestions_evidence_schema_check",
+                "discovery_rule_suggestions_generator_check",
+                "discovery_rule_suggestions_policy_etag_check",
+                "discovery_rule_suggestions_semantic_digest_check",
+                "discovery_rule_suggestions_snapshot_digest_check",
             ],
             "nine NOT VALID constraints"
         );
