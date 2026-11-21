@@ -2868,11 +2868,13 @@ mod cluster_connection_keys {
     const CLUSTER_ISSUER: &str = "https://cluster-connection-keys.example.test";
     const DEPLOYMENT: &str = "deploy-cluster-connection-keys";
 
-    /// A cluster replica over `pool` whose operation gate asks `membership`.
+    /// A cluster replica over `pool` whose operation gate asks `membership`
+    /// and which audits to `audit_log`.
     async fn replica(
         config: config::Config,
         pool: &deadpool_postgres::Pool,
         membership: Arc<cluster_membership::ClusterMembership>,
+        audit_log: audit::AuditLog,
     ) -> Router {
         let policy = Arc::new(storage::PostgresPolicyStore::new(pool.clone()));
         let tools = Arc::new(storage::PostgresToolStore::new(pool.clone()));
@@ -2899,7 +2901,7 @@ mod cluster_connection_keys {
         let app = gateway_app_with_process_started_at_and_overrides(
             config,
             PrometheusBuilder::new().build_recorder().handle(),
-            test_audit_log(),
+            audit_log,
             test_audit_event_sender(),
             Instant::now(),
             GatewayAppBuildOverrides {
@@ -3006,12 +3008,14 @@ mod cluster_connection_keys {
     /// live member built before caller keys: the router and that member's
     /// instance ID, which [`stale`] ages out.
     async fn keyed_replica(pool: &deadpool_postgres::Pool) -> (Router, uuid::Uuid) {
-        keyed_replica_with(pool, |_| {}).await
+        keyed_replica_with(pool, test_audit_log(), |_| {}).await
     }
 
-    /// [`keyed_replica`] with `configure` applied to its configuration last.
+    /// [`keyed_replica`] auditing to `audit_log`, with `configure` applied to
+    /// its configuration last.
     async fn keyed_replica_with(
         pool: &deadpool_postgres::Pool,
+        audit_log: audit::AuditLog,
         configure: impl FnOnce(&mut config::Config),
     ) -> (Router, uuid::Uuid) {
         storage::postgres_authority_events::PostgresAuthorityEventStore::new(pool.clone())
@@ -3096,7 +3100,7 @@ mod cluster_connection_keys {
         config.rate_limit_write_burst = 1000;
         config.rate_limit_write_rps = 1000.0;
         configure(&mut config);
-        (replica(config, pool, membership).await, earlier)
+        (replica(config, pool, membership, audit_log).await, earlier)
     }
 
     /// Age member `instance` out of the live fleet.
@@ -3811,14 +3815,21 @@ mod cluster_connection_keys {
     /// overlay replacement with a marked enum source request and a keyed
     /// overlay delete, each with its exact retry; then a keyed create whose
     /// caller key cannot be reserved and a keyed overlay replacement whose
-    /// catalog evidence row cannot be inserted; and, once that Connection
-    /// is replaced to name a discovery path, a keyed refresh whose
-    /// specification fetch fails. The SQLite
-    /// form also drives the OAuth client-credentials replacement and the
-    /// Connection delete. No marker and no
-    /// binding digest reaches a log line at any level, the rendered metrics,
-    /// a receipt, or a conflict or failure answer. Each forced failure is
-    /// answered `503`, and both are counted on
+    /// catalog evidence row cannot be inserted. Then, with that Connection
+    /// replaced to name a discovery path: a keyed refresh refused at the
+    /// egress preflight (`502 egress_denied`: its host is not admitted, so
+    /// nothing is resolved or sent); a keyed refresh from a loopback HTTPS
+    /// upstream the test controls, which records that it received the
+    /// bearer value and the additional header's value read from the
+    /// aliases' files, so the aliases were resolved and their files read;
+    /// and a keyed refresh that fails after that (the upstream answers
+    /// `500`, the refresh `502 request_failed`, and the upstream again
+    /// received both values). The SQLite form also drives the OAuth
+    /// client-credentials replacement and the Connection delete. No marker
+    /// and no binding digest reaches a log line at any level, the rendered
+    /// metrics, a receipt, a conflict or failure answer, or the audit
+    /// stream. Each forced store failure is answered `503`, and both are
+    /// counted on
     /// `greengateway_authority_event_evidence_failures_total` in the same
     /// rendering, so the capture saw the store's metrics. Connection IDs and
     /// caller keys are not secrets and are not searched for; each receipt
@@ -3828,12 +3839,15 @@ mod cluster_connection_keys {
     ) {
         use super::marker_keys::{
             bound_digest, configure_catalog_source_aliases, credentialed_catalog_connection_body,
-            delegated_connection_body, enum_source_overlay_document, marked_connection_body,
-            marked_overlay_document, write_catalog_source_secrets, CATALOG_SOURCE_MARKERS,
-            DELEGATED_MARKERS, ENUM_SOURCE_MARKERS, OVERLAY_MARKERS, REFERENCE_MARKERS, SUFFIXES,
+            credentialed_catalog_connection_body_at, delegated_connection_body,
+            enum_source_overlay_document, marked_connection_body, marked_overlay_document,
+            resolved_catalog_credentials, write_catalog_source_secrets, RecordingSpecUpstream,
+            CATALOG_SOURCE_MARKERS, DELEGATED_MARKERS, ENUM_SOURCE_MARKERS, OVERLAY_MARKERS,
+            REFERENCE_MARKERS, SUFFIXES,
         };
         let secrets = TempDb::new("cluster-catalog-markers");
         write_catalog_source_secrets(&secrets);
+        let (audit_log, capture) = captured_audit();
         let (outcome, logged, rendered) =
             super::super::admin_tokens_app_tests::capture_logs_and_metrics_on_every_runtime_thread(
                 async {
@@ -3851,7 +3865,11 @@ mod cluster_connection_keys {
                     storage::migrations::apply_missing_for_startup(pool, &test_settings())
                         .await
                         .unwrap();
-                    let (router, earlier) = keyed_replica_with(pool, |config| {
+                    // The replica's egress policy admits loopback, where
+                    // this upstream listens, and not the Connection's own
+                    // host.
+                    let upstream = RecordingSpecUpstream::spawn(&secrets).await;
+                    let (router, earlier) = keyed_replica_with(pool, audit_log, |config| {
                         config.connection_secrets_root =
                             Some(connections::secret::SecretRootConfig::new(
                                 secrets.path.with_extension("secrets"),
@@ -4219,14 +4237,16 @@ mod cluster_connection_keys {
                     ));
 
                     admit_inserts_into(pool, "catalog_change_evidence").await;
-                    // A refresh whose credentialed specification fetch fails:
-                    // the Connection, replaced without a key to name a
-                    // discovery path, fetches with its own secrets, and the
-                    // replica's egress policy does not admit the host.
+                    // The Connection, replaced without a key, names a
+                    // discovery path at its own host, which the replica's
+                    // egress policy does not admit: a keyed refresh is
+                    // refused at the egress preflight, before any secret is
+                    // resolved, and the upstream hears nothing.
+                    let connection_route = format!("{CONNECTIONS_ADMIN_ROUTE}/{catalog_id}");
                     let (status, headers, replaced) = call(
                         &router,
                         Method::PUT,
-                        &format!("{CONNECTIONS_ADMIN_ROUTE}/{catalog_id}"),
+                        &connection_route,
                         &admin,
                         Some(credentialed_catalog_connection_body(Some("/openapi.json"))),
                         Some(&catalog_etag),
@@ -4234,29 +4254,99 @@ mod cluster_connection_keys {
                     )
                     .await;
                     assert_eq!(status, StatusCode::OK, "{replaced}");
-                    let fetched_etag = headers[header::ETAG].to_str().unwrap().to_owned();
-                    let fetch_key = caller_key(119);
+                    let refused_etag = headers[header::ETAG].to_str().unwrap().to_owned();
                     let (method, uri) = CatalogCall::Refresh.route(&catalog_id);
-                    let (status, _, failed) = call(
-                        &router,
-                        method,
-                        &uri,
-                        &admin,
-                        None,
-                        Some(&fetched_etag),
-                        Some(&fetch_key),
-                    )
-                    .await;
-                    assert!(!status.is_success(), "{status}: {failed}");
+                    let keyed_refresh = |key: String, if_match: String| {
+                        let (router, admin, method, uri) =
+                            (router.clone(), admin.clone(), method.clone(), uri.clone());
+                        async move {
+                            call(
+                                &router,
+                                method,
+                                &uri,
+                                &admin,
+                                None,
+                                Some(&if_match),
+                                Some(&key),
+                            )
+                            .await
+                        }
+                    };
+                    let refused_key = caller_key(119);
+                    let (status, _, failed) =
+                        keyed_refresh(refused_key.clone(), refused_etag.clone()).await;
+                    assert_eq!(status, StatusCode::BAD_GATEWAY, "{failed}");
+                    assert_eq!(failed["reason"], "egress_denied", "{failed}");
+                    assert!(upstream.take_received().is_empty());
                     answers.push(failed);
                     refused.push(bound_digest(
                         &actor,
-                        &fetch_key,
+                        &refused_key,
+                        "catalog.openapi.publish",
+                        &catalog_id,
+                        &refused_etag,
+                        "",
+                    ));
+
+                    // Replaced to fetch from the upstream the test controls,
+                    // a keyed refresh resolves both operator aliases, reads
+                    // their files and sends their values: the upstream
+                    // received them.
+                    let (status, headers, replaced) = call(
+                        &router,
+                        Method::PUT,
+                        &connection_route,
+                        &admin,
+                        Some(credentialed_catalog_connection_body_at(
+                            &upstream.base_url(),
+                            Some("/openapi.json"),
+                        )),
+                        Some(&refused_etag),
+                        None,
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::OK, "{replaced}");
+                    let fetched_etag = headers[header::ETAG].to_str().unwrap().to_owned();
+                    let fetched_key = caller_key(122);
+                    let (status, _, fetched) =
+                        keyed_refresh(fetched_key.clone(), fetched_etag.clone()).await;
+                    assert_eq!(status, StatusCode::OK, "{fetched}");
+                    assert_eq!(upstream.take_received(), [resolved_catalog_credentials()]);
+                    let fetched_revision = fetched["catalog_revision"]
+                        .as_u64()
+                        .expect("the refresh names its catalog revision");
+                    answers.push(fetched);
+                    committed.push(bound_digest(
+                        &actor,
+                        &fetched_key,
                         "catalog.openapi.publish",
                         &catalog_id,
                         &fetched_etag,
                         "",
                     ));
+
+                    // A keyed refresh whose fetch fails after the
+                    // credentials were resolved and sent: the upstream
+                    // answers `500`.
+                    upstream.fail();
+                    let failed_key = caller_key(123);
+                    let (status, _, failed) =
+                        keyed_refresh(failed_key.clone(), fetched_etag.clone()).await;
+                    assert_eq!(status, StatusCode::BAD_GATEWAY, "{failed}");
+                    assert_eq!(failed["reason"], "request_failed", "{failed}");
+                    assert_eq!(upstream.take_received(), [resolved_catalog_credentials()]);
+                    answers.push(failed);
+                    refused.push(bound_digest(
+                        &actor,
+                        &failed_key,
+                        "catalog.openapi.publish",
+                        &catalog_id,
+                        &fetched_etag,
+                        "",
+                    ));
+                    // The audit writer delivers in order: wait until it has
+                    // delivered the publication of the fetched refresh.
+                    catalog_changes_through(&capture, &catalog_id, fetched_revision);
 
                     let mut stored: Vec<String> = pool
                         .get()
@@ -4290,7 +4380,8 @@ mod cluster_connection_keys {
             crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL
         );
         // Once for the refused reservation, once for the refused catalog
-        // evidence insert; the failed fetch is answered before any evidence.
+        // evidence insert; the two failed refreshes are answered before any
+        // evidence.
         assert_eq!(
             rendered
                 .lines()
@@ -4300,6 +4391,7 @@ mod cluster_connection_keys {
             "both forced failures were counted where the capture saw them"
         );
         let answered = format!("{answers:?}");
+        let audited = format!("{:?}", capture.events());
         let markers = SUFFIXES
             .iter()
             .flat_map(|suffix| {
@@ -4317,11 +4409,19 @@ mod cluster_connection_keys {
             );
         for marker in markers {
             assert!(!answered.contains(&marker), "{marker} reached an answer");
+            assert!(
+                !audited.contains(&marker),
+                "{marker} reached the audit stream"
+            );
             assert!(!logged.contains(&marker), "{marker} reached the logs");
             assert!(!rendered.contains(&marker), "{marker} reached the metrics");
         }
         for digest in committed.iter().chain(&refused) {
             assert!(!answered.contains(digest), "a digest reached an answer");
+            assert!(
+                !audited.contains(digest),
+                "a digest reached the audit stream"
+            );
             assert!(!logged.contains(digest), "a digest reached the logs");
             assert!(!rendered.contains(digest), "a digest reached the metrics");
         }

@@ -475,13 +475,18 @@ fn a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_lo
 /// naming other markers; a keyed overlay replacement with
 /// `allow_unresolved_enum_sources` whose enum source request names a marker
 /// in its path and in a query value, and its exact retry; a keyed overlay
-/// delete of an overlay holding those markers, and its exact retry. Then a
-/// keyed overlay replacement whose reservation cannot be written and, once
-/// the Connection is replaced to name a discovery path, a keyed refresh
-/// whose credentialed specification fetch fails (the test egress policy
-/// admits no host). No marker and no binding digest reaches a log line, the
-/// rendered metrics, a receipt, a conflict or failure answer, or the audit
-/// stream.
+/// delete of an overlay holding those markers, and its exact retry. Then,
+/// with the Connection replaced to name a discovery path: a keyed refresh
+/// refused at the egress preflight (`502 egress_denied`: its host is not
+/// admitted, so nothing is resolved or sent); a keyed refresh from a
+/// loopback upstream the test controls, which records that it received the
+/// bearer value and the additional header's value read from the aliases'
+/// files, so the aliases were resolved and their files read; a keyed
+/// refresh that fails after that (the upstream answers `500`, the refresh
+/// `502 request_failed`, and the upstream again received both values); and
+/// a keyed overlay replacement whose reservation cannot be written. No
+/// marker and no binding digest reaches a log line, the rendered metrics, a
+/// receipt, a conflict or failure answer, or the audit stream.
 ///
 /// Not driven: the TLS client certificate and key aliases of a catalog's
 /// Connection, because an enabled Connection builds its TLS client from PEM
@@ -499,12 +504,14 @@ fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_
     let ((answers, digests, committed), logged, rendered) =
         super::super::admin_tokens_app_tests::capture_logs_and_metrics_on_every_runtime_thread(
             async {
-                let router = keyed_connection_router(
-                    &connection_db,
-                    &policy,
-                    audit_log,
-                    configure_catalog_source_aliases,
-                );
+                let upstream = RecordingSpecUpstream::spawn(&connection_db).await;
+                let router =
+                    keyed_connection_router(&connection_db, &policy, audit_log, |config| {
+                        configure_catalog_source_aliases(config);
+                        // Loopback only, where the upstream listens.
+                        config.egress_allowed_hosts = vec!["127.0.0.1".to_owned()];
+                        config.egress_deny_private_ips = false;
+                    });
                 let roles: Vec<&str> = std::iter::once("connections-superadmin")
                     .chain(CATALOG_ROLES.iter().copied())
                     .collect();
@@ -670,6 +677,100 @@ fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_
                     "",
                 ));
 
+                // The Connection, replaced without a key, names a discovery
+                // path at a host the egress policy does not admit: a keyed
+                // refresh is refused at the egress preflight, before any
+                // secret is resolved, and the upstream hears nothing.
+                let route = format!("{CONNECTIONS_ADMIN_ROUTE}/{id}");
+                let replace = |body: String, if_match: &str| {
+                    keyed_connection_request(
+                        Method::PUT,
+                        &route,
+                        admin.clone(),
+                        Some(body),
+                        Some(if_match),
+                        None,
+                    )
+                };
+                let (status, refused_etag, replaced) = exchange(
+                    &router,
+                    replace(
+                        credentialed_catalog_connection_body(Some("/openapi.json")),
+                        &etag,
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{replaced}");
+                let refused_etag = refused_etag.expect("the replacement names its ETag");
+                let keyed_refresh = |key: &str, if_match: &str| {
+                    CatalogCall::Refresh.request(&id, if_match, None, admin.clone(), Some(key))
+                };
+                let refused_key = caller_key(101);
+                let (status, _, refused) =
+                    exchange(&router, keyed_refresh(&refused_key, &refused_etag)).await;
+                assert_eq!(status, StatusCode::BAD_GATEWAY, "{refused}");
+                assert_eq!(refused["reason"], "egress_denied", "{refused}");
+                assert!(upstream.take_received().is_empty());
+                answers.push(refused);
+                digests.push(bound_digest(
+                    &actor,
+                    &refused_key,
+                    "catalog.openapi.publish",
+                    &id,
+                    &refused_etag,
+                    "",
+                ));
+
+                // Replaced to fetch from the upstream the test controls, a
+                // keyed refresh resolves both operator aliases, reads their
+                // files and sends their values: the upstream received them.
+                let (status, fetched_etag, replaced) = exchange(
+                    &router,
+                    replace(
+                        credentialed_catalog_connection_body_at(
+                            &upstream.base_url(),
+                            Some("/openapi.json"),
+                        ),
+                        &refused_etag,
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{replaced}");
+                let fetched_etag = fetched_etag.expect("the replacement names its ETag");
+                let fetched_key = caller_key(102);
+                let (status, _, fetched) =
+                    exchange(&router, keyed_refresh(&fetched_key, &fetched_etag)).await;
+                assert_eq!(status, StatusCode::OK, "{fetched}");
+                assert_eq!(upstream.take_received(), [resolved_catalog_credentials()]);
+                answers.push(fetched);
+                committed.push(bound_digest(
+                    &actor,
+                    &fetched_key,
+                    "catalog.openapi.publish",
+                    &id,
+                    &fetched_etag,
+                    "",
+                ));
+
+                // A keyed refresh whose fetch fails after the credentials
+                // were resolved and sent: the upstream answers `500`.
+                upstream.fail();
+                let failed_key = caller_key(103);
+                let (status, _, failed) =
+                    exchange(&router, keyed_refresh(&failed_key, &fetched_etag)).await;
+                assert_eq!(status, StatusCode::BAD_GATEWAY, "{failed}");
+                assert_eq!(failed["reason"], "request_failed", "{failed}");
+                assert_eq!(upstream.take_received(), [resolved_catalog_credentials()]);
+                answers.push(failed);
+                digests.push(bound_digest(
+                    &actor,
+                    &failed_key,
+                    "catalog.openapi.publish",
+                    &id,
+                    &fetched_etag,
+                    "",
+                ));
+
                 fail_every_reservation(&connection_db.path);
                 let overlay = overlay_etag(&router, &id).await;
                 let failed_key = caller_key(95);
@@ -685,47 +786,6 @@ fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_
                     &id,
                     &overlay,
                     &failing,
-                ));
-
-                // A refresh whose credentialed specification fetch fails:
-                // the Connection, replaced without a key to name a discovery
-                // path, fetches its specification with its own secrets.
-                let route = format!("{CONNECTIONS_ADMIN_ROUTE}/{id}");
-                let (status, fetched_etag, replaced) = exchange(
-                    &router,
-                    keyed_connection_request(
-                        Method::PUT,
-                        &route,
-                        admin.clone(),
-                        Some(credentialed_catalog_connection_body(Some("/openapi.json"))),
-                        Some(&etag),
-                        None,
-                    ),
-                )
-                .await;
-                assert_eq!(status, StatusCode::OK, "{replaced}");
-                let fetched_etag = fetched_etag.expect("the replacement names its ETag");
-                let fetch_key = caller_key(101);
-                let (status, _, failed) = exchange(
-                    &router,
-                    CatalogCall::Refresh.request(
-                        &id,
-                        &fetched_etag,
-                        None,
-                        admin.clone(),
-                        Some(&fetch_key),
-                    ),
-                )
-                .await;
-                assert!(!status.is_success(), "{status}: {failed}");
-                answers.push(failed);
-                digests.push(bound_digest(
-                    &actor,
-                    &fetch_key,
-                    "catalog.openapi.publish",
-                    &id,
-                    &fetched_etag,
-                    "",
                 ));
 
                 assert!(catalog_changes_through(&capture, &id, 5) >= 5);
@@ -806,7 +866,8 @@ pub(super) fn write_catalog_source_secrets(connection_db: &TempDb) {
     }
 }
 
-/// Configures the two operator aliases of [`CATALOG_SOURCE_MARKERS`].
+/// Configures the two operator aliases of [`CATALOG_SOURCE_MARKERS`] and
+/// [`UPSTREAM_CA_ALIAS`].
 pub(super) fn configure_catalog_source_aliases(config: &mut config::Config) {
     for (id, locator) in [
         (CATALOG_SOURCE_MARKERS[0], CATALOG_SOURCE_MARKERS[2]),
@@ -822,13 +883,44 @@ pub(super) fn configure_catalog_source_aliases(config: &mut config::Config) {
                 },
             });
     }
+    config
+        .connection_secret_aliases
+        .push(connections::secret::OperatorSecretAliasConfig {
+            id: UPSTREAM_CA_ALIAS.to_owned(),
+            label: "Catalog upstream CA".to_owned(),
+            source: connections::secret::OperatorSecretAliasSource::File {
+                key: UPSTREAM_CA_LOCATOR.to_owned(),
+            },
+        });
 }
+
+/// The endpoint of [`credentialed_catalog_connection_body`]: a host no test
+/// egress policy admits.
+pub(super) const UNADMITTED_CATALOG_ENDPOINT: &str = "https://openapi.example.test";
 
 /// The body of an enabled managed OpenAPI Connection whose discovery uses
 /// its own bearer and additional-header secrets, the aliases of
-/// [`CATALOG_SOURCE_MARKERS`], with `discovery_path` as its discovery path.
+/// [`CATALOG_SOURCE_MARKERS`], with `discovery_path` as its discovery path
+/// at [`UNADMITTED_CATALOG_ENDPOINT`].
 pub(super) fn credentialed_catalog_connection_body(discovery_path: Option<&str>) -> String {
+    credentialed_catalog_connection_body_at(UNADMITTED_CATALOG_ENDPOINT, discovery_path)
+}
+
+/// [`credentialed_catalog_connection_body`] with `base_url` as its endpoint;
+/// any other endpoint than [`UNADMITTED_CATALOG_ENDPOINT`] is a
+/// [`RecordingSpecUpstream`], whose CA it trusts through
+/// [`UPSTREAM_CA_ALIAS`].
+pub(super) fn credentialed_catalog_connection_body_at(
+    base_url: &str,
+    discovery_path: Option<&str>,
+) -> String {
     let mut discovery = json!({"type": "managed_openapi", "use_connection_authentication": true});
+    // Only the test's own upstream needs its CA trusted.
+    let tls = if base_url == UNADMITTED_CATALOG_ENDPOINT {
+        json!({})
+    } else {
+        json!({"ca_bundle_alias": UPSTREAM_CA_ALIAS})
+    };
     if let Some(path) = discovery_path {
         discovery["path"] = json!(path);
     }
@@ -836,11 +928,12 @@ pub(super) fn credentialed_catalog_connection_body(discovery_path: Option<&str>)
         "display_name": format!("Marked catalog {}", discovery_path.unwrap_or("upload")),
         "enabled": true,
         "kind": "http_api",
-        "endpoint": {"base_url": "https://openapi.example.test", "base_path": "/v1"},
+        "endpoint": {"base_url": base_url, "base_path": "/v1"},
         "authentication": {"type": "static_bearer", "secret_id": CATALOG_SOURCE_MARKERS[0]},
         "additional_headers": [
             {"header_name": "x-proxy-token", "secret_id": CATALOG_SOURCE_MARKERS[1]}
         ],
+        "tls": tls,
         "discovery": discovery
     })
     .to_string()
@@ -871,6 +964,144 @@ async fn create_credentialed_catalog_connection(
         created["id"].as_str().expect("an ID").to_owned(),
         etag.expect("the create names its ETag"),
     )
+}
+
+/// The two credential headers a catalog Connection's discovery sends, as
+/// one upstream request carried them: `authorization`, then `x-proxy-token`.
+pub(super) type ReceivedCredentials = (Option<String>, Option<String>);
+
+/// What a fetch of the catalog Connection's specification must carry: the
+/// two secret values of [`CATALOG_SOURCE_MARKERS`], read from the files the
+/// operator aliases name.
+pub(super) fn resolved_catalog_credentials() -> ReceivedCredentials {
+    (
+        Some(format!("Bearer {}", CATALOG_SOURCE_MARKERS[4])),
+        Some(CATALOG_SOURCE_MARKERS[5].to_owned()),
+    )
+}
+
+/// The operator alias, and the file it reads in the test secret root, of the
+/// CA that [`RecordingSpecUpstream`]'s certificate chains to. A CA
+/// certificate is not a secret, so these are not markers.
+pub(super) const UPSTREAM_CA_ALIAS: &str = "catalog-upstream-ca";
+const UPSTREAM_CA_LOCATOR: &str = "catalog-upstream-ca.pem";
+
+/// A loopback HTTPS upstream the test controls, standing in for a catalog
+/// Connection's specification host (a credentialed Connection must use
+/// HTTPS): it records the credential headers of every request it receives
+/// and answers with the widget specification, or with `500` once
+/// [`Self::fail`] was called.
+pub(super) struct RecordingSpecUpstream {
+    address: std::net::SocketAddr,
+    received: Arc<std::sync::Mutex<Vec<ReceivedCredentials>>>,
+    failing: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RecordingSpecUpstream {
+    /// Starts the upstream under a CA generated for this run, whose
+    /// certificate it writes to [`UPSTREAM_CA_LOCATOR`] in the test secret
+    /// root of `connection_db`.
+    pub(super) async fn spawn(connection_db: &TempDb) -> Self {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let (ca_pem, server_cert_der, server_key_der) = test_ca_signed_server_certificate();
+        let secret_root = connection_db.path.with_extension("secrets");
+        fs::create_dir_all(&secret_root).expect("the test secret root creates");
+        fs::write(secret_root.join(UPSTREAM_CA_LOCATOR), ca_pem).expect("the CA writes");
+        let acceptor = TlsAcceptor::from(Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![CertificateDer::from(server_cert_der)],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key_der)),
+                )
+                .expect("the upstream TLS configuration builds"),
+        ));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("the upstream binds");
+        let address = listener.local_addr().expect("the upstream has an address");
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (recorded, fails) = (Arc::clone(&received), Arc::clone(&failing));
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (acceptor, recorded, fails) =
+                    (acceptor.clone(), Arc::clone(&recorded), Arc::clone(&fails));
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let Some(credentials) = read_request_credentials(&mut stream).await else {
+                        return;
+                    };
+                    recorded.lock().expect("the record locks").push(credentials);
+                    let response = if fails.load(std::sync::atomic::Ordering::SeqCst) {
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\
+                         Connection: close\r\n\r\n"
+                            .to_owned()
+                    } else {
+                        let spec = widget_openapi_spec();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{spec}",
+                            spec.len()
+                        )
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        Self {
+            address,
+            received,
+            failing,
+        }
+    }
+
+    /// The base URL a Connection names to fetch from this upstream.
+    pub(super) fn base_url(&self) -> String {
+        format!("https://{}", self.address)
+    }
+
+    /// From here on every request is answered `500`.
+    pub(super) fn fail(&self) {
+        self.failing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The requests received since the last call, oldest first.
+    pub(super) fn take_received(&self) -> Vec<ReceivedCredentials> {
+        std::mem::take(&mut *self.received.lock().expect("the record locks"))
+    }
+}
+
+/// Reads one request's head from `stream` and returns its credential
+/// headers, or `None` if the stream closes first.
+async fn read_request_credentials(
+    stream: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+) -> Option<ReceivedCredentials> {
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        head.extend_from_slice(&chunk[..read]);
+        assert!(head.len() <= 16 * 1024, "the request head stays bounded");
+    }
+    let head = String::from_utf8(head).expect("the request head is text");
+    let named = |name: &str| {
+        head.split("\r\n").skip(1).find_map(|line| {
+            let (header, value) = line.split_once(':')?;
+            header
+                .trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_owned())
+        })
+    };
+    Some((named("authorization"), named("x-proxy-token")))
 }
 
 /// An overlay whose one enum source requests a path and a query value that
