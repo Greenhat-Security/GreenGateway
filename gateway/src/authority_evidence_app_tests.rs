@@ -2868,11 +2868,13 @@ mod cluster_connection_keys {
     const CLUSTER_ISSUER: &str = "https://cluster-connection-keys.example.test";
     const DEPLOYMENT: &str = "deploy-cluster-connection-keys";
 
-    /// A cluster replica over `pool` whose operation gate asks `membership`.
+    /// A cluster replica over `pool` whose operation gate asks `membership`
+    /// and which audits to `audit_log`.
     async fn replica(
         config: config::Config,
         pool: &deadpool_postgres::Pool,
         membership: Arc<cluster_membership::ClusterMembership>,
+        audit_log: audit::AuditLog,
     ) -> Router {
         let policy = Arc::new(storage::PostgresPolicyStore::new(pool.clone()));
         let tools = Arc::new(storage::PostgresToolStore::new(pool.clone()));
@@ -2899,7 +2901,7 @@ mod cluster_connection_keys {
         let app = gateway_app_with_process_started_at_and_overrides(
             config,
             PrometheusBuilder::new().build_recorder().handle(),
-            test_audit_log(),
+            audit_log,
             test_audit_event_sender(),
             Instant::now(),
             GatewayAppBuildOverrides {
@@ -3006,6 +3008,16 @@ mod cluster_connection_keys {
     /// live member built before caller keys: the router and that member's
     /// instance ID, which [`stale`] ages out.
     async fn keyed_replica(pool: &deadpool_postgres::Pool) -> (Router, uuid::Uuid) {
+        keyed_replica_with(pool, test_audit_log(), |_| {}).await
+    }
+
+    /// [`keyed_replica`] auditing to `audit_log`, with `configure` applied to
+    /// its configuration last.
+    async fn keyed_replica_with(
+        pool: &deadpool_postgres::Pool,
+        audit_log: audit::AuditLog,
+        configure: impl FnOnce(&mut config::Config),
+    ) -> (Router, uuid::Uuid) {
         storage::postgres_authority_events::PostgresAuthorityEventStore::new(pool.clone())
             .configure_capacity(100)
             .await
@@ -3087,7 +3099,8 @@ mod cluster_connection_keys {
         config.egress_deny_private_ips = false;
         config.rate_limit_write_burst = 1000;
         config.rate_limit_write_rps = 1000.0;
-        (replica(config, pool, membership).await, earlier)
+        configure(&mut config);
+        (replica(config, pool, membership, audit_log).await, earlier)
     }
 
     /// Age member `instance` out of the live fleet.
@@ -3695,6 +3708,724 @@ mod cluster_connection_keys {
             fence.generation + 1
         );
     }
+
+    /// Installs a test-only trigger that refuses every insert into
+    /// `greengateway.{table}`.
+    async fn fail_inserts_into(pool: &deadpool_postgres::Pool, table: &str) {
+        pool.get()
+            .await
+            .unwrap()
+            .batch_execute(&format!(
+                "CREATE FUNCTION greengateway.fail_{table}() \
+                 RETURNS trigger LANGUAGE plpgsql AS $$ \
+                 BEGIN RAISE EXCEPTION 'injected {table} failure'; END; $$; \
+                 CREATE TRIGGER fail_{table} BEFORE INSERT ON greengateway.{table} \
+                 FOR EACH ROW EXECUTE FUNCTION greengateway.fail_{table}();"
+            ))
+            .await
+            .expect("the failure trigger installs");
+    }
+
+    /// Removes what [`fail_inserts_into`] installed.
+    async fn admit_inserts_into(pool: &deadpool_postgres::Pool, table: &str) {
+        pool.get()
+            .await
+            .unwrap()
+            .batch_execute(&format!(
+                "DROP TRIGGER fail_{table} ON greengateway.{table}; \
+                 DROP FUNCTION greengateway.fail_{table}();"
+            ))
+            .await
+            .expect("the failure trigger drops");
+    }
+
+    /// Creates, without a discovery path and without a key, the
+    /// credentialed catalog Connection of
+    /// `marker_keys::credentialed_catalog_connection_body`; returns its ID
+    /// and ETag. Its answer names its references to its creator.
+    async fn create_cluster_catalog_connection(router: &Router, admin: &str) -> (String, String) {
+        let collection = collection_etag(router, admin).await;
+        let (status, headers, created) = call(
+            router,
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            admin,
+            Some(super::marker_keys::credentialed_catalog_connection_body(
+                None,
+            )),
+            Some(&collection),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        (
+            created["id"].as_str().unwrap().to_owned(),
+            headers[header::ETAG].to_str().unwrap().to_owned(),
+        )
+    }
+
+    /// The registration body of the widget specification for Connection
+    /// `id`, selecting `tool`, from its preview.
+    async fn cluster_openapi_registration(
+        router: &Router,
+        admin: &str,
+        id: &str,
+        tool: &str,
+    ) -> String {
+        let (status, _, preview) = call(
+            router,
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{id}/openapi/preview"),
+            admin,
+            Some(json!({ "spec": widget_openapi_spec() }).to_string()),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        let confirmations: Vec<Value> = preview["security_confirmations"]
+            .as_array()
+            .expect("the preview lists security confirmations")
+            .iter()
+            .filter(|confirmation| confirmation["tool_name"] == json!(tool))
+            .cloned()
+            .collect();
+        json!({
+            "spec": widget_openapi_spec(),
+            "spec_digest": preview["spec_digest"],
+            "expected_spec_revision": preview["spec_revision"],
+            "expected_catalog_revision": preview["catalog_revision"],
+            "selected_tool_names": [tool],
+            "security_confirmations": confirmations,
+        })
+        .to_string()
+    }
+
+    /// I5 for the Connection and catalog families on a PostgreSQL-backed
+    /// cluster replica, the form of
+    /// `marker_keys::a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
+    /// and its catalog sibling that runs against the PostgreSQL store: the
+    /// same marked requests (a keyed create naming a marker in each bearer
+    /// credential reference, a keyed replacement to a delegated-issuer body
+    /// naming its client secret, signing key and published key aliases, a
+    /// keyed OpenAPI registration on an enabled Connection whose discovery
+    /// uses its marked operator secret aliases, and a keyed overlay
+    /// replacement with marked free text), each with its exact retry and a
+    /// conflicting retry; a keyed refresh of that Connection, a keyed
+    /// overlay replacement with a marked enum source request and a keyed
+    /// overlay delete, each with its exact retry; then a keyed create whose
+    /// caller key cannot be reserved and a keyed overlay replacement whose
+    /// catalog evidence row cannot be inserted. Then, with that Connection
+    /// replaced to name a discovery path: a keyed refresh refused at the
+    /// egress preflight (`502 egress_denied`: its host is not admitted, so
+    /// nothing is resolved or sent); a keyed refresh from a loopback HTTPS
+    /// upstream the test controls, which records that it received the
+    /// bearer value and the additional header's value read from the
+    /// aliases' files, so the aliases were resolved and their files read;
+    /// and a keyed refresh that fails after that (the upstream answers
+    /// `500`, the refresh `502 request_failed`, and the upstream again
+    /// received both values). The SQLite form also drives the OAuth
+    /// client-credentials replacement and the Connection delete. No marker
+    /// and no binding digest reaches a log line at any level, the rendered
+    /// metrics, a receipt, a conflict or failure answer, or the audit
+    /// stream. Each forced store failure is answered `503`, and both are
+    /// counted on
+    /// `greengateway_authority_event_evidence_failures_total` in the same
+    /// rendering, so the capture saw the store's metrics. Connection IDs and
+    /// caller keys are not secrets and are not searched for; each receipt
+    /// names its key to its caller by design.
+    #[test]
+    fn postgres_keyed_connection_and_catalog_changes_keep_synthetic_markers_out_of_the_logs_and_metrics(
+    ) {
+        use super::marker_keys::{
+            bound_digest, configure_catalog_source_aliases, credentialed_catalog_connection_body,
+            credentialed_catalog_connection_body_at, delegated_connection_body,
+            enum_source_overlay_document, marked_connection_body, marked_overlay_document,
+            resolved_catalog_credentials, write_catalog_source_secrets, RecordingSpecUpstream,
+            CATALOG_SOURCE_MARKERS, DELEGATED_MARKERS, ENUM_SOURCE_MARKERS, OVERLAY_MARKERS,
+            REFERENCE_MARKERS, SUFFIXES,
+        };
+        let secrets = TempDb::new("cluster-catalog-markers");
+        write_catalog_source_secrets(&secrets);
+        let (audit_log, capture) = captured_audit();
+        let (outcome, logged, rendered) =
+            super::super::admin_tokens_app_tests::capture_logs_and_metrics_on_every_runtime_thread(
+                async {
+                    let Some(admin_dsn) = locator() else {
+                        eprintln!("skipping: no test database locator; CI runs this test");
+                        return None;
+                    };
+                    let database =
+                        storage::contract_tests::postgres_audit_tests::create_test_database(
+                            &admin_dsn,
+                        )
+                        .await;
+                    let foundation = test_pool(&database.dsn).await;
+                    let pool = foundation.pool();
+                    storage::migrations::apply_missing_for_startup(pool, &test_settings())
+                        .await
+                        .unwrap();
+                    // The replica's egress policy admits loopback, where
+                    // this upstream listens, and not the Connection's own
+                    // host.
+                    let upstream = RecordingSpecUpstream::spawn(&secrets).await;
+                    let (router, earlier) = keyed_replica_with(pool, audit_log, |config| {
+                        config.connection_secrets_root =
+                            Some(connections::secret::SecretRootConfig::new(
+                                secrets.path.with_extension("secrets"),
+                            ));
+                        configure_catalog_source_aliases(config);
+                    })
+                    .await;
+                    stale(pool, earlier).await;
+                    let roles: Vec<&str> = std::iter::once("connections-superadmin")
+                        .chain(CATALOG_ROLES.iter().copied())
+                        .collect();
+                    let admin = signed_token_with_issuer("operator", &roles, CLUSTER_ISSUER);
+                    let actor = auth::change_actor::ChangeActor::for_test_with_issuer(
+                        "operator",
+                        CLUSTER_ISSUER,
+                    );
+                    let mut answers = Vec::new();
+                    let mut committed = Vec::new();
+                    let mut refused = Vec::new();
+
+                    // A Connection create, its retries.
+                    let collection = collection_etag(&router, &admin).await;
+                    let create_key = caller_key(110);
+                    let marked = marked_connection_body(SUFFIXES[0]);
+                    let conflicting = marked_connection_body(SUFFIXES[1]);
+                    let mut statuses = Vec::new();
+                    let mut created = None;
+                    for body in [&marked, &marked, &conflicting] {
+                        let (status, headers, answer) = call(
+                            &router,
+                            Method::POST,
+                            CONNECTIONS_ADMIN_ROUTE,
+                            &admin,
+                            Some(body.clone()),
+                            Some(&collection),
+                            Some(&create_key),
+                        )
+                        .await;
+                        statuses.push(status);
+                        if created.is_none() {
+                            created = Some((answer, headers));
+                        } else {
+                            answers.push(answer);
+                        }
+                    }
+                    assert_eq!(
+                        statuses,
+                        [StatusCode::CREATED, StatusCode::OK, StatusCode::CONFLICT],
+                        "{answers:?}"
+                    );
+                    let (created, headers) = created.expect("the create answered");
+                    let id = created["id"].as_str().expect("an ID").to_owned();
+                    let etag = headers[header::ETAG].to_str().unwrap().to_owned();
+                    committed.push(bound_digest(
+                        &actor,
+                        &create_key,
+                        "connection.create",
+                        "",
+                        &collection,
+                        &marked,
+                    ));
+                    refused.push(bound_digest(
+                        &actor,
+                        &create_key,
+                        "connection.create",
+                        "",
+                        &collection,
+                        &conflicting,
+                    ));
+
+                    // A replacement to a delegated-issuer body, its retries.
+                    let route = format!("{CONNECTIONS_ADMIN_ROUTE}/{id}");
+                    let replace_key = caller_key(111);
+                    let delegated = delegated_connection_body(SUFFIXES[0]);
+                    let conflicting = delegated_connection_body(SUFFIXES[1]);
+                    let mut statuses = Vec::new();
+                    for (index, body) in [&delegated, &delegated, &conflicting]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let (status, _, answer) = call(
+                            &router,
+                            Method::PUT,
+                            &route,
+                            &admin,
+                            Some(body.clone()),
+                            Some(&etag),
+                            Some(&replace_key),
+                        )
+                        .await;
+                        statuses.push(status);
+                        if index > 0 {
+                            answers.push(answer);
+                        }
+                    }
+                    assert_eq!(
+                        statuses,
+                        [StatusCode::OK, StatusCode::OK, StatusCode::CONFLICT],
+                        "{answers:?}"
+                    );
+                    committed.push(bound_digest(
+                        &actor,
+                        &replace_key,
+                        "connection.replace",
+                        &id,
+                        &etag,
+                        &delegated,
+                    ));
+                    refused.push(bound_digest(
+                        &actor,
+                        &replace_key,
+                        "connection.replace",
+                        &id,
+                        &etag,
+                        &conflicting,
+                    ));
+
+                    // An OpenAPI registration on a credentialed Connection,
+                    // its retry, its key on the refresh route.
+                    let (catalog_id, catalog_etag) =
+                        create_cluster_catalog_connection(&router, &admin).await;
+                    let registration =
+                        cluster_openapi_registration(&router, &admin, &catalog_id, "createWidget")
+                            .await;
+                    let register_key = caller_key(112);
+                    let mut statuses = Vec::new();
+                    for (index, catalog_call) in [
+                        CatalogCall::Register,
+                        CatalogCall::Register,
+                        CatalogCall::Refresh,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let (method, uri) = catalog_call.route(&catalog_id);
+                        let body = matches!(catalog_call, CatalogCall::Register)
+                            .then(|| registration.clone());
+                        let (status, _, answer) = call(
+                            &router,
+                            method,
+                            &uri,
+                            &admin,
+                            body,
+                            Some(&catalog_etag),
+                            Some(&register_key),
+                        )
+                        .await;
+                        statuses.push(status);
+                        if index > 0 {
+                            answers.push(answer);
+                        }
+                    }
+                    assert_eq!(
+                        statuses,
+                        [StatusCode::CREATED, StatusCode::OK, StatusCode::CONFLICT],
+                        "{answers:?}"
+                    );
+                    committed.push(bound_digest(
+                        &actor,
+                        &register_key,
+                        "catalog.openapi.publish",
+                        &catalog_id,
+                        &catalog_etag,
+                        &registration,
+                    ));
+                    // The refresh route binds no body.
+                    refused.push(bound_digest(
+                        &actor,
+                        &register_key,
+                        "catalog.openapi.publish",
+                        &catalog_id,
+                        &catalog_etag,
+                        "",
+                    ));
+
+                    // A refresh, which loads the credentialed Connection and
+                    // republishes the stored specification, and its retry.
+                    let refresh_key = caller_key(116);
+                    for _ in 0..2 {
+                        let (method, uri) = CatalogCall::Refresh.route(&catalog_id);
+                        let (status, _, answer) = call(
+                            &router,
+                            method,
+                            &uri,
+                            &admin,
+                            None,
+                            Some(&catalog_etag),
+                            Some(&refresh_key),
+                        )
+                        .await;
+                        assert_eq!(status, StatusCode::OK, "{answer}");
+                        answers.push(answer);
+                    }
+                    committed.push(bound_digest(
+                        &actor,
+                        &refresh_key,
+                        "catalog.openapi.publish",
+                        &catalog_id,
+                        &catalog_etag,
+                        "",
+                    ));
+
+                    // An overlay replacement, its retries.
+                    let overlay_route = format!("{CONNECTIONS_ADMIN_ROUTE}/{catalog_id}/overlay");
+                    let overlay_etag = |router: Router, admin: String, route: String| async move {
+                        let (status, headers, overlay) =
+                            call(&router, Method::GET, &route, &admin, None, None, None).await;
+                        assert_eq!(status, StatusCode::OK, "{overlay}");
+                        headers[header::ETAG].to_str().unwrap().to_owned()
+                    };
+                    let overlay =
+                        overlay_etag(router.clone(), admin.clone(), overlay_route.clone()).await;
+                    let put_key = caller_key(113);
+                    let marked = marked_overlay_document(SUFFIXES[0]);
+                    let conflicting = marked_overlay_document(SUFFIXES[1]);
+                    let mut statuses = Vec::new();
+                    for (index, document) in
+                        [&marked, &marked, &conflicting].into_iter().enumerate()
+                    {
+                        let (status, _, answer) = call(
+                            &router,
+                            Method::PUT,
+                            &overlay_route,
+                            &admin,
+                            Some(document.clone()),
+                            Some(&overlay),
+                            Some(&put_key),
+                        )
+                        .await;
+                        statuses.push(status);
+                        if index > 0 {
+                            answers.push(answer);
+                        }
+                    }
+                    assert_eq!(
+                        statuses,
+                        [StatusCode::OK, StatusCode::OK, StatusCode::CONFLICT],
+                        "{answers:?}"
+                    );
+                    for (document, digests) in
+                        [(&marked, &mut committed), (&conflicting, &mut refused)]
+                    {
+                        digests.push(bound_digest(
+                            &actor,
+                            &put_key,
+                            "catalog.overlay.replace",
+                            &catalog_id,
+                            &overlay,
+                            document,
+                        ));
+                    }
+
+                    // An enum source the gateway would fetch with the
+                    // Connection's credentials, admitted unresolved, then a
+                    // delete of the overlay holding it; each with its retry.
+                    let overlay =
+                        overlay_etag(router.clone(), admin.clone(), overlay_route.clone()).await;
+                    let sourced_key = caller_key(117);
+                    let sourced = enum_source_overlay_document();
+                    for _ in 0..2 {
+                        let (status, _, answer) = call(
+                            &router,
+                            Method::PUT,
+                            &format!("{overlay_route}?allow_unresolved_enum_sources=true"),
+                            &admin,
+                            Some(sourced.clone()),
+                            Some(&overlay),
+                            Some(&sourced_key),
+                        )
+                        .await;
+                        assert_eq!(status, StatusCode::OK, "{answer}");
+                        answers.push(answer);
+                    }
+                    committed.push(bound_digest(
+                        &actor,
+                        &sourced_key,
+                        "catalog.overlay.replace",
+                        &catalog_id,
+                        &overlay,
+                        &json!([
+                            serde_json::from_str::<Value>(&sourced).expect("the overlay is JSON"),
+                            {"allow_unresolved_enum_sources": true}
+                        ])
+                        .to_string(),
+                    ));
+                    let overlay =
+                        overlay_etag(router.clone(), admin.clone(), overlay_route.clone()).await;
+                    let delete_key = caller_key(118);
+                    for _ in 0..2 {
+                        let (method, uri) = CatalogCall::OverlayDelete.route(&catalog_id);
+                        let (status, _, answer) = call(
+                            &router,
+                            method,
+                            &uri,
+                            &admin,
+                            None,
+                            Some(&overlay),
+                            Some(&delete_key),
+                        )
+                        .await;
+                        assert_eq!(status, StatusCode::OK, "{answer}");
+                        answers.push(answer);
+                    }
+                    committed.push(bound_digest(
+                        &actor,
+                        &delete_key,
+                        "catalog.overlay.delete",
+                        &catalog_id,
+                        &overlay,
+                        "",
+                    ));
+
+                    // Test-only fault injection: a create whose key cannot
+                    // be reserved, then an overlay replacement whose catalog
+                    // evidence cannot be inserted.
+                    fail_inserts_into(pool, "authority_caller_operation_ids").await;
+                    let collection = collection_etag(&router, &admin).await;
+                    let failed_key = caller_key(114);
+                    let failing = marked_connection_body(SUFFIXES[2]);
+                    let (status, _, failed) = call(
+                        &router,
+                        Method::POST,
+                        CONNECTIONS_ADMIN_ROUTE,
+                        &admin,
+                        Some(failing.clone()),
+                        Some(&collection),
+                        Some(&failed_key),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{failed}");
+                    answers.push(failed);
+                    refused.push(bound_digest(
+                        &actor,
+                        &failed_key,
+                        "connection.create",
+                        "",
+                        &collection,
+                        &failing,
+                    ));
+                    admit_inserts_into(pool, "authority_caller_operation_ids").await;
+                    fail_inserts_into(pool, "catalog_change_evidence").await;
+                    let overlay =
+                        overlay_etag(router.clone(), admin.clone(), overlay_route.clone()).await;
+                    let failed_key = caller_key(115);
+                    let failing = marked_overlay_document(SUFFIXES[2]);
+                    let (status, _, failed) = call(
+                        &router,
+                        Method::PUT,
+                        &overlay_route,
+                        &admin,
+                        Some(failing.clone()),
+                        Some(&overlay),
+                        Some(&failed_key),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{failed}");
+                    answers.push(failed);
+                    refused.push(bound_digest(
+                        &actor,
+                        &failed_key,
+                        "catalog.overlay.replace",
+                        &catalog_id,
+                        &overlay,
+                        &failing,
+                    ));
+
+                    admit_inserts_into(pool, "catalog_change_evidence").await;
+                    // The Connection, replaced without a key, names a
+                    // discovery path at its own host, which the replica's
+                    // egress policy does not admit: a keyed refresh is
+                    // refused at the egress preflight, before any secret is
+                    // resolved, and the upstream hears nothing.
+                    let connection_route = format!("{CONNECTIONS_ADMIN_ROUTE}/{catalog_id}");
+                    let (status, headers, replaced) = call(
+                        &router,
+                        Method::PUT,
+                        &connection_route,
+                        &admin,
+                        Some(credentialed_catalog_connection_body(Some("/openapi.json"))),
+                        Some(&catalog_etag),
+                        None,
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::OK, "{replaced}");
+                    let refused_etag = headers[header::ETAG].to_str().unwrap().to_owned();
+                    let (method, uri) = CatalogCall::Refresh.route(&catalog_id);
+                    let keyed_refresh = |key: String, if_match: String| {
+                        let (router, admin, method, uri) =
+                            (router.clone(), admin.clone(), method.clone(), uri.clone());
+                        async move {
+                            call(
+                                &router,
+                                method,
+                                &uri,
+                                &admin,
+                                None,
+                                Some(&if_match),
+                                Some(&key),
+                            )
+                            .await
+                        }
+                    };
+                    let refused_key = caller_key(119);
+                    let (status, _, failed) =
+                        keyed_refresh(refused_key.clone(), refused_etag.clone()).await;
+                    assert_eq!(status, StatusCode::BAD_GATEWAY, "{failed}");
+                    assert_eq!(failed["reason"], "egress_denied", "{failed}");
+                    assert!(upstream.take_received().is_empty());
+                    answers.push(failed);
+                    refused.push(bound_digest(
+                        &actor,
+                        &refused_key,
+                        "catalog.openapi.publish",
+                        &catalog_id,
+                        &refused_etag,
+                        "",
+                    ));
+
+                    // Replaced to fetch from the upstream the test controls,
+                    // a keyed refresh resolves both operator aliases, reads
+                    // their files and sends their values: the upstream
+                    // received them.
+                    let (status, headers, replaced) = call(
+                        &router,
+                        Method::PUT,
+                        &connection_route,
+                        &admin,
+                        Some(credentialed_catalog_connection_body_at(
+                            &upstream.base_url(),
+                            Some("/openapi.json"),
+                        )),
+                        Some(&refused_etag),
+                        None,
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::OK, "{replaced}");
+                    let fetched_etag = headers[header::ETAG].to_str().unwrap().to_owned();
+                    let fetched_key = caller_key(122);
+                    let (status, _, fetched) =
+                        keyed_refresh(fetched_key.clone(), fetched_etag.clone()).await;
+                    assert_eq!(status, StatusCode::OK, "{fetched}");
+                    assert_eq!(upstream.take_received(), [resolved_catalog_credentials()]);
+                    let fetched_revision = fetched["catalog_revision"]
+                        .as_u64()
+                        .expect("the refresh names its catalog revision");
+                    answers.push(fetched);
+                    committed.push(bound_digest(
+                        &actor,
+                        &fetched_key,
+                        "catalog.openapi.publish",
+                        &catalog_id,
+                        &fetched_etag,
+                        "",
+                    ));
+
+                    // A keyed refresh whose fetch fails after the
+                    // credentials were resolved and sent: the upstream
+                    // answers `500`.
+                    upstream.fail();
+                    let failed_key = caller_key(123);
+                    let (status, _, failed) =
+                        keyed_refresh(failed_key.clone(), fetched_etag.clone()).await;
+                    assert_eq!(status, StatusCode::BAD_GATEWAY, "{failed}");
+                    assert_eq!(failed["reason"], "request_failed", "{failed}");
+                    assert_eq!(upstream.take_received(), [resolved_catalog_credentials()]);
+                    answers.push(failed);
+                    refused.push(bound_digest(
+                        &actor,
+                        &failed_key,
+                        "catalog.openapi.publish",
+                        &catalog_id,
+                        &fetched_etag,
+                        "",
+                    ));
+                    // The audit writer delivers in order: wait until it has
+                    // delivered the publication of the fetched refresh.
+                    catalog_changes_through(&capture, &catalog_id, fetched_revision);
+
+                    let mut stored: Vec<String> = pool
+                        .get()
+                        .await
+                        .unwrap()
+                        .query(
+                            "SELECT binding_digest FROM greengateway.authority_caller_operation_ids",
+                            &[],
+                        )
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(|row| row.get::<_, Option<String>>(0).expect("a bound digest"))
+                        .collect();
+                    stored.sort();
+                    Some((answers, committed, refused, stored))
+                },
+            );
+        let Some((answers, mut committed, refused, stored)) = outcome else {
+            return;
+        };
+
+        // The digests computed here are the ones the handlers bound: each
+        // committed key's reservation holds the one computed for its request.
+        committed.sort();
+        assert_eq!(stored, committed);
+
+        assert!(!logged.is_empty(), "the handlers' log lines were captured");
+        let failures = format!(
+            "{} ",
+            crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL
+        );
+        // Once for the refused reservation, once for the refused catalog
+        // evidence insert; the two failed refreshes are answered before any
+        // evidence.
+        assert_eq!(
+            rendered
+                .lines()
+                .filter_map(|line| line.strip_prefix(failures.as_str()))
+                .collect::<Vec<_>>(),
+            ["2"],
+            "both forced failures were counted where the capture saw them"
+        );
+        let answered = format!("{answers:?}");
+        let audited = format!("{:?}", capture.events());
+        let markers = SUFFIXES
+            .iter()
+            .flat_map(|suffix| {
+                REFERENCE_MARKERS
+                    .iter()
+                    .chain(DELEGATED_MARKERS.iter())
+                    .chain(OVERLAY_MARKERS.iter())
+                    .map(move |marker| format!("{marker}{suffix}"))
+            })
+            .chain(
+                CATALOG_SOURCE_MARKERS
+                    .iter()
+                    .chain(ENUM_SOURCE_MARKERS.iter())
+                    .map(|marker| (*marker).to_owned()),
+            );
+        for marker in markers {
+            assert!(!answered.contains(&marker), "{marker} reached an answer");
+            assert!(
+                !audited.contains(&marker),
+                "{marker} reached the audit stream"
+            );
+            assert!(!logged.contains(&marker), "{marker} reached the logs");
+            assert!(!rendered.contains(&marker), "{marker} reached the metrics");
+        }
+        for digest in committed.iter().chain(&refused) {
+            assert!(!answered.contains(digest), "a digest reached an answer");
+            assert!(
+                !audited.contains(digest),
+                "a digest reached the audit stream"
+            );
+            assert!(!logged.contains(digest), "a digest reached the logs");
+            assert!(!rendered.contains(digest), "a digest reached the metrics");
+        }
+    }
 }
 
 /// Keyed service-token issue and rotation in cluster mode, through the admin
@@ -4120,3 +4851,8 @@ mod cluster_token_keys {
         assert_eq!(read_fence().await, raised, "the fence was raised once");
     }
 }
+
+/// Synthetic markers and binding digests kept out of the logs and metrics of
+/// keyed Connection and catalog changes (issue #425).
+#[path = "authority_evidence_marker_app_tests.rs"]
+mod marker_keys;
