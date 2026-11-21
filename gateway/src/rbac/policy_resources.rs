@@ -429,6 +429,21 @@ impl PolicyResourceSnapshot {
     pub(crate) fn is_complete(&self) -> bool {
         self.complete
     }
+
+    /// The components a discovery suggestion binds (issue #243, item 19):
+    /// every component except the cluster security revision, which advances
+    /// on every security change and alone never makes a suggestion stale.
+    /// `gateway_build` is the crate version, not a per-build identity, so it
+    /// moves only when that version does; a planner change is marked by
+    /// `RULE_SUGGESTION_GENERATOR_VERSION`, not by this component.
+    pub(crate) fn binding_components(&self) -> serde_json::Value {
+        let mut components = serde_json::to_value(&self.components)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(components) = components.as_object_mut() {
+            components.remove("security_revision");
+        }
+        components
+    }
 }
 
 fn snapshot_digest(components: &SnapshotComponents) -> Option<String> {

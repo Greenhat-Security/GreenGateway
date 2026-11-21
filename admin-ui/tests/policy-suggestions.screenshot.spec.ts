@@ -63,6 +63,15 @@ const baseline = {
   transitioned_at: null,
   transitioned_by: null,
   revision: 1,
+  generation: {
+    generator_version: 'rule-suggestions.v1',
+    evidence_schema_version: 'rule-suggestion-evidence.v1',
+    evidence_cutoff: '2026-11-01T10:00:00Z',
+    evidence_digest: `sha256:${'4'.repeat(64)}`,
+    resource_snapshot_digest: `sha256:${'5'.repeat(64)}`,
+    resource_snapshot_complete: true,
+  } as Record<string, unknown> | null,
+  freshness: { status: 'current', reasons: [] as string[] },
 };
 
 const signal = {
@@ -88,6 +97,8 @@ const signal = {
     action: 'shadow',
   },
   source_signal_id: 'sig-7',
+  generation: null,
+  freshness: { status: 'unbound', reasons: ['binding_not_recorded'] },
 };
 
 const drafted = { ...baseline.proposed_rule, id: 'rule-drafted' };

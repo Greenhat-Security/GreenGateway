@@ -11,8 +11,11 @@
 //!   store (`PostgresAuditEventStore::observed_role_endpoint_matrix`), the
 //!   same scan the SQLite audit store runs, folded by the same accumulator.
 //! - **Suggestions** are persisted by the PostgreSQL lifecycle store with
-//!   `ON CONFLICT ... DO NOTHING` on the suggestion identity, so re-running
-//!   generation -- on this replica or another -- changes nothing.
+//!   one `ON CONFLICT ... DO UPDATE ... WHERE` on the suggestion identity:
+//!   a new target is inserted, an open row is rebound only when the policy,
+//!   resources, generator or proposal it was bound to changed (issue #243,
+//!   item 19), and re-running generation -- on this replica or another --
+//!   against unchanged inputs changes nothing.
 //!
 //! The planning between the inputs and the output is
 //! [`crate::discovery::suggestions::SuggestionPlanner`], shared with the
@@ -28,11 +31,13 @@ use crate::{
         lifecycle::{TransitionOutcome, TransitionPrecondition},
         query::{utc_timestamp_rfc3339, DiscoveryReadStore},
         signals::{Signal, SignalLifecycleState, SignalListFilters},
+        suggestion_binding::SuggestionGenerationContext,
         suggestions::{
             direct_rule_safety_for_target, lookback_cutoff, ConfiguredProxyRoute,
-            DirectRuleSuggestionSafety, RuleSuggestion, RuleSuggestionConfig, RuleSuggestionError,
-            RuleSuggestionLifecycleState, RuleSuggestionListFilters, RuleSuggestionListPage,
-            RuleSuggestionRun, SuggestionPlanner, AUDIT_POSTGRES_EVIDENCE_SOURCE,
+            DirectRuleSuggestionSafety, PlannedSuggestionRun, RuleSuggestion, RuleSuggestionConfig,
+            RuleSuggestionError, RuleSuggestionLifecycleState, RuleSuggestionListFilters,
+            RuleSuggestionListPage, RuleSuggestionRun, SuggestionPlanner,
+            AUDIT_POSTGRES_EVIDENCE_SOURCE,
         },
     },
     rbac::Policy,
@@ -82,13 +87,14 @@ impl ClusterRuleSuggestionEngine {
         &self.suggestion_store
     }
 
-    /// One explicit generation run against PostgreSQL; the standalone
-    /// engine's `generate`, input for input. The baseline is always
-    /// available: cluster mode's audit store is the durable one.
-    pub async fn generate(
+    /// Plan one explicit generation run against PostgreSQL; the standalone
+    /// engine's `plan`, input for input. The baseline is always available:
+    /// cluster mode's audit store is the durable one. Writes nothing.
+    pub(crate) async fn plan(
         &self,
         policy: &Policy,
-    ) -> Result<RuleSuggestionRun, RuleSuggestionError> {
+        context: &SuggestionGenerationContext,
+    ) -> Result<PlannedSuggestionRun, RuleSuggestionError> {
         let created_at = utc_timestamp_rfc3339();
         let mut run = RuleSuggestionRun::default();
         let observed_endpoints = self.read_store.observed_endpoints().await?;
@@ -121,12 +127,52 @@ impl ClusterRuleSuggestionEngine {
             &mut run.anomaly,
         )?);
 
-        let inserted = self
+        Ok(PlannedSuggestionRun::bound(
+            run,
+            suggestions,
+            context,
+            &created_at,
+        ))
+    }
+
+    /// Persist a planned run: one statement inserts new suggestions and
+    /// rebinds the open rows whose freshness inputs or proposal changed.
+    pub(crate) async fn persist(
+        &self,
+        planned: PlannedSuggestionRun,
+    ) -> Result<RuleSuggestionRun, RuleSuggestionError> {
+        let PlannedSuggestionRun {
+            mut run,
+            suggestions,
+        } = planned;
+        let persisted = self
             .suggestion_store
-            .insert_suggestions(&suggestions)
+            .persist_suggestions(&suggestions)
             .await?;
-        run.inserted_count = inserted.len();
+        run.inserted_count = persisted.inserted.len();
+        run.rebound_count = persisted.rebound;
         Ok(run)
+    }
+
+    /// Plan and persist in one call, bound to a fixed test context.
+    #[cfg(test)]
+    pub async fn generate(
+        &self,
+        policy: &Policy,
+    ) -> Result<RuleSuggestionRun, RuleSuggestionError> {
+        self.generate_bound(policy, &SuggestionGenerationContext::for_tests())
+            .await
+    }
+
+    /// Plan and persist in one call.
+    #[cfg(test)]
+    pub async fn generate_bound(
+        &self,
+        policy: &Policy,
+        context: &SuggestionGenerationContext,
+    ) -> Result<RuleSuggestionRun, RuleSuggestionError> {
+        let planned = self.plan(policy, context).await?;
+        self.persist(planned).await
     }
 
     pub async fn list_suggestions(&self) -> Result<Vec<RuleSuggestion>, RuleSuggestionError> {
