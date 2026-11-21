@@ -175,8 +175,11 @@ fn validate_change(
     Ok(())
 }
 
-/// A caller key bound to another action cannot describe this commit: it is
-/// refused as the conflict it is, before the transaction writes anything.
+/// A caller key bound to another action cannot describe this commit. That
+/// is the gateway's defect, not the caller's: the client's key was never
+/// used for anything else, so it is refused as an internal store failure,
+/// never as `caller_operation_conflict`, before the transaction writes
+/// anything (as `validate_change` refuses mislabeled evidence).
 fn validate_caller(
     resource: DocumentResource,
     change: &DocumentChange,
@@ -190,7 +193,10 @@ fn validate_caller(
                 action = change.action.code(),
                 "a document commit was passed a caller key bound to another action; it is refused"
             );
-            Err(PolicyCommitError::CallerOperationConflict)
+            Err(PolicyCommitError::Store(RepositoryError::new(
+                RepositoryErrorKind::Internal,
+                OPERATION_DOCUMENT_EVIDENCE,
+            )))
         }
         _ => Ok(()),
     }

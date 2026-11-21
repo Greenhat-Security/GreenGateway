@@ -2675,10 +2675,11 @@ async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_
     }
 }
 
-/// Keyed policy and tools publications (issue #425, plan PR 9) are
-/// delivered under the negotiated format as closed `authority_event.v1`
-/// events through the file sink, produced from real document commits, each
-/// under its own caller key. A crash after the sink accepted the batch and
+/// Keyed policy, tools and policy test suite publications (issue #425, plan
+/// PR 9) are delivered under the negotiated format as closed
+/// `authority_event.v1` events through the file sink, produced from real
+/// document commits, each under its own caller key; the suite's is its first
+/// write (`If-None-Match: *`, no prior version) on its own revision axis. A crash after the sink accepted the batch and
 /// before the cursor commit redelivers the same records byte for byte, so
 /// consumers deduplicate on `(authority_id, event_id)`. No document text,
 /// subject, issuer or binding digest reaches the file.
@@ -2692,6 +2693,7 @@ async fn a_keyed_document_change_is_redelivered_identically_after_a_crash_before
 
     const POLICY_MARKER: &str = "keyed-dispatch-policy-marker";
     const TOOL_MARKER: &str = "keyed_dispatch_tool_marker";
+    const SUITE_MARKER: &str = "keyed-dispatch-suite-marker";
     let (_guard, database) = database_or_skip!();
     let pool = migrated_pool(&database).await;
     let requirement = &crate::storage::compatibility::CALLER_OPERATION_KEYS;
@@ -2809,6 +2811,30 @@ async fn a_keyed_document_change_is_redelivered_identically_after_a_crash_before
         matches!(outcome, CallerOutcome::Committed(_)),
         "a first use commits"
     );
+    let suite = bind(82, DocumentAction::PolicyTestsPublish, "*", SUITE_MARKER);
+    let outcome = crate::storage::PolicyTestSuiteStore::commit_with_operation(
+        &producers.policies.test_suite_store(),
+        crate::storage::policy_tests::PolicyTestSuitePrecondition::Absent,
+        &serde_json::json!({
+            "schema_version": "policy-tests.v1",
+            "description": SUITE_MARKER,
+            "cases": [{
+                "id": "health-is-public",
+                "kind": "http",
+                "request": { "method": "GET", "path": "/health" },
+                "principal": "anonymous",
+                "expect": { "logical": "allow" }
+            }]
+        }),
+        &principal,
+        Some(&suite),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, CallerOutcome::Committed(_)),
+        "a first use commits"
+    );
 
     let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
     let keyring = keyring_for(&store).await;
@@ -2868,12 +2894,16 @@ async fn a_keyed_document_change_is_redelivered_identically_after_a_crash_before
         .iter()
         .map(|line| serde_json::from_str(line).unwrap())
         .filter(|event: &serde_json::Value| {
-            [publish.id().to_string(), register.id().to_string()]
-                .iter()
-                .any(|key| event["operation_id"] == *key)
+            [
+                publish.id().to_string(),
+                register.id().to_string(),
+                suite.id().to_string(),
+            ]
+            .iter()
+            .any(|key| event["operation_id"] == *key)
         })
         .collect();
-    assert_eq!(keyed.len(), 2, "{contents}");
+    assert_eq!(keyed.len(), 3, "{contents}");
     for event in &keyed {
         assert_eq!(event["schema_version"], "authority_event.v1", "{event}");
         validator.validate(event).unwrap();
@@ -2883,15 +2913,17 @@ async fn a_keyed_document_change_is_redelivered_identically_after_a_crash_before
             .iter()
             .map(|event| event["operation"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["policy.publish", "tools.publish"]
+        ["policy.publish", "tools.publish", "policy_tests.publish"]
     );
     for marker in [
         POLICY_MARKER,
         TOOL_MARKER,
+        SUITE_MARKER,
         "keyed-document-admin",
         ACTOR_ISSUER,
         publish.binding_digest(),
         register.binding_digest(),
+        suite.binding_digest(),
     ] {
         assert!(!contents.contains(marker), "{marker} reached the file");
     }

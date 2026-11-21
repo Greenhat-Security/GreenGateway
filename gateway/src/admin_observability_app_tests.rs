@@ -9054,6 +9054,26 @@ mod cluster_discovery_tests {
         audit_store: Arc<PostgresAuditEventStore>,
         policy_tests_required: bool,
     ) -> ClusterSuggestionsHarness {
+        cluster_suggestions_harness_gated(
+            pool,
+            audit_store,
+            policy_tests_required,
+            authority_events::required::AuthorityEvidenceGate::best_effort(),
+        )
+        .await
+    }
+
+    /// [`cluster_suggestions_harness_with`], asking `authority_evidence`
+    /// as its evidence gate. The harness has no cluster membership, so a
+    /// keyed change is admitted only by a gate whose backend is not
+    /// PostgreSQL (the best-effort default); the PostgreSQL gate is for
+    /// refusals.
+    async fn cluster_suggestions_harness_gated(
+        pool: &deadpool_postgres::Pool,
+        audit_store: Arc<PostgresAuditEventStore>,
+        policy_tests_required: bool,
+        authority_evidence: authority_events::required::AuthorityEvidenceGate,
+    ) -> ClusterSuggestionsHarness {
         let policy = parse_policy_body(&axum::body::Bytes::from(
             suggestions_policy_document_string(),
         ))
@@ -9145,8 +9165,7 @@ mod cluster_discovery_tests {
                     replay_cluster: None,
                     event_store: None,
                     query_store: None,
-                    authority_evidence:
-                        authority_events::required::AuthorityEvidenceGate::best_effort(),
+                    authority_evidence,
                     audit: audit_log,
                     client_ip_policy: client_ip::ClientIpPolicy::default(),
                     max_body_size: 1024 * 1024,
@@ -10753,5 +10772,526 @@ mod cluster_discovery_tests {
             acceptance_footprint(&harness.policy_store, &pool, &id).await,
             after
         );
+    }
+
+    // ---- Caller keys on the acceptance and draft publication routes
+    // (issue #425, plan PR 9). The harness has no roster, so the contract
+    // fence is raised directly and the best-effort gate admits; the
+    // operation gate is covered by `document_keys_app_tests`.
+
+    fn caller_key(seed: u8) -> String {
+        crate::authority_events::caller_operation::test_caller_key(seed).to_string()
+    }
+
+    /// The suggestions-policy writer with a canonical issuer: a principal
+    /// a caller key can be bound to.
+    fn keyed_principal() -> auth::Principal {
+        auth::Principal {
+            issuer: Some("https://keys.example.test".to_owned()),
+            ..test_principal(&["suggestions-policy-writer"])
+        }
+    }
+
+    /// `request` as the keyed principal's, under caller key `key`, with
+    /// `headers` added.
+    fn keyed_request(
+        mut request: Request<Body>,
+        key: &str,
+        headers: &[(&'static str, &str)],
+    ) -> Request<Body> {
+        request.extensions_mut().insert(keyed_principal());
+        request.headers_mut().insert(
+            HeaderName::from_static("idempotency-key"),
+            HeaderValue::from_str(key).expect("key header should build"),
+        );
+        for (name, value) in headers.iter().copied() {
+            request.headers_mut().insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_str(value).expect("header should build"),
+            );
+        }
+        request
+    }
+
+    /// A keyed acceptance of `id` at suggestion `revision`.
+    fn keyed_accept(
+        id: &str,
+        key: &str,
+        policy_etag: &str,
+        revision: &str,
+        headers: &[(&'static str, &str)],
+    ) -> Request<Body> {
+        keyed_request(
+            accept_request(id, Some(policy_etag), Some(revision)),
+            key,
+            headers,
+        )
+    }
+
+    /// A keyed publication of `draft`, with `body` (`None`: unbound).
+    fn keyed_publish(
+        draft: &(String, String),
+        policy_etag: &str,
+        key: &str,
+        body: Option<String>,
+    ) -> Request<Body> {
+        keyed_request(
+            suggestions_admin_request(
+                Method::POST,
+                &format!("{POLICY_DRAFTS_ADMIN_ROUTE}/{}/publish", draft.0),
+                None,
+                body,
+                Some(policy_etag),
+            ),
+            key,
+            &[(POLICY_DRAFT_ETAG_HEADER, draft.1.as_str())],
+        )
+    }
+
+    /// Open `id` in a draft the keyed principal owns.
+    async fn open_in_keyed_draft(router: &Router, id: &str, policy_etag: &str) -> (String, String) {
+        let opened = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                &format!("/v1/admin/suggestions/{id}/draft"),
+                Some(keyed_principal()),
+                None,
+                Some(policy_etag),
+            ))
+            .await
+            .expect("draft request should complete");
+        assert_eq!(opened.status(), StatusCode::CREATED);
+        let draft_etag = policy_etag_header(&opened);
+        let draft_id = json_body(opened).await["draft"]["draft_id"]
+            .as_str()
+            .expect("the draft names its id")
+            .to_owned();
+        (draft_id, draft_etag)
+    }
+
+    /// Raise the contract fence to `caller_operation_keys`, as a roster's
+    /// operation gate does before the first keyed change.
+    async fn raise_caller_key_fence(pool: &deadpool_postgres::Pool) {
+        let requirement = &storage::compatibility::CALLER_OPERATION_KEYS;
+        let raised = pool
+            .get()
+            .await
+            .expect("fence checkout")
+            .execute(
+                "UPDATE greengateway.contract_fence
+                 SET generation = generation + 1,
+                     minimum_schema = GREATEST(minimum_schema, $1),
+                     capabilities = $2,
+                     raised_at = now(),
+                     raised_by = 'fixture.caller_operation_keys'
+                 WHERE singleton",
+                &[
+                    &requirement.minimum_schema,
+                    &requirement.capability.as_str(),
+                ],
+            )
+            .await
+            .expect("the fence raises");
+        assert_eq!(raised, 1);
+    }
+
+    /// Every caller-key reservation of a policy action: `(key, action)`.
+    async fn policy_reservations(pool: &deadpool_postgres::Pool) -> Vec<(String, String)> {
+        pool.get()
+            .await
+            .expect("client")
+            .query(
+                "SELECT operation_id::text, action FROM greengateway.authority_caller_operation_ids \
+                 WHERE action LIKE 'policy%' ORDER BY operation_id",
+                &[],
+            )
+            .await
+            .expect("reservations read")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
+    fn events_of(capture: &audit::sink::tests::CaptureSink, event_type: &str) -> usize {
+        capture
+            .events()
+            .into_iter()
+            .filter(|event| event.event_type == event_type)
+            .count()
+    }
+
+    /// The audit events a policy commit through these routes emits.
+    const KEYED_ROUTE_EVENTS: [&str; 3] = [
+        audit::event::POLICY_CHANGED,
+        audit::event::SUGGESTION_LIFECYCLE_CHANGED,
+        audit::event::POLICY_DRAFT_PUBLISHED,
+    ];
+
+    fn event_counts(capture: &audit::sink::tests::CaptureSink) -> Vec<usize> {
+        KEYED_ROUTE_EVENTS
+            .iter()
+            .map(|event_type| events_of(capture, event_type))
+            .collect()
+    }
+
+    fn assert_policy_receipt(receipt: &Value, key: &str, operation: &str) {
+        assert_eq!(receipt["operation_id"], json!(key), "{receipt}");
+        assert_eq!(receipt["operation"], json!(operation), "{receipt}");
+        assert_eq!(receipt["resource_id"], json!("policy"), "{receipt}");
+        assert!(receipt["revision"].as_u64().is_some(), "{receipt}");
+        assert!(receipt["committed_at"].is_string(), "{receipt}");
+    }
+
+    /// After a keyed commit: an exact retry (`retry`) is `200` with the
+    /// receipt of `operation` and repeats no write, reservation, evidence
+    /// row or audit event; each request of `conflicts` reuses the key for
+    /// another binding and is `409 caller_operation_conflict`, changing
+    /// nothing.
+    async fn assert_replayed_without_side_effect(
+        harness: &ClusterSuggestionsHarness,
+        pool: &deadpool_postgres::Pool,
+        suggestion_id: &str,
+        key: &str,
+        operation: &str,
+        retry: Request<Body>,
+        conflicts: Vec<(&str, Request<Body>)>,
+    ) {
+        let footprint = acceptance_footprint(&harness.policy_store, pool, suggestion_id).await;
+        let evidence = count_rows(pool, "document_change_evidence").await;
+        let reservations = policy_reservations(pool).await;
+        let events = event_counts(&harness.audit);
+
+        let retried = harness
+            .router
+            .clone()
+            .oneshot(retry)
+            .await
+            .expect("retry should complete");
+        assert_eq!(retried.status(), StatusCode::OK, "{operation}");
+        assert_policy_receipt(&json_body(retried).await, key, operation);
+        for (what, request) in conflicts {
+            let conflict = harness
+                .router
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("conflicting request should complete");
+            assert_eq!(conflict.status(), StatusCode::CONFLICT, "{what}");
+            assert_eq!(
+                json_body(conflict).await["reason"],
+                json!("caller_operation_conflict"),
+                "{what}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            acceptance_footprint(&harness.policy_store, pool, suggestion_id).await,
+            footprint
+        );
+        assert_eq!(count_rows(pool, "document_change_evidence").await, evidence);
+        assert_eq!(policy_reservations(pool).await, reservations);
+        assert_eq!(
+            event_counts(&harness.audit),
+            events,
+            "no second audit event"
+        );
+    }
+
+    /// A keyed acceptance over HTTP: the first request accepts with the
+    /// route's own answer and reserves `policy.suggestion.accept`; an exact
+    /// retry, once the suggestion is no longer open and its `If-Match` is
+    /// stale, is `200` with the receipt before the suggestion is read, and
+    /// repeats nothing; the same key with another suggestion revision,
+    /// `If-Match` or resource snapshot binding is `409`.
+    #[tokio::test]
+    async fn a_keyed_cluster_acceptance_is_answered_from_its_receipt_once_the_suggestion_is_closed()
+    {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database.dsn).await;
+        let audit_store = cluster_audit_store(&pool).await;
+        seed_baseline_generation_fixture(&pool, &audit_store).await;
+        let harness = cluster_suggestions_harness(&pool, audit_store).await;
+        raise_caller_key_fence(&pool).await;
+        let id = generate_one_suggestion(&harness.router).await;
+        let before = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+        let events = event_counts(&harness.audit);
+        let key = caller_key(90);
+
+        let accepted = harness
+            .router
+            .clone()
+            .oneshot(keyed_accept(&id, &key, &before.active_etag, "1", &[]))
+            .await
+            .expect("accept request should complete");
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+        let accepted_etag = policy_etag_header(&accepted);
+        assert_eq!(
+            json_body(accepted).await["suggestion"]["state"],
+            json!("accepted")
+        );
+        assert_eventually(Duration::from_secs(5), || {
+            event_counts(&harness.audit) == vec![events[0] + 1, events[1] + 1, events[2]]
+        });
+        assert_eq!(
+            policy_reservations(&pool).await,
+            vec![(key.clone(), "policy.suggestion.accept".to_owned())]
+        );
+
+        assert_replayed_without_side_effect(
+            &harness,
+            &pool,
+            &id,
+            &key,
+            "policy.suggestion.accept",
+            keyed_accept(&id, &key, &before.active_etag, "1", &[]),
+            vec![
+                (
+                    "another suggestion revision",
+                    keyed_accept(&id, &key, &before.active_etag, "2", &[]),
+                ),
+                (
+                    "another If-Match",
+                    keyed_accept(&id, &key, &accepted_etag, "1", &[]),
+                ),
+                (
+                    "a resource snapshot binding",
+                    keyed_accept(
+                        &id,
+                        &key,
+                        &before.active_etag,
+                        "1",
+                        &[(RESOURCE_SNAPSHOT_HEADER, "a-snapshot")],
+                    ),
+                ),
+            ],
+        )
+        .await;
+    }
+
+    /// A keyed draft publication without a suggestion: admitted before the
+    /// draft is read, it reserves `policy.publish`; an exact retry after
+    /// the ETag moved is `200` with the receipt and no second event; the
+    /// same key on the acceptance route, or binding the draft's suggestion,
+    /// is `409`. The suggestion stays open.
+    #[tokio::test]
+    async fn a_keyed_cluster_draft_publication_reserves_policy_publish_and_replays_its_receipt() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database.dsn).await;
+        let audit_store = cluster_audit_store(&pool).await;
+        seed_baseline_generation_fixture(&pool, &audit_store).await;
+        let harness = cluster_suggestions_harness(&pool, audit_store).await;
+        raise_caller_key_fence(&pool).await;
+        let id = generate_one_suggestion(&harness.router).await;
+        let before = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+        let draft = open_in_keyed_draft(&harness.router, &id, &before.active_etag).await;
+        let events = event_counts(&harness.audit);
+        let key = caller_key(91);
+
+        let published = harness
+            .router
+            .clone()
+            .oneshot(keyed_publish(&draft, &before.active_etag, &key, None))
+            .await
+            .expect("publication should complete");
+        assert_eq!(published.status(), StatusCode::OK);
+        let published_etag = policy_etag_header(&published);
+        assert_eventually(Duration::from_secs(5), || {
+            event_counts(&harness.audit) == vec![events[0] + 1, events[1], events[2] + 1]
+        });
+        assert_eq!(
+            policy_reservations(&pool).await,
+            vec![(key.clone(), "policy.publish".to_owned())]
+        );
+        let after = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+        assert_eq!(after.active_etag, published_etag);
+        assert_eq!(after.suggestion_state, "open");
+
+        let bound = json!({ "suggestion": { "id": id, "revision": 1 } }).to_string();
+        assert_replayed_without_side_effect(
+            &harness,
+            &pool,
+            &id,
+            &key,
+            "policy.publish",
+            keyed_publish(&draft, &before.active_etag, &key, None),
+            vec![
+                (
+                    "the acceptance route",
+                    keyed_accept(&id, &key, &published_etag, "1", &[]),
+                ),
+                (
+                    "a publication bound to the suggestion",
+                    keyed_publish(&draft, &before.active_etag, &key, Some(bound)),
+                ),
+            ],
+        )
+        .await;
+    }
+
+    /// A keyed draft publication bound to a suggestion is that suggestion's
+    /// acceptance: it reserves `policy.suggestion.accept` in the acceptance
+    /// transaction; an exact retry once the suggestion is accepted and the
+    /// ETag moved is `200` with that receipt and no second event; the same
+    /// key without the binding is `409`.
+    #[tokio::test]
+    async fn a_keyed_cluster_bound_draft_publication_reserves_the_acceptance_and_replays_its_receipt(
+    ) {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database.dsn).await;
+        let audit_store = cluster_audit_store(&pool).await;
+        seed_baseline_generation_fixture(&pool, &audit_store).await;
+        let harness = cluster_suggestions_harness(&pool, audit_store).await;
+        raise_caller_key_fence(&pool).await;
+        let id = generate_one_suggestion(&harness.router).await;
+        let before = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+        let draft = open_in_keyed_draft(&harness.router, &id, &before.active_etag).await;
+        let events = event_counts(&harness.audit);
+        let key = caller_key(92);
+        let bound = json!({ "suggestion": { "id": id, "revision": 1 } }).to_string();
+
+        let published = harness
+            .router
+            .clone()
+            .oneshot(keyed_publish(
+                &draft,
+                &before.active_etag,
+                &key,
+                Some(bound.clone()),
+            ))
+            .await
+            .expect("publication should complete");
+        assert_eq!(published.status(), StatusCode::OK);
+        assert_eventually(Duration::from_secs(5), || {
+            event_counts(&harness.audit) == vec![events[0] + 1, events[1] + 1, events[2] + 1]
+        });
+        assert_eq!(
+            policy_reservations(&pool).await,
+            vec![(key.clone(), "policy.suggestion.accept".to_owned())]
+        );
+        let after = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+        assert_eq!(after.suggestion_state, "accepted");
+
+        assert_replayed_without_side_effect(
+            &harness,
+            &pool,
+            &id,
+            &key,
+            "policy.suggestion.accept",
+            keyed_publish(&draft, &before.active_etag, &key, Some(bound)),
+            vec![(
+                "an unbound publication",
+                keyed_publish(&draft, &before.active_etag, &key, None),
+            )],
+        )
+        .await;
+    }
+
+    /// Required mode in cluster mode refuses the unkeyed acceptance and the
+    /// unkeyed draft publication, bound or not, with `409
+    /// authority_evidence_unsupported` before anything is read (I4): a
+    /// suggestion or draft that does not exist gets the same refusal, not
+    /// `404`. The draft route also records the refusal against the draft ID
+    /// in its path. Nothing is written or reserved.
+    #[tokio::test]
+    async fn required_mode_refuses_the_unkeyed_cluster_acceptance_and_draft_publication_before_reading(
+    ) {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database.dsn).await;
+        let audit_store = cluster_audit_store(&pool).await;
+        let harness = cluster_suggestions_harness_gated(
+            &pool,
+            audit_store,
+            false,
+            authority_events::required::AuthorityEvidenceGate::new(
+                config::AuthorityEvidenceDurability::Required,
+                config::StateBackend::Postgres,
+            ),
+        )
+        .await;
+        let active = PolicyControlPlane::active(harness.policy_store.as_ref())
+            .await
+            .expect("active policy reads")
+            .expect("a policy is active");
+        let evidence = count_rows(&pool, "document_change_evidence").await;
+        let unkeyed_publish = |body: Option<String>| {
+            let mut request = suggestions_admin_request(
+                Method::POST,
+                &format!("{POLICY_DRAFTS_ADMIN_ROUTE}/no-such-draft/publish"),
+                Some(test_principal(&["suggestions-policy-writer"])),
+                body,
+                Some(&active.etag),
+            );
+            request.headers_mut().insert(
+                HeaderName::from_static(POLICY_DRAFT_ETAG_HEADER),
+                HeaderValue::from_str(&active.etag).expect("draft ETag header should build"),
+            );
+            request
+        };
+        let bound = json!({ "suggestion": { "id": "no-such-suggestion", "revision": 1 } });
+        for (request, operation) in [
+            (unkeyed_publish(None), "policy.publish"),
+            (
+                unkeyed_publish(Some(bound.to_string())),
+                "policy.suggestion.accept",
+            ),
+            (
+                accept_request("no-such-suggestion", Some(&active.etag), Some("1")),
+                "policy.suggestion.accept",
+            ),
+        ] {
+            let refused = harness
+                .router
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("refused request should complete");
+            assert_eq!(refused.status(), StatusCode::CONFLICT, "{operation}");
+            let body = json_body(refused).await;
+            assert_eq!(
+                body["reason"],
+                json!("authority_evidence_unsupported"),
+                "{body}"
+            );
+            assert_eq!(body["operation"], json!(operation), "{body}");
+        }
+        assert_eventually(Duration::from_secs(5), || {
+            events_of(&harness.audit, audit::event::POLICY_DRAFT_PUBLISH_REFUSED) == 2
+        });
+        for event in harness.audit.events() {
+            if event.event_type == audit::event::POLICY_DRAFT_PUBLISH_REFUSED {
+                assert_eq!(event.payload["draft_id"], json!("no-such-draft"));
+                assert_eq!(
+                    event.payload["reason"],
+                    json!("authority_evidence_unsupported")
+                );
+            }
+        }
+        let after = PolicyControlPlane::active(harness.policy_store.as_ref())
+            .await
+            .expect("active policy reads")
+            .expect("a policy is active");
+        assert_eq!(after.version, active.version);
+        assert_eq!(
+            count_rows(&pool, "document_change_evidence").await,
+            evidence
+        );
+        assert!(policy_reservations(&pool).await.is_empty());
     }
 }

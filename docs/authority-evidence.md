@@ -1006,10 +1006,11 @@ publishes the policy without it.
 - **Binding.** The key is bound to the action, the recorded actor, the target (the
   version for a rollback, the rule ID for a rule update or delete, the suggestion ID
   for an acceptance, the draft ID for a draft publication, empty otherwise), the
-  precondition headers as received (`If-Match`; for an acceptance also the
-  suggestion revision header; for a draft publication the draft ETag, `If-Match` and
-  resource snapshot headers; for the policy test suite `If-Match` and
-  `If-None-Match`), and the request: a JSON body as canonical JSON, a YAML policy
+  precondition headers as received (for the policy routes `If-Match` and the
+  resource snapshot header; for an acceptance those and the suggestion revision
+  header; for a draft publication the draft ETag, `If-Match` and resource snapshot
+  headers; for a tools registration `If-Match`; for the policy test suite `If-Match`
+  and `If-None-Match`), and the request: a JSON body as canonical JSON, a YAML policy
   as received, nothing for a rollback, a rule delete or an acceptance. A draft
   publication binds its body as received and the action it will commit. An
   acceptance's generation binding (issue #243) is not in the digest: it is
@@ -1028,8 +1029,11 @@ publishes the policy without it.
   `caller_operation_keys`), then the version, its `document_change_evidence` row
   under the caller's key and the journal entry are written. An acceptance does all
   of this inside the acceptance transaction, and looks the key up before its
-  open-suggestion predicate. An unkeyed draft publication still asks the evidence
-  gate at its commit, so its refusal is recorded against the draft. Each admitted
+  open-suggestion predicate. An unkeyed draft publication asks the evidence gate in
+  its unkeyed form at the same point, before the draft is read or the suggestion
+  lifecycle reconciled; its refusal is also recorded as
+  `policy.draft_publish_refused` naming the draft ID from the path, with the fields
+  that need the draft null. Each admitted
   change runs on a task of its own (`document_change_to_completion`), so a client
   disconnect cannot separate the commit from its install and audit event.
 - **Answers.** The first commit answers as the route always has. An exact retry is
@@ -1038,20 +1042,28 @@ publishes the policy without it.
   document (`policy`, `tools` or `policy_tests`) and `revision` the version the
   change committed. This holds for an acceptance after its suggestion is no longer
   open and for a draft publication after the policy ETag has moved. A replay writes and
-  audits nothing; the replica reinstalls the active policy, or reconciles its tools
-  lane, as the original did. The same key with any other request is
-  `409 caller_operation_conflict`. If two writers race on one key, the loser gets the
-  receipt.
+  audits nothing. A policy, acceptance or suite replay answered by the pre-check
+  changes nothing on the replica; one answered inside the commit transaction (a
+  writer that raced the original) reinstalls the active policy. A tools replay
+  reconciles the replica's tools lane either way. A replayed draft publication does
+  not mark the draft published: if the original's process stopped after its commit
+  and before that step, the draft stays open on a stale base (its later publication
+  is `policy_draft_base_stale`) and can be deleted. The same key with any other
+  request is `409 caller_operation_conflict`. Two writers racing on one key commit
+  one change. Across replicas the loser gets the receipt from the commit
+  transaction; on one replica the loser waits on the policy write lane and may then
+  be answered `412` (or `409 suggestion_not_open` for an acceptance), and a retry
+  under the same key gets the receipt.
 - **Required mode.** The nine operations are `caller_key_required` in cluster mode:
   only the keyed request of an issuer-bound principal with `qualified_v1`, the file
   sink and a Unix build is admitted, and every other form, service-token callers
   included, is `409 authority_evidence_unsupported` before anything is read or
-  written. The admin UI sends no key, so under `required` it cannot change policy,
-  register tools or store a policy test suite (#242 tracks adding keys to it). The
+  written (an unkeyed draft publication included). The admin UI sends no key, so
+  under `required` it cannot change policy, register tools or store a policy test suite (#242 tracks adding keys to it). The
   first-boot tools seed is an unkeyed system-actor `tools.publish`: when the tools
   document does not exist, cluster preflight asks the gate for that form before
   seeding, so under `required` it refuses to start and says how to provision the
-  document (start once with `best_effort`, or run the import). When the document
+  document (start once, or run the import, with `best_effort`). When the document
   exists the seed is a no-op and nothing is asked.
 
 Tests. The store contract is in
@@ -1070,8 +1082,9 @@ family), `a_reused_key_with_a_different_binding_conflicts_and_changes_nothing`,
 `a_keyed_suggestion_acceptance_reserves_inside_the_acceptance_transaction` and
 `the_first_boot_seed_stays_a_system_record_and_reserves_nothing`.
 `authority_events::dispatcher::tests::a_keyed_document_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit`
-delivers real keyed policy and tools commits as closed v1 events through the file
-sink and redelivers them byte for byte. Through the admin handlers of a cluster
+delivers real keyed policy, tools and policy test suite commits (the suite's first
+write, with no prior version) as closed v1 events through the file sink and
+redelivers them byte for byte. Through the admin handlers of a cluster
 replica, against PostgreSQL and a real roster,
 `document_keys_app_tests::cluster_document_keys::` proves
 `a_keyed_policy_change_is_refused_while_a_live_member_lacks_the_capability` (with
@@ -1085,6 +1098,16 @@ policy test suite: the receipt after the ETag moved, `409` on another binding,
 `required_mode_refuses_a_keyed_policy_change_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink`,
 `required_mode_preflight_refuses_to_seed_an_empty_tools_document` and
 `required_mode_preflight_passes_when_the_tools_document_exists`.
+The acceptance and draft publication routes are proved through the suggestion
+admin handlers of a cluster replica, against PostgreSQL, by
+`admin_observability_app_tests::cluster_discovery_tests::`
+`a_keyed_cluster_acceptance_is_answered_from_its_receipt_once_the_suggestion_is_closed`
+(the receipt after the suggestion closed, `409` on another revision, `If-Match` or
+resource snapshot binding),
+`a_keyed_cluster_draft_publication_reserves_policy_publish_and_replays_its_receipt`,
+`a_keyed_cluster_bound_draft_publication_reserves_the_acceptance_and_replays_its_receipt`
+and
+`required_mode_refuses_the_unkeyed_cluster_acceptance_and_draft_publication_before_reading`.
 `document_keys_app_tests::a_keyed_standalone_policy_change_is_refused_and_writes_nothing`
 covers the standalone refusal, and
 `authority_events::required::tests::policy_tools_and_policy_test_changes_admit_only_their_keyed_issuer_bound_form_in_cluster_mode`

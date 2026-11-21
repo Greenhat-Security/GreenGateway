@@ -1150,35 +1150,50 @@ async fn policy_draft_publish(
             })
         }
     };
-    // A keyed publication is bound and admitted, and an exact retry of a
-    // committed one answered with its receipt, before the draft, the policy
-    // or the suggestion is read (issue #425). A bound publication is the
-    // suggestion's acceptance and is keyed as one. An unkeyed publication
-    // asks the evidence gate at its commit, as before, so a refusal is
-    // recorded against the draft it names.
-    let caller = if parts.headers.contains_key("idempotency-key") {
-        match admit_keyed_policy_change(
-            state,
-            &parts,
-            &principal,
-            DocumentChangeBinding {
-                action: if bound.is_some() {
-                    storage::DocumentAction::PolicySuggestionAccept
-                } else {
-                    storage::DocumentAction::PolicyPublish
-                },
-                target: &draft_id,
-                preconditions: DRAFT_PUBLISH_PRECONDITIONS,
-                request: &raw_body,
+    // Every publication is admitted, a keyed one bound first and an exact
+    // retry of a committed one answered with its receipt, before the draft,
+    // the policy or the suggestion is read or the suggestion lifecycle is
+    // reconciled (issue #425, I4). A bound publication is the suggestion's
+    // acceptance and is keyed and gated as one. An unkeyed publication asks
+    // only the evidence gate; its refusal is also recorded against the
+    // draft the path names, which was not read.
+    let keyed = parts.headers.contains_key("idempotency-key");
+    let admitted = admit_keyed_policy_change(
+        state,
+        &parts,
+        &principal,
+        DocumentChangeBinding {
+            action: if bound.is_some() {
+                storage::DocumentAction::PolicySuggestionAccept
+            } else {
+                storage::DocumentAction::PolicyPublish
             },
-        )
-        .await
-        {
-            Ok(caller) => caller,
-            Err(response) => return *response,
+            target: &draft_id,
+            preconditions: DRAFT_PUBLISH_PRECONDITIONS,
+            request: &raw_body,
+        },
+    )
+    .await;
+    let caller = match admitted {
+        Ok(caller) => caller,
+        Err(response) if keyed => return *response,
+        Err(response) => {
+            emit_policy_draft_event(
+                state,
+                &parts,
+                &principal,
+                audit::event::POLICY_DRAFT_PUBLISH_REFUSED,
+                json!({
+                    "draft_id": draft_id,
+                    "draft_revision": null,
+                    "reason": authority_events::required::REFUSAL_REASON,
+                    "base_etag": null,
+                    "candidate_etag": null,
+                    "current_policy_etag": null,
+                }),
+            );
+            return *response;
         }
-    } else {
-        None
     };
 
     let owner = policy_draft_owner(&principal);

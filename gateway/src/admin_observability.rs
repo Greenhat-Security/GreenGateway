@@ -832,9 +832,13 @@ pub(super) async fn rule_suggestion_accept_endpoint(
 }
 
 /// The precondition headers a suggestion acceptance reads: the live policy
-/// ETag and the suggestion revision.
-pub(super) const SUGGESTION_ACCEPT_PRECONDITIONS: &[&str] =
-    &["if-match", SUGGESTION_REVISION_HEADER];
+/// ETag, the suggestion revision and the optional resource snapshot
+/// binding its policy commit compares.
+pub(super) const SUGGESTION_ACCEPT_PRECONDITIONS: &[&str] = &[
+    "if-match",
+    SUGGESTION_REVISION_HEADER,
+    RESOURCE_SNAPSHOT_HEADER,
+];
 
 async fn rule_suggestion_accept(
     state: SuggestionsAdminState,

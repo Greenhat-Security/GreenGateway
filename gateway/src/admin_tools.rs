@@ -839,7 +839,7 @@ async fn admit_keyed_tools_registration(
         DocumentChangeBinding {
             action: storage::DocumentAction::ToolsPublish,
             target: "",
-            preconditions: POLICY_PRECONDITIONS,
+            preconditions: TOOLS_PRECONDITIONS,
             request: body,
         },
         honours_keys,

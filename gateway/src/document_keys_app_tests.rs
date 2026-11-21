@@ -632,8 +632,11 @@ mod cluster_document_keys {
     /// An exact retry of a keyed OpenAPI tools registration is answered from
     /// its receipt before the specification is turned into tools again, and
     /// audits no second registry change. The route takes the specification
-    /// inline, so there is nothing to fetch; the receipt comes before any
-    /// work on it.
+    /// inline, so there is nothing to fetch. The retry carries the If-Match
+    /// its own commit made stale, and the handler compares If-Match only
+    /// after generating the tools: a retry that got past the pre-check
+    /// would be `412`, so the `200` receipt shows the pre-check answered
+    /// before that work (the store's in-transaction replay is never reached).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_replayed_tools_registration_fetches_no_specification_again() {
         let Some((_database, foundation)) = database().await else {
@@ -749,6 +752,67 @@ mod cluster_document_keys {
         let (status, body) =
             required_mode_policy_put(pool, 60, qualified, Some(file.clone()), false).await;
         assert_evidence_refusal(status, &body);
+
+        // The unkeyed form of the other routes is refused the same way, by
+        // the gate `admit_keyed_document_change` asks for it, before the
+        // authority is read: the rollback, a rule create, the tools
+        // registration and the suite write.
+        let (router, _) = keyed_replica(pool, false, test_audit_log(), |config| {
+            config.authority_events.durability = config::AuthorityEvidenceDurability::Required;
+            config.authority_events.format = qualified;
+            config.authority_events.sink = config::AuthorityEventSinkSetting::File(file.clone());
+        })
+        .await;
+        let admin = signed_token_with_issuer("operator", &["policy-admin"], CLUSTER_ISSUER);
+        let etag = policy_etag(&router, &admin).await;
+        let unkeyed: Vec<(Method, &str, Option<String>, &str)> = vec![
+            (
+                Method::POST,
+                "/v1/admin/policy/rollback/1",
+                None,
+                "policy.rollback",
+            ),
+            (
+                Method::POST,
+                POLICY_RULES_ADMIN_ROUTE,
+                Some(json!({"id": "unkeyed", "path": "/unkeyed", "action": "allow"}).to_string()),
+                "policy.rule.create",
+            ),
+            (
+                Method::POST,
+                TOOLS_OPENAPI_REGISTER_ADMIN_ROUTE,
+                Some(
+                    json!({
+                        "spec": widget_openapi_spec(),
+                        "selected_tool_names": ["createWidget"]
+                    })
+                    .to_string(),
+                ),
+                "tools.publish",
+            ),
+            (
+                Method::PUT,
+                POLICY_TESTS_ADMIN_ROUTE,
+                Some(suite_document()),
+                "policy_tests.publish",
+            ),
+        ];
+        for (method, uri, body, operation) in unkeyed {
+            let (status, _, refused) = call(
+                &router,
+                method,
+                uri,
+                &admin,
+                body,
+                &[("if-match", &etag)],
+                None,
+            )
+            .await;
+            assert_evidence_refusal(status, &refused);
+            assert_eq!(refused["operation"], json!(operation), "{refused}");
+        }
+        assert!(document_reservations(pool).await.is_empty());
+
         let (status, body) = required_mode_policy_put(pool, 61, qualified, Some(file), true).await;
         if cfg!(unix) {
             assert_eq!(status, StatusCode::OK, "{body}");
@@ -818,6 +882,7 @@ mod cluster_document_keys {
         let message = refused.to_string();
         assert!(message.contains("tools.publish"), "{message}");
         assert!(message.contains("best_effort"), "{message}");
+        assert!(message.contains("import-standalone"), "{message}");
         assert!(
             storage::ToolControlPlane::active_tools(&*store)
                 .await

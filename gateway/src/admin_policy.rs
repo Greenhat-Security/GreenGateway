@@ -2786,8 +2786,14 @@ pub(super) fn standalone_caller_key_unsupported() -> Response {
         .into_response()
 }
 
-/// The precondition headers every policy route reads.
-pub(super) const POLICY_PRECONDITIONS: &[&str] = &["if-match"];
+/// The precondition headers every policy route reads: the live policy ETag
+/// and the optional resource snapshot binding, which every policy commit
+/// compares ([`admit_policy_resources`]).
+pub(super) const POLICY_PRECONDITIONS: &[&str] = &["if-match", RESOURCE_SNAPSHOT_HEADER];
+
+/// The precondition headers an OpenAPI tools registration reads: the tools
+/// document ETag only.
+pub(super) const TOOLS_PRECONDITIONS: &[&str] = &["if-match"];
 
 /// The gates a keyed policy change asks.
 pub(super) fn policy_change_gates(state: &PolicyAdminState) -> KeyedChangeGates<'_> {

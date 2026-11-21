@@ -806,10 +806,17 @@ async fn a_key_reserved_by_another_action_cannot_take_effect_here() {
             ..request.clone()
         }
         .key(70 + index as u8, &actor);
+        // That is the gateway's defect, not a reused key: an internal store
+        // failure, never `caller_operation_conflict`.
         let before = fixture.footprint().await;
-        expect_conflict(
-            fixture.commit(&request, &actor, Some(&mislabeled)).await,
-            &format!("{family:?} under a key bound to {other:?}"),
+        let outcome = fixture.commit(&request, &actor, Some(&mislabeled)).await;
+        assert!(
+            matches!(
+                &outcome,
+                Err(PolicyCommitError::Store(error))
+                    if error.kind() == RepositoryErrorKind::Internal
+            ),
+            "{family:?} under a key bound to {other:?} is an internal failure: {outcome:?}"
         );
         assert_eq!(fixture.footprint().await, before);
     }
