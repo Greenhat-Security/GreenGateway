@@ -1172,8 +1172,8 @@ async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_befo
     }
 }
 
-/// A keyed OpenAPI registration, overlay put and overlay delete (issue #425)
-/// are delivered under the negotiated format as closed `authority_event.v1`
+/// A keyed OpenAPI registration, overlay put, overlay delete and MCP
+/// publication (issue #425) are delivered under the negotiated format as closed `authority_event.v1`
 /// events through the file sink, produced from real commits, each under its
 /// own caller key. A crash after the sink accepted and before the cursor
 /// advance redelivers the same records byte for byte, so consumers
@@ -1185,12 +1185,13 @@ async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_
     use crate::authority_events::caller_operation::{CallerOperation, CallerOutcome};
     use crate::config::AuthorityEventFormat;
     use crate::connections::catalog_operation_contract::{
-        openapi_candidate, openapi_key, overlay_delete, overlay_delete_key, overlay_document,
-        overlay_put, overlay_put_key, spec_digest, SPEC,
+        mcp_candidate, mcp_key, openapi_candidate, openapi_key, overlay_delete, overlay_delete_key,
+        overlay_document, overlay_put, overlay_put_key, spec_digest, SPEC,
     };
     use crate::connections::store::StoredOverlayWrite;
 
     const OVERLAY_MARKER: &str = "standalone-keyed-overlay-marker";
+    const MCP_NAME_MARKER: &str = "Standalone keyed MCP catalog marker";
     let scratch = Scratch::new("keyed-catalogs");
     let path = scratch.path("connections.sqlite");
     let connections = SqliteConnectionStore::open(&path).expect("the Connections store opens");
@@ -1231,6 +1232,26 @@ async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_
     publish((1, 1), Some(&overlay_put(&document, 0)), 1, &put);
     let delete = overlay_delete_key(56, &actor, &api, 1);
     publish((1, 2), Some(&overlay_delete(1)), 0, &delete);
+    let mcp = connections
+        .create(mcp_candidate(MCP_NAME_MARKER), &actor)
+        .expect("the MCP Connection creates");
+    let refresh = mcp_key(57, &actor, &mcp);
+    match connections
+        .replace_mcp_catalog_expecting_with_operation(
+            &mcp.id,
+            &mcp.etag(),
+            &[],
+            &[],
+            &[],
+            Some(0),
+            &actor,
+            Some(&refresh),
+        )
+        .expect("the keyed MCP publication commits")
+    {
+        CallerOutcome::Committed(_) => {}
+        CallerOutcome::Replayed(receipt) => panic!("a first use replayed: {receipt:?}"),
+    }
 
     let material = generated_key_hex();
     let events = scratch.path("keyed-catalogs.jsonl");
@@ -1242,8 +1263,8 @@ async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_
     });
     let mut crashed = 0;
     for mut lane in lanes_for(&crashing, &material).await {
-        // The Connection lane holds the unkeyed create, the catalog lane the
-        // three keyed publications; each advance fails after the sink
+        // The Connection lane holds the two unkeyed creates, the catalog lane
+        // the four keyed publications; each advance fails after the sink
         // accepted its rows.
         match lane.step(&sink, 100, &stop).await {
             Err(StepError::Cursor(_)) => crashed += 1,
@@ -1263,14 +1284,14 @@ async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_
             .await
             .expect("delivery succeeds");
     }
-    assert_eq!(cursor(&path, StandaloneEvidenceSource::CatalogChange), 3);
+    assert_eq!(cursor(&path, StandaloneEvidenceSource::CatalogChange), 4);
 
     let contents = std::fs::read_to_string(&events).expect("the event file reads");
     let lines: Vec<&str> = contents.lines().filter(|line| !line.is_empty()).collect();
-    assert_eq!(lines.len(), 8);
+    assert_eq!(lines.len(), 12);
     assert_eq!(
-        &lines[..4],
-        &lines[4..],
+        &lines[..6],
+        &lines[6..],
         "recovery must redeliver byte-identical records"
     );
     let schema: serde_json::Value = serde_json::from_str(include_str!(
@@ -1278,7 +1299,7 @@ async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_
     ))
     .expect("the schema parses");
     let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
-    let delivered: Vec<serde_json::Value> = lines[..4]
+    let delivered: Vec<serde_json::Value> = lines[..6]
         .iter()
         .map(|line| serde_json::from_str(line).expect("every line is JSON"))
         .filter(|event: &serde_json::Value| {
@@ -1299,13 +1320,15 @@ async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_
         [
             "catalog.openapi.publish",
             "catalog.overlay.replace",
-            "catalog.overlay.delete"
+            "catalog.overlay.delete",
+            "catalog.mcp.publish"
         ]
     );
-    for (event, key) in delivered.iter().zip([&register, &put, &delete]) {
+    for (event, key) in delivered.iter().zip([&register, &put, &delete, &refresh]) {
         assert_eq!(event["operation_id"], key.id().to_string(), "{event}");
     }
     let api_id = api.id.to_string();
+    let mcp_id = mcp.id.to_string();
     for marker in [
         ACTOR_MARKER,
         ACTOR_ISSUER_MARKER,
@@ -1314,9 +1337,13 @@ async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_
         "keyed-openapi.example.test",
         "keyed-openapi-token",
         api_id.as_str(),
+        MCP_NAME_MARKER,
+        "keyed-mcp.example.test",
+        mcp_id.as_str(),
         register.binding_digest(),
         put.binding_digest(),
         delete.binding_digest(),
+        refresh.binding_digest(),
     ] {
         assert!(!contents.contains(marker), "{marker} reached the file");
     }

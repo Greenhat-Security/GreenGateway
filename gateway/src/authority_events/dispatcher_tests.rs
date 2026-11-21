@@ -2266,8 +2266,8 @@ async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_befo
     }
 }
 
-/// A keyed OpenAPI registration, overlay put and overlay delete (issue #425)
-/// are delivered under the negotiated format as closed `authority_event.v1`
+/// A keyed OpenAPI registration, overlay put, overlay delete and MCP
+/// publication (issue #425) are delivered under the negotiated format as closed `authority_event.v1`
 /// events through the file sink, produced from real commits, each under its
 /// own caller key. A crash after the sink accepted the batch and before the
 /// cursor commit redelivers the same records byte for byte, so consumers
@@ -2279,13 +2279,14 @@ async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_
     use crate::authority_events::caller_operation::{CallerOperation, CallerOutcome};
     use crate::config::{AuthorityEventFormat, AuthorityEventSinkSetting};
     use crate::connections::catalog_operation_contract::{
-        openapi_candidate, openapi_key, overlay_delete, overlay_delete_key, overlay_document,
-        overlay_put, overlay_put_key, spec_digest, SPEC,
+        mcp_candidate, mcp_key, openapi_candidate, openapi_key, overlay_delete, overlay_delete_key,
+        overlay_document, overlay_put, overlay_put_key, spec_digest, SPEC,
     };
     use crate::connections::store::StoredOverlayWrite;
 
     const NAME_MARKER: &str = "Keyed dispatch catalog marker";
     const OVERLAY_MARKER: &str = "keyed-dispatch-overlay-marker";
+    const MCP_NAME_MARKER: &str = "Keyed dispatch MCP catalog marker";
     let (_guard, database) = database_or_skip!();
     let pool = migrated_pool(&database).await;
     let requirement = &crate::storage::compatibility::CALLER_OPERATION_KEYS;
@@ -2363,6 +2364,30 @@ async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_
         overlay_delete_key(46, &actor, &api, 1),
     )
     .await;
+    let mcp = producers
+        .connections
+        .create(mcp_candidate(MCP_NAME_MARKER), &actor, None)
+        .await
+        .unwrap();
+    let refresh = mcp_key(47, &actor, &mcp);
+    let outcome = producers
+        .connections
+        .replace_mcp_catalog_with_operation(
+            &mcp.id,
+            &mcp.etag(),
+            &[],
+            &[],
+            &[],
+            0,
+            &actor,
+            Some(&refresh),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, CallerOutcome::Committed(_)),
+        "a first use commits"
+    );
 
     let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
     let keyring = keyring_for(&store).await;
@@ -2398,22 +2423,22 @@ async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_
     )
     .await
     .unwrap();
-    // The unkeyed create and the three keyed publications.
+    // The two unkeyed creates and the four keyed publications.
     assert_eq!(
         successor
             .deliver_until_caught_up(&CancellationToken::new())
             .await
             .unwrap(),
-        Some(4)
+        Some(6)
     );
 
     let contents = std::fs::read_to_string(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
     let lines: Vec<_> = contents.lines().filter(|line| !line.is_empty()).collect();
-    assert_eq!(lines.len(), 8);
+    assert_eq!(lines.len(), 12);
     assert_eq!(
-        &lines[..4],
-        &lines[4..],
+        &lines[..6],
+        &lines[6..],
         "recovery must redeliver byte-identical records"
     );
     let schema: serde_json::Value = serde_json::from_str(include_str!(
@@ -2421,7 +2446,7 @@ async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_
     ))
     .unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
-    let events: Vec<serde_json::Value> = lines[..4]
+    let events: Vec<serde_json::Value> = lines[..6]
         .iter()
         .map(|line| serde_json::from_str(line).unwrap())
         .filter(|event: &serde_json::Value| {
@@ -2442,13 +2467,15 @@ async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_
         [
             "catalog.openapi.publish",
             "catalog.overlay.replace",
-            "catalog.overlay.delete"
+            "catalog.overlay.delete",
+            "catalog.mcp.publish"
         ]
     );
-    for (event, key) in events.iter().zip([&register, &put, &delete]) {
+    for (event, key) in events.iter().zip([&register, &put, &delete, &refresh]) {
         assert_eq!(event["operation_id"], key.id().to_string(), "{event}");
     }
     let api_id = api.id.to_string();
+    let mcp_id = mcp.id.to_string();
     for marker in [
         api_id.as_str(),
         actor.subject(),
@@ -2457,9 +2484,13 @@ async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_
         OVERLAY_MARKER,
         "keyed-openapi.example.test",
         "keyed-openapi-token",
+        mcp_id.as_str(),
+        MCP_NAME_MARKER,
+        "keyed-mcp.example.test",
         register.binding_digest(),
         put.binding_digest(),
         delete.binding_digest(),
+        refresh.binding_digest(),
     ] {
         assert!(!contents.contains(marker), "{marker} reached the file");
     }
