@@ -2444,3 +2444,233 @@ async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_befo
         assert!(!contents.contains(marker), "{marker} reached the stream");
     }
 }
+
+/// A keyed OpenAPI registration, overlay put, overlay delete and MCP
+/// publication (issue #425) are delivered under the negotiated format as closed `authority_event.v1`
+/// events through the file sink, produced from real commits, each under its
+/// own caller key. A crash after the sink accepted the batch and before the
+/// cursor commit redelivers the same records byte for byte, so consumers
+/// deduplicate on `(authority_id, event_id)`. No identifier, actor, issuer,
+/// specification, overlay text or binding digest reaches the file.
+#[tokio::test]
+async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit()
+{
+    use crate::authority_events::caller_operation::{CallerOperation, CallerOutcome};
+    use crate::config::{AuthorityEventFormat, AuthorityEventSinkSetting};
+    use crate::connections::catalog_operation_contract::{
+        mcp_candidate, mcp_key, openapi_candidate, openapi_key, overlay_delete, overlay_delete_key,
+        overlay_document, overlay_put, overlay_put_key, spec_digest, SPEC,
+    };
+    use crate::connections::store::StoredOverlayWrite;
+
+    const NAME_MARKER: &str = "Keyed dispatch catalog marker";
+    const OVERLAY_MARKER: &str = "keyed-dispatch-overlay-marker";
+    const MCP_NAME_MARKER: &str = "Keyed dispatch MCP catalog marker";
+    let (_guard, database) = database_or_skip!();
+    let pool = migrated_pool(&database).await;
+    let requirement = &crate::storage::compatibility::CALLER_OPERATION_KEYS;
+    pool.get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE greengateway.contract_fence
+             SET generation = generation + 1,
+                 minimum_schema = GREATEST(minimum_schema, $1),
+                 capabilities = $2,
+                 raised_at = now(),
+                 raised_by = 'fixture.caller_operation_keys'
+             WHERE singleton",
+            &[
+                &requirement.minimum_schema,
+                &requirement.capability.as_str(),
+            ],
+        )
+        .await
+        .unwrap();
+    let producers = Producers::new(&pool);
+    let actor = ChangeActor::for_test_with_issuer("keyed-catalog-admin", ACTOR_ISSUER);
+    let api = producers
+        .connections
+        .create(openapi_candidate(NAME_MARKER), &actor, None)
+        .await
+        .unwrap();
+    let publish = |(spec, catalog): (u64, u64),
+                   overlay: Option<StoredOverlayWrite>,
+                   compiled: u64,
+                   caller: CallerOperation| {
+        let connections = &producers.connections;
+        let api = &api;
+        let actor = &actor;
+        async move {
+            let outcome = connections
+                .replace_openapi_catalog_with_overlay_and_enum_values_with_operation(
+                    &api.id,
+                    &api.etag(),
+                    spec,
+                    catalog,
+                    SPEC,
+                    &spec_digest(),
+                    &[],
+                    overlay.as_ref(),
+                    compiled,
+                    actor,
+                    &[],
+                    &[],
+                    Some(&caller),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, CallerOutcome::Committed(_)),
+                "a first use commits"
+            );
+            caller
+        }
+    };
+    let register = publish((0, 0), None, 0, openapi_key(44, &actor, &api)).await;
+    let document = overlay_document(OVERLAY_MARKER);
+    let put = publish(
+        (1, 1),
+        Some(overlay_put(&document, 0)),
+        1,
+        overlay_put_key(45, &actor, &api, 0, &document),
+    )
+    .await;
+    let delete = publish(
+        (1, 2),
+        Some(overlay_delete(1)),
+        0,
+        overlay_delete_key(46, &actor, &api, 1),
+    )
+    .await;
+    let mcp = producers
+        .connections
+        .create(mcp_candidate(MCP_NAME_MARKER), &actor, None)
+        .await
+        .unwrap();
+    let refresh = mcp_key(47, &actor, &mcp);
+    let outcome = producers
+        .connections
+        .replace_mcp_catalog_with_operation(
+            &mcp.id,
+            &mcp.etag(),
+            &[],
+            &[],
+            &[],
+            0,
+            &actor,
+            Some(&refresh),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, CallerOutcome::Committed(_)),
+        "a first use commits"
+    );
+
+    let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
+    let keyring = keyring_for(&store).await;
+    let path = std::env::temp_dir().join(format!("gg-keyed-catalog-{}.jsonl", Uuid::new_v4()));
+    let setting = AuthorityEventSinkSetting::File(path.to_str().unwrap().to_owned());
+    let sink =
+        crate::authority_events::sink::configured_sink(&setting, AuthorityEventFormat::QualifiedV1)
+            .await
+            .unwrap()
+            .unwrap();
+    let mut crashed = DispatcherTerm::begin(
+        store.clone(),
+        sink.clone(),
+        keyring.clone(),
+        test_config(10),
+        1,
+        Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    assert!(crashed.fill().await.unwrap());
+    crashed.offer().await.unwrap();
+    // The process dies here: the sink accepted, the cursor did not move.
+    drop(crashed);
+    assert_eq!(store.stats().await.unwrap().cursor, Some(0));
+    let mut successor = DispatcherTerm::begin(
+        store.clone(),
+        sink,
+        keyring.clone(),
+        test_config(10),
+        2,
+        Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    // The two unkeyed creates and the four keyed publications.
+    assert_eq!(
+        successor
+            .deliver_until_caught_up(&CancellationToken::new())
+            .await
+            .unwrap(),
+        Some(6)
+    );
+
+    let contents = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let lines: Vec<_> = contents.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), 12);
+    assert_eq!(
+        &lines[..6],
+        &lines[6..],
+        "recovery must redeliver byte-identical records"
+    );
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/schemas/authority_event.v1.schema.json"
+    ))
+    .unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let events: Vec<serde_json::Value> = lines[..6]
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &serde_json::Value| {
+            event["operation"]
+                .as_str()
+                .is_some_and(|operation| operation.starts_with("catalog."))
+        })
+        .collect();
+    for event in &events {
+        assert_eq!(event["schema_version"], "authority_event.v1", "{event}");
+        validator.validate(event).unwrap();
+    }
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["operation"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "catalog.openapi.publish",
+            "catalog.overlay.replace",
+            "catalog.overlay.delete",
+            "catalog.mcp.publish"
+        ]
+    );
+    for (event, key) in events.iter().zip([&register, &put, &delete, &refresh]) {
+        assert_eq!(event["operation_id"], key.id().to_string(), "{event}");
+    }
+    let api_id = api.id.to_string();
+    let mcp_id = mcp.id.to_string();
+    for marker in [
+        api_id.as_str(),
+        actor.subject(),
+        ACTOR_ISSUER,
+        NAME_MARKER,
+        OVERLAY_MARKER,
+        "keyed-openapi.example.test",
+        "keyed-openapi-token",
+        mcp_id.as_str(),
+        MCP_NAME_MARKER,
+        "keyed-mcp.example.test",
+        register.binding_digest(),
+        put.binding_digest(),
+        delete.binding_digest(),
+        refresh.binding_digest(),
+    ] {
+        assert!(!contents.contains(marker), "{marker} reached the file");
+    }
+}

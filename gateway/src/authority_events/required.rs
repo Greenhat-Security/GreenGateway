@@ -58,16 +58,15 @@ pub(crate) const REFUSAL_REASON: &str = "authority_evidence_unsupported";
 /// Only changes some deployment mode refuses, or admits only in their keyed
 /// form, are listed. An operation every mode that performs it records in its
 /// own transaction, and that no change has bound to a caller key yet, never
-/// asks: local-secret changes and re-encryption, managed catalog publication
-/// and overlay writes and removals (the standalone Connections database's
-/// own evidence tables), service-token revocation, and JWT revocation. The
-/// inventory test holds that rule too: an operation no gate asks about must
-/// be `admitted` or `unavailable` wherever its row says. Connection create
-/// and replace, and service-token issue and rotation, are listed since they
-/// bind caller keys (issue #425): both modes admit only their keyed form
-/// under `required`. A
-/// `credential.binding_change` is never asked on its own: it is part of the
-/// `connection.replace` that makes it, under the same caller key.
+/// asks: local-secret changes and re-encryption, service-token revocation,
+/// and JWT revocation. The inventory test holds that rule too: an operation
+/// no gate asks about must be `admitted` or `unavailable` wherever its row
+/// says. Connection create and replace, service-token issue and rotation, and
+/// managed catalog publication and overlay writes and removals, are listed
+/// since they bind caller keys (issue #425): both modes admit only their
+/// keyed form under `required`. A `credential.binding_change` is never asked
+/// on its own: it is part of the `connection.replace` that makes it, under
+/// the same caller key.
 ///
 /// The withdrawals a remote caller starts -- `service_token.revoke`,
 /// `connection.delete` and `secret.delete` -- are never listed, and no
@@ -115,6 +114,16 @@ pub(crate) enum AuthorityOperation {
     /// with the `credential.binding_change` it makes when it advances the
     /// credential revision.
     ConnectionReplace,
+    /// A managed MCP catalog published by a refresh through the admin API.
+    CatalogMcpPublish,
+    /// A managed OpenAPI catalog published by a registration or a refresh
+    /// through the admin API, with no overlay change.
+    CatalogOpenapiPublish,
+    /// A managed OpenAPI overlay stored, and its catalog published with it.
+    CatalogOverlayReplace,
+    /// A managed OpenAPI overlay removed, and its catalog published without
+    /// it: a publication, not a withdrawal.
+    CatalogOverlayDelete,
 }
 
 /// The changes a remote caller starts that only remove authority, and so
@@ -228,6 +237,10 @@ impl AuthorityOperation {
             Self::MutationApprovalRevoke => "mutation_approval.revoke",
             Self::ConnectionCreate => "connection.create",
             Self::ConnectionReplace => "connection.replace",
+            Self::CatalogMcpPublish => "catalog.mcp.publish",
+            Self::CatalogOpenapiPublish => "catalog.openapi.publish",
+            Self::CatalogOverlayReplace => "catalog.overlay.replace",
+            Self::CatalogOverlayDelete => "catalog.overlay.delete",
         }
     }
 
@@ -239,14 +252,14 @@ impl AuthorityOperation {
     /// PostgreSQL transaction, and has no policy file to reload. Standalone
     /// mode records none of them: the policy and tools files, their reloads
     /// and their optional history are separate steps, and the stored
-    /// policy test suite's versions name only the writer's subject. (The
-    /// Connections database records catalog and overlay publication in its
-    /// own transaction, so those operations are not listed.) The offline
-    /// import is refused in cluster mode because it records evidence for
-    /// only two of its sections. Connection create and replace bind a caller
-    /// key in both modes (issue #425): the change, its evidence and its key's
-    /// reservation commit in one transaction of the mode's own store, so
-    /// both admit their keyed form.
+    /// policy test suite's versions name only the writer's subject. The
+    /// offline import is refused in cluster mode because it records evidence
+    /// for only two of its sections. Connection create and replace, and
+    /// managed catalog publication and overlay changes, bind a caller key in
+    /// both modes (issue #425): the change, its evidence and its key's
+    /// reservation commit in one transaction of the mode's own store (the
+    /// Connections database in standalone mode), so both admit their keyed
+    /// form.
     pub(crate) const fn required_mode(self, backend: StateBackend) -> RequiredMode {
         match backend {
             StateBackend::Postgres => match self {
@@ -256,6 +269,10 @@ impl AuthorityOperation {
                 Self::PolicyFileReload => RequiredMode::Unavailable,
                 Self::MutationApprovalPrepare => RequiredMode::CallerKeyRequired,
                 Self::ConnectionCreate | Self::ConnectionReplace => RequiredMode::CallerKeyRequired,
+                Self::CatalogMcpPublish
+                | Self::CatalogOpenapiPublish
+                | Self::CatalogOverlayReplace
+                | Self::CatalogOverlayDelete => RequiredMode::CallerKeyRequired,
                 Self::MutationApprovalConsume
                 | Self::MutationApprovalReview
                 | Self::MutationApprovalRevoke
@@ -278,6 +295,10 @@ impl AuthorityOperation {
                 // configuration is only its source.
                 Self::ConfigurationImport => RequiredMode::Unavailable,
                 Self::ConnectionCreate | Self::ConnectionReplace => RequiredMode::CallerKeyRequired,
+                Self::CatalogMcpPublish
+                | Self::CatalogOpenapiPublish
+                | Self::CatalogOverlayReplace
+                | Self::CatalogOverlayDelete => RequiredMode::CallerKeyRequired,
                 _ => RequiredMode::Refused,
             },
         }

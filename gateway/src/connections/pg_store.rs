@@ -880,8 +880,9 @@ impl PostgresConnectionStore {
         crate::storage::postgres_authority_events::read_caller_operation(&client, caller).await
     }
 
-    /// The receipt of the Connection change `caller`'s key committed, read
-    /// from its evidence row, or `None` when there is none.
+    /// The receipt of the Connection or catalog change `caller`'s key
+    /// committed, read from the evidence row of the key's action, or `None`
+    /// when there is none.
     pub(crate) async fn caller_operation_receipt(
         &self,
         caller: &CallerOperation,
@@ -893,7 +894,7 @@ impl PostgresConnectionStore {
             )
         };
         let client = self.pool.get().await.map_err(|_| unavailable())?;
-        connection_operation_receipt(&client, caller)
+        operation_receipt_for(&client, caller)
             .await
             .map_err(|_| unavailable())
     }
@@ -957,6 +958,50 @@ async fn connection_operation_receipt(
     }))
 }
 
+/// The receipt of the catalog publication `caller`'s key committed: its
+/// `catalog_change_evidence` row for the key's action, naming the Connection
+/// and the catalog revision it published, never anything from the request.
+async fn catalog_operation_receipt(
+    client: &tokio_postgres::Client,
+    caller: &CallerOperation,
+) -> Result<Option<OperationReceipt>, ConnectionStoreError> {
+    let row = client
+        .query_opt(
+            "SELECT connection_id::text, new_version, \
+                    to_char(committed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
+             FROM greengateway.catalog_change_evidence \
+             WHERE operation_id = $1::text::uuid AND action = $2",
+            &[&caller.id().to_string(), &caller.action()],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_CALLER_OPERATION, error))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some(OperationReceipt {
+        operation_id: caller.id().to_string(),
+        operation: caller.action().to_owned(),
+        resource_id: scalar(&row, 0, OPERATION_CALLER_OPERATION)?,
+        revision: Some(scalar(&row, 1, OPERATION_CALLER_OPERATION)?),
+        committed_at: scalar(&row, 2, OPERATION_CALLER_OPERATION)?,
+    }))
+}
+
+/// The receipt of the change `caller`'s key committed, read from the
+/// evidence table its action is recorded in: a catalog publication's from
+/// `catalog_change_evidence`, a Connection change's from
+/// `connection_change_evidence`.
+async fn operation_receipt_for(
+    client: &tokio_postgres::Client,
+    caller: &CallerOperation,
+) -> Result<Option<OperationReceipt>, ConnectionStoreError> {
+    if super::store::is_catalog_action(caller.action()) {
+        catalog_operation_receipt(client, caller).await
+    } else {
+        connection_operation_receipt(client, caller).await
+    }
+}
+
 /// A reservation's store error, as this store reports it: a fence below
 /// `caller_operation_keys` or an unreachable table is unavailable (`503`),
 /// never a conflict or a validation problem.
@@ -1003,16 +1048,14 @@ async fn committed_receipt(
     client: &deadpool_postgres::Object,
     caller: &CallerOperation,
 ) -> Result<OperationReceipt, ConnectionStoreError> {
-    connection_operation_receipt(client, caller)
-        .await?
-        .ok_or_else(|| {
-            tracing::error!(
-                "a caller operation is reserved without its Connection evidence row; the change is refused"
-            );
-            ConnectionStoreError::Unavailable {
-                operation: OPERATION_CALLER_OPERATION,
-            }
-        })
+    operation_receipt_for(client, caller).await?.ok_or_else(|| {
+        tracing::error!(
+            "a caller operation is reserved without its evidence row; the change is refused"
+        );
+        ConnectionStoreError::Unavailable {
+            operation: OPERATION_CALLER_OPERATION,
+        }
+    })
 }
 
 /// Step 3 of a keyed change: reserve the key with its binding digest in the
@@ -1116,18 +1159,58 @@ impl PostgresConnectionStore {
         expected_catalog_revision: u64,
         actor: &crate::auth::change_actor::ChangeActor,
     ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
+        super::store::committed(
+            self.replace_mcp_catalog_with_operation(
+                id,
+                expected,
+                entries,
+                resources,
+                resource_templates,
+                expected_catalog_revision,
+                actor,
+                None,
+            )
+            .await,
+        )
+    }
+
+    /// [`Self::replace_mcp_catalog`] under a caller key (issue #425): inside
+    /// the one transaction the key is looked up first (an exact retry of a
+    /// committed publication is answered with its receipt and changes
+    /// nothing; a key bound to anything else is a conflict), then the
+    /// Connection ETag and the catalog revision are checked, the key is
+    /// reserved with its binding digest once the contract fence is confirmed
+    /// to carry `caller_operation_keys`, and the catalog, its evidence under
+    /// the caller's key and its journal entry commit with it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn replace_mcp_catalog_with_operation(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        entries: &[StoredMcpCatalogEntry],
+        resources: &[StoredMcpResource],
+        resource_templates: &[StoredMcpResourceTemplate],
+        expected_catalog_revision: u64,
+        actor: &crate::auth::change_actor::ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<StoredMcpCatalog>, ConnectionStoreError> {
         validate_evidence_actor(actor)?;
+        super::store::ensure_caller_action(caller, CATALOG_EVIDENCE_ACTION_MCP_PUBLISH)?;
         let actor_user_id = actor.subject();
         let validated = validate_mcp_catalog(id, entries, resources, resource_templates)?;
         let now = utc_timestamp()?;
-        let operation_id = uuid::Uuid::new_v4();
+        // One logical operation: the caller's key, or one minted per call.
+        let operation_id = caller.map_or_else(uuid::Uuid::new_v4, CallerOperation::id);
         let client = self
             .pool
             .get()
             .await
             .map_err(|_| pg_unavailable(OPERATION_MCP_CATALOG))?;
         begin_mutation(&client, OPERATION_MCP_CATALOG).await?;
-        let outcome: Result<StoredMcpCatalog, ConnectionStoreError> = async {
+        let outcome: Result<CallerOutcome<StoredMcpCatalog>, ConnectionStoreError> = async {
+            if let Some(receipt) = keyed_receipt(&client, caller, OPERATION_MCP_CATALOG).await? {
+                return Ok(CallerOutcome::Replayed(receipt));
+            }
             let current = load_record_for_update(&client, id, OPERATION_MCP_CATALOG)
                 .await?
                 .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?;
@@ -1217,6 +1300,12 @@ impl PostgresConnectionStore {
                 });
             }
             let catalog_revision = increment_revision(id, previous_revision)?;
+            // The key is reserved after this store's own lock and before the
+            // shared revision and the journal state row (the lock order of
+            // `reserve_bound_operation`).
+            if let Some(receipt) = reserve_caller_key(&client, caller, OPERATION_MCP_CATALOG).await? {
+                return Ok(CallerOutcome::Replayed(receipt));
+            }
 
             client
                 .execute(
@@ -1400,7 +1489,7 @@ impl PostgresConnectionStore {
                 },
             )
             .await?;
-            Ok(StoredMcpCatalog {
+            Ok(CallerOutcome::Committed(StoredMcpCatalog {
                 connection_id: id.clone(),
                 catalog_revision,
                 observed_etag: expected.clone(),
@@ -1408,19 +1497,10 @@ impl PostgresConnectionStore {
                 entries: entries.to_vec(),
                 resources: resources.to_vec(),
                 resource_templates: resource_templates.to_vec(),
-            })
+            }))
         }
         .await;
-        match outcome {
-            Ok(catalog) => {
-                commit(&client, OPERATION_MCP_CATALOG).await?;
-                Ok(catalog)
-            }
-            Err(error) => {
-                let _ = client.batch_execute("ROLLBACK").await;
-                Err(error)
-            }
-        }
+        finish_keyed(&client, OPERATION_MCP_CATALOG, outcome).await
     }
 
     pub async fn openapi_catalogs(
@@ -1924,6 +2004,48 @@ impl PostgresConnectionStore {
         policy_protected_names: &[String],
         enum_values: &[StoredEnumSourceValueWrite],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
+        super::store::committed(
+            self.replace_openapi_catalog_with_overlay_and_enum_values_with_operation(
+                id,
+                expected_connection_etag,
+                expected_spec_revision,
+                expected_catalog_revision,
+                spec,
+                spec_digest,
+                entries,
+                overlay,
+                compiled_overlay_revision,
+                actor,
+                policy_protected_names,
+                enum_values,
+                None,
+            )
+            .await,
+        )
+    }
+
+    /// [`Self::replace_openapi_catalog_with_overlay_and_enum_values`] under a
+    /// caller key (issue #425), in the order
+    /// [`Self::replace_mcp_catalog_with_operation`] describes. The key must
+    /// be bound to the action the write records -- what it does to the
+    /// overlay -- or the call is refused before anything is read.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn replace_openapi_catalog_with_overlay_and_enum_values_with_operation(
+        &self,
+        id: &ConnectionId,
+        expected_connection_etag: &ConnectionEtag,
+        expected_spec_revision: u64,
+        expected_catalog_revision: u64,
+        spec: &str,
+        spec_digest: &str,
+        entries: &[StoredOpenApiCatalogEntry],
+        overlay: Option<&StoredOverlayWrite>,
+        compiled_overlay_revision: u64,
+        actor: &crate::auth::change_actor::ChangeActor,
+        policy_protected_names: &[String],
+        enum_values: &[StoredEnumSourceValueWrite],
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<StoredOpenApiCatalog>, ConnectionStoreError> {
         validate_evidence_actor(actor)?;
         let actor_user_id = actor.subject();
         let evidence_action = match overlay {
@@ -1933,7 +2055,9 @@ impl PostgresConnectionStore {
                 CATALOG_EVIDENCE_ACTION_OPENAPI_PUBLISH
             }
         };
-        let operation_id = uuid::Uuid::new_v4();
+        super::store::ensure_caller_action(caller, evidence_action)?;
+        // One logical operation: the caller's key, or one minted per call.
+        let operation_id = caller.map_or_else(uuid::Uuid::new_v4, CallerOperation::id);
         validate_openapi_spec(spec, spec_digest)?;
         if let Some(overlay) = overlay {
             validate_openapi_overlay_write(overlay)?;
@@ -1950,7 +2074,12 @@ impl PostgresConnectionStore {
             .await
             .map_err(|_| pg_unavailable(OPERATION_OPENAPI_CATALOG))?;
         begin_mutation(&client, OPERATION_OPENAPI_CATALOG).await?;
-        let outcome: Result<StoredOpenApiCatalog, ConnectionStoreError> = async {
+        let outcome: Result<CallerOutcome<StoredOpenApiCatalog>, ConnectionStoreError> = async {
+            if let Some(receipt) =
+                keyed_receipt(&client, caller, OPERATION_OPENAPI_CATALOG).await?
+            {
+                return Ok(CallerOutcome::Replayed(receipt));
+            }
             if overlay.is_some() {
                 postgres_policy::acquire_policy_overlay_lock(&client)
                     .await
@@ -2114,6 +2243,11 @@ impl PostgresConnectionStore {
                 increment_revision(id, previous_spec_revision)?
             };
             let catalog_revision = increment_revision(id, previous_catalog_revision)?;
+            if let Some(receipt) =
+                reserve_caller_key(&client, caller, OPERATION_OPENAPI_CATALOG).await?
+            {
+                return Ok(CallerOutcome::Replayed(receipt));
+            }
 
             client
                 .execute(
@@ -2263,7 +2397,7 @@ impl PostgresConnectionStore {
                 },
             )
             .await?;
-            Ok(StoredOpenApiCatalog {
+            Ok(CallerOutcome::Committed(StoredOpenApiCatalog {
                 connection_id: id.clone(),
                 spec_revision,
                 catalog_revision,
@@ -2273,19 +2407,10 @@ impl PostgresConnectionStore {
                 refreshed_at: now.clone(),
                 entries: normalized_entries,
                 overlay_revision,
-            })
+            }))
         }
         .await;
-        match outcome {
-            Ok(catalog) => {
-                commit(&client, OPERATION_OPENAPI_CATALOG).await?;
-                Ok(catalog)
-            }
-            Err(error) => {
-                let _ = client.batch_execute("ROLLBACK").await;
-                Err(error)
-            }
-        }
+        finish_keyed(&client, OPERATION_OPENAPI_CATALOG, outcome).await
     }
 
     // ==== Status (observational: no security-revision bumps) ====

@@ -73,6 +73,63 @@ fn explicit_hidden_binding_fields_are_secret_authority_intent() {
     })));
 }
 
+/// A keyed replacement of a Connection that is no longer in the snapshot is
+/// validated with a stand-in for each binding it keeps by marker (issue
+/// #425). Two kept bindings must not look like one alias bound twice: a
+/// caller assertion keeping its signing key and a published key, and a
+/// delegated-issuer-token Connection keeping its client secret beside other
+/// kept bindings, are valid and reach admission.
+#[test]
+fn a_replacement_without_its_record_keeps_each_marked_binding_apart() {
+    let kept_key = |mut key: Value| {
+        let key_object = key.as_object_mut().expect("a key object");
+        key_object.remove("signing_key_id");
+        key_object.insert("signing_key_configured".to_owned(), json!(true));
+        key
+    };
+    let mut rotating = kept_key(admin_caller_assertion_json());
+    rotating["published_keys"] = json!([{
+        "signing_key_configured": true,
+        "kid": "gw-test-2",
+        "algorithm": "rs256"
+    }]);
+    let mut delegated = kept_key(admin_caller_assertion_json());
+    delegated["bind_request"] = json!(false);
+    delegated["audience"] = json!("https://issuer.example.test");
+    for body in [
+        json!({
+            "display_name": "Attested API",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {"base_url": "https://billing.example.test", "base_path": "/"},
+            "authentication": {"type": "none"},
+            "caller_assertion": rotating
+        }),
+        json!({
+            "display_name": "Mail",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {"base_url": "https://mail.example.test", "base_path": "/v1"},
+            "authentication": {
+                "type": "delegated_issuer_token",
+                "token_exchange_url": "https://issuer.example.test/oauth2/token-exchange",
+                "client_id": "greengateway",
+                "client_secret_configured": true,
+                "subject_token_source": "caller_assertion"
+            },
+            "additional_headers": [
+                {"header_name": "x-proxy-token", "secret_configured": true}
+            ],
+            "caller_assertion": delegated
+        }),
+    ] {
+        validate_connection_replacement_without_record(&Bytes::from(body.to_string()))
+            .unwrap_or_else(|response| {
+                panic!("a valid body was refused with {}", response.status())
+            });
+    }
+}
+
 #[test]
 fn redacted_additional_header_bindings_round_trip_clear_and_reject_false_markers() {
     let current: connections::model::ConnectionWrite = serde_json::from_value(json!({

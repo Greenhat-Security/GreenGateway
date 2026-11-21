@@ -16,6 +16,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     auth::change_actor::ChangeActor,
+    authority_events::caller_operation::{
+        CallerKeyState, CallerOperation, CallerOutcome, OperationReceipt,
+    },
     egress::{EgressError, EgressRequestBody},
     middleware::rbac::RbacState,
     tools::{
@@ -42,6 +45,7 @@ use super::{
         caller_assertion_servable_on, credential_servable_on, AttestingLane, ConnectionHttpError,
         ConnectionHttpRuntime,
     },
+    managed_store::ManagedConnectionStore,
     model::{
         normalize_origin_relative_path, ConnectionId, ConnectionKind, DiscoveryConfig,
         MAX_CATALOG_ENTRIES, MAX_MANAGED_OPENAPI_CATALOG_BYTES, MAX_MANAGED_SPEC_BYTES,
@@ -143,6 +147,9 @@ struct OpenApiPublishCandidate<'a> {
     /// (`catalog_change_evidence`); standalone mode records only the
     /// subject, on the overlay row an overlay write stores.
     actor: &'a ChangeActor,
+    /// The caller key the publication is bound to (issue #425), reserved in
+    /// its transaction and recorded as its evidence's operation ID.
+    caller: Option<&'a CallerOperation>,
 }
 
 struct OpenApiPublishedCatalog {
@@ -330,6 +337,9 @@ pub enum OpenApiCatalogError {
     ConvertedCatalogNeedsAdmission {
         requirement: CatalogWriteRequirement,
     },
+    /// The write's caller key (`Idempotency-Key`, issue #425) is reserved
+    /// for another request. Nothing was published or recorded.
+    CallerOperationConflict,
 }
 
 impl OpenApiCatalogError {
@@ -359,6 +369,7 @@ impl OpenApiCatalogError {
             Self::InvalidResponse => "invalid_response",
             Self::StorageUnavailable => "storage_unavailable",
             Self::ConvertedCatalogNeedsAdmission { .. } => "operation_gate_required",
+            Self::CallerOperationConflict => "caller_operation_conflict",
         }
     }
 }
@@ -1066,6 +1077,38 @@ impl OpenApiConnectionCatalogService {
         converted_catalog: ConvertedCatalogAdmission,
         actor: &ChangeActor,
     ) -> Result<OpenApiOverlayMutationResult, OpenApiOverlayOperationError> {
+        committed_publication(
+            self.put_overlay_with_operation(
+                raw_connection_id,
+                expected_overlay_etag,
+                document,
+                allow_unresolved_enum_sources,
+                secrets_write_authorized,
+                converted_catalog,
+                actor,
+                None,
+            )
+            .await,
+        )
+    }
+
+    /// [`Self::put_overlay_with_authorization`] under a caller key bound to
+    /// `catalog.overlay.replace` (issue #425). Under the Connection's catalog
+    /// lifecycle guard, and before the overlay precondition that a committed
+    /// put has moved, an exact retry is answered with its receipt; the store
+    /// decides again in the publishing transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_overlay_with_operation(
+        &self,
+        raw_connection_id: &str,
+        expected_overlay_etag: &str,
+        document: &Value,
+        allow_unresolved_enum_sources: bool,
+        secrets_write_authorized: bool,
+        converted_catalog: ConvertedCatalogAdmission,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<OpenApiOverlayMutationResult>, OpenApiOverlayOperationError> {
         let connection_id = ConnectionId::parse(raw_connection_id.to_owned())
             .map_err(|_| OpenApiCatalogError::InvalidConnectionId)?;
         let _active = self
@@ -1075,6 +1118,9 @@ impl OpenApiConnectionCatalogService {
         let document = overlay::validate(document)?;
         if document.has_raw_path_sources() && !secrets_write_authorized {
             return Err(OpenApiOverlayOperationError::SecretsWriteRequired);
+        }
+        if let Some(receipt) = self.committed_by_key(caller).await? {
+            return Ok(CallerOutcome::Replayed(receipt));
         }
         // A rename is checked against the live policy map. Serialize this
         // local mutation with policy writes so a grant cannot appear between
@@ -1202,9 +1248,14 @@ impl OpenApiConnectionCatalogService {
                 enum_values: resolved.enum_values,
                 started: Instant::now(),
                 actor,
+                caller,
             })
             .await
             .map_err(OpenApiPublishError::into_overlay_operation)?;
+        let published = match published {
+            CallerOutcome::Committed(published) => published,
+            CallerOutcome::Replayed(receipt) => return Ok(CallerOutcome::Replayed(receipt)),
+        };
         if published.catalog.overlay_revision != next_overlay_revision {
             return Err(OpenApiCatalogError::StorageUnavailable.into());
         }
@@ -1222,12 +1273,12 @@ impl OpenApiConnectionCatalogService {
             published.catalog.catalog_revision,
             stored.overlay_revision,
         );
-        Ok(OpenApiOverlayMutationResult {
+        Ok(CallerOutcome::Committed(OpenApiOverlayMutationResult {
             stored: Some(stored),
             etag,
             report: Some(report),
             catalog: published.result,
-        })
+        }))
     }
 
     /// Recompile the registered catalog without an overlay and delete the
@@ -1239,12 +1290,38 @@ impl OpenApiConnectionCatalogService {
         converted_catalog: ConvertedCatalogAdmission,
         actor: &ChangeActor,
     ) -> Result<OpenApiOverlayMutationResult, OpenApiOverlayOperationError> {
+        committed_publication(
+            self.delete_overlay_with_operation(
+                raw_connection_id,
+                expected_overlay_etag,
+                converted_catalog,
+                actor,
+                None,
+            )
+            .await,
+        )
+    }
+
+    /// [`Self::delete_overlay`] under a caller key bound to
+    /// `catalog.overlay.delete`, as [`Self::put_overlay_with_operation`]
+    /// describes.
+    pub async fn delete_overlay_with_operation(
+        &self,
+        raw_connection_id: &str,
+        expected_overlay_etag: &str,
+        converted_catalog: ConvertedCatalogAdmission,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<OpenApiOverlayMutationResult>, OpenApiOverlayOperationError> {
         let connection_id = ConnectionId::parse(raw_connection_id.to_owned())
             .map_err(|_| OpenApiCatalogError::InvalidConnectionId)?;
         let _active = self
             .control_plane
             .begin_catalog_mutation(&connection_id)
             .map_err(catalog_lifecycle_error)?;
+        if let Some(receipt) = self.committed_by_key(caller).await? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         let _policy_write_guard = match self.rbac.as_ref() {
             Some(rbac) => Some(rbac.policy_write_guard().await),
             None => None,
@@ -1309,9 +1386,14 @@ impl OpenApiConnectionCatalogService {
                 enum_values: Vec::new(),
                 started: Instant::now(),
                 actor,
+                caller,
             })
             .await
             .map_err(OpenApiPublishError::into_overlay_operation)?;
+        let published = match published {
+            CallerOutcome::Committed(published) => published,
+            CallerOutcome::Replayed(receipt) => return Ok(CallerOutcome::Replayed(receipt)),
+        };
         if published.catalog.overlay_revision != 0 {
             return Err(OpenApiCatalogError::StorageUnavailable.into());
         }
@@ -1321,12 +1403,12 @@ impl OpenApiConnectionCatalogService {
             published.catalog.catalog_revision,
             0,
         );
-        Ok(OpenApiOverlayMutationResult {
+        Ok(CallerOutcome::Committed(OpenApiOverlayMutationResult {
             stored: None,
             etag,
             report: None,
             catalog: published.result,
-        })
+        }))
     }
 
     pub async fn preview(
@@ -1495,10 +1577,44 @@ impl OpenApiConnectionCatalogService {
         converted_catalog: ConvertedCatalogAdmission,
         actor: &ChangeActor,
     ) -> Result<OpenApiCatalogPublishResult, OpenApiCatalogError> {
-        validate_spec_size(spec)?;
-        if spec_digest(spec) != expected_spec_digest {
-            return Err(OpenApiCatalogError::StalePreview);
-        }
+        committed_publication(
+            self.register_with_operation(
+                raw_connection_id,
+                expected_connection_etag,
+                expected_spec_revision,
+                expected_catalog_revision,
+                expected_spec_digest,
+                spec,
+                selected_tool_names,
+                confirmations,
+                converted_catalog,
+                actor,
+                None,
+            )
+            .await,
+        )
+    }
+
+    /// [`Self::register_with_admission`] under a caller key bound to
+    /// `catalog.openapi.publish` (issue #425). The store looks the key up
+    /// before the catalog revisions a committed registration has moved, so a
+    /// retry that raced its first attempt is answered with its receipt.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_with_operation(
+        &self,
+        raw_connection_id: &str,
+        expected_connection_etag: &str,
+        expected_spec_revision: u64,
+        expected_catalog_revision: u64,
+        expected_spec_digest: &str,
+        spec: &str,
+        selected_tool_names: &[String],
+        confirmations: &[OpenApiToolSecuritySelection],
+        converted_catalog: ConvertedCatalogAdmission,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<OpenApiCatalogPublishResult>, OpenApiCatalogError> {
+        check_registration_spec(spec, expected_spec_digest)?;
         let connection_id = ConnectionId::parse(raw_connection_id.to_owned())
             .map_err(|_| OpenApiCatalogError::InvalidConnectionId)?;
         let _active = self
@@ -1596,9 +1712,13 @@ impl OpenApiConnectionCatalogService {
             enum_values,
             started: Instant::now(),
             actor,
+            caller,
         })
         .await
-        .map(|published| published.result)
+        .map(|published| match published {
+            CallerOutcome::Committed(published) => CallerOutcome::Committed(published.result),
+            CallerOutcome::Replayed(receipt) => CallerOutcome::Replayed(receipt),
+        })
         .map_err(OpenApiPublishError::into_catalog)
     }
 
@@ -1630,6 +1750,32 @@ impl OpenApiConnectionCatalogService {
         converted_catalog: ConvertedCatalogAdmission,
         actor: &ChangeActor,
     ) -> Result<OpenApiCatalogPublishResult, OpenApiCatalogError> {
+        committed_publication(
+            self.refresh_with_operation(
+                raw_connection_id,
+                expected_connection_etag,
+                converted_catalog,
+                actor,
+                None,
+            )
+            .await,
+        )
+    }
+
+    /// [`Self::refresh_with_admission`] under a caller key bound to
+    /// `catalog.openapi.publish` (issue #425). The handler has already
+    /// answered an exact retry of a committed refresh from its receipt before
+    /// calling this, so the specification is not fetched again; a retry that
+    /// raced its first attempt is answered by the store from the committed
+    /// evidence, and nothing is installed or recorded for it.
+    pub async fn refresh_with_operation(
+        &self,
+        raw_connection_id: &str,
+        expected_connection_etag: &str,
+        converted_catalog: ConvertedCatalogAdmission,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<OpenApiCatalogPublishResult>, OpenApiCatalogError> {
         let connection_id = ConnectionId::parse(raw_connection_id.to_owned())
             .map_err(|_| OpenApiCatalogError::InvalidConnectionId)?;
         let _active = self
@@ -1855,20 +2001,31 @@ impl OpenApiConnectionCatalogService {
                 enum_values,
                 started,
                 actor,
+                caller,
             })
             .await;
         match published {
-            Ok(published) => Ok(published.result),
+            Ok(CallerOutcome::Committed(published)) => {
+                Ok(CallerOutcome::Committed(published.result))
+            }
+            // An exact retry of a refresh that committed meanwhile: nothing
+            // changed, so nothing is recorded.
+            Ok(CallerOutcome::Replayed(receipt)) => Ok(CallerOutcome::Replayed(receipt)),
             Err(error) => {
                 let error = error.into_catalog();
-                self.record_failed_status(
-                    &connection_id,
-                    &record.etag(),
-                    Some(&prior),
-                    error,
-                    started.elapsed(),
-                )
-                .await;
+                // A key bound to another request says nothing about the
+                // specification or the catalog, so the Connection's status
+                // keeps what it had.
+                if error != OpenApiCatalogError::CallerOperationConflict {
+                    self.record_failed_status(
+                        &connection_id,
+                        &record.etag(),
+                        Some(&prior),
+                        error,
+                        started.elapsed(),
+                    )
+                    .await;
+                }
                 Err(error)
             }
         }
@@ -1971,15 +2128,7 @@ impl OpenApiConnectionCatalogService {
         if expected_etag.is_some_and(|expected| record.etag().as_str() != expected) {
             return Err(OpenApiCatalogError::PreconditionFailed);
         }
-        if record.write.kind != ConnectionKind::HttpApi {
-            return Err(OpenApiCatalogError::ConnectionKindMismatch);
-        }
-        if !matches!(
-            &record.write.discovery,
-            Some(DiscoveryConfig::ManagedOpenapi { .. })
-        ) {
-            return Err(OpenApiCatalogError::DiscoveryNotConfigured);
-        }
+        managed_openapi_target(&record)?;
         Ok((connection_id, record))
     }
 
@@ -2010,10 +2159,29 @@ impl OpenApiConnectionCatalogService {
         unlisted
     }
 
+    /// Under the Connection's catalog lifecycle guard, before an overlay
+    /// precondition that a committed change has moved: the receipt of the
+    /// publication `caller`'s key committed, a conflict for a key bound to
+    /// anything else, or `None` to go on. The store's own transaction decides
+    /// again (issue #425).
+    async fn committed_by_key(
+        &self,
+        caller: Option<&CallerOperation>,
+    ) -> Result<Option<OperationReceipt>, OpenApiCatalogError> {
+        let Some(caller) = caller else {
+            return Ok(None);
+        };
+        let store = self
+            .control_plane
+            .managed_store()
+            .map_err(|_| OpenApiCatalogError::StoreUnavailable)?;
+        committed_receipt_by_key(store, caller).await
+    }
+
     async fn publish_candidate(
         &self,
         candidate: OpenApiPublishCandidate<'_>,
-    ) -> Result<OpenApiPublishedCatalog, OpenApiPublishError> {
+    ) -> Result<CallerOutcome<OpenApiPublishedCatalog>, OpenApiPublishError> {
         let OpenApiPublishCandidate {
             record,
             expected_spec_revision,
@@ -2028,6 +2196,7 @@ impl OpenApiConnectionCatalogService {
             enum_values,
             started,
             actor,
+            caller,
         } = candidate;
         if !binding.incompatibilities.is_empty() {
             return Err(OpenApiCatalogError::AuthenticationMismatch.into());
@@ -2085,8 +2254,8 @@ impl OpenApiConnectionCatalogService {
         registry
             .validate_openapi_connection_catalog(record.id.as_str(), &binding_definitions)
             .map_err(|_| OpenApiCatalogError::ToolConflict)?;
-        let catalog = store
-            .replace_openapi_catalog_with_overlay_and_enum_values(
+        let catalog = match store
+            .replace_openapi_catalog_with_overlay_and_enum_values_with_operation(
                 &record.id,
                 &expected_connection_etag,
                 expected_spec_revision,
@@ -2099,9 +2268,16 @@ impl OpenApiConnectionCatalogService {
                 actor,
                 &policy_protected_names,
                 &enum_values,
+                caller,
             )
             .await
-            .map_err(|error| publish_store_error(&record.id, &error))?;
+            .map_err(|error| publish_store_error(&record.id, &error))?
+        {
+            CallerOutcome::Committed(catalog) => catalog,
+            // An exact retry of a publication that committed meanwhile:
+            // nothing changed, so nothing is installed or recorded.
+            CallerOutcome::Replayed(receipt) => return Ok(CallerOutcome::Replayed(receipt)),
+        };
         // Catalog revisions reset when a Connection leaves and later
         // re-enters managed OpenAPI. Order first by the monotonically
         // increasing Connection generation, then by the exact observed
@@ -2224,7 +2400,7 @@ impl OpenApiConnectionCatalogService {
             .iter()
             .map(|entry| entry.tool_name.clone())
             .collect::<Vec<_>>();
-        Ok(OpenApiPublishedCatalog {
+        Ok(CallerOutcome::Committed(OpenApiPublishedCatalog {
             result: OpenApiCatalogPublishResult {
                 connection_id: record.id.clone(),
                 spec_digest: catalog.spec_digest.clone(),
@@ -2238,7 +2414,7 @@ impl OpenApiConnectionCatalogService {
                 removed_count: counts.2,
             },
             catalog,
-        })
+        }))
     }
 
     async fn fetch_stored_spec(
@@ -3007,6 +3183,23 @@ fn validate_spec_size(spec: &str) -> Result<(), OpenApiCatalogError> {
     Ok(())
 }
 
+/// Whether a Connection is one a managed OpenAPI catalog change may name:
+/// an HTTP API Connection with managed OpenAPI discovery. The admin handlers
+/// ask it before a caller key is bound (issue #425), and the service asks it
+/// again under its lifecycle guard.
+pub(crate) fn managed_openapi_target(record: &StoredConnection) -> Result<(), OpenApiCatalogError> {
+    if record.write.kind != ConnectionKind::HttpApi {
+        return Err(OpenApiCatalogError::ConnectionKindMismatch);
+    }
+    if !matches!(
+        &record.write.discovery,
+        Some(DiscoveryConfig::ManagedOpenapi { .. })
+    ) {
+        return Err(OpenApiCatalogError::DiscoveryNotConfigured);
+    }
+    Ok(())
+}
+
 fn supports_managed_openapi_catalog(record: &StoredConnection) -> bool {
     record.write.kind == ConnectionKind::HttpApi
         && matches!(
@@ -3186,10 +3379,68 @@ fn openapi_store_error(error: &ConnectionStoreError) -> OpenApiCatalogError {
     match error {
         ConnectionStoreError::ToolNameConflict { .. } => OpenApiCatalogError::ToolConflict,
         ConnectionStoreError::Conflict { .. } => OpenApiCatalogError::StalePreview,
+        ConnectionStoreError::CallerOperationConflict => {
+            OpenApiCatalogError::CallerOperationConflict
+        }
         ConnectionStoreError::Validation { .. } | ConnectionStoreError::LimitExceeded { .. } => {
             OpenApiCatalogError::InvalidSpec
         }
         _ => OpenApiCatalogError::StorageUnavailable,
+    }
+}
+
+/// What a registration request says about its own specification, checked
+/// before anything is read: it is within the size bound and is the document
+/// its preview digested. The handler asks this before it admits a keyed
+/// registration (issue #425), and the service asks it again.
+pub(crate) fn check_registration_spec(
+    spec: &str,
+    expected_spec_digest: &str,
+) -> Result<(), OpenApiCatalogError> {
+    validate_spec_size(spec)?;
+    if spec_digest(spec) != expected_spec_digest {
+        return Err(OpenApiCatalogError::StalePreview);
+    }
+    Ok(())
+}
+
+/// The publication an unkeyed call committed. Only a keyed call is answered
+/// from a receipt, so a receipt here is a store defect and is refused rather
+/// than taken for a publication.
+fn committed_publication<T, E: From<OpenApiCatalogError>>(
+    outcome: Result<CallerOutcome<T>, E>,
+) -> Result<T, E> {
+    match outcome? {
+        CallerOutcome::Committed(value) => Ok(value),
+        CallerOutcome::Replayed(_) => Err(OpenApiCatalogError::StorageUnavailable.into()),
+    }
+}
+
+/// What the store's reservation table says about `caller`'s key, and the
+/// receipt of the publication it committed: `None` for an unused key, the
+/// receipt for an exact retry, a conflict for a key bound to anything else,
+/// and unavailable when either read fails or a reservation has no evidence.
+async fn committed_receipt_by_key(
+    store: &ManagedConnectionStore,
+    caller: &CallerOperation,
+) -> Result<Option<OperationReceipt>, OpenApiCatalogError> {
+    let unavailable = |error: crate::storage::RepositoryError| {
+        tracing::error!(error = %error, "a catalog change's caller key could not be read");
+        OpenApiCatalogError::StorageUnavailable
+    };
+    match store
+        .caller_operation_state(caller)
+        .await
+        .map_err(unavailable)?
+    {
+        CallerKeyState::Unused => Ok(None),
+        CallerKeyState::OtherBinding => Err(OpenApiCatalogError::CallerOperationConflict),
+        CallerKeyState::SameBinding => store
+            .caller_operation_receipt(caller)
+            .await
+            .map_err(unavailable)?
+            .map(Some)
+            .ok_or(OpenApiCatalogError::StorageUnavailable),
     }
 }
 

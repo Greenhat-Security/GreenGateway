@@ -8889,7 +8889,7 @@
         "capability-in-macro-input"
       ],
       "scope": "gateway::connections::mcp::refresh_store_error#1",
-      "sha256": "d7fed9341b4062ba45a7b73c835c4ae3aad8aa0d1c9da80c982ee38c30f2e414",
+      "sha256": "ac54e65b2c0996f354e206d909b401b959a5cf076d73a81198c308b31b23c266",
       "owner": "GreenGateway maintainers",
       "purpose": "Connection configuration, shared storage or checked provider/MCP protocol handling in this exact scope."
     },
@@ -9028,6 +9028,26 @@
       "reasons": [
         "network-or-process-reference"
       ],
+      "scope": "gateway::connections::pg_store::catalog_operation_receipt#1",
+      "sha256": "41c5f81dfa57ddcc4906440bb7ef41628fccf54c9077ea7ce3d4ad3870acdc94",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Reads a catalog publication's committed receipt from catalog_change_evidence inside the keyed change's transaction (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::operation_receipt_for#1",
+      "sha256": "532924f7985c088a47b25039a5a4eb2961906b1fd605a6517736d0c1a4b7a636",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Picks the evidence table an exact retry's receipt is read from by the key's action, inside the keyed change's transaction (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
       "scope": "gateway::connections::pg_store::keyed_receipt#1",
       "sha256": "6f26a316bd1dc40def3e05677e879e50d7b7e68722462a23d4794bb9399249f2",
       "owner": "GreenGateway authority evidence maintainers",
@@ -9039,7 +9059,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::committed_receipt#1",
-      "sha256": "def02c02708c1ef83680fa561c665543558ced3b872b6f7fc14b5a6798a42dbb",
+      "sha256": "37945593ea152a2087223c8a50b9ab4e7bc9f9786feedc66f47b2766dfcccbcb",
       "owner": "GreenGateway authority evidence maintainers",
       "purpose": "Reads the committed receipt of an exact retry inside a Connection change's transaction, refusing a reservation without its evidence row (issue #425); no caller-selected HTTP authority."
     },

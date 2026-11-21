@@ -15,6 +15,8 @@ pub mod azure_secret;
 pub mod caller_assertion;
 #[cfg(test)]
 pub(crate) mod caller_operation_contract;
+#[cfg(test)]
+pub(crate) mod catalog_operation_contract;
 pub mod control_plane;
 pub mod gcp_secret;
 pub mod google_delegation;
