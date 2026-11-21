@@ -1458,7 +1458,7 @@ async fn admit_keyed(
 async fn a_keyed_change_is_admitted_through_the_evidence_gate_then_the_operation_gate() {
     use authority_events::required::{AuthorityEvidenceGate, AuthorityOperation, Withdrawal};
 
-    let (audit_log, _capture) = captured_audit();
+    let (audit_log, capture) = captured_audit();
     let owner = issuer_bound_owner();
     let actor = auth::change_actor::ChangeActor::from_principal(&owner);
     let key = crate::auth::tokens::test_revoke_operation_id(4).to_string();
@@ -1531,6 +1531,22 @@ async fn a_keyed_change_is_admitted_through_the_evidence_gate_then_the_operation
             bound.action()
         );
     }
+    // The mismatch is refused before any gate is asked: where the evidence
+    // gate would refuse, it is still the 500, not that gate's 409, and no
+    // evidence refusal is audited for it. The publication that follows is
+    // the second audited refusal of this test, not the third.
+    let refused = admit_keyed(standalone, publish, Some(&caller), request)
+        .await
+        .expect_err("the change and its key disagree");
+    assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let refused = admit_keyed(standalone, publish, Some(&publish_key), request)
+        .await
+        .expect_err("standalone mode records no policy evidence");
+    assert_refused(*refused, "policy.publish").await;
+    assert_eq!(
+        refused_operations(&capture, 2),
+        ["policy.publish", "policy.publish"]
+    );
 
     // Cluster mode: an unkeyed change does not ask the operation gate; a
     // keyed one with no membership to ask is refused.

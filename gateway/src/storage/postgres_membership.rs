@@ -191,8 +191,9 @@ pub enum HeartbeatOutcome {
     Fenced,
 }
 
-/// What [`PostgresMembershipStore::raise_contract_fence`] read under the
-/// fence's row lock, for the caller's decision.
+/// What [`PostgresMembershipStore::raise_contract_fence`] read for the
+/// caller's decision: on the first pass without the fence row lock, and on
+/// the second, for a raise, under it.
 pub(crate) struct FenceDecision<'a> {
     pub(crate) fence: &'a ContractFence,
     /// The ledger's `(version, checksum)` rows, bounded as the readiness
@@ -759,13 +760,11 @@ impl PostgresMembershipStore {
                                 .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?;
                             return Ok(FenceRaise::Unchanged { decided });
                         }
-                        Err(refusal) => {
-                            transaction
-                                .rollback()
-                                .await
-                                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?;
-                            return Ok(FenceRaise::Refused(refusal));
-                        }
+                        // Nothing was written, so the refusal is the answer
+                        // whatever the rollback does: the transaction's drop
+                        // rolls it back, as on the locked pass, and a failed
+                        // rollback cannot turn a decided refusal into a 503.
+                        Err(refusal) => return Ok(FenceRaise::Refused(refusal)),
                         Ok((_, Some(_))) => {
                             transaction
                                 .rollback()
