@@ -1452,17 +1452,21 @@ async fn admit_keyed(
 /// and an unkeyed one does not ask. A change cannot be called a withdrawal
 /// to skip the evidence gate: a key bound to another action, or a gated
 /// change whose key is bound to a withdrawal, is refused before anything is
-/// asked.
+/// asked. Nor can a gated change be asked about under another operation's
+/// name: its key must be bound to that operation's code.
 #[tokio::test]
 async fn a_keyed_change_is_admitted_through_the_evidence_gate_then_the_operation_gate() {
     use authority_events::required::{AuthorityEvidenceGate, AuthorityOperation, Withdrawal};
 
-    let (audit_log, _capture) = captured_audit();
+    let (audit_log, capture) = captured_audit();
     let owner = issuer_bound_owner();
     let actor = auth::change_actor::ChangeActor::from_principal(&owner);
     let key = crate::auth::tokens::test_revoke_operation_id(4).to_string();
     let parts = keyed_parts(&[&key]);
     let caller = caller_operation(&parts.headers, &actor, "connection.create", "", "", b"{}")
+        .expect("binds")
+        .expect("keyed");
+    let publish_key = caller_operation(&parts.headers, &actor, "policy.publish", "", "", b"{}")
         .expect("binds")
         .expect("keyed");
     let delete = caller_operation(
@@ -1484,7 +1488,7 @@ async fn a_keyed_change_is_admitted_through_the_evidence_gate_then_the_operation
 
     // Standalone: the gate decides, and nothing else is asked.
     let standalone = required(config::StateBackend::Sqlite);
-    let refused = admit_keyed(standalone, publish, Some(&caller), request)
+    let refused = admit_keyed(standalone, publish, Some(&publish_key), request)
         .await
         .expect_err("standalone mode records no policy evidence");
     assert_refused(*refused, "policy.publish").await;
@@ -1497,16 +1501,21 @@ async fn a_keyed_change_is_admitted_through_the_evidence_gate_then_the_operation
     admit_keyed(
         AuthorityEvidenceGate::best_effort(),
         publish,
-        Some(&caller),
+        Some(&publish_key),
         request,
     )
     .await
     .expect("best_effort admits");
 
-    // A key bound to `connection.create` is not a withdrawal, and a gated
-    // change cannot carry a withdrawal's key: both are handler defects,
-    // refused even where every gate would admit.
-    for (change, bound) in [(withdrawal, &caller), (publish, &delete)] {
+    // A key bound to `connection.create` is not a withdrawal, a gated
+    // change cannot carry a withdrawal's key, and a policy publication
+    // cannot carry a key bound to `connection.create`: all are handler
+    // defects, refused even where every gate would admit.
+    for (change, bound) in [
+        (withdrawal, &caller),
+        (publish, &delete),
+        (publish, &caller),
+    ] {
         let refused = admit_keyed(
             AuthorityEvidenceGate::best_effort(),
             change,
@@ -1522,6 +1531,22 @@ async fn a_keyed_change_is_admitted_through_the_evidence_gate_then_the_operation
             bound.action()
         );
     }
+    // The mismatch is refused before any gate is asked: where the evidence
+    // gate would refuse, it is still the 500, not that gate's 409, and no
+    // evidence refusal is audited for it. The publication that follows is
+    // the second audited refusal of this test, not the third.
+    let refused = admit_keyed(standalone, publish, Some(&caller), request)
+        .await
+        .expect_err("the change and its key disagree");
+    assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let refused = admit_keyed(standalone, publish, Some(&publish_key), request)
+        .await
+        .expect_err("standalone mode records no policy evidence");
+    assert_refused(*refused, "policy.publish").await;
+    assert_eq!(
+        refused_operations(&capture, 2),
+        ["policy.publish", "policy.publish"]
+    );
 
     // Cluster mode: an unkeyed change does not ask the operation gate; a
     // keyed one with no membership to ask is refused.

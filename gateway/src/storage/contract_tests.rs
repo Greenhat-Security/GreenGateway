@@ -8612,9 +8612,11 @@ pub(crate) mod postgres_audit_tests {
     /// `CALLER_OPERATION_KEYS`, through a real `ClusterMembership`, and the
     /// store's own fence check. While a live member lacks
     /// `caller_operation_keys` the gate refuses and the store refuses the
-    /// key. Once that member is stale, two first admissions racing each
-    /// other are both admitted and raise the fence once, to schema 36 and
-    /// the capability, and the store then reserves. After that an admission
+    /// key; a refusal writes nothing, so it is answered without the fence
+    /// row's lock, even while another transaction holds that row. Once that
+    /// member is stale, two first admissions that both wait on the fence row
+    /// are both admitted and raise the fence once, to schema 36 and the
+    /// capability, and the store then reserves. After that an admission
     /// takes no exclusive lock: it is admitted while another admission holds
     /// the fence row and the migrator's lock shared, and admissions running
     /// at the same time admit each other. None of them writes the fence
@@ -8649,6 +8651,70 @@ pub(crate) mod postgres_audit_tests {
                 crate::storage::read_contract_fence(&pool)
                     .await
                     .expect("the fence reads")
+            }
+        };
+        // Another admission in flight: the migrator's lock held shared and
+        // the fence row locked, until the returned client commits. Returns
+        // the holding session's backend pid with it.
+        let hold_fence_row = || {
+            let pool = pool.clone();
+            async move {
+                let holder = pool.get().await.expect("client");
+                holder
+                    .batch_execute(&format!(
+                        "BEGIN;
+                         SELECT pg_advisory_xact_lock_shared({key});
+                         SELECT 1 FROM greengateway.contract_fence WHERE singleton FOR UPDATE;",
+                        key = migrations::migration_lock_key()
+                    ))
+                    .await
+                    .expect("an admission holds the fence row");
+                let pid: i32 = holder
+                    .query_one("SELECT pg_backend_pid() AS pid", &[])
+                    .await
+                    .expect("the holder's pid reads")
+                    .get("pid");
+                (holder, pid)
+            }
+        };
+        // Wait until exactly `count` sessions are blocked, directly or
+        // behind another waiter, by the session holding the fence row. The
+        // first waiter waits on the holder's transaction; a later one queues
+        // on the row's tuple lock behind the first. Counting by who blocks
+        // whom, not by statement text, keeps the check honest if the fence
+        // statement is reworded.
+        let wait_for_fence_row_waiters = |holder_pid: i32, count: i64| {
+            let pool = pool.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let waiting: i64 = pool
+                        .get()
+                        .await
+                        .expect("client")
+                        .query_one(
+                            "WITH RECURSIVE blocked(pid) AS (
+                                 SELECT pid FROM pg_stat_activity
+                                 WHERE $1 = ANY(pg_blocking_pids(pid))
+                                 UNION
+                                 SELECT activity.pid FROM pg_stat_activity activity
+                                 JOIN blocked ON blocked.pid = ANY(pg_blocking_pids(activity.pid))
+                             )
+                             SELECT count(*) AS waiting FROM blocked",
+                            &[&holder_pid],
+                        )
+                        .await
+                        .expect("the activity view reads")
+                        .get("waiting");
+                    if waiting == count {
+                        return;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "{waiting} sessions wait on the fence row, not {count}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
             }
         };
         let harness = PostgresCallerOperations { pool: pool.clone() };
@@ -8713,10 +8779,38 @@ pub(crate) mod postgres_audit_tests {
             .expect_err("no admission raised the fence");
         assert_eq!(refused.kind(), RepositoryErrorKind::Unavailable);
 
-        // Once it is stale, two first admissions race: both are admitted,
-        // and the fence is raised once, to the requirement.
+        // A refusal writes nothing, so it is answered from the unlocked
+        // read: it does not queue behind a transaction holding the fence row
+        // (as every heartbeat would queue behind it in turn).
+        let (holder, _) = hold_fence_row().await;
+        let refused_while_held = tokio::time::timeout(
+            Duration::from_secs(5),
+            this.admit_operation(&CALLER_OPERATION_KEYS, &audit, &request),
+        )
+        .await
+        .expect("a refusal does not wait for the fence row");
+        assert_eq!(
+            refused_while_held,
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![older_store.instance_id()],
+                live: 2
+            })
+        );
+        holder.batch_execute("COMMIT").await.expect("commit");
+        drop(holder);
+
+        // Once it is stale, two first admissions race. Both find a raise to
+        // make and queue on the fence row while another transaction holds
+        // it; once it lets go, both are admitted and the fence is raised
+        // once, to the requirement: the second re-reads the raised row.
         backdate_heartbeat(&pool, older_store.instance_id(), 60.0).await;
-        for outcome in admit_together(2).await {
+        let (holder, holder_pid) = hold_fence_row().await;
+        let racing = admit_together(2);
+        wait_for_fence_row_waiters(holder_pid, 2).await;
+        assert_eq!(read_fence().await.generation, 0);
+        holder.batch_execute("COMMIT").await.expect("commit");
+        drop(holder);
+        for outcome in racing.await {
             assert_eq!(outcome, Ok(OperationAdmission { live_members: 1 }));
         }
         let raised = read_fence().await;
@@ -8747,16 +8841,7 @@ pub(crate) mod postgres_audit_tests {
         // An admission in flight holds the fence row and the migrator's lock
         // shared; a repeat admission neither waits for it nor takes it for a
         // migrator.
-        let in_flight = pool.get().await.expect("client");
-        in_flight
-            .batch_execute(&format!(
-                "BEGIN;
-                 SELECT pg_advisory_xact_lock_shared({key});
-                 SELECT 1 FROM greengateway.contract_fence WHERE singleton FOR UPDATE;",
-                key = migrations::migration_lock_key()
-            ))
-            .await
-            .expect("an admission holds the fence row");
+        let (in_flight, _) = hold_fence_row().await;
         let admitted = tokio::time::timeout(
             Duration::from_secs(5),
             this.admit_operation(&CALLER_OPERATION_KEYS, &audit, &request),
@@ -8777,8 +8862,8 @@ pub(crate) mod postgres_audit_tests {
             "no admission after the first wrote the fence"
         );
 
-        // One raise and one refusal were audited, nothing else.
-        wait_for_events(&capture, 2).await;
+        // One raise and the two refusals were audited, nothing else.
+        wait_for_events(&capture, 3).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         let events = capture.events();
         let count = |event_type: &str| {
@@ -8788,7 +8873,7 @@ pub(crate) mod postgres_audit_tests {
                 .count()
         };
         assert_eq!(count("cluster.contract_fence_raised"), 1, "{events:?}");
-        assert_eq!(count("cluster.operation_refused"), 1, "{events:?}");
+        assert_eq!(count("cluster.operation_refused"), 2, "{events:?}");
     }
 
     struct PostgresTokenIssueHarness<'a> {
