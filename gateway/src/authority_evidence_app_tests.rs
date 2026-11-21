@@ -2525,23 +2525,25 @@ async fn required_mode_authorizes_a_connection_change_before_it_asks_the_evidenc
 /// Drive `request` through `router` until `committed` says its change is in
 /// the store, then drop it: what a client that disconnects at that moment
 /// leaves behind. The store's own transaction keeps running when a handler's
-/// future is dropped (SQLite runs it on the blocking pool).
+/// future is dropped (SQLite runs it on the blocking pool). Returns whether
+/// the request was dropped unanswered; `false` means it was answered before
+/// the commit was observed, so nothing was abandoned.
 pub(super) async fn abandon_once_committed(
     router: &Router,
     request: Request<Body>,
     committed: impl Fn() -> bool,
-) {
+) -> bool {
     let mut in_flight = std::pin::pin!(router.clone().oneshot(request));
     for _ in 0..10_000 {
         if committed() {
-            return;
+            return true;
         }
         let polled = std::future::poll_fn(|context| {
             std::task::Poll::Ready(std::future::Future::poll(in_flight.as_mut(), context))
         })
         .await;
         if polled.is_ready() {
-            return;
+            return false;
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
@@ -2856,6 +2858,10 @@ async fn a_keyed_catalog_change_on_a_connection_without_openapi_discovery_is_ref
 /// Keyed local-secret changes (issue #425, plan P8).
 #[path = "authority_evidence_secret_app_tests.rs"]
 mod local_secret_keys;
+
+/// Every keyed route's unkeyed form in required mode (issue #425, plan P10).
+#[path = "authority_evidence_route_app_tests.rs"]
+mod keyed_route_refusals;
 
 #[cfg(feature = "postgres")]
 mod cluster_connection_keys {

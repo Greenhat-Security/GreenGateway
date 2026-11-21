@@ -629,6 +629,124 @@ mod cluster_document_keys {
         assert_eq!(events_of(&capture, audit::event::POLICY_TESTS_CHANGED), 1);
     }
 
+    /// An admitted keyed `PUT /policy` runs to completion when its client
+    /// goes away while the store is committing it: the change commits, this
+    /// replica installs it (a role only the new policy grants is honoured),
+    /// and it is audited exactly once, though nobody waited for the
+    /// response. The keyed retry is answered from the receipt and repeats no
+    /// audit event. This is the policy family's row of the disconnect tests
+    /// for Connections and token rotation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_admitted_policy_change_finishes_after_its_client_goes_away() {
+        let Some((_database, foundation)) = database().await else {
+            return;
+        };
+        let pool = foundation.pool();
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let (router, _) = keyed_replica(pool, false, audit_log, |_| {}).await;
+        let admin = signed_token_with_issuer("operator", &["policy-admin"], CLUSTER_ISSUER);
+        let abandoned_reader =
+            signed_token_with_issuer("abandoned", &["abandoned-reader"], CLUSTER_ISSUER);
+        let (status, _, _) = call(
+            &router,
+            Method::GET,
+            POLICY_ADMIN_ROUTE,
+            &abandoned_reader,
+            None,
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "the role does not exist yet");
+
+        let mut replacement = cluster_policy("abandoned");
+        replacement["roles"]["abandoned-reader"] =
+            json!({ "permissions": [ADMIN_POLICY_READ_PERMISSION] });
+        let replacement = replacement.to_string();
+        let etag = policy_etag(&router, &admin).await;
+        let evidence = document_evidence_count(pool).await;
+        let key = caller_key(90);
+        let put = || {
+            Request::builder()
+                .method(Method::PUT)
+                .uri(POLICY_ADMIN_ROUTE)
+                .header(header::AUTHORIZATION, format!("Bearer {admin}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, etag.as_str())
+                .header("idempotency-key", key.as_str())
+                .body(Body::from(replacement.clone()))
+                .unwrap()
+        };
+        let reserved = || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(document_reservations(pool))
+            })
+            .contains(&(key.clone(), "policy.publish".to_owned()))
+        };
+        // The request is dropped unanswered, or this test proves nothing
+        // about a client that goes away.
+        assert!(
+            super::super::authority_evidence_app_tests::abandon_once_committed(
+                &router,
+                put(),
+                reserved,
+            )
+            .await,
+            "the change was answered before its commit was observed, so nothing was abandoned"
+        );
+
+        // The replica installs what committed, and audits it once.
+        assert_eventually(Duration::from_secs(5), || {
+            events_of(&capture, audit::event::POLICY_CHANGED) == 1
+        });
+        let started = Instant::now();
+        let status = loop {
+            let (status, _, _) = call(
+                &router,
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                &abandoned_reader,
+                None,
+                &[],
+                None,
+            )
+            .await;
+            if status == StatusCode::OK || started.elapsed() > Duration::from_secs(5) {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the replica serves the policy its retry is told committed"
+        );
+        assert_eq!(document_evidence_count(pool).await, evidence + 1);
+
+        // The retry gets the receipt and repeats nothing.
+        let (status, _, receipt) = call(
+            &router,
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            &admin,
+            Some(replacement.clone()),
+            &[("if-match", &etag)],
+            Some(&key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_receipt(&receipt, &key, "policy.publish", "policy");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(events_of(&capture, audit::event::POLICY_CHANGED), 1);
+        assert_eq!(document_evidence_count(pool).await, evidence + 1);
+        assert_eq!(
+            document_reservations(pool).await,
+            vec![(key.clone(), "policy.publish".to_owned())]
+        );
+    }
+
     /// An exact retry of a keyed OpenAPI tools registration is answered from
     /// its receipt before the specification is turned into tools again, and
     /// audits no second registry change. The route takes the specification
@@ -755,8 +873,12 @@ mod cluster_document_keys {
 
         // The unkeyed form of the other routes is refused the same way, by
         // the gate `admit_keyed_document_change` asks for it, before the
-        // authority is read: the rollback, a rule create, the tools
-        // registration and the suite write.
+        // authority is read: the rollback, each rule edit, the tools
+        // registration and the suite write. These are the cluster form of
+        // the policy-family rows of `KEYED_ROUTES`, which the standalone
+        // route walk (`authority_evidence_route_app_tests`) sees refused in
+        // every form; suggestion acceptance and draft publication are
+        // `cluster_discovery_tests`' (they need the discovery store).
         let (router, _) = keyed_replica(pool, false, test_audit_log(), |config| {
             config.authority_events.durability = config::AuthorityEvidenceDurability::Required;
             config.authority_events.format = qualified;
@@ -777,6 +899,24 @@ mod cluster_document_keys {
                 POLICY_RULES_ADMIN_ROUTE,
                 Some(json!({"id": "unkeyed", "path": "/unkeyed", "action": "allow"}).to_string()),
                 "policy.rule.create",
+            ),
+            (
+                Method::PATCH,
+                "/v1/admin/policy/rules/unkeyed",
+                Some(json!({"action": "deny"}).to_string()),
+                "policy.rule.update",
+            ),
+            (
+                Method::DELETE,
+                "/v1/admin/policy/rules/unkeyed",
+                None,
+                "policy.rule.delete",
+            ),
+            (
+                Method::PUT,
+                POLICY_RULES_ORDER_ADMIN_ROUTE,
+                Some(json!(["unkeyed", "other"]).to_string()),
+                "policy.rule.reorder",
             ),
             (
                 Method::POST,
@@ -812,6 +952,7 @@ mod cluster_document_keys {
             assert_eq!(refused["operation"], json!(operation), "{refused}");
         }
         assert!(document_reservations(pool).await.is_empty());
+        assert_eq!(policy_etag(&router, &admin).await, etag);
 
         let (status, body) = required_mode_policy_put(pool, 61, qualified, Some(file), true).await;
         if cfg!(unix) {

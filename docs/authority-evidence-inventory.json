@@ -1,7 +1,7 @@
 {
   "version": 1,
   "issue": 425,
-  "reviewed_revision": "ebb579e6444d437bf477d0617b8841d1eea34cfc",
+  "reviewed_revision": "5da986d6c915c15fdd1f6aa2e490c3157ce9bf1c",
   "storage_modes": [
     "postgres",
     "standalone"
@@ -1270,7 +1270,7 @@
       "disposition": [
         "unsupported_future_operation"
       ],
-      "follow_up": "PR4 depends on #242: introduce/reuse its crash-safe standalone revision ledger, bind file digest + activation + history + evidence, recover interrupted activation; keep required-durability policy mutations unsupported until proven.",
+      "follow_up": "Not part of #425 by owner decision, recorded 2026-11-19; tracked in #242. Required mode keeps this row refused until #242 demonstrates, with tests: a ledger-owned safe manifest and digest; parent revision and compare-and-swap; actor and operation intent; activation and evidence that are atomic or recoverably staged; authoritative replay after interruption; and export intent accepted before an artifact is released. Raw secrets are never hashed or exported as a substitute for redaction. For this row: introduce or reuse #242's crash-safe standalone revision ledger, bind file digest, activation, history and evidence, and recover an interrupted activation.",
       "sources": [
         {
           "path": "gateway/src/rbac/policy.rs",
@@ -1320,7 +1320,7 @@
       "disposition": [
         "unsupported_future_operation"
       ],
-      "follow_up": "#242/#425 PR4 must route watcher, SIGHUP and startup activation through the same ledger as admin publication; testing only admin endpoints is insufficient.",
+      "follow_up": "Not part of #425 by owner decision, recorded 2026-11-19; tracked in #242. Required mode keeps this row refused until #242 demonstrates, with tests: a ledger-owned safe manifest and digest; parent revision and compare-and-swap; actor and operation intent; activation and evidence that are atomic or recoverably staged; authoritative replay after interruption; and export intent accepted before an artifact is released. Raw secrets are never hashed or exported as a substitute for redaction. For this row: route watcher, SIGHUP and startup activation through the same ledger as admin publication; testing only admin endpoints is insufficient.",
       "sources": [
         {
           "path": "gateway/src/middleware/rbac.rs",
@@ -1634,7 +1634,7 @@
       "disposition": [
         "unsupported_future_operation"
       ],
-      "follow_up": "#242/#425 PR4: include tools-file writes and watcher/startup paths in ledger integration; current fs::write must not be described as an atomic evidence transaction.",
+      "follow_up": "Not part of #425 by owner decision, recorded 2026-11-19; tracked in #242. Required mode keeps this row refused until #242 demonstrates, with tests: a ledger-owned safe manifest and digest; parent revision and compare-and-swap; actor and operation intent; activation and evidence that are atomic or recoverably staged; authoritative replay after interruption; and export intent accepted before an artifact is released. Raw secrets are never hashed or exported as a substitute for redaction. For this row: include tools-file writes and the watcher and startup paths in the ledger integration; the current fs::write must not be described as an atomic evidence transaction.",
       "sources": [
         {
           "path": "gateway/src/admin_tools.rs",
@@ -1874,7 +1874,7 @@
       "disposition": [
         "unsupported_future_operation"
       ],
-      "follow_up": "#242/#425: bind standalone suite writes into the crash-safe standalone revision ledger with the policy writes; keep required-durability suite writes refused until then.",
+      "follow_up": "Not part of #425 by owner decision, recorded 2026-11-19; tracked in #242. Required mode keeps this row refused until #242 demonstrates, with tests: a ledger-owned safe manifest and digest; parent revision and compare-and-swap; actor and operation intent; activation and evidence that are atomic or recoverably staged; authoritative replay after interruption; and export intent accepted before an artifact is released. Raw secrets are never hashed or exported as a substitute for redaction. For this row: bind standalone suite writes into the crash-safe standalone revision ledger with the policy writes.",
       "sources": [
         {
           "path": "gateway/src/storage/policy_tests.rs",
@@ -5028,7 +5028,7 @@
             },
             {
               "path": "gateway/src/admin_tokens_app_tests.rs",
-              "anchor": "async fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
+              "anchor": "fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
             },
             {
               "path": "gateway/src/authority_events/required_tests.rs",
@@ -5217,7 +5217,7 @@
             },
             {
               "path": "gateway/src/admin_tokens_app_tests.rs",
-              "anchor": "async fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
+              "anchor": "fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
             },
             {
               "path": "gateway/src/admin_tokens_app_tests.rs",
@@ -5438,7 +5438,7 @@
             },
             {
               "path": "gateway/src/admin_tokens_app_tests.rs",
-              "anchor": "async fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
+              "anchor": "fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
             },
             {
               "path": "gateway/src/authority_events/required_tests.rs",
@@ -5828,7 +5828,7 @@
             },
             {
               "path": "gateway/src/admin_tokens_app_tests.rs",
-              "anchor": "async fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
+              "anchor": "fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
             },
             {
               "path": "gateway/src/admin_tokens_app_tests.rs",
@@ -6566,7 +6566,7 @@
       "disposition": [
         "unsupported_future_operation"
       ],
-      "follow_up": "#242/#425 PR4: define authorized redacted artifact release bound to ledger revision, artifact digest and durable export event before release; keep unsupported. Internal import projections include sensitive state and must never become authority-event payloads.",
+      "follow_up": "Not part of #425 by owner decision, recorded 2026-11-19; tracked in #242. Required mode keeps this row unavailable until #242 demonstrates, with tests: a ledger-owned safe manifest and digest; parent revision and compare-and-swap; actor and operation intent; activation and evidence that are atomic or recoverably staged; authoritative replay after interruption; and export intent accepted before an artifact is released. Raw secrets are never hashed or exported as a substitute for redaction. For this row: define an authorized, redacted artifact release bound to the ledger revision, the artifact digest and a durable export event before release. Internal import projections include sensitive state and must never become authority-event payloads.",
       "sources": [
         {
           "path": "gateway/src/import/exports.rs",

@@ -311,11 +311,66 @@ test("a keyed route shared by reviewed paths names only pairs that have one", ()
 
 test("the summary line is computed from the inventory", () => {
   const line = summary(validateInventory(inventory()));
-  assert.match(line, new RegExp(`^Authority evidence inventory valid: ${inventory().groups.length} groups, ${OPERATIONS.length * 2} operation/mode pairs, \\d+ source references\\.`));
+  assert.match(line, new RegExp(`^Authority evidence inventory valid: ${inventory().groups.length} rows, ${OPERATIONS.length * 2} operation/mode pairs, \\d+ source references\\.`));
+  // The end state of issue #425, counted from the rows rather than stated.
+  assert.match(line, / Required mode: 13 qualified rows; 9 admitted rows, none qualified \(5 withdrawal_admitted, 4 no_caller_key\); 7 refused, 2 refused at startup, 5 unavailable, 1 outside the gateway\./);
+  assert.ok(line.endsWith(" Qualified rows are proven by tests that build the application directly. Required mode refuses to start until #242 provides activation evidence."), line);
   assert.match(line, / Qualified in required mode: catalog\.mcp\.publish\/postgres, .*, connection\.create\/postgres, .*, mutation_approval\.prepare\/postgres, policy\.publish\/postgres, .*, policy_tests\.publish\/postgres, secret\.create\/standalone, secret\.rotate\/standalone, service_token\.issue\/postgres, .*, service_token\.rotate\/standalone, tools\.publish\/postgres\./);
   assert.match(line, / Admitted withdrawals with a reviewed keyed path: connection\.delete\/postgres, connection\.delete\/standalone, secret\.delete\/standalone, service_token\.revoke\/postgres, service_token\.revoke\/standalone\./);
-  assert.equal(summary({ groups: 1, operationModePairs: 2, sourceReferences: 3, qualifiedPairs: [], keyedWithdrawalPairs: [] }),
-    "Authority evidence inventory valid: 1 groups, 2 operation/mode pairs, 3 source references. Qualified in required mode: none. Admitted withdrawals with a reviewed keyed path: none.");
+  const counted = {
+    groups: 1, operationModePairs: 2, sourceReferences: 3, qualifiedPairs: [], keyedWithdrawalPairs: [],
+    qualifiedRows: 0, admittedRows: { withdrawal_admitted: 0, no_caller_key: 0 },
+    requiredModes: { refused: 1, refused_at_startup: 0, unavailable: 0, outside_gateway: 0 }, activationRefusedAtStartup: true,
+  };
+  assert.equal(summary(counted),
+    "Authority evidence inventory valid: 1 rows, 2 operation/mode pairs, 3 source references."
+    + " Required mode: 0 qualified rows; 0 admitted rows, none qualified (0 withdrawal_admitted, 0 no_caller_key); 1 refused, 0 refused at startup, 0 unavailable, 0 outside the gateway."
+    + " Qualified in required mode: none. Admitted withdrawals with a reviewed keyed path: none."
+    + " Qualified rows are proven by tests that build the application directly. Required mode refuses to start until #242 provides activation evidence.");
+  // The startup sentence is the checker's reading of the proof type, not prose.
+  assert.ok(!summary({ ...counted, activationRefusedAtStartup: false }).includes("refuses to start"));
+});
+
+// Closing rule of issue #425: an admitted row is one of the two reviewed
+// unqualified dispositions, and a known metadata gap is tolerated only where
+// required mode refuses the change.
+test("no admitted row is left with missing metadata", () => {
+  for (const group of inventory().groups) {
+    if (group.required_mode === "admitted") {
+      assert.ok(group.disposition.length === 1 && ["no_caller_key", "withdrawal_admitted"].includes(group.disposition[0]), group.id);
+    }
+    if (group.disposition.includes("missing_metadata")) assert.ok(["refused", "refused_at_startup"].includes(group.required_mode), group.id);
+  }
+  for (const disposition of [["missing_metadata"], ["missing_delivery"], ["missing_delivery", "missing_metadata"]]) {
+    const relabelled = inventory();
+    groupOf(relabelled, "jwt_postgres").disposition = disposition;
+    assert.throws(() => validateInventory(relabelled), /jwt_postgres: an admitted row must be no_caller_key or withdrawal_admitted/, disposition.join("+"));
+  }
+  const admittedImport = inventory();
+  groupOf(admittedImport, "configuration_import").required_mode = "admitted";
+  assert.throws(() => validateInventory(admittedImport), /configuration_import: an admitted row must be no_caller_key or withdrawal_admitted/);
+  for (const mode of ["unavailable", "outside_gateway"]) {
+    const moved = inventory();
+    groupOf(moved, "configuration_import").required_mode = mode;
+    assert.throws(() => validateInventory(moved), /configuration_import: missing_metadata is allowed only on a row that required mode refuses/, mode);
+  }
+  const startup = inventory();
+  groupOf(startup, "configuration_import").required_mode = "refused_at_startup";
+  assert.doesNotThrow(() => validateInventory(startup));
+});
+
+// Section 6 of the #425 plan: six rows stay with #242 by owner decision, and
+// each says so in the same words.
+test("the rows handed to #242 carry the owner's hand-off wording", () => {
+  const handOff = (state) => "Not part of #425 by owner decision, recorded 2026-11-19; tracked in #242."
+    + ` Required mode keeps this row ${state} until #242 demonstrates, with tests:`;
+  const rows = { policy_standalone: "refused", policy_reload: "refused", tools_standalone: "refused", policy_tests_standalone: "refused", configuration_activation: "refused at startup", configuration_export: "unavailable" };
+  for (const [id, state] of Object.entries(rows)) {
+    const group = groupOf(inventory(), id);
+    assert.equal(group.required_mode, state.replaceAll(" ", "_"), id);
+    assert.ok(group.follow_up.startsWith(handOff(state)), id);
+    assert.ok(group.follow_up.includes("Raw secrets are never hashed or exported as a substitute for redaction."), id);
+  }
 });
 
 test("resource creation and replacement retain distinct revision histories", () => {
