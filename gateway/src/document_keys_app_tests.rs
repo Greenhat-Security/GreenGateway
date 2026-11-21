@@ -629,6 +629,119 @@ mod cluster_document_keys {
         assert_eq!(events_of(&capture, audit::event::POLICY_TESTS_CHANGED), 1);
     }
 
+    /// An admitted keyed `PUT /policy` runs to completion when its client
+    /// goes away while the store is committing it: the change commits, this
+    /// replica installs it (a role only the new policy grants is honoured),
+    /// and it is audited exactly once, though nobody waited for the
+    /// response. The keyed retry is answered from the receipt and repeats no
+    /// audit event. This is the policy family's row of the disconnect tests
+    /// for Connections and token rotation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_admitted_policy_change_finishes_after_its_client_goes_away() {
+        let Some((_database, foundation)) = database().await else {
+            return;
+        };
+        let pool = foundation.pool();
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let (router, _) = keyed_replica(pool, false, audit_log, |_| {}).await;
+        let admin = signed_token_with_issuer("operator", &["policy-admin"], CLUSTER_ISSUER);
+        let abandoned_reader =
+            signed_token_with_issuer("abandoned", &["abandoned-reader"], CLUSTER_ISSUER);
+        let (status, _, _) = call(
+            &router,
+            Method::GET,
+            POLICY_ADMIN_ROUTE,
+            &abandoned_reader,
+            None,
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "the role does not exist yet");
+
+        let mut replacement = cluster_policy("abandoned");
+        replacement["roles"]["abandoned-reader"] =
+            json!({ "permissions": [ADMIN_POLICY_READ_PERMISSION] });
+        let replacement = replacement.to_string();
+        let etag = policy_etag(&router, &admin).await;
+        let evidence = document_evidence_count(pool).await;
+        let key = caller_key(90);
+        let put = || {
+            Request::builder()
+                .method(Method::PUT)
+                .uri(POLICY_ADMIN_ROUTE)
+                .header(header::AUTHORIZATION, format!("Bearer {admin}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::IF_MATCH, etag.as_str())
+                .header("idempotency-key", key.as_str())
+                .body(Body::from(replacement.clone()))
+                .unwrap()
+        };
+        let reserved = || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(document_reservations(pool))
+            })
+            .contains(&(key.clone(), "policy.publish".to_owned()))
+        };
+        super::super::authority_evidence_app_tests::abandon_once_committed(
+            &router,
+            put(),
+            reserved,
+        )
+        .await;
+
+        // The replica installs what committed, and audits it once.
+        assert_eventually(Duration::from_secs(5), || {
+            events_of(&capture, audit::event::POLICY_CHANGED) == 1
+        });
+        let started = Instant::now();
+        let status = loop {
+            let (status, _, _) = call(
+                &router,
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                &abandoned_reader,
+                None,
+                &[],
+                None,
+            )
+            .await;
+            if status == StatusCode::OK || started.elapsed() > Duration::from_secs(5) {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the replica serves the policy its retry is told committed"
+        );
+        assert_eq!(document_evidence_count(pool).await, evidence + 1);
+
+        // The retry gets the receipt and repeats nothing.
+        let (status, _, receipt) = call(
+            &router,
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            &admin,
+            Some(replacement.clone()),
+            &[("if-match", &etag)],
+            Some(&key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_receipt(&receipt, &key, "policy.publish", "policy");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(events_of(&capture, audit::event::POLICY_CHANGED), 1);
+        assert_eq!(document_evidence_count(pool).await, evidence + 1);
+        assert_eq!(
+            document_reservations(pool).await,
+            vec![(key.clone(), "policy.publish".to_owned())]
+        );
+    }
+
     /// An exact retry of a keyed OpenAPI tools registration is answered from
     /// its receipt before the specification is turned into tools again, and
     /// audits no second registry change. The route takes the specification

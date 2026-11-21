@@ -2857,6 +2857,10 @@ async fn a_keyed_catalog_change_on_a_connection_without_openapi_discovery_is_ref
 #[path = "authority_evidence_secret_app_tests.rs"]
 mod local_secret_keys;
 
+/// Every keyed route's unkeyed form in required mode (issue #425, plan P10).
+#[path = "authority_evidence_route_app_tests.rs"]
+mod keyed_route_refusals;
+
 #[cfg(feature = "postgres")]
 mod cluster_connection_keys {
     use super::*;
