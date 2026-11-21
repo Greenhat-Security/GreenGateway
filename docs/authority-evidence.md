@@ -435,6 +435,13 @@ log line or a metric.
   pre-upgrade file copy brings back every Connection and secret deleted since and
   undoes every rotation, so it is disaster recovery, not rollback. The token
   database needs no restore to run an older build, at the cost above.
+- The token database's revision columns (plan P5) are added on open in the
+  same way and need no restore either. An older build serving the file inserts
+  by its own column list, so its tokens start at revision 1 and its evidence rows
+  take NULL revisions and `revised = 0` and stay legacy delivery records; but it
+  does not advance `service_tokens.revision` when it rotates or revokes, so after
+  such a rollback the next revised row of that token can name a prior revision
+  older than the token's real history. Nothing is backfilled or rewritten.
 - Each SQLite file is its own authority, so a key is unique within one file, as
   consumers deduplicate events on `(authority_id, event_id)`: the token database
   and a separate Connections database each accept a key once.
@@ -461,8 +468,9 @@ these cases.
 ### Keyed authority changes
 
 Every admin change that binds an `Idempotency-Key` through the shared helpers
-in `gateway/src/admin_responses.rs` follows one contract. No route does yet:
-each operation family adopts the contract in its own change, and the inventory
+in `gateway/src/admin_responses.rs` follows one contract. Service-token issue
+and rotation do ([below](#keyed-service-token-issue-and-rotation)); each other
+operation family adopts the contract in its own change, and the inventory
 qualifies its rows when it does. The two routes that take a key today, the
 keyed service-token revoke and the keyed approval preparation, predate the
 contract. They are listed in `KEYED_ROUTES` and follow the first rule below,
@@ -474,7 +482,8 @@ that bind keys through the shared helpers.
 
 **A key is honoured or refused, never ignored.** The router keeps a reviewed table
 of the routes that honour a key, `KEYED_ROUTES` in `gateway/src/routing.rs`
-(today `POST /v1{ADMIN_PREFIX}/tokens/{id}/revoke` and
+(today `POST /v1{ADMIN_PREFIX}/tokens`, `POST /v1{ADMIN_PREFIX}/tokens/{id}/rotate`,
+`POST /v1{ADMIN_PREFIX}/tokens/{id}/revoke` and
 `PUT /v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals`). Any other admin request
 that carries the header with a method other than `GET`, `HEAD` or `OPTIONS` is
 answered `400 {"error":"...","reason":"idempotency_key_unsupported"}` before its
@@ -597,6 +606,104 @@ lacks the capability, the first admission raises the fence and the store then
 reserves, later admissions write nothing and admit each other while another
 admission holds the fence row); and `authority_evidence_app_tests` proves the
 helpers.
+
+### Keyed service-token issue and rotation
+
+An operation family on the contract above (issue #425, plan P5). Rows
+`token_issue_postgres`, `token_issue_standalone`, `token_rotate_postgres` and
+`token_rotate_standalone` are qualified, and `token_revoke_standalone` joins
+`token_revoke_postgres` as `withdrawal_admitted` with its keyed path
+([below](#rows-admitted-without-qualification)). These are the first standalone
+qualifications.
+
+- **Routes.** `POST /v1{ADMIN_PREFIX}/tokens` and
+  `POST /v1{ADMIN_PREFIX}/tokens/{id}/rotate`, each with an optional
+  `Idempotency-Key`. They are in `KEYED_ROUTES`, and the checker's
+  `QUALIFIED_PATHS` names the same methods and routes for both modes. The keyed
+  revoke keeps its own route, receipt and replay check (issue #765); its
+  standalone form now also has a reviewed path.
+- **Binding.** An issue's key is bound to `service_token.issue`, the recorded actor
+  and the request as canonical JSON (`{"expires_at":...,"scopes":[...]}`, the scopes
+  in the order given; an issue has no target). A rotation's key is bound to
+  `service_token.rotate`, the actor and the token ID; it has no body. Neither route
+  takes a precondition, so the `If-Match` field of the binding is empty. A token
+  request holds no secret: the plaintext does not exist until the store mints it.
+- **Order of work.** The handler authorizes the caller (`admin:tokens:write`), checks
+  the scope bounds and the caller's delegation authority over the scopes (for a
+  rotation, the stored token's scopes, which it reads to do so), then binds the key,
+  asks the gates (as `service_token.issue` or `service_token.rotate`) and answers an
+  exact retry from the read-only pre-check. Inside the store's one transaction
+  (PostgreSQL after its `service_token_state_revision` lock, SQLite under
+  `IMMEDIATE`) the key is looked up first, then a rotation reads its token (an
+  unknown token is `404` and a revoked one `409`, and neither reserves anything),
+  then the key is reserved (PostgreSQL confirms the fence carries
+  `caller_operation_keys`, before the shared revision), then the change and its
+  evidence row are written under the caller's key, and the journal entry last.
+- **Answers.** The first commit answers as the route always has: `201` or `200` with
+  the token and its plaintext, returned this once. An exact retry is `200` with
+  `Cache-Control: no-store` and the receipt
+  `{operation_id, operation, resource_id, revision, committed_at, secret_returned}`,
+  where `resource_id` is the token ID, `revision` the token's revision after the
+  change and `secret_returned` always `false`. The plaintext is never stored, so a
+  retry cannot return it, and it repeats no change, no audit event and no cache
+  invalidation. A rotation's retry is answered whatever happened to the token
+  since. Any other use of the key is `409 caller_operation_conflict`.
+- **A lost response.** If the first response was lost, a live token exists whose
+  plaintext nobody holds, and which may have been seen in transit. The caller
+  revokes it by the ID in the receipt (`DELETE .../tokens/{id}` or the keyed
+  `POST .../tokens/{id}/revoke`) and issues again with a new key; a lost rotation
+  is answered the same way, by rotating again with a new key or revoking.
+- **Revisions.** Every committed issue, rotation and revocation records the token's
+  revision before and after it. PostgreSQL always has (`service_tokens.revision`).
+  The standalone token database gains it on open: `service_tokens.revision`
+  (`DEFAULT 1`) and the evidence columns `prior_version`, `new_version` and the
+  per-row marker `revised`. Rows written before then, and rows an older build still
+  writes into the upgraded file (it inserts by its own column list), keep NULL
+  revisions and `revised = 0` and are delivered as the unrevised
+  `authority_event_delivery.v1` records they always were. Every row this build
+  writes has `revised = 1` and a transition (issue NULL to 1, rotation and
+  revocation one step up), so under `qualified_v1` a keyed principal issue,
+  rotation or revocation in the token database is delivered as `authority_event.v1`
+  ([Standalone delivery](#standalone-delivery)).
+- **Required mode.** Issue and rotation are `caller_key_required` in both modes: only
+  the keyed request of an issuer-bound principal with `qualified_v1`, the file sink
+  and a Unix build is admitted, and every other form, service-token callers
+  included, is `409 authority_evidence_unsupported` before anything is written.
+  Revocation is a withdrawal and stays admitted in every form. The admin UI sends no
+  key, so under `required` it can revoke a token but not issue or rotate one (#242
+  tracks adding keys to it).
+
+Tests. The store contract is written once in `gateway/src/storage/contract_tests.rs`
+and run against both stores (`sqlite_*` there, `postgres_*` in
+`postgres_audit_tests::keyed_token_changes`); each case ends by asserting that a
+token action's reservation exists exactly when its keyed evidence row does:
+`service_token_caller_operation_contract` (exact retries answered from the receipt
+with no second token, row or plaintext; another body or actor under the key, an
+issue's key on a rotation, a rotation's key on another token and a keyed revoke's
+key on an issue all `409`, and a revoke cannot take an issue's key; an unknown or
+revoked token reserves nothing; the token a receipt names can be revoked by its ID;
+the revision chain; no plaintext or binding digest outside the reservation),
+`keyed_token_writers_racing_commit_one_change_and_never_leave_a_live_plaintext` and
+`a_failed_evidence_insert_rolls_back_the_keyed_issue_and_rotation_and_their_reservations`.
+PostgreSQL adds `a_full_journal_refuses_the_keyed_token_change_and_reserves_nothing`
+and `a_keyed_token_change_below_the_fence_is_refused_and_changes_nothing`. Delivery:
+`authority_events::dispatcher::tests::a_keyed_token_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit`
+and its standalone twin in `authority_events::standalone::tests`, which deliver real
+keyed changes through the file sink as schema-valid `authority_event.v1` events and
+redeliver them byte for byte; `standalone_delivery::tests` proves the `revised` rule
+(`a_revised_token_row_with_a_null_revision_stalls`,
+`a_row_an_older_build_writes_after_the_upgrade_stays_a_legacy_record`, and a #765
+keyed revoke written by the older insert staying a legacy record); and
+`auth::tokens::tests::standalone_token_revisions_start_at_one_and_legacy_evidence_stays_unrevised`
+proves the open-time columns. Through the router, `admin_tokens_app_tests`:
+`a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext`
+(including `403` for a caller without `admin:tokens:write` before its key is
+consulted),
+`required_mode_refuses_the_unkeyed_token_issue_and_rotation_and_admits_the_keyed_principal`
+(Unix),
+`required_mode_refuses_a_keyed_token_issue_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink`
+and `required_mode_admits_every_form_of_token_revocation`; and
+`required_tests::service_token_issue_and_rotation_admit_only_their_keyed_issuer_bound_form_in_both_modes`.
 
 ## Keyed safe references
 
@@ -1168,7 +1275,7 @@ second SQLite file cannot commit atomically with the first.
 
 | Store | Table | Written by | Each row holds |
 | --- | --- | --- | --- |
-| `SERVICE_TOKEN_SQLITE_PATH` | `service_token_change_evidence`, created on open (a table created before the issue action existed is rebuilt once on open to admit it, keeping every row, its sequence and the sequence counter) | service-token issue, rotate and revoke | actor, action, event and operation UUIDs, token ID, commit time (an issue's is the token's own `created_at`) |
+| `SERVICE_TOKEN_SQLITE_PATH` | `service_token_change_evidence`, created on open (a table created before the issue action existed is rebuilt once on open to admit it, keeping every row, its sequence and the sequence counter) | service-token issue, rotate and revoke | actor, action, event and operation UUIDs, token ID, commit time (an issue's is the token's own `created_at`), and since plan P5 of #425 the token's revision before and after with the `revised` marker (columns added on open; older rows keep NULL revisions and `revised = 0`) |
 | `CONNECTIONS_SQLITE_PATH` | `connection_change_evidence`, Connections schema migration 12 | Connection create, replace and delete | actor, action, event and operation UUIDs, Connection ID, the revision before and after on the action's axis, commit time. A replace that advances the credential revision adds a `credential.binding_change` row on the credential axis under the same operation ID |
 | `CONNECTIONS_SQLITE_PATH` | `connection_local_secret_change_evidence`, Connections schema migration 12 | local-secret create, rotate and delete, and each re-encryption batch that rewrote at least one envelope | actor, action, event and operation UUIDs, the gateway-minted secret ID and its version before and after; a batch records only how many envelopes it rewrote |
 | `CONNECTIONS_SQLITE_PATH` | `catalog_change_evidence`, Connections schema migration 13 | managed MCP and OpenAPI catalog publication: an MCP refresh, an OpenAPI registration or refresh, and an overlay put or delete | actor, action, event and operation UUIDs, Connection ID, the catalog revision before and after, the overlay revision the published OpenAPI catalog was compiled from, commit time (the catalog's `refreshed_at`) |
@@ -1238,7 +1345,9 @@ What standalone evidence lacks compared with cluster mode:
   grows by one small row per change. A restore of the file rewinds the evidence
   with the state it describes.
 - **Operation identity.** Both modes accept a caller-bound UUIDv7 for a keyed
-  service-token revoke. Other mutations generate their operation IDs in the store. The actor's kind, auth mode and issuer
+  service-token issue, rotation and revoke ([Keyed service-token issue and
+  rotation](#keyed-service-token-issue-and-rotation)). Other mutations generate their
+  operation IDs in the store, as unkeyed ones do. The actor's kind, auth mode and issuer
   are recorded, as in cluster mode since migration 24.
 - **Not carried across a cutover.** `import-standalone` leaves these rows in the
   standalone files and names them in its report.
@@ -1305,8 +1414,11 @@ costs only disk, because standalone evidence has no capacity bound and no retent
 own table, so it orders events within an operation family (`service_token.*`;
 `connection.*` and `credential.*`; `secret.*`; `catalog.*`), not across them.
 `revision.security` is `null`: a standalone store has no shared security revision.
-Service-token records carry `null` before and after: the token database keeps no token
-revision, and nothing is invented. Local-secret changes sit on the `secret` axis with
+Service-token records carry the token's revision before and after (issue #425,
+plan P5): an issue creates revision 1, a rotation or revocation advances it. A token
+row whose writer recorded no revision (`revised = 0`: written before the token table
+recorded revisions, or by an older build since) carries `null` before and after, and
+nothing is invented. Local-secret changes sit on the `secret` axis with
 the secret's version, referenced by its gateway-minted ID. A re-encryption batch names
 no secret and changes no version, so it sits on the `maintenance` axis with no
 revisions, and its resource is the local-secret store as a whole, referenced from the
@@ -1322,10 +1434,13 @@ local-secret or catalog row follows the cluster rule in
 [Authority event v1](#authority-event-v1): a caller UUIDv7 with an issuer-bound
 principal is delivered as `authority_event.v1` with `revision.security` `null`,
 and a caller UUIDv7 with any other actor that is not a service token stalls its
-table. No standalone route binds a caller key yet, so these tables hold no such
-row. Token rows record no revision, so they keep `authority_event_delivery.v1`
-whatever their operation ID, including the keyed revocations recorded since
-#765, and so does a re-encryption batch.
+table. A revised token row follows the same rule, so a keyed principal issue,
+rotation or revocation is delivered as `authority_event.v1`. A token row that is
+not revised records no revision, so it keeps `authority_event_delivery.v1`
+whatever its operation ID, including the keyed revocations recorded since #765
+before the token table recorded revisions, and so does a re-encryption batch. A
+revised token row without its transition stalls its table, as an unprojectable row
+of any table does.
 
 **Signals.** `greengateway_standalone_authority_event_undelivered{store}` (rows above
 the cursors, summed per store) and
@@ -1383,8 +1498,8 @@ sink and a Unix build, and names the first of these that fails
 
 | `required_mode` | Rows | What required mode does |
 | --- | --- | --- |
-| `admitted` | Cluster policy, tools, Connection create, replace and delete, catalogs, token issue, rotation and revocation, JWT revocation, and admin session grant and withdrawal, and standalone Connection create, replace and delete, local-secret create, rotate, delete and re-encryption, catalog publication and overlays, and token issue, rotation and revocation | Runs it. Its evidence is the row's `record`. Nine of these pairs stay admitted without qualification on purpose ([below](#rows-admitted-without-qualification)) |
-| `caller_key_required` | PostgreSQL mutation approval preparation | Admits only the issuer-bound keyed PUT with `qualified_v1`, `AUTHORITY_EVENT_SINK=file` and a Unix build. Required mode refuses ordinary POST. |
+| `admitted` | Cluster policy, tools, Connection create, replace and delete, catalogs, token revocation, JWT revocation, and admin session grant and withdrawal, and standalone Connection create, replace and delete, local-secret create, rotate, delete and re-encryption, catalog publication and overlays, and token revocation | Runs it. Its evidence is the row's `record`. Nine of these pairs stay admitted without qualification on purpose ([below](#rows-admitted-without-qualification)) |
+| `caller_key_required` | PostgreSQL mutation approval preparation, and service-token issue and rotation in both modes | Admits only the issuer-bound keyed request with `qualified_v1`, `AUTHORITY_EVENT_SINK=file` and a Unix build. Required mode refuses the ordinary preparation POST and the unkeyed token issue and rotation. |
 | `refused` | Standalone mutation approval preparation and mutation approval review, revocation and consumption in both modes. Standalone policy mutations, policy file reloads, and tools publication (admin API and file reloads). The writing form of the offline import (`import-standalone --apply`, with or without `--resume`) in cluster mode | Refuses it when asked, before anything is written |
 | `refused_at_startup` | Standalone admin sessions (`ADMIN_SESSION_MODE=standalone_memory`), and configuration activation in both modes | Refuses to start |
 | `unavailable` | Cluster policy file reload and local secrets, standalone JWT revocation and import, configuration export | Nothing to refuse: the mode or the build has no such operation. A gate that is asked anyway refuses it |
@@ -1553,9 +1668,11 @@ the change's transaction and are delivered as `authority_event_delivery.v1`, but
 not caller-keyed. Only the keyed principal form is qualified, so a
 `withdrawal_admitted` row carries exactly one reviewed `qualified_delivery_paths`
 entry for each of its pairs. The pairs are `service_token.revoke` in both modes,
-`connection.delete` in both modes and standalone `secret.delete`. Today only
-`token_revoke_postgres` has its reviewed path (`POST .../tokens/{id}/revoke`); the
-other four rows keep `missing_metadata` until their keyed paths are reviewed.
+`connection.delete` in both modes and standalone `secret.delete`. Today
+`token_revoke_postgres` and `token_revoke_standalone` have their reviewed paths
+(`POST .../tokens/{id}/revoke`; the standalone one since the token database records
+the token's revision, plan P5); the other three rows keep `missing_metadata` until
+their keyed paths are reviewed.
 
 `catalog.overlay.delete` is not a withdrawal: removing an overlay publishes a new
 catalog revision. The session withdrawal reason stays in `admin_session_evidence`;
@@ -1595,7 +1712,8 @@ disposable PostgreSQL 16, the same pinned image, that accepts TLS and nothing el
   `jwt_revocation_evidence_survives_extension_reactivation_and_cleanup`,
   `a_failed_jwt_evidence_insert_rolls_back_the_revoke`,
   `repeating_an_effective_jwt_revoke_records_no_second_evidence_row`,
-  `extending_a_jwt_revocation_records_exactly_one_more_evidence_row`), the suggestion acceptance's
+  `extending_a_jwt_revocation_records_exactly_one_more_evidence_row`), the keyed
+  service-token issue and rotation (`postgres_audit_tests::keyed_token_changes::`), the suggestion acceptance's
   document evidence (`an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction`)
   and `a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity`;
 - the whole PostgreSQL Connection store suite (`connections::pg_store`), its create,

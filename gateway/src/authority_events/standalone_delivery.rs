@@ -17,9 +17,13 @@
 //!   deduplicate on `(authority_id, event_id)` as in cluster mode.
 //! - **`revision.security` is `null`**: a standalone store has no shared
 //!   security revision.
-//! - **Service-token revisions are `null`**: the token database keeps no
-//!   revision per token, so an issue, rotate or revoke says nothing before or
-//!   after rather than inventing one.
+//! - **Service-token revisions** are the token row's store-owned revision
+//!   (issue #425, plan P5): an issue creates revision 1, a rotation or
+//!   revocation advances it by one. A row records them only when its
+//!   per-row `revised` marker says its writer did: rows written before the
+//!   token table recorded revisions, and rows an older build still writes,
+//!   are not revised, say nothing before or after rather than inventing a
+//!   revision, and are delivered as the legacy records they always were.
 //! - **Local secrets** sit on the v1 `secret` axis with the secret's version
 //!   before and after. A re-encryption batch names no secret (its row records
 //!   only how many envelopes it rewrote) and changes no version: it sits on
@@ -39,8 +43,9 @@
 //!   of a table that records revisions (Connection, local secret, catalog)
 //!   follows the cluster rule ([`qualify_caller_bound`]): a caller UUIDv7
 //!   and an issuer-bound principal make an `authority_event.v1`, with no
-//!   shared security revision. A token row records no revision, and v1
-//!   needs one, so it keeps its delivery record whatever its operation ID.
+//!   shared security revision. A revised token row follows the same rule; a
+//!   token row that is not revised records no revision, and v1 needs one, so
+//!   it keeps its delivery record whatever its operation ID.
 //!
 //! A row that cannot be projected faithfully -- an action its table may not
 //! hold, a revision out of its transition, a value out of shape -- is refused
@@ -66,8 +71,8 @@ use crate::{
 pub(crate) const LOCAL_SECRET_STORE_COMPONENT: &str = "connection_local_secrets";
 
 /// The revision a created resource starts at, as each table's CHECK holds
-/// it: a Connection's first specification version and a local secret's
-/// first version.
+/// it: a Connection's first specification version, a local secret's first
+/// version and a service token's first revision.
 const FIRST_REVISION: i64 = 1;
 
 /// The v1 revision transition of each delivered standalone operation.
@@ -85,7 +90,8 @@ enum Transition {
     /// An optional positive prior revision and a strictly greater new one: a
     /// catalog publication, whose first catalog has nothing before it.
     Publish,
-    /// No revision either side: the row records none.
+    /// No revision either side: the row records none. A token row that is
+    /// not revised is read this way whatever its action.
     Unrevised,
 }
 
@@ -133,7 +139,7 @@ pub(crate) const STANDALONE_SHAPES: [StandaloneShape; 15] = [
         "service_token",
         ReferenceDomain::ServiceToken,
         "token",
-        Transition::Unrevised,
+        Transition::Create,
     ),
     shape(
         StandaloneEvidenceSource::ServiceTokenChange,
@@ -141,7 +147,7 @@ pub(crate) const STANDALONE_SHAPES: [StandaloneShape; 15] = [
         "service_token",
         ReferenceDomain::ServiceToken,
         "token",
-        Transition::Unrevised,
+        Transition::Advance,
     ),
     shape(
         StandaloneEvidenceSource::ServiceTokenChange,
@@ -149,7 +155,7 @@ pub(crate) const STANDALONE_SHAPES: [StandaloneShape; 15] = [
         "service_token",
         ReferenceDomain::ServiceToken,
         "token",
-        Transition::Unrevised,
+        Transition::Advance,
     ),
     shape(
         StandaloneEvidenceSource::ConnectionChange,
@@ -275,7 +281,15 @@ pub(crate) fn project_standalone(
         return Err(ProjectionError::InvalidEvidence);
     }
 
-    let (before, after) = revisions(shape.transition, evidence)?;
+    // A token row whose writer recorded no revisions is a legacy row: it
+    // must carry none and is read as unrevised. Every other table's rows are
+    // revised, so a row that says otherwise is not one they hold.
+    let transition = match (evidence.revised, evidence.source) {
+        (true, _) => shape.transition,
+        (false, StandaloneEvidenceSource::ServiceTokenChange) => Transition::Unrevised,
+        (false, _) => return Err(ProjectionError::InvalidEvidence),
+    };
+    let (before, after) = revisions(transition, evidence)?;
     let resource_reference = match (shape.names_resource, evidence.resource_id.as_deref()) {
         (true, Some(resource_id)) => keyring.derive(shape.domain, &[required(Some(resource_id))?]),
         (true, None) => return Err(ProjectionError::MissingEvidence),
@@ -296,13 +310,13 @@ pub(crate) fn project_standalone(
     };
     let qualified = match (format, evidence.resource_id.as_deref()) {
         // A row that records revisions follows the cluster rule. A row that
-        // records none -- a token row, whose table keeps no token revision,
-        // or a re-encryption batch, which no caller starts -- has no v1
+        // records none -- a token row its writer did not revise, or a
+        // re-encryption batch, which no caller starts -- has no v1
         // transition and keeps its delivery record whatever its operation
-        // ID: the keyed revocations recorded since #765 are delivered as
-        // they always were.
+        // ID: the keyed revocations recorded since #765, before the token
+        // table recorded revisions, are delivered as they always were.
         (AuthorityEventFormat::QualifiedV1, Some(resource_id))
-            if shape.transition != Transition::Unrevised =>
+            if transition != Transition::Unrevised =>
         {
             qualify_caller_bound(
                 &CallerBoundRow {

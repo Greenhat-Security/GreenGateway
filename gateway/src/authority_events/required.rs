@@ -60,7 +60,8 @@ pub(crate) const REFUSAL_REASON: &str = "authority_evidence_unsupported";
 /// Connection create, replace and delete, local-secret changes and
 /// re-encryption, managed catalog publication and overlay writes and
 /// removals (the standalone Connections database's own evidence tables),
-/// service-token issue, rotation and revocation, and JWT revocation. The
+/// service-token revocation, and JWT revocation. Service-token issue and
+/// rotation are listed since they bind caller keys (issue #425). The
 /// inventory test holds that rule too: an operation no gate asks about must
 /// be `admitted` or `unavailable` wherever its row says.
 ///
@@ -92,6 +93,14 @@ pub(crate) enum AuthorityOperation {
     ConfigurationImport,
     /// The stored policy test suite replaced or first stored (issue #243).
     PolicyTestsPublish,
+    /// A service token issued through the admin API. It binds a caller key
+    /// (issue #425): in both modes the issue, its evidence and its key's
+    /// reservation commit in one transaction of the token store, so required
+    /// mode admits only its keyed form.
+    ServiceTokenIssue,
+    /// A service token rotated through the admin API, keyed like an issue.
+    /// Revocation is a withdrawal and never asks ([`Withdrawal`]).
+    ServiceTokenRotate,
     MutationApprovalPrepare,
     MutationApprovalConsume,
     MutationApprovalReview,
@@ -201,6 +210,8 @@ impl AuthorityOperation {
             Self::ToolsPublish => "tools.publish",
             Self::ConfigurationImport => "configuration.import",
             Self::PolicyTestsPublish => "policy_tests.publish",
+            Self::ServiceTokenIssue => "service_token.issue",
+            Self::ServiceTokenRotate => "service_token.rotate",
             Self::MutationApprovalConsume => "mutation_approval.consume",
             Self::MutationApprovalPrepare => "mutation_approval.prepare",
             Self::MutationApprovalReview => "mutation_approval.review",
@@ -224,6 +235,9 @@ impl AuthorityOperation {
     pub(crate) const fn required_mode(self, backend: StateBackend) -> RequiredMode {
         match backend {
             StateBackend::Postgres => match self {
+                Self::ServiceTokenIssue | Self::ServiceTokenRotate => {
+                    RequiredMode::CallerKeyRequired
+                }
                 Self::PolicyFileReload => RequiredMode::Unavailable,
                 Self::MutationApprovalPrepare => RequiredMode::CallerKeyRequired,
                 Self::MutationApprovalConsume
@@ -241,6 +255,9 @@ impl AuthorityOperation {
                 | Self::PolicyTestsPublish => RequiredMode::Admitted,
             },
             StateBackend::Sqlite => match self {
+                Self::ServiceTokenIssue | Self::ServiceTokenRotate => {
+                    RequiredMode::CallerKeyRequired
+                }
                 // `import-standalone` imports into PostgreSQL; a standalone
                 // configuration is only its source.
                 Self::ConfigurationImport => RequiredMode::Unavailable,

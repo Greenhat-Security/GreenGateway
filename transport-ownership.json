@@ -14785,6 +14785,56 @@
       "reasons": [
         "network-or-process-reference"
       ],
+      "scope": "gateway::storage::postgres_service_tokens::keyed_receipt#1",
+      "sha256": "80e017e39b2ad875c1f94a4ab8cb12b4f9d46a5ce410c5a52034de0ababbe646",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reads a keyed token change's caller-key reservation and committed receipt inside the change's PostgreSQL transaction (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_service_tokens.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_service_tokens::reserve_caller_key#1",
+      "sha256": "2b9d1e0c8f10779b2a1ebd5f68a44ec77319729e2f478cf3cfe4b59b5bba650c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reserves a keyed token change's caller key, after the contract fence check, inside the change's PostgreSQL transaction (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_service_tokens.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_service_tokens::committed_receipt#1",
+      "sha256": "15f287ba785e21c8c55d806a8a1011d7a68deb41785dca68b348c3767a545493",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reads the committed evidence row an exact keyed token retry is answered from (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_service_tokens.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_service_tokens::token_operation_receipt#1",
+      "sha256": "1a1956d123931b98433dea91e0525c260d7a548e5e1577e1c877da6bef1ff78c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reads a keyed token change's receipt from its evidence row through the shared infrastructure pool (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_service_tokens.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_service_tokens::finish_keyed#1",
+      "sha256": "981359c34ad3899c08a1e027fc531f7cb6d51a4c978a6321efe0b53c9147b600",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Commits a keyed token change's transaction, or rolls back an exact retry answered from its receipt (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_service_tokens.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
       "scope": "gateway::storage::postgres_service_tokens::finish#1",
       "sha256": "17bc1a59ba8afa948e09e22a47a233cd035d3923c609d5eab6dcc139ed275822",
       "owner": "GreenGateway maintainers",

@@ -58,6 +58,9 @@ use crate::auth::tokens::{
     TokenCursor, TokenListFilters, TokenPage, TokenRecord, TokenStoreError, TokenVerification,
     TokenVerificationFailure, VerifiedToken,
 };
+use crate::authority_events::caller_operation::{
+    CallerKeyReservation, CallerKeyState, CallerOperation, CallerOutcome, OperationReceipt,
+};
 
 use super::{
     log_classified,
@@ -166,11 +169,12 @@ impl PostgresServiceTokenStore {
 
 #[async_trait]
 impl ServiceTokenStore for PostgresServiceTokenStore {
-    async fn create(
+    async fn create_with_operation(
         &self,
         request: CreateTokenRequest,
         actor: &ChangeActor,
-    ) -> Result<CreatedToken, RepositoryError> {
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<CreatedToken>, RepositoryError> {
         // A malformed expiry is the caller's input, answered 400 by the
         // admin API through the parameter-carrying classification; it is
         // rejected before any connection is taken.
@@ -185,7 +189,12 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
             ));
         }
         validate_change_actor(OPERATION_CREATE, actor)?;
-        let operation_id = uuid::Uuid::new_v4();
+        validate_caller_action(
+            OPERATION_CREATE,
+            caller,
+            crate::auth::tokens::TOKEN_CHANGE_ACTION_ISSUE,
+        )?;
+        let operation_id = caller.map_or_else(uuid::Uuid::new_v4, CallerOperation::id);
         let plaintext_token = generate_plaintext_token()
             .map_err(|error| map_helper_error(OPERATION_CREATE, error))?;
         let token_hash = hash_token(&plaintext_token);
@@ -196,7 +205,16 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
 
         let client = checkout(&self.pool, CheckoutClass::ControlPlaneWrite).await?;
         begin_mutation(&client, OPERATION_CREATE).await?;
-        let outcome: Result<TokenRecord, RepositoryError> = async {
+        let outcome: Result<CallerOutcome<TokenRecord>, RepositoryError> = async {
+            // Under the token mutation lock: an exact retry is answered from
+            // what committed, with no second token and no plaintext; then the
+            // key is reserved before the shared revision (issue #425).
+            if let Some(receipt) = keyed_receipt(&client, caller, OPERATION_CREATE).await? {
+                return Ok(CallerOutcome::Replayed(receipt));
+            }
+            if let Some(receipt) = reserve_caller_key(&client, caller, OPERATION_CREATE).await? {
+                return Ok(CallerOutcome::Replayed(receipt));
+            }
             let security_revision = reserve_shared_revision(&client, OPERATION_CREATE).await?;
             let sql = format!(
                 r#"
@@ -249,14 +267,34 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
                 },
             )
             .await?;
-            Ok(raw.record)
+            Ok(CallerOutcome::Committed(raw.record))
         }
         .await;
-        let record = finish(&client, OPERATION_CREATE, outcome).await?;
-        Ok(CreatedToken {
-            record,
-            plaintext_token,
-        })
+        Ok(
+            match finish_keyed(&client, OPERATION_CREATE, outcome).await? {
+                CallerOutcome::Committed(record) => CallerOutcome::Committed(CreatedToken {
+                    record,
+                    plaintext_token,
+                }),
+                CallerOutcome::Replayed(receipt) => CallerOutcome::Replayed(receipt),
+            },
+        )
+    }
+
+    async fn caller_operation_state(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<CallerKeyState, RepositoryError> {
+        let client = checkout(&self.pool, CheckoutClass::SecurityStateRead).await?;
+        super::postgres_authority_events::read_caller_operation(&client, caller).await
+    }
+
+    async fn caller_operation_receipt(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<Option<OperationReceipt>, RepositoryError> {
+        let client = checkout(&self.pool, CheckoutClass::SecurityStateRead).await?;
+        token_operation_receipt(&client, caller).await
     }
 
     async fn list(&self, filters: &TokenListFilters) -> Result<TokenPage, RepositoryError> {
@@ -441,13 +479,19 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
         finish(&client, OPERATION_REVOKE, outcome).await
     }
 
-    async fn rotate(
+    async fn rotate_with_operation(
         &self,
         id: &str,
         actor: &ChangeActor,
-    ) -> Result<Option<CreatedToken>, RepositoryError> {
+        caller: Option<&CallerOperation>,
+    ) -> Result<Option<CallerOutcome<CreatedToken>>, RepositoryError> {
         validate_change_actor(OPERATION_ROTATE, actor)?;
-        let operation_id = uuid::Uuid::new_v4();
+        validate_caller_action(
+            OPERATION_ROTATE,
+            caller,
+            crate::auth::tokens::TOKEN_CHANGE_ACTION_ROTATE,
+        )?;
+        let operation_id = caller.map_or_else(uuid::Uuid::new_v4, CallerOperation::id);
         let plaintext_token = generate_plaintext_token()
             .map_err(|error| map_helper_error(OPERATION_ROTATE, error))?;
         let token_hash = hash_token(&plaintext_token);
@@ -455,7 +499,13 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
 
         let client = checkout(&self.pool, CheckoutClass::ControlPlaneWrite).await?;
         begin_mutation(&client, OPERATION_ROTATE).await?;
-        let outcome: Result<Option<TokenRecord>, RepositoryError> = async {
+        let outcome: Result<Option<CallerOutcome<TokenRecord>>, RepositoryError> = async {
+            // The key first, under the token mutation lock: an exact retry
+            // is answered from the committed rotation whatever happened to
+            // the token since, never with a plaintext (issue #425).
+            if let Some(receipt) = keyed_receipt(&client, caller, OPERATION_ROTATE).await? {
+                return Ok(Some(CallerOutcome::Replayed(receipt)));
+            }
             let Some(current) = Self::load_by_id(&client, id, OPERATION_ROTATE, true).await? else {
                 return Ok(None);
             };
@@ -466,6 +516,10 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
                     RepositoryErrorKind::Conflict,
                     OPERATION_ROTATE,
                 ));
+            }
+            // After the token row's lock and before the shared revision.
+            if let Some(receipt) = reserve_caller_key(&client, caller, OPERATION_ROTATE).await? {
+                return Ok(Some(CallerOutcome::Replayed(receipt)));
             }
             let security_revision = reserve_shared_revision(&client, OPERATION_ROTATE).await?;
             let sql = format!(
@@ -508,13 +562,20 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
                 },
             )
             .await?;
-            Ok(Some(rotated.record))
+            Ok(Some(CallerOutcome::Committed(rotated.record)))
         }
         .await;
-        let record = finish(&client, OPERATION_ROTATE, outcome).await?;
-        Ok(record.map(|record| CreatedToken {
-            record,
-            plaintext_token,
+        let outcome = match outcome {
+            Ok(None) => finish(&client, OPERATION_ROTATE, Ok(None)).await?,
+            Ok(Some(outcome)) => Some(finish_keyed(&client, OPERATION_ROTATE, Ok(outcome)).await?),
+            Err(error) => finish(&client, OPERATION_ROTATE, Err(error)).await?,
+        };
+        Ok(outcome.map(|outcome| match outcome {
+            CallerOutcome::Committed(record) => CallerOutcome::Committed(CreatedToken {
+                record,
+                plaintext_token,
+            }),
+            CallerOutcome::Replayed(receipt) => CallerOutcome::Replayed(receipt),
         }))
     }
 
@@ -874,6 +935,169 @@ fn journal_failure(error: super::postgres_authority_events::JournalAppendError) 
                 classified
             }
         }
+    }
+}
+
+const OPERATION_CALLER_OPERATION: &str = "service_token_caller_operation";
+
+/// A caller key handed to an issue or rotation must be bound to exactly that
+/// action; anything else is the gateway's defect, refused before checkout.
+fn validate_caller_action(
+    operation: &'static str,
+    caller: Option<&CallerOperation>,
+    action: &'static str,
+) -> Result<(), RepositoryError> {
+    match caller {
+        Some(caller) if caller.action() != action => Err(RepositoryError::new(
+            RepositoryErrorKind::Internal,
+            operation,
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// A keyed issue or rotation refused because its key is bound to another
+/// request: the one conflict the admin API answers `409
+/// caller_operation_conflict`.
+fn caller_operation_conflict() -> RepositoryError {
+    RepositoryError::new(
+        RepositoryErrorKind::Conflict,
+        crate::auth::tokens::CALLER_OPERATION_BINDING,
+    )
+}
+
+/// A reservation's store error as this store reports it: never `Conflict`,
+/// which on rotate means exactly "the token is revoked". A fence below
+/// `caller_operation_keys` stays `Unavailable` (`503`).
+fn reservation_failure(operation: &'static str, error: &RepositoryError) -> RepositoryError {
+    tracing::warn!(
+        operation,
+        kind = ?error.kind(),
+        "a service-token change's caller key could not be read or reserved; nothing was changed"
+    );
+    match error.kind() {
+        RepositoryErrorKind::Conflict => {
+            RepositoryError::new(RepositoryErrorKind::Internal, OPERATION_CALLER_OPERATION)
+        }
+        kind => RepositoryError::new(kind, OPERATION_CALLER_OPERATION),
+    }
+}
+
+/// Step 1 of a keyed issue or rotation, after the token mutation lock (issue
+/// #425): `None` for no key or an unused one; the receipt for an exact retry
+/// of a committed change; a conflict for a key reserved for anything else. A
+/// reservation without its evidence row is refused.
+async fn keyed_receipt(
+    client: &deadpool_postgres::Object,
+    caller: Option<&CallerOperation>,
+    operation: &'static str,
+) -> Result<Option<OperationReceipt>, RepositoryError> {
+    let Some(caller) = caller else {
+        return Ok(None);
+    };
+    let state = super::postgres_authority_events::read_caller_operation(client, caller)
+        .await
+        .map_err(|error| reservation_failure(operation, &error))?;
+    match state {
+        CallerKeyState::Unused => Ok(None),
+        CallerKeyState::OtherBinding => Err(caller_operation_conflict()),
+        CallerKeyState::SameBinding => committed_receipt(client, caller).await.map(Some),
+    }
+}
+
+/// Step 3 of a keyed issue or rotation: reserve the key with its binding
+/// digest in the change's transaction, after the token locks and before the
+/// shared revision, once the contract fence is confirmed to carry
+/// `caller_operation_keys`. A reservation that cannot be written rolls the
+/// change back like a failed evidence insert and is counted with them (I2);
+/// a writer that committed the same key meanwhile is answered as step 1
+/// answers it.
+async fn reserve_caller_key(
+    client: &deadpool_postgres::Object,
+    caller: Option<&CallerOperation>,
+    operation: &'static str,
+) -> Result<Option<OperationReceipt>, RepositoryError> {
+    let Some(caller) = caller else {
+        return Ok(None);
+    };
+    let reservation = super::postgres_authority_events::reserve_bound_operation(client, caller)
+        .await
+        .map_err(|error| {
+            super::postgres_authority_events::record_evidence_failure();
+            reservation_failure(operation, &error)
+        })?;
+    match reservation {
+        CallerKeyReservation::Reserved => Ok(None),
+        CallerKeyReservation::OtherBinding => Err(caller_operation_conflict()),
+        CallerKeyReservation::SameBinding => committed_receipt(client, caller).await.map(Some),
+    }
+}
+
+/// The committed receipt of an exact retry, or a refusal when the
+/// reservation has no evidence row.
+async fn committed_receipt(
+    client: &deadpool_postgres::Object,
+    caller: &CallerOperation,
+) -> Result<OperationReceipt, RepositoryError> {
+    token_operation_receipt(client, caller)
+        .await?
+        .ok_or_else(|| {
+            tracing::error!(
+                "a caller operation is reserved without its service-token evidence row; the change is refused"
+            );
+            RepositoryError::new(RepositoryErrorKind::Unavailable, OPERATION_CALLER_OPERATION)
+        })
+}
+
+/// The receipt of the issue or rotation `caller`'s key committed: its
+/// evidence row for the key's action, never anything from the request and
+/// never token material.
+async fn token_operation_receipt(
+    client: &tokio_postgres::Client,
+    caller: &CallerOperation,
+) -> Result<Option<OperationReceipt>, RepositoryError> {
+    let row = client
+        .query_opt(
+            &format!(
+                "SELECT token_id, new_version, \
+                 to_char(committed_at AT TIME ZONE 'UTC', {TIMESTAMP_FORMAT}) \
+                 FROM greengateway.service_token_change_evidence \
+                 WHERE operation_id = $1::text::uuid AND action = $2"
+            ),
+            &[&caller.id().to_string(), &caller.action()],
+        )
+        .await
+        .map_err(|error| classify_query(error, OPERATION_CALLER_OPERATION))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let revision: i64 = column(&row, 1, OPERATION_CALLER_OPERATION)?;
+    Ok(Some(OperationReceipt {
+        operation_id: caller.id().to_string(),
+        operation: caller.action().to_owned(),
+        resource_id: column(&row, 0, OPERATION_CALLER_OPERATION)?,
+        revision: Some(revision),
+        committed_at: column(&row, 2, OPERATION_CALLER_OPERATION)?,
+    }))
+}
+
+/// Commit a keyed change's transaction, or roll it back: an exact retry
+/// answered from its receipt wrote nothing and rolls back explicitly, as
+/// every failure does.
+async fn finish_keyed<T>(
+    client: &deadpool_postgres::Object,
+    operation: &'static str,
+    outcome: Result<CallerOutcome<T>, RepositoryError>,
+) -> Result<CallerOutcome<T>, RepositoryError> {
+    match outcome {
+        Ok(CallerOutcome::Committed(value)) => {
+            finish(client, operation, Ok(CallerOutcome::Committed(value))).await
+        }
+        Ok(CallerOutcome::Replayed(receipt)) => {
+            let _ = client.batch_execute("ROLLBACK").await;
+            Ok(CallerOutcome::Replayed(receipt))
+        }
+        Err(error) => finish(client, operation, Err(error)).await,
     }
 }
 

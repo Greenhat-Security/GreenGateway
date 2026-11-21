@@ -691,6 +691,15 @@ pub(super) const KEYED_ROUTES: &[KeyedRoute] = &[
         method: "POST",
         route: "/v1{ADMIN_PREFIX}/tokens/{id}/revoke",
     },
+    // Keyed service-token issue and rotation (issue #425).
+    KeyedRoute {
+        method: "POST",
+        route: "/v1{ADMIN_PREFIX}/tokens",
+    },
+    KeyedRoute {
+        method: "POST",
+        route: "/v1{ADMIN_PREFIX}/tokens/{id}/rotate",
+    },
     // Keyed approval preparation (issue #794).
     KeyedRoute {
         method: "PUT",

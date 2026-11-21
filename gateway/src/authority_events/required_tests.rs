@@ -8,7 +8,7 @@ use serde_json::Value;
 use super::*;
 use crate::audit::sink::tests::CaptureSink;
 
-const EVERY_OPERATION: [AuthorityOperation; 15] = [
+const EVERY_OPERATION: [AuthorityOperation; 17] = [
     AuthorityOperation::PolicyPublish,
     AuthorityOperation::PolicyRollback,
     AuthorityOperation::PolicyRuleCreate,
@@ -20,10 +20,19 @@ const EVERY_OPERATION: [AuthorityOperation; 15] = [
     AuthorityOperation::ToolsPublish,
     AuthorityOperation::ConfigurationImport,
     AuthorityOperation::PolicyTestsPublish,
+    AuthorityOperation::ServiceTokenIssue,
+    AuthorityOperation::ServiceTokenRotate,
     AuthorityOperation::MutationApprovalPrepare,
     AuthorityOperation::MutationApprovalConsume,
     AuthorityOperation::MutationApprovalReview,
     AuthorityOperation::MutationApprovalRevoke,
+];
+
+/// The service-token changes both modes admit only in their keyed form
+/// (issue #425, plan P5).
+const KEYED_TOKEN_OPERATIONS: [AuthorityOperation; 2] = [
+    AuthorityOperation::ServiceTokenIssue,
+    AuthorityOperation::ServiceTokenRotate,
 ];
 
 /// The operation whose gate covers an inventory operation code, or `None`
@@ -96,6 +105,8 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
         assert_eq!(refusal.operation(), operation);
         let why = if operation == AuthorityOperation::ConfigurationImport {
             "does not perform it"
+        } else if KEYED_TOKEN_OPERATIONS.contains(&operation) {
+            "admits it only with an Idempotency-Key, on a route that honours one"
         } else {
             "records no durable evidence of it"
         };
@@ -122,6 +133,8 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
         [
             AuthorityOperation::PolicyFileReload,
             AuthorityOperation::ConfigurationImport,
+            AuthorityOperation::ServiceTokenIssue,
+            AuthorityOperation::ServiceTokenRotate,
             AuthorityOperation::MutationApprovalPrepare,
             AuthorityOperation::MutationApprovalConsume,
             AuthorityOperation::MutationApprovalReview,
@@ -133,6 +146,9 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
         let why = match operation {
             AuthorityOperation::PolicyFileReload => "does not perform it",
             AuthorityOperation::ConfigurationImport => "records evidence for only part of it",
+            AuthorityOperation::ServiceTokenIssue | AuthorityOperation::ServiceTokenRotate => {
+                "admits it only with an Idempotency-Key, on a route that honours one"
+            }
             // The ordinary preparation POST refuses a key: the message names
             // the keyed route instead.
             AuthorityOperation::MutationApprovalPrepare => {
@@ -618,6 +634,96 @@ fn the_gate_enforces_exactly_what_the_evidence_inventory_says() {
         );
         assert!(gated_operation(code).is_none(), "{code} is not gated");
     }
+    // Service-token issue and rotation bind caller keys in both modes (issue
+    // #425, plan P5): only their keyed form is admitted. Revocation is a
+    // withdrawal, admitted in every form.
+    for mode in ["postgres", "standalone"] {
+        for code in ["service_token.issue", "service_token.rotate"] {
+            assert_eq!(
+                by_mode.get(&(code, mode)),
+                Some(&"caller_key_required"),
+                "{code} in {mode}"
+            );
+        }
+        assert_eq!(
+            by_mode.get(&("service_token.revoke", mode)),
+            Some(&"admitted"),
+            "service_token.revoke in {mode}"
+        );
+    }
+}
+
+/// Service-token issue and rotation (issue #425, plan P5): in both modes
+/// required mode admits only the keyed request of an issuer-bound principal
+/// under `qualified_v1` with the file sink on a Unix build, and the refusal
+/// of every other form names the first criterion it misses. Revocation is a
+/// withdrawal and never asks.
+#[test]
+fn service_token_issue_and_rotation_admit_only_their_keyed_issuer_bound_form_in_both_modes() {
+    use crate::auth::change_actor::ChangeActor;
+    use crate::config::AuthorityEventFormat;
+
+    let principal = issuer_bound_principal();
+    let keyed = RequestForm::of(true, &principal);
+    let service_token = ChangeActor::service_token_for_test("service-token:1");
+    for backend in [StateBackend::Sqlite, StateBackend::Postgres] {
+        let gate = AuthorityEvidenceGate::new(AuthorityEvidenceDurability::Required, backend)
+            .with_delivery(AuthorityEventFormat::QualifiedV1, true, true);
+        for operation in KEYED_TOKEN_OPERATIONS {
+            assert_eq!(
+                operation.required_mode(backend),
+                RequiredMode::CallerKeyRequired,
+                "{operation:?} {backend:?}"
+            );
+            assert_eq!(gate.refusal_for(operation, keyed), None, "{operation:?}");
+            for (gate, form, expected) in [
+                (gate, RequestForm::UNKEYED, KeyedAdmission::CallerKey),
+                (
+                    gate,
+                    RequestForm::of(false, &principal),
+                    KeyedAdmission::CallerKey,
+                ),
+                (
+                    gate,
+                    RequestForm::of(true, &service_token),
+                    KeyedAdmission::IssuerBoundPrincipal,
+                ),
+                (
+                    gate.with_delivery(AuthorityEventFormat::DeliveryV1, true, true),
+                    keyed,
+                    KeyedAdmission::QualifiedFormat,
+                ),
+                (
+                    gate.with_delivery(AuthorityEventFormat::QualifiedV1, false, true),
+                    keyed,
+                    KeyedAdmission::FileSink,
+                ),
+                (
+                    gate.with_delivery(AuthorityEventFormat::QualifiedV1, true, false),
+                    keyed,
+                    KeyedAdmission::SyncedFilesystem,
+                ),
+            ] {
+                assert_eq!(
+                    gate.refusal_for(operation, form)
+                        .and_then(|refusal| refusal.unmet()),
+                    Some(expected),
+                    "{operation:?} {backend:?} {form:?}"
+                );
+            }
+            assert_eq!(
+                AuthorityEvidenceGate::new(AuthorityEvidenceDurability::BestEffort, backend)
+                    .refusal(operation),
+                None,
+                "best_effort admits the unkeyed form"
+            );
+        }
+    }
+    assert_eq!(
+        Withdrawal::from_code("service_token.revoke"),
+        Some(Withdrawal::ServiceTokenRevoke)
+    );
+    assert_eq!(gated_operation("service_token.revoke"), None);
 }
 
 /// No proof of a configuration activation exists, so required mode refuses

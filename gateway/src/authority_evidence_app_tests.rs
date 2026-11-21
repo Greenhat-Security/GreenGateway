@@ -682,45 +682,6 @@ fn response_etag(response: &Response) -> String {
         .to_owned()
 }
 
-/// Token changes record their evidence in the token store's own
-/// transaction in standalone mode too, so required mode admits them.
-#[tokio::test]
-async fn required_evidence_admits_standalone_service_token_changes() {
-    let token_db = TempDb::new("authority-evidence-tokens");
-    let policy = TempPolicyFile::new(&token_policy_document_string());
-    let mut config = test_config(Vec::new());
-    config.auth_enabled = false;
-    config.policy_file = Some(policy.path.to_string_lossy().into_owned());
-    config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
-    config.rbac_exempt_paths.push(TOKENS_ADMIN_ROUTE.to_owned());
-    let (audit_log, capture) = captured_audit();
-    let router = router_with(required(config), audit_log);
-
-    let created = router
-        .clone()
-        .oneshot(token_admin_request(
-            Method::POST,
-            TOKENS_ADMIN_ROUTE,
-            Some(test_principal(&["tokens-writer", "probe-reader"])),
-            Some(json!({ "scopes": ["probe-reader"] }).to_string()),
-        ))
-        .await
-        .expect("token create request should complete");
-    assert_eq!(created.status(), StatusCode::CREATED);
-    // The audit writer delivers in order: once the change's own event has
-    // arrived, a refusal before it would have too.
-    assert_eventually(Duration::from_secs(5), || {
-        capture
-            .events()
-            .iter()
-            .any(|event| event.event_type == audit::event::SERVICE_TOKEN_CHANGED)
-    });
-    assert!(capture
-        .events()
-        .iter()
-        .all(|event| event.event_type != audit::event::AUTHORITY_EVIDENCE_OPERATION_REFUSED));
-}
-
 // --- the keyed-change helpers every operation family uses (issue #425) -----
 
 fn keyed_parts(keys: &[&str]) -> http::request::Parts {

@@ -1223,6 +1223,713 @@ async fn sqlite_service_token_change_evidence_satisfies_the_contract() {
 }
 
 // ---------------------------------------------------------------------------
+// Keyed service-token issue and rotation (issue #425, plan P5): the caller
+// key is reserved with the change and its evidence row in one transaction,
+// an exact retry is answered from the receipt with no second token and no
+// plaintext, and every other use of the key changes nothing. Run against both
+// stores: `sqlite_*` here, `postgres_audit_tests::keyed_token_changes::*` in
+// the PostgreSQL jobs.
+// ---------------------------------------------------------------------------
+
+/// One evidence row as the keyed contract reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KeyedTokenEvidence {
+    operation_id: String,
+    action: String,
+    token_id: String,
+    prior_version: Option<i64>,
+    new_version: Option<i64>,
+}
+
+/// One store's tables, read the way the keyed contract checks them.
+#[async_trait::async_trait]
+trait KeyedTokenDatabase: Send + Sync {
+    /// Every reservation as (operation ID, action, binding digest).
+    async fn reservations(&self) -> Vec<(String, String, Option<String>)>;
+
+    /// Every evidence row in commit order.
+    async fn evidence(&self) -> Vec<KeyedTokenEvidence>;
+
+    /// How many token rows exist.
+    async fn token_rows(&self) -> i64;
+
+    /// Every stored column of the evidence and token tables as text.
+    async fn evidence_and_token_text(&self) -> String;
+
+    /// Make every evidence insert fail until [`Self::restore_evidence_inserts`].
+    async fn fail_evidence_inserts(&self);
+
+    async fn restore_evidence_inserts(&self);
+}
+
+/// The token actions a caller key can be reserved for.
+const TOKEN_KEYED_ACTIONS: [&str; 3] = [
+    "service_token.issue",
+    "service_token.rotate",
+    "service_token.revoke",
+];
+
+/// I3 over the token tables: a reservation for a token action exists exactly
+/// when an evidence row with that operation ID and action exists. Unkeyed
+/// changes mint v4 operation IDs and reserve nothing.
+async fn assert_token_reservations_match_evidence(database: &dyn KeyedTokenDatabase) {
+    let reserved: std::collections::BTreeSet<(String, String)> = database
+        .reservations()
+        .await
+        .into_iter()
+        .filter(|(_, action, _)| TOKEN_KEYED_ACTIONS.contains(&action.as_str()))
+        .map(|(id, action, _)| (id, action))
+        .collect();
+    let keyed: std::collections::BTreeSet<(String, String)> = database
+        .evidence()
+        .await
+        .into_iter()
+        .filter(|row| {
+            uuid::Uuid::parse_str(&row.operation_id)
+                .is_ok_and(crate::auth::tokens::valid_caller_operation_id)
+        })
+        .map(|row| (row.operation_id, row.action))
+        .collect();
+    assert_eq!(
+        reserved, keyed,
+        "a reservation exists exactly for each keyed evidence row"
+    );
+}
+
+/// A caller key bound to a token change.
+fn token_operation(
+    seed: u8,
+    action: &'static str,
+    actor: &ChangeActor,
+    target: &str,
+    request: &[u8],
+) -> CallerOperation {
+    CallerOperation::bind(
+        test_caller_key(seed),
+        &CallerOperationBinding {
+            action,
+            actor,
+            target,
+            precondition: "",
+            request,
+        },
+    )
+    .expect("the key binds")
+}
+
+fn keyed_token_request(scopes: &[&str]) -> CreateTokenRequest {
+    CreateTokenRequest {
+        scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+        created_by: "operator".to_owned(),
+        expires_at: None,
+    }
+}
+
+fn assert_caller_operation_conflict<T: std::fmt::Debug>(outcome: Result<T, RepositoryError>) {
+    let error = outcome.expect_err("the key is bound to another request");
+    assert_eq!(error.kind(), RepositoryErrorKind::Conflict, "{error}");
+    assert_eq!(
+        error.operation(),
+        crate::auth::tokens::CALLER_OPERATION_BINDING,
+        "{error}"
+    );
+}
+
+/// The keyed issue and rotation contract both stores share.
+async fn service_token_caller_operation_contract(
+    store: &dyn ServiceTokenStore,
+    database: &dyn KeyedTokenDatabase,
+) {
+    use crate::authority_events::caller_operation::{CallerOutcome, OperationReceipt};
+
+    let owner = ChangeActor::for_test_with_issuer("operator", "https://one.example.test");
+    let other_issuer = ChangeActor::for_test_with_issuer("operator", "https://two.example.test");
+    let read_scopes = br#"{"expires_at":null,"scopes":["read"]}"#;
+    let issue = token_operation(41, "service_token.issue", &owner, "", read_scopes);
+
+    // A keyed issue commits its token, its evidence under the caller's key
+    // and the key's reservation.
+    let created = match store
+        .create_with_operation(keyed_token_request(&["read"]), &owner, Some(&issue))
+        .await
+        .expect("the keyed issue commits")
+    {
+        CallerOutcome::Committed(created) => created,
+        CallerOutcome::Replayed(receipt) => panic!("a first attempt commits: {receipt:?}"),
+    };
+    let id = created.record.id.clone();
+    let issued_plaintext = created.plaintext_token.clone();
+    let evidence = database.evidence().await;
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(
+        evidence[0],
+        KeyedTokenEvidence {
+            operation_id: issue.id().to_string(),
+            action: "service_token.issue".to_owned(),
+            token_id: id.clone(),
+            prior_version: None,
+            new_version: Some(1),
+        }
+    );
+
+    // The exact retry is answered from the committed evidence: no second
+    // token, no second row, and no plaintext (the type has none to carry).
+    let receipt = match store
+        .create_with_operation(keyed_token_request(&["read"]), &owner, Some(&issue))
+        .await
+        .expect("the retry is answered")
+    {
+        CallerOutcome::Replayed(receipt) => receipt,
+        CallerOutcome::Committed(created) => {
+            panic!("a retry never issues a second token: {}", created.record.id)
+        }
+    };
+    assert_eq!(receipt.operation_id, issue.id().to_string());
+    assert_eq!(receipt.operation, "service_token.issue");
+    assert_eq!(receipt.resource_id, id);
+    assert_eq!(receipt.revision, Some(1));
+    assert!(!receipt.committed_at.is_empty());
+    assert_eq!(database.token_rows().await, 1);
+    assert_eq!(database.evidence().await.len(), 1);
+    // The read-only pre-check agrees.
+    assert_eq!(
+        store.caller_operation_state(&issue).await.expect("reads"),
+        CallerKeyState::SameBinding
+    );
+    assert_eq!(
+        store.caller_operation_receipt(&issue).await.expect("reads"),
+        Some(receipt.clone())
+    );
+
+    // The same key with another request or another actor is a conflict and
+    // changes nothing.
+    let other_scopes = token_operation(
+        41,
+        "service_token.issue",
+        &owner,
+        "",
+        br#"{"expires_at":null,"scopes":["write"]}"#,
+    );
+    let other_actor = token_operation(41, "service_token.issue", &other_issuer, "", read_scopes);
+    for (operation, actor, scopes) in [
+        (&other_scopes, &owner, ["write"]),
+        (&other_actor, &other_issuer, ["read"]),
+    ] {
+        assert_eq!(
+            store
+                .caller_operation_state(operation)
+                .await
+                .expect("reads"),
+            CallerKeyState::OtherBinding
+        );
+        assert_caller_operation_conflict(
+            store
+                .create_with_operation(keyed_token_request(&scopes), actor, Some(operation))
+                .await,
+        );
+    }
+    assert_eq!(database.token_rows().await, 1);
+    assert_eq!(database.evidence().await.len(), 1);
+
+    // A keyed rotation advances the revision and mints a new plaintext; its
+    // exact retry is answered with the receipt and rotates nothing again.
+    let rotation = token_operation(42, "service_token.rotate", &owner, &id, b"");
+    let rotated = match store
+        .rotate_with_operation(&id, &owner, Some(&rotation))
+        .await
+        .expect("the keyed rotation commits")
+        .expect("the token exists")
+    {
+        CallerOutcome::Committed(rotated) => rotated,
+        CallerOutcome::Replayed(receipt) => panic!("a first attempt commits: {receipt:?}"),
+    };
+    let rotated_plaintext = rotated.plaintext_token.clone();
+    assert_ne!(rotated_plaintext, issued_plaintext);
+    let rotation_receipt: OperationReceipt = match store
+        .rotate_with_operation(&id, &owner, Some(&rotation))
+        .await
+        .expect("the retry is answered")
+        .expect("a receipt, not a missing token")
+    {
+        CallerOutcome::Replayed(receipt) => receipt,
+        CallerOutcome::Committed(_) => panic!("a retry never rotates again"),
+    };
+    assert_eq!(rotation_receipt.operation, "service_token.rotate");
+    assert_eq!(rotation_receipt.resource_id, id);
+    assert_eq!(rotation_receipt.revision, Some(2));
+    assert!(matches!(
+        store.verify(&rotated_plaintext).await.expect("verifies"),
+        TokenVerification::Valid(_)
+    ));
+    assert!(matches!(
+        store.verify(&issued_plaintext).await.expect("verifies"),
+        TokenVerification::Invalid(_)
+    ));
+
+    // A key reserved by another action, or for another token, cannot take
+    // effect here, nor can a key a keyed revoke used; and a revoke cannot
+    // take an issue's key.
+    let other = store
+        .create(keyed_token_request(&["read"]), &owner)
+        .await
+        .expect("an unkeyed issue commits")
+        .record
+        .id;
+    let issue_key_on_rotate = CallerOperation::bind(
+        issue.id(),
+        &CallerOperationBinding {
+            action: "service_token.rotate",
+            actor: &owner,
+            target: &id,
+            precondition: "",
+            request: b"",
+        },
+    )
+    .expect("binds");
+    assert_caller_operation_conflict(
+        store
+            .rotate_with_operation(&id, &owner, Some(&issue_key_on_rotate))
+            .await,
+    );
+    let rotation_of_other = token_operation(42, "service_token.rotate", &owner, &other, b"");
+    assert_caller_operation_conflict(
+        store
+            .rotate_with_operation(&other, &owner, Some(&rotation_of_other))
+            .await,
+    );
+    let revoke_key = test_caller_key(43);
+    let revoked_other = store
+        .revoke_with_operation(&other, &owner, Some(revoke_key))
+        .await
+        .expect("the keyed revoke commits")
+        .expect("the token exists");
+    assert!(revoked_other.revoked_at.is_some());
+    let revoke_key_on_issue = token_operation(43, "service_token.issue", &owner, "", read_scopes);
+    assert_caller_operation_conflict(
+        store
+            .create_with_operation(
+                keyed_token_request(&["read"]),
+                &owner,
+                Some(&revoke_key_on_issue),
+            )
+            .await,
+    );
+    let refused_revoke = store
+        .revoke_with_operation(&id, &owner, Some(issue.id()))
+        .await
+        .expect_err("a revoke cannot take an issue's key");
+    assert_eq!(refused_revoke.kind(), RepositoryErrorKind::Conflict);
+    assert_eq!(
+        refused_revoke.operation(),
+        crate::auth::tokens::REVOKE_OPERATION_BINDING
+    );
+
+    // A keyed rotation of an unknown token, or of a revoked one, reserves
+    // nothing.
+    let reservations = database.reservations().await;
+    let unknown = token_operation(44, "service_token.rotate", &owner, "unknown", b"");
+    assert!(store
+        .rotate_with_operation("unknown", &owner, Some(&unknown))
+        .await
+        .expect("an unknown token is not an error")
+        .is_none());
+    let revoked_rotation = token_operation(45, "service_token.rotate", &owner, &other, b"");
+    let refused = store
+        .rotate_with_operation(&other, &owner, Some(&revoked_rotation))
+        .await
+        .expect_err("a revoked token is not rotated");
+    assert_eq!(refused.kind(), RepositoryErrorKind::Conflict);
+    assert_ne!(
+        refused.operation(),
+        crate::auth::tokens::CALLER_OPERATION_BINDING,
+        "the revoked-token conflict, not a key conflict"
+    );
+    assert_eq!(database.reservations().await, reservations);
+
+    // The token a replayed issue receipt names can be revoked by its ID:
+    // what a caller whose first response was lost does before issuing again.
+    store
+        .revoke(&receipt.resource_id, &owner)
+        .await
+        .expect("the revoke commits")
+        .expect("the receipt names a real token");
+    assert!(matches!(
+        store.verify(&rotated_plaintext).await.expect("verifies"),
+        TokenVerification::Invalid(TokenVerificationFailure::Revoked)
+    ));
+    // Both receipts are still answered after the revocation.
+    for (operation, expected) in [(&issue, &receipt), (&rotation, &rotation_receipt)] {
+        assert_eq!(
+            store
+                .caller_operation_receipt(operation)
+                .await
+                .expect("reads"),
+            Some(expected.clone())
+        );
+    }
+    assert!(matches!(
+        store
+            .rotate_with_operation(&id, &owner, Some(&rotation))
+            .await
+            .expect("the retry is answered"),
+        Some(CallerOutcome::Replayed(_))
+    ));
+
+    // The token's revisions: issued at 1, rotated to 2, revoked to 3.
+    let chain: Vec<_> = database
+        .evidence()
+        .await
+        .into_iter()
+        .filter(|row| row.token_id == id)
+        .map(|row| (row.action, row.prior_version, row.new_version))
+        .collect();
+    assert_eq!(
+        chain,
+        [
+            ("service_token.issue".to_owned(), None, Some(1)),
+            ("service_token.rotate".to_owned(), Some(1), Some(2)),
+            ("service_token.revoke".to_owned(), Some(2), Some(3)),
+        ]
+    );
+
+    // I5: no plaintext reaches the evidence, the token table, a reservation
+    // or a receipt, and a binding digest is stored in its reservation only.
+    let stored = database.evidence_and_token_text().await;
+    let receipts = serde_json::to_string(&[&receipt, &rotation_receipt]).expect("serializes");
+    for secret in [&issued_plaintext, &rotated_plaintext] {
+        assert!(!stored.contains(secret.as_str()), "a plaintext was stored");
+        assert!(
+            !receipts.contains(secret.as_str()),
+            "a plaintext was returned"
+        );
+    }
+    for operation in [&issue, &rotation] {
+        let digest = operation.binding_digest();
+        assert!(!stored.contains(digest), "a digest left its reservation");
+        assert!(!receipts.contains(digest), "a digest reached a receipt");
+    }
+    let reservations = database.reservations().await;
+    for (operation, action) in [
+        (&issue, "service_token.issue"),
+        (&rotation, "service_token.rotate"),
+    ] {
+        assert!(reservations.contains(&(
+            operation.id().to_string(),
+            action.to_owned(),
+            Some(operation.binding_digest().to_owned())
+        )));
+    }
+    assert_token_reservations_match_evidence(database).await;
+}
+
+/// Competing writers under caller keys: two attempts of one keyed issue
+/// commit one token, the other answered from its receipt; and a keyed
+/// rotation racing a keyed revoke never leaves a live plaintext.
+async fn service_token_caller_operation_race_contract(
+    store: &dyn ServiceTokenStore,
+    database: &dyn KeyedTokenDatabase,
+) {
+    use crate::authority_events::caller_operation::CallerOutcome;
+
+    let owner = ChangeActor::for_test_with_issuer("operator", "https://one.example.test");
+    let issue = token_operation(
+        51,
+        "service_token.issue",
+        &owner,
+        "",
+        br#"{"expires_at":null,"scopes":["read"]}"#,
+    );
+    let tokens_before = database.token_rows().await;
+    let (left, right) = tokio::join!(
+        store.create_with_operation(keyed_token_request(&["read"]), &owner, Some(&issue)),
+        store.create_with_operation(keyed_token_request(&["read"]), &owner, Some(&issue)),
+    );
+    let outcomes = [
+        left.expect("one attempt answers"),
+        right.expect("the other attempt answers"),
+    ];
+    let committed: Vec<_> = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            CallerOutcome::Committed(created) => Some(created.record.id.clone()),
+            CallerOutcome::Replayed(_) => None,
+        })
+        .collect();
+    let replayed: Vec<_> = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            CallerOutcome::Replayed(receipt) => Some(receipt.resource_id.clone()),
+            CallerOutcome::Committed(_) => None,
+        })
+        .collect();
+    assert_eq!(committed.len(), 1, "exactly one attempt commits");
+    assert_eq!(
+        replayed, committed,
+        "the other is answered with its receipt"
+    );
+    assert_eq!(database.token_rows().await, tokens_before + 1);
+
+    for round in 0..4_u8 {
+        let token = store
+            .create(keyed_token_request(&["read"]), &owner)
+            .await
+            .expect("an unkeyed issue commits")
+            .record
+            .id;
+        let rotation = token_operation(60 + round, "service_token.rotate", &owner, &token, b"");
+        let (rotated, revoked) = tokio::join!(
+            store.rotate_with_operation(&token, &owner, Some(&rotation)),
+            store.revoke_with_operation(&token, &owner, Some(test_caller_key(70 + round))),
+        );
+        assert!(revoked
+            .expect("the revoke commits")
+            .expect("the token exists")
+            .revoked_at
+            .is_some());
+        match rotated {
+            Ok(Some(CallerOutcome::Committed(created))) => {
+                // The rotation committed first: the revoke withdrew its
+                // plaintext.
+                assert!(matches!(
+                    store
+                        .verify(&created.plaintext_token)
+                        .await
+                        .expect("verifies"),
+                    TokenVerification::Invalid(TokenVerificationFailure::Revoked)
+                ));
+            }
+            Err(error) => {
+                // The revoke committed first: the rotation was refused and
+                // reserved nothing.
+                assert_eq!(error.kind(), RepositoryErrorKind::Conflict, "{error}");
+                assert!(!database
+                    .reservations()
+                    .await
+                    .iter()
+                    .any(|(id, _, _)| *id == rotation.id().to_string()));
+            }
+            other => panic!("an unexpected rotation outcome: {other:?}"),
+        }
+    }
+    assert_token_reservations_match_evidence(database).await;
+}
+
+/// I1 and I2: an evidence insert that fails rolls back the keyed issue or
+/// rotation and its reservation, so the same key commits once evidence can
+/// be written.
+async fn service_token_failed_keyed_evidence_contract(
+    store: &dyn ServiceTokenStore,
+    database: &dyn KeyedTokenDatabase,
+) {
+    use crate::authority_events::caller_operation::CallerOutcome;
+
+    let owner = ChangeActor::for_test_with_issuer("operator", "https://one.example.test");
+    let created = store
+        .create(keyed_token_request(&["read"]), &owner)
+        .await
+        .expect("an unkeyed issue commits");
+    let id = created.record.id.clone();
+    let issue = token_operation(
+        81,
+        "service_token.issue",
+        &owner,
+        "",
+        br#"{"expires_at":null,"scopes":["read"]}"#,
+    );
+    let rotation = token_operation(82, "service_token.rotate", &owner, &id, b"");
+    let reservations = database.reservations().await;
+    let evidence = database.evidence().await;
+    let tokens = database.token_rows().await;
+
+    database.fail_evidence_inserts().await;
+    let issue_error = store
+        .create_with_operation(keyed_token_request(&["read"]), &owner, Some(&issue))
+        .await
+        .expect_err("an issue whose evidence cannot commit fails");
+    let rotate_error = store
+        .rotate_with_operation(&id, &owner, Some(&rotation))
+        .await
+        .expect_err("a rotation whose evidence cannot commit fails");
+    database.restore_evidence_inserts().await;
+    for error in [issue_error, rotate_error] {
+        assert_ne!(
+            error.kind(),
+            RepositoryErrorKind::Conflict,
+            "an evidence failure is a store failure: {error}"
+        );
+    }
+    assert_eq!(database.reservations().await, reservations);
+    assert_eq!(database.evidence().await, evidence);
+    assert_eq!(database.token_rows().await, tokens);
+    assert!(matches!(
+        store
+            .verify(&created.plaintext_token)
+            .await
+            .expect("verifies"),
+        TokenVerification::Valid(_)
+    ));
+
+    // The same keys commit once evidence can be written.
+    assert!(matches!(
+        store
+            .create_with_operation(keyed_token_request(&["read"]), &owner, Some(&issue))
+            .await
+            .expect("the issue commits"),
+        CallerOutcome::Committed(_)
+    ));
+    assert!(matches!(
+        store
+            .rotate_with_operation(&id, &owner, Some(&rotation))
+            .await
+            .expect("the rotation commits"),
+        Some(CallerOutcome::Committed(_))
+    ));
+    assert_token_reservations_match_evidence(database).await;
+}
+
+struct SqliteKeyedTokenDatabase {
+    path: PathBuf,
+}
+
+impl SqliteKeyedTokenDatabase {
+    fn connection(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(&self.path).expect("the token database opens")
+    }
+}
+
+#[async_trait::async_trait]
+impl KeyedTokenDatabase for SqliteKeyedTokenDatabase {
+    async fn reservations(&self) -> Vec<(String, String, Option<String>)> {
+        let connection = self.connection();
+        let mut statement = connection
+            .prepare(
+                "SELECT operation_id, action, binding_digest \
+                 FROM authority_caller_operation_ids ORDER BY operation_id",
+            )
+            .expect("the reservations prepare");
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("the reservations read")
+            .collect::<Result<_, _>>()
+            .expect("every reservation reads")
+    }
+
+    async fn evidence(&self) -> Vec<KeyedTokenEvidence> {
+        let connection = self.connection();
+        let mut statement = connection
+            .prepare(
+                "SELECT operation_id, action, token_id, prior_version, new_version \
+                 FROM service_token_change_evidence ORDER BY sequence",
+            )
+            .expect("the evidence prepares");
+        statement
+            .query_map([], |row| {
+                Ok(KeyedTokenEvidence {
+                    operation_id: row.get(0)?,
+                    action: row.get(1)?,
+                    token_id: row.get(2)?,
+                    prior_version: row.get(3)?,
+                    new_version: row.get(4)?,
+                })
+            })
+            .expect("the evidence reads")
+            .collect::<Result<_, _>>()
+            .expect("every evidence row reads")
+    }
+
+    async fn token_rows(&self) -> i64 {
+        self.connection()
+            .query_row("SELECT count(*) FROM service_tokens", [], |row| row.get(0))
+            .expect("the tokens count")
+    }
+
+    async fn evidence_and_token_text(&self) -> String {
+        let mut text = sqlite_token_evidence_text(&self.path).join("\n");
+        let connection = self.connection();
+        let mut statement = connection
+            .prepare("SELECT * FROM service_tokens")
+            .expect("the tokens prepare");
+        let columns = statement.column_count();
+        let rows: Vec<String> = statement
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|index| {
+                        row.get_ref(index).map(|value| match value {
+                            rusqlite::types::ValueRef::Text(text) => {
+                                String::from_utf8_lossy(text).into_owned()
+                            }
+                            other => format!("{other:?}"),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|values| values.join("|"))
+            })
+            .expect("the tokens read")
+            .collect::<Result<_, _>>()
+            .expect("every token reads");
+        text.push('\n');
+        text.push_str(&rows.join("\n"));
+        text
+    }
+
+    async fn fail_evidence_inserts(&self) {
+        self.connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_keyed_token_evidence \
+                 BEFORE INSERT ON service_token_change_evidence \
+                 BEGIN SELECT RAISE(ABORT, 'injected evidence failure'); END;",
+            )
+            .expect("the failure trigger installs");
+    }
+
+    async fn restore_evidence_inserts(&self) {
+        self.connection()
+            .execute_batch("DROP TRIGGER fail_keyed_token_evidence;")
+            .expect("the failure trigger drops");
+    }
+}
+
+#[tokio::test]
+async fn sqlite_service_token_caller_operation_contract() {
+    let db = TempDb::new("token-caller-operation-contract");
+    let store = SqliteTokenStore::open(&db.path).expect("token store should open");
+    service_token_caller_operation_contract(
+        &store,
+        &SqliteKeyedTokenDatabase {
+            path: db.path.clone(),
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_keyed_token_writers_racing_commit_one_change_and_never_leave_a_live_plaintext() {
+    let db = TempDb::new("token-caller-operation-race");
+    let store = SqliteTokenStore::open(&db.path).expect("token store should open");
+    service_token_caller_operation_race_contract(
+        &store,
+        &SqliteKeyedTokenDatabase {
+            path: db.path.clone(),
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sqlite_a_failed_evidence_insert_rolls_back_the_keyed_issue_and_rotation_and_their_reservations(
+) {
+    let db = TempDb::new("token-caller-operation-fault");
+    let store = SqliteTokenStore::open(&db.path).expect("token store should open");
+    service_token_failed_keyed_evidence_contract(
+        &store,
+        &SqliteKeyedTokenDatabase {
+            path: db.path.clone(),
+        },
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
 // Caller operation keys bound to one request (issue #425; PostgreSQL
 // migration 36, the standalone reservation table)
 // ---------------------------------------------------------------------------
@@ -2081,16 +2788,17 @@ async fn sqlite_change_evidence_survives_token_deletion_and_restart() {
     let revoked_at = revoked.revoked_at.expect("revoke sets revoked_at");
     // The commit time is followed by the actor metadata columns the store
     // adds on open: kind, auth mode and (for this issuer-less principal) no
-    // issuer.
+    // issuer; then the revision columns it adds after them (issue #425):
+    // the revision before and after, and the `revised` marker.
     assert!(
         before[0].ends_with(&format!(
-            "|{}|principal|bearer_token|NULL",
+            "|{}|principal|bearer_token|NULL|NULL|1|1",
             created.record.created_at
         )),
         "the issue's evidence carries the token's own creation instant: {before:?}"
     );
     assert!(
-        before[2].ends_with(&format!("|{revoked_at}|principal|bearer_token|NULL")),
+        before[2].ends_with(&format!("|{revoked_at}|principal|bearer_token|NULL|2|3|1")),
         "the revoke's evidence carries the revoke's own instant: {before:?}"
     );
     drop(store);
@@ -4029,11 +4737,15 @@ struct GatedTokenStore {
 
 #[async_trait::async_trait]
 impl ServiceTokenStore for GatedTokenStore {
-    async fn create(
+    async fn create_with_operation(
         &self,
         _request: CreateTokenRequest,
         _actor: &ChangeActor,
-    ) -> Result<crate::auth::tokens::CreatedToken, RepositoryError> {
+        _caller: Option<&crate::authority_events::caller_operation::CallerOperation>,
+    ) -> Result<
+        crate::authority_events::caller_operation::CallerOutcome<crate::auth::tokens::CreatedToken>,
+        RepositoryError,
+    > {
         unimplemented!("not needed by the executor proof")
     }
 
@@ -4060,11 +4772,19 @@ impl ServiceTokenStore for GatedTokenStore {
         unimplemented!("not needed by the executor proof")
     }
 
-    async fn rotate(
+    async fn rotate_with_operation(
         &self,
         _id: &str,
         _actor: &ChangeActor,
-    ) -> Result<Option<crate::auth::tokens::CreatedToken>, RepositoryError> {
+        _caller: Option<&crate::authority_events::caller_operation::CallerOperation>,
+    ) -> Result<
+        Option<
+            crate::authority_events::caller_operation::CallerOutcome<
+                crate::auth::tokens::CreatedToken,
+            >,
+        >,
+        RepositoryError,
+    > {
         unimplemented!("not needed by the executor proof")
     }
 
@@ -8199,6 +8919,288 @@ pub(crate) mod postgres_audit_tests {
             shared_before + 1,
             "the aborted attempts consumed no revision"
         );
+    }
+
+    /// Keyed service-token issue and rotation against PostgreSQL (issue
+    /// #425, plan P5): the shared contract, plus what only this store has --
+    /// the journal's capacity and the contract fence the reservation
+    /// confirms. The verified-TLS shard selects this module by its prefix.
+    mod keyed_token_changes {
+        use super::*;
+        use crate::authority_events::caller_operation::CallerOutcome;
+
+        struct PostgresKeyedTokenDatabase {
+            pool: deadpool_postgres::Pool,
+            restore: tokio::sync::Mutex<Option<String>>,
+        }
+
+        impl PostgresKeyedTokenDatabase {
+            fn new(pool: deadpool_postgres::Pool) -> Self {
+                Self {
+                    pool,
+                    restore: tokio::sync::Mutex::new(None),
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl super::super::KeyedTokenDatabase for PostgresKeyedTokenDatabase {
+            async fn reservations(&self) -> Vec<(String, String, Option<String>)> {
+                self.pool
+                    .get()
+                    .await
+                    .expect("checkout")
+                    .query(
+                        "SELECT operation_id::text, action, binding_digest \
+                         FROM greengateway.authority_caller_operation_ids ORDER BY operation_id",
+                        &[],
+                    )
+                    .await
+                    .expect("the reservations read")
+                    .iter()
+                    .map(|row| (row.get(0), row.get(1), row.get(2)))
+                    .collect()
+            }
+
+            async fn evidence(&self) -> Vec<super::super::KeyedTokenEvidence> {
+                self.pool
+                    .get()
+                    .await
+                    .expect("checkout")
+                    .query(
+                        "SELECT operation_id::text, action, token_id, prior_version, new_version \
+                         FROM greengateway.service_token_change_evidence \
+                         ORDER BY security_revision, event_id",
+                        &[],
+                    )
+                    .await
+                    .expect("the evidence reads")
+                    .iter()
+                    .map(|row| super::super::KeyedTokenEvidence {
+                        operation_id: row.get(0),
+                        action: row.get(1),
+                        token_id: row.get(2),
+                        prior_version: row.get(3),
+                        new_version: Some(row.get(4)),
+                    })
+                    .collect()
+            }
+
+            async fn token_rows(&self) -> i64 {
+                scalar_i64(
+                    &self.pool,
+                    "SELECT count(*) FROM greengateway.service_tokens",
+                )
+                .await
+            }
+
+            async fn evidence_and_token_text(&self) -> String {
+                let mut rows = table_json(&self.pool, "service_token_change_evidence").await;
+                rows.extend(table_json(&self.pool, "service_tokens").await);
+                rows.join("\n")
+            }
+
+            async fn fail_evidence_inserts(&self) {
+                let restore = fail_inserts_into(&self.pool, "service_token_change_evidence").await;
+                *self.restore.lock().await = Some(restore);
+            }
+
+            async fn restore_evidence_inserts(&self) {
+                let restore = self
+                    .restore
+                    .lock()
+                    .await
+                    .take()
+                    .expect("a failure trigger is installed");
+                self.pool
+                    .get()
+                    .await
+                    .expect("checkout")
+                    .batch_execute(&restore)
+                    .await
+                    .expect("the failure trigger drops");
+            }
+        }
+
+        /// A migrated database whose contract fence carries
+        /// `caller_operation_keys`, as the operation gate's first admission
+        /// of a keyed change leaves it.
+        async fn fenced_store(
+            database: &TestDatabase,
+        ) -> (Arc<PostgresServiceTokenStore>, PostgresKeyedTokenDatabase) {
+            let (store, pool) = migrated_service_token_store(database).await;
+            raise_caller_operation_keys_fence(&pool).await;
+            (store, PostgresKeyedTokenDatabase::new(pool))
+        }
+
+        #[tokio::test]
+        async fn postgres_service_token_caller_operation_contract() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let _guard = DATABASE.lock().await;
+            let database = create_test_database(&admin_dsn).await;
+            let (store, tables) = fenced_store(&database).await;
+            super::super::service_token_caller_operation_contract(&*store, &tables).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn postgres_keyed_token_writers_racing_commit_one_change_and_never_leave_a_live_plaintext(
+        ) {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let _guard = DATABASE.lock().await;
+            let database = create_test_database(&admin_dsn).await;
+            let (store, tables) = fenced_store(&database).await;
+            super::super::service_token_caller_operation_race_contract(&*store, &tables).await;
+        }
+
+        #[tokio::test]
+        async fn postgres_a_failed_evidence_insert_rolls_back_the_keyed_issue_and_rotation_and_their_reservations(
+        ) {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let _guard = DATABASE.lock().await;
+            let database = create_test_database(&admin_dsn).await;
+            let (store, tables) = fenced_store(&database).await;
+            super::super::service_token_failed_keyed_evidence_contract(&*store, &tables).await;
+        }
+
+        /// I2, I4 and A4: a full journal refuses a keyed issue and a keyed
+        /// rotation with `Unavailable` and reserves nothing, so the keys stay
+        /// usable once there is room.
+        #[tokio::test]
+        async fn a_full_journal_refuses_the_keyed_token_change_and_reserves_nothing() {
+            use crate::storage::postgres_authority_events::PostgresAuthorityEventStore;
+            use crate::storage::RepositoryErrorKind;
+
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let _guard = DATABASE.lock().await;
+            let database = create_test_database(&admin_dsn).await;
+            let (store, tables) = fenced_store(&database).await;
+            let owner = ChangeActor::for_test_with_issuer("operator", "https://one.example.test");
+            let id = store
+                .create(super::super::keyed_token_request(&["read"]), &owner)
+                .await
+                .expect("an unkeyed issue commits")
+                .record
+                .id;
+            let journal = PostgresAuthorityEventStore::new(tables.pool.clone());
+            journal
+                .configure_capacity(1)
+                .await
+                .expect("capacity applies");
+
+            let issue = super::super::token_operation(
+                91,
+                "service_token.issue",
+                &owner,
+                "",
+                br#"{"expires_at":null,"scopes":["read"]}"#,
+            );
+            let rotation =
+                super::super::token_operation(92, "service_token.rotate", &owner, &id, b"");
+            let issue_error = store
+                .create_with_operation(
+                    super::super::keyed_token_request(&["read"]),
+                    &owner,
+                    Some(&issue),
+                )
+                .await
+                .expect_err("a full journal refuses the issue");
+            let rotate_error = store
+                .rotate_with_operation(&id, &owner, Some(&rotation))
+                .await
+                .expect_err("a full journal refuses the rotation");
+            for error in [issue_error, rotate_error] {
+                assert_eq!(error.kind(), RepositoryErrorKind::Unavailable, "{error}");
+            }
+            assert!(tables.reservations().await.is_empty(), "nothing reserved");
+            assert_eq!(tables.token_rows().await, 1);
+            assert_eq!(tables.evidence().await.len(), 1);
+
+            journal
+                .configure_capacity(100)
+                .await
+                .expect("capacity applies");
+            assert!(matches!(
+                store
+                    .create_with_operation(
+                        super::super::keyed_token_request(&["read"]),
+                        &owner,
+                        Some(&issue)
+                    )
+                    .await
+                    .expect("the issue commits once there is room"),
+                CallerOutcome::Committed(_)
+            ));
+            super::super::assert_token_reservations_match_evidence(&tables).await;
+        }
+
+        /// The store's own fence check for this family: below the fence
+        /// (`caller_operation_keys` never admitted by the operation gate) a
+        /// keyed issue or rotation is refused as unavailable and nothing is
+        /// reserved or changed, while the unkeyed forms still commit.
+        #[tokio::test]
+        async fn a_keyed_token_change_below_the_fence_is_refused_and_changes_nothing() {
+            use crate::storage::RepositoryErrorKind;
+
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let _guard = DATABASE.lock().await;
+            let database = create_test_database(&admin_dsn).await;
+            let (store, pool) = migrated_service_token_store(&database).await;
+            let tables = PostgresKeyedTokenDatabase::new(pool);
+            let owner = ChangeActor::for_test_with_issuer("operator", "https://one.example.test");
+            let id = store
+                .create(super::super::keyed_token_request(&["read"]), &owner)
+                .await
+                .expect("an unkeyed issue commits")
+                .record
+                .id;
+            let issue = super::super::token_operation(
+                93,
+                "service_token.issue",
+                &owner,
+                "",
+                br#"{"expires_at":null,"scopes":["read"]}"#,
+            );
+            let rotation =
+                super::super::token_operation(94, "service_token.rotate", &owner, &id, b"");
+            let issue_error = store
+                .create_with_operation(
+                    super::super::keyed_token_request(&["read"]),
+                    &owner,
+                    Some(&issue),
+                )
+                .await
+                .expect_err("below the fence a keyed issue is refused");
+            let rotate_error = store
+                .rotate_with_operation(&id, &owner, Some(&rotation))
+                .await
+                .expect_err("below the fence a keyed rotation is refused");
+            for error in [issue_error, rotate_error] {
+                assert_eq!(error.kind(), RepositoryErrorKind::Unavailable, "{error}");
+            }
+            assert!(tables.reservations().await.is_empty());
+            assert_eq!(tables.token_rows().await, 1);
+            assert_eq!(tables.evidence().await.len(), 1);
+            store
+                .rotate(&id, &owner)
+                .await
+                .expect("the unkeyed rotation commits")
+                .expect("the token exists");
+        }
     }
 
     /// One `jwt_revocation_evidence` row. The expiry is read as epoch

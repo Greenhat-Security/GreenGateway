@@ -1616,12 +1616,12 @@
       "boundary": "create refuses an actor the evidence cannot record exactly (ChangeActor::is_recordable) before checkout, then takes the token high-water mark, reserves the shared revision, inserts the token row at revision 1, sets the high-water mark, appends the create outbox row, writes one service_token_change_evidence row carrying the same shared revision (no prior revision, revision 1 after) and journals it, and commits once. An evidence insert or journal append failure rolls the whole create back, so no token is minted, and is reported as a store failure, never a conflict; a full journal refuses the create with 503.",
       "record": "Token created_by/created_at and the immutable create outbox revision as before. Since migration 27, service_token_change_evidence (no foreign key) holds one service_token.issue row per committed create: the actor (subject, kind, auth mode and canonical issuer), event/operation UUIDs, prior_version NULL, new_version 1, the outbox row's shared revision and database-clock committed_at, never the returned plaintext, its hash, the display prefix or the scopes. Tokens created before migration 27 have no issue row and keep created_by as their only record; nothing is backfilled.",
       "actor": "The authenticated principal the admin create endpoint passes through ServiceTokenStore as a ChangeActor, committed with the create: actor_user_id (the subject, 1 to 4096 bytes), actor_kind (principal, or service_token for a service-token caller), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). created_by still names the creating subject on the token row. A keyed safe actor reference exists only in what is delivered.",
-      "identity": "Generated event_id and operation_id UUIDs per create (not bound to a client idempotency key), token ID, row revision 1, shared revision equal to the create outbox row, database-clock committed_at. A lost create response cannot return its plaintext: the evidence shows the issue committed, and creating again issues a second token with its own row.",
+      "identity": "A keyed POST binds the caller-supplied UUIDv7 (Idempotency-Key) to the issue, the recorded actor and the canonical request, and the issue records it as its operation_id with the key's reservation in the same transaction; an exact retry is answered with the receipt of the committed issue (token ID, revision 1, committed_at) and secret_returned false, never the plaintext, and any other use of the key conflicts. An unkeyed create generates its operation UUID. Every event has its own generated event UUID; token ID, row revision 1, shared revision equal to the create outbox row, database-clock committed_at. A lost keyed create response leaves a live token whose plaintext only that response carried: the caller revokes it by the ID in the receipt and issues again with a new key.",
       "delivery": "journaled_dispatch",
       "disposition": [
-        "missing_metadata"
+        "already_sufficient"
       ],
-      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the store and derive an issuer-scoped subject reference. Delivery journals each issue row in the create's transaction and dispatches it as authority_event_delivery.v1 service_token.issue on the token axis (before null, after 1); AUTHORITY_EVIDENCE_DURABILITY=required makes a configured sink mandatory and admits this row; nothing qualifies it yet.",
+      "follow_up": "Qualified by plan P5 of #425: AUTHORITY_EVIDENCE_DURABILITY=required admits only the keyed POST of a provider-authenticated principal with a canonical issuer, under AUTHORITY_EVENT_FORMAT=qualified_v1 with AUTHORITY_EVENT_SINK=file on a Unix build; the unkeyed form and service-token callers are refused before anything is written. In best_effort an unkeyed or service-token issue is still recorded and journaled and delivered as authority_event_delivery.v1.",
       "sources": [
         {
           "path": "gateway/src/storage/migrations/0027_service_token_issue_evidence.sql",
@@ -1645,7 +1645,7 @@
         },
         {
           "path": "gateway/src/admin_tokens.rs",
-          "anchor": "store.create(request, &actor)"
+          "anchor": ".create_with_operation(request, &actor, caller.as_ref())"
         },
         {
           "path": "gateway/src/authority_events/delivery.rs",
@@ -1686,9 +1686,95 @@
           "anchor": "fn an_issue_projects_only_as_the_tokens_first_revision("
         }
       ],
-      "required_durability_supported": false,
-      "required_mode": "admitted",
-      "test_claim": "PostgreSQL-gated regression anchors for the transactional issue evidence and its journaled delivery: the actor recorded, rollback on a failed evidence insert, capacity refusal, commit order and the contiguous issue, rotate and revoke chain. They do not certify the proposed authority_event.v1 contract."
+      "required_durability_supported": true,
+      "required_mode": "caller_key_required",
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional issue evidence and its journaled delivery, and, through the qualified delivery path, the keyed contract: exact retries answered from the receipt with no second token or plaintext, conflicting bindings and cross-action keys refused, rollback of the reservation with the evidence, a full journal and a fence below caller_operation_keys refusing the keyed issue, racing writers, and v1 delivery and redelivery through the file sink.",
+      "qualified_delivery_paths": [
+        {
+          "criteria": {
+            "operation": "service_token.issue",
+            "storage_mode": "postgres",
+            "method": "POST",
+            "route": "/v1{ADMIN_PREFIX}/tokens",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed POST binds the caller's UUIDv7 to service_token.issue, the recorded actor and the canonical request (the scopes and expiry as given; an issue has no target and no precondition). Under the token high-water-mark lock the key is looked up first; An exact retry is answered 200 with the receipt {operation_id, operation, resource_id, revision, committed_at} read from the committed evidence row and secret_returned false, never the plaintext; any other use of the key is 409 caller_operation_conflict and changes nothing. Otherwise the key is reserved once the contract fence is confirmed to carry caller_operation_keys, and the token row at revision 1, the outbox row, the evidence row under the caller's key and the journal append commit together. The negotiated file sink syncs the qualified event and its parent directory on Unix before cursor advance. Consumers deduplicate on (authority_id, event_id). Durable cluster file delivery assumes shared storage or shipping to the same durable consumer. The opt-in log sink emits the same representation with process-log acceptance only.",
+          "sources": [
+            {
+              "path": "gateway/src/storage/postgres_service_tokens.rs",
+              "anchor": "async fn create_with_operation("
+            },
+            {
+              "path": "gateway/src/storage/postgres_service_tokens.rs",
+              "anchor": "async fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/storage/postgres_service_tokens.rs",
+              "anchor": "async fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/storage/postgres_service_tokens.rs",
+              "anchor": "async fn token_operation_receipt("
+            },
+            {
+              "path": "gateway/src/admin_tokens.rs",
+              "anchor": "pub(super) async fn admit_keyed_token_change("
+            },
+            {
+              "path": "gateway/src/admin_tokens.rs",
+              "anchor": "pub(super) fn token_operation_receipt("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery.rs",
+              "anchor": "pub(super) fn qualify_caller_bound("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn postgres_service_token_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn postgres_keyed_token_writers_racing_commit_one_change_and_never_leave_a_live_plaintext("
+            },
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn postgres_a_failed_evidence_insert_rolls_back_the_keyed_issue_and_rotation_and_their_reservations("
+            },
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn a_full_journal_refuses_the_keyed_token_change_and_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn a_keyed_token_change_below_the_fence_is_refused_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/authority_events/dispatcher_tests.rs",
+              "anchor": "async fn a_keyed_token_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/admin_tokens_app_tests.rs",
+              "anchor": "async fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
+            },
+            {
+              "path": "gateway/src/authority_events/required_tests.rs",
+              "anchor": "fn service_token_issue_and_rotation_admit_only_their_keyed_issuer_bound_form_in_both_modes("
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "token_issue_standalone",
@@ -1705,14 +1791,14 @@
         }
       ],
       "boundary": "SqliteTokenStore create refuses an actor the evidence cannot record exactly (ChangeActor::is_recordable), then runs one IMMEDIATE transaction on the SERVICE_TOKEN_SQLITE_PATH database: insert the token row, append one service_token_change_evidence row, commit. An evidence insert failure rolls the create back, so no token is minted, and is reported as a store failure, never a conflict. A database whose evidence table predates the issue action has that table rebuilt once on open, in one IMMEDIATE transaction that keeps every row, its sequence and the AUTOINCREMENT high-water mark and recreates the index.",
-      "record": "Token row with hash and created_by/created_at as before. The same database's service_token_change_evidence (no foreign key) keeps one append-only service_token.issue row per committed create: actor (subject, kind, auth mode and canonical issuer), event/operation UUIDs, token ID and committed_at (the token's own created_at), never the returned plaintext, its hash, the display prefix or the scopes. Tokens created before this build have no issue row and keep created_by as their only record; nothing is backfilled. import-standalone does not carry these rows.",
+      "record": "Token row with hash and created_by/created_at as before, and since plan P5 of #425 a store-owned revision (1 at issue, added on open with DEFAULT 1). The same database's service_token_change_evidence (no foreign key) keeps one append-only service_token.issue row per committed create: actor (subject, kind, auth mode and canonical issuer), event/operation UUIDs, token ID, committed_at (the token's own created_at), prior_version NULL, new_version 1 and revised 1, never the returned plaintext, its hash, the display prefix or the scopes. Tokens created before this build have no issue row and keep created_by as their only record; rows written before the revision columns, or by an older build since, keep NULL revisions and revised 0; nothing is backfilled. import-standalone does not carry these rows.",
       "actor": "The authenticated principal the admin create endpoint passes through ServiceTokenStore as a ChangeActor, committed with the create: the subject (1 to 4096 bytes), actor_kind (principal or service_token), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). created_by still names the creator on the token row.",
-      "identity": "Generated event_id/operation_id UUIDs, token ID, a store sequence and the process-clock committed_at. SQLite token rows have no revision chain, so the row records no prior/new revision; no caller-bound operation ID.",
+      "identity": "A keyed POST binds the caller-supplied UUIDv7 (Idempotency-Key) to the issue, the recorded actor and the canonical request; the IMMEDIATE transaction looks the key up in this file's authority_caller_operation_ids first, reserves it with the token row and the evidence row, whose operation_id it is, and answers an exact retry with the receipt (token ID, revision 1, committed_at) and secret_returned false, never the plaintext. An unkeyed create generates its operation UUID. Every event has its own generated event UUID; a store sequence and the process-clock committed_at.",
       "delivery": "standalone_cursor_dispatch",
       "disposition": [
-        "missing_metadata"
+        "already_sufficient"
       ],
-      "follow_up": "PR4: a store-owned revision per change (the delivered record says null before and after rather than inventing one). Delivered from this same database after a cursor created on open (standalone_cursor_dispatch), with no audit-database dual write.",
+      "follow_up": "Qualified by plan P5 of #425, the first standalone qualification: the token row carries a store-owned revision, so a keyed principal issue is delivered as authority_event.v1 under the negotiated format from this same database after its cursor (standalone_cursor_dispatch). Required mode admits only the keyed POST of a provider-authenticated principal with a canonical issuer, under qualified_v1 with the file sink on a Unix build.",
       "sources": [
         {
           "path": "gateway/src/auth/tokens.rs",
@@ -1736,7 +1822,11 @@
         },
         {
           "path": "gateway/src/admin_tokens.rs",
-          "anchor": "store.create(request, &actor)"
+          "anchor": ".create_with_operation(request, &actor, caller.as_ref())"
+        },
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "const SERVICE_TOKEN_REVISION_COLUMNS"
         }
       ],
       "tests": [
@@ -1773,9 +1863,115 @@
           "anchor": "async fn a_restart_resumes_after_the_cursor_under_the_persisted_authority("
         }
       ],
-      "required_durability_supported": false,
-      "required_mode": "admitted",
-      "test_claim": "Standalone regression anchors for the transactional issue evidence in the token store's own database and the one-time table rebuild that admits it. They do not certify the proposed authority-event contract or delivery."
+      "required_durability_supported": true,
+      "required_mode": "caller_key_required",
+      "test_claim": "Standalone regression anchors for the transactional issue evidence in the token store's own database, the one-time table rebuild that admits it and the revision columns added on open, and, through the qualified delivery path, the keyed contract: exact retries answered from the receipt with no second token or plaintext, conflicts, rollback with the evidence, racing writers, legacy rows staying unrevised, and v1 delivery and redelivery through the file sink.",
+      "qualified_delivery_paths": [
+        {
+          "criteria": {
+            "operation": "service_token.issue",
+            "storage_mode": "standalone",
+            "method": "POST",
+            "route": "/v1{ADMIN_PREFIX}/tokens",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed POST binds the caller's UUIDv7 to service_token.issue, the recorded actor and the canonical request (the scopes and expiry as given; an issue has no target and no precondition). In one IMMEDIATE transaction on the token database the key is looked up first; An exact retry is answered 200 with the receipt {operation_id, operation, resource_id, revision, committed_at} read from the committed evidence row and secret_returned false, never the plaintext; any other use of the key is 409 caller_operation_conflict and changes nothing. Otherwise the key is reserved, and the token row at revision 1 and the revised evidence row under the caller's key commit together. The negotiated file sink syncs the qualified event and its parent directory on Unix before cursor advance. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/auth/tokens.rs",
+              "anchor": "const CHANGE_EVIDENCE_REVISION_COLUMNS"
+            },
+            {
+              "path": "gateway/src/auth/tokens.rs",
+              "anchor": "fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/auth/tokens.rs",
+              "anchor": "fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/auth/tokens.rs",
+              "anchor": "fn token_operation_receipt("
+            },
+            {
+              "path": "gateway/src/admin_tokens.rs",
+              "anchor": "pub(super) async fn admit_keyed_token_change("
+            },
+            {
+              "path": "gateway/src/admin_tokens.rs",
+              "anchor": "pub(super) fn token_operation_receipt("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery.rs",
+              "anchor": "pub(crate) fn project_standalone("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery.rs",
+              "anchor": "pub(super) fn qualify_caller_bound("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn sqlite_service_token_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn sqlite_keyed_token_writers_racing_commit_one_change_and_never_leave_a_live_plaintext("
+            },
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn sqlite_a_failed_evidence_insert_rolls_back_the_keyed_issue_and_rotation_and_their_reservations("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_tests.rs",
+              "anchor": "async fn a_keyed_token_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery_tests.rs",
+              "anchor": "fn a_keyed_principal_row_of_a_revised_source_is_qualified_under_the_negotiated_format_only("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery_tests.rs",
+              "anchor": "fn a_revised_token_row_with_a_null_revision_stalls("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery_tests.rs",
+              "anchor": "fn a_row_an_older_build_writes_after_the_upgrade_stays_a_legacy_record("
+            },
+            {
+              "path": "gateway/src/auth/tokens.rs",
+              "anchor": "fn standalone_token_revisions_start_at_one_and_legacy_evidence_stays_unrevised("
+            },
+            {
+              "path": "gateway/src/admin_tokens_app_tests.rs",
+              "anchor": "async fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
+            },
+            {
+              "path": "gateway/src/admin_tokens_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_the_unkeyed_token_issue_and_rotation_and_admits_the_keyed_principal("
+            },
+            {
+              "path": "gateway/src/admin_tokens_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_a_keyed_token_issue_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink("
+            },
+            {
+              "path": "gateway/src/authority_events/required_tests.rs",
+              "anchor": "fn service_token_issue_and_rotation_admit_only_their_keyed_issuer_bound_form_in_both_modes("
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "token_rotate_postgres",
@@ -1794,12 +1990,12 @@
       "boundary": "rotate refuses an actor the evidence cannot record exactly (ChangeActor::is_recordable) before checkout, then serializes on the token high-water mark and row, changes the token row, reserves the shared revision, appends the outbox row and one service_token_change_evidence row carrying the same revision and row-revision step, and commits once. An evidence insert failure rolls the whole change back and is reported as a store failure, never as the rotate conflict. Rotate of a revoked token (a conflict) and an unknown ID write no outbox or evidence row.",
       "record": "Outbox revision chain unchanged. service_token_change_evidence (migration 18) has no foreign key, so it survives removal of the token row and a restart; it holds the actor (subject and, since migration 24, kind, auth mode and canonical issuer), action, event/operation UUIDs, prior/new row revision, shared revision and database-clock committed_at, never the plaintext, hash, display prefix or scopes. The token row still names only its creator.",
       "actor": "The authenticated principal the admin endpoint passes through ServiceTokenStore as a ChangeActor, committed with each rotate and revoke and retained after it: actor_user_id (the subject, 1 to 4096 bytes, the principal bound) and, since migration 24, actor_kind (principal for a session cookie, bearer JWT or client certificate; service_token for a service token, whose service-token:<id> subject would otherwise read like a person's), actor_auth_mode and actor_issuer (the canonical issuer of a principal that has one, 1 to 4096 bytes). Rows committed before migration 24 record none of the three. A keyed safe actor reference exists only in what is delivered.",
-      "identity": "Rotation generates its operation UUID. Every event has its own generated event UUID. PostgreSQL records the previous and new row revisions, shared outbox revision and database-clock commit time.",
+      "identity": "A keyed POST binds the caller-supplied UUIDv7 (Idempotency-Key) to the rotation, the recorded actor and the token ID, and the rotation records it as its operation_id with the key's reservation in the same transaction; an exact retry is answered with the receipt of the committed rotation (token ID, its new revision, committed_at) and secret_returned false, never the plaintext, whatever the token's state since. An unkeyed rotation generates its operation UUID. Every event has its own generated event UUID. PostgreSQL records the previous and new row revisions, shared outbox revision and database-clock commit time.",
       "delivery": "journaled_dispatch",
       "disposition": [
-        "missing_metadata"
+        "already_sufficient"
       ],
-      "follow_up": "Plan P5 of #425: caller-bound operation identity for rotation and an issuer-scoped subject reference. Token issue is recorded and journaled in the same table since migration 27 (token_issue_postgres). Issuer, actor kind and auth mode are recorded since migration 24. Delivery journals each row in the change's transaction and dispatches it as authority_event_delivery.v1 behind a persisted cursor; AUTHORITY_EVIDENCE_DURABILITY=required makes a configured sink mandatory and admits this row; nothing qualifies it yet.",
+      "follow_up": "Qualified by plan P5 of #425: AUTHORITY_EVIDENCE_DURABILITY=required admits only the keyed POST of a provider-authenticated principal with a canonical issuer, under AUTHORITY_EVENT_FORMAT=qualified_v1 with AUTHORITY_EVENT_SINK=file on a Unix build. Token issue is token_issue_postgres; revocation is token_revoke_postgres, a withdrawal admitted in every form.",
       "sources": [
         {
           "path": "gateway/src/storage/migrations/0018_service_token_and_jwt_evidence.sql",
@@ -1835,7 +2031,7 @@
         },
         {
           "path": "gateway/src/admin_tokens.rs",
-          "anchor": "store.rotate(&token_id, &actor)"
+          "anchor": ".rotate_with_operation(&token_id, &actor, caller.as_ref())"
         }
       ],
       "tests": [
@@ -1900,9 +2096,95 @@
           "anchor": "async fn concurrent_rotations_serialize_and_leave_exactly_one_live_plaintext("
         }
       ],
-      "required_durability_supported": false,
-      "required_mode": "admitted",
-      "test_claim": "PostgreSQL-gated regression anchors for the transactional rotate evidence and its journaled delivery: commit order, crash redelivery under the same event IDs, retention floors and capacity refusal. They do not certify the proposed authority_event.v1 contract."
+      "required_durability_supported": true,
+      "required_mode": "caller_key_required",
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional rotate evidence and its journaled delivery, and, through the qualified delivery path, the keyed contract: exact retries answered from the receipt with no second rotation or plaintext, conflicts, rollback with the evidence, a full journal and a fence below caller_operation_keys refusing the keyed rotation, a keyed rotation racing a keyed revoke, and v1 delivery and redelivery through the file sink.",
+      "qualified_delivery_paths": [
+        {
+          "criteria": {
+            "operation": "service_token.rotate",
+            "storage_mode": "postgres",
+            "method": "POST",
+            "route": "/v1{ADMIN_PREFIX}/tokens/{id}/rotate",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed POST binds the caller's UUIDv7 to service_token.rotate, the recorded actor and the token ID (a rotation has no body and no precondition). Under the token high-water-mark lock the key is looked up first; An exact retry is answered 200 with the receipt {operation_id, operation, resource_id, revision, committed_at} read from the committed evidence row and secret_returned false, never the plaintext; any other use of the key is 409 caller_operation_conflict and changes nothing. Otherwise the token row is locked (a revoked token is a conflict and reserves nothing), the key is reserved once the contract fence is confirmed to carry caller_operation_keys, and the new hash, the next row revision, the outbox row, the evidence row under the caller's key and the journal append commit together. The negotiated file sink syncs the qualified event and its parent directory on Unix before cursor advance. Consumers deduplicate on (authority_id, event_id). Durable cluster file delivery assumes shared storage or shipping to the same durable consumer. The opt-in log sink emits the same representation with process-log acceptance only.",
+          "sources": [
+            {
+              "path": "gateway/src/storage/postgres_service_tokens.rs",
+              "anchor": "async fn rotate_with_operation("
+            },
+            {
+              "path": "gateway/src/storage/postgres_service_tokens.rs",
+              "anchor": "async fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/storage/postgres_service_tokens.rs",
+              "anchor": "async fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/storage/postgres_service_tokens.rs",
+              "anchor": "async fn token_operation_receipt("
+            },
+            {
+              "path": "gateway/src/admin_tokens.rs",
+              "anchor": "pub(super) async fn admit_keyed_token_change("
+            },
+            {
+              "path": "gateway/src/admin_tokens.rs",
+              "anchor": "pub(super) fn token_operation_receipt("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery.rs",
+              "anchor": "pub(super) fn qualify_caller_bound("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn postgres_service_token_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn postgres_keyed_token_writers_racing_commit_one_change_and_never_leave_a_live_plaintext("
+            },
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn postgres_a_failed_evidence_insert_rolls_back_the_keyed_issue_and_rotation_and_their_reservations("
+            },
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn a_full_journal_refuses_the_keyed_token_change_and_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn a_keyed_token_change_below_the_fence_is_refused_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/authority_events/dispatcher_tests.rs",
+              "anchor": "async fn a_keyed_token_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/admin_tokens_app_tests.rs",
+              "anchor": "async fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
+            },
+            {
+              "path": "gateway/src/authority_events/required_tests.rs",
+              "anchor": "fn service_token_issue_and_rotation_admit_only_their_keyed_issuer_bound_form_in_both_modes("
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "token_revoke_postgres",
@@ -2108,14 +2390,14 @@
         }
       ],
       "boundary": "SqliteTokenStore rotate/revoke refuse an actor the evidence cannot record exactly (ChangeActor::is_recordable), then run one IMMEDIATE transaction on the SERVICE_TOKEN_SQLITE_PATH database: read the revoked guard, update the guarded row, append one service_token_change_evidence row, reload and commit. An evidence insert failure rolls the change back and is reported as a store failure, never as the rotate conflict. A second connection to the file waits rather than interleaving.",
-      "record": "Current hash/revoked_at replaces earlier state and the creator is unchanged. The same database's service_token_change_evidence table (created on open, no foreign key) keeps one append-only row per committed rotate/revoke: actor (subject, kind, auth mode and canonical issuer, the last three in columns the store adds to an older database on open, with the same CHECK as PostgreSQL migration 24), action, event/operation UUIDs and committed_at, never token material. Repeated revoke, rotate of a revoked token and an unknown ID write none. import-standalone does not carry these rows.",
+      "record": "Current hash/revoked_at replaces earlier state and the creator is unchanged; since plan P5 of #425 the token row's store-owned revision advances by one with each rotation and revocation. The same database's service_token_change_evidence table (created on open, no foreign key) keeps one append-only row per committed rotate/revoke: actor (subject, kind, auth mode and canonical issuer, the last three in columns the store adds to an older database on open, with the same CHECK as PostgreSQL migration 24), action, event/operation UUIDs, committed_at, and the revision before and after with revised 1, never token material. Rows written before the revision columns, or by an older build since, keep NULL revisions and revised 0. Repeated revoke, rotate of a revoked token and an unknown ID write none. import-standalone does not carry these rows.",
       "actor": "The authenticated principal the admin endpoint passes through ServiceTokenStore as a ChangeActor, committed with the change: the subject (1 to 4096 bytes), actor_kind (principal or service_token), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). Rows written before the store added those columns record none of the three, and none is guessed.",
-      "identity": "Rotation generates its operation UUID. Every event has its own generated event UUID. SQLite records the sequence and process-clock commit time. Token rows have no revision chain.",
+      "identity": "A keyed POST binds the caller-supplied UUIDv7 (Idempotency-Key) to the rotation, the recorded actor and the token ID; the IMMEDIATE transaction looks the key up first, reserves it with the rotation and its evidence row, whose operation_id it is, and answers an exact retry with the receipt (token ID, its new revision, committed_at) and secret_returned false, never the plaintext. An unkeyed rotation generates its operation UUID. Every event has its own generated event UUID. SQLite records the sequence, the process-clock commit time and the token's revision before and after.",
       "delivery": "standalone_cursor_dispatch",
       "disposition": [
-        "missing_metadata"
+        "already_sufficient"
       ],
-      "follow_up": "Plan P5 of #425: a store-owned revision per change (the delivered record says null before and after rather than inventing one) and caller-bound operation identity for rotation. Delivered from this same database after a cursor created on open (standalone_cursor_dispatch), with no audit-database dual write. Token issue is recorded in the same table (token_issue_standalone). Issuer, actor kind and auth mode are recorded.",
+      "follow_up": "Qualified by plan P5 of #425: the token row carries a store-owned revision, so a keyed principal rotation is delivered as authority_event.v1 under the negotiated format from this same database after its cursor (standalone_cursor_dispatch). Required mode admits only the keyed POST of a provider-authenticated principal with a canonical issuer, under qualified_v1 with the file sink on a Unix build. Token issue is token_issue_standalone; revocation is token_revoke_standalone.",
       "sources": [
         {
           "path": "gateway/src/auth/tokens.rs",
@@ -2140,6 +2422,14 @@
         {
           "path": "gateway/src/auth/tokens.rs",
           "anchor": "fn add_change_evidence_actor_columns(connection: &Connection)"
+        },
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "fn rotate_with_operation("
+        },
+        {
+          "path": "gateway/src/admin_tokens.rs",
+          "anchor": ".rotate_with_operation(&token_id, &actor, caller.as_ref())"
         }
       ],
       "tests": [
@@ -2184,9 +2474,115 @@
           "anchor": "fn rotate_preserves_record_metadata_and_invalidates_old_plaintext("
         }
       ],
-      "required_durability_supported": false,
-      "required_mode": "admitted",
-      "test_claim": "Standalone regression anchors for the transactional rotate evidence in the token store's own database. They do not certify the proposed authority-event contract or delivery."
+      "required_durability_supported": true,
+      "required_mode": "caller_key_required",
+      "test_claim": "Standalone regression anchors for the transactional rotate evidence in the token store's own database, and, through the qualified delivery path, the keyed contract: exact retries answered from the receipt with no second rotation or plaintext, conflicts, rollback with the evidence, a keyed rotation racing a keyed revoke, legacy rows staying unrevised, and v1 delivery and redelivery through the file sink.",
+      "qualified_delivery_paths": [
+        {
+          "criteria": {
+            "operation": "service_token.rotate",
+            "storage_mode": "standalone",
+            "method": "POST",
+            "route": "/v1{ADMIN_PREFIX}/tokens/{id}/rotate",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed POST binds the caller's UUIDv7 to service_token.rotate, the recorded actor and the token ID (a rotation has no body and no precondition). In one IMMEDIATE transaction on the token database the key is looked up first; An exact retry is answered 200 with the receipt {operation_id, operation, resource_id, revision, committed_at} read from the committed evidence row and secret_returned false, never the plaintext; any other use of the key is 409 caller_operation_conflict and changes nothing. Otherwise the token row is read (a revoked token is a conflict and reserves nothing), the key is reserved, and the new hash, the next revision and the revised evidence row under the caller's key commit together. The negotiated file sink syncs the qualified event and its parent directory on Unix before cursor advance. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/auth/tokens.rs",
+              "anchor": "const CHANGE_EVIDENCE_REVISION_COLUMNS"
+            },
+            {
+              "path": "gateway/src/auth/tokens.rs",
+              "anchor": "fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/auth/tokens.rs",
+              "anchor": "fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/auth/tokens.rs",
+              "anchor": "fn token_operation_receipt("
+            },
+            {
+              "path": "gateway/src/admin_tokens.rs",
+              "anchor": "pub(super) async fn admit_keyed_token_change("
+            },
+            {
+              "path": "gateway/src/admin_tokens.rs",
+              "anchor": "pub(super) fn token_operation_receipt("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery.rs",
+              "anchor": "pub(crate) fn project_standalone("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery.rs",
+              "anchor": "pub(super) fn qualify_caller_bound("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn sqlite_service_token_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn sqlite_keyed_token_writers_racing_commit_one_change_and_never_leave_a_live_plaintext("
+            },
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn sqlite_a_failed_evidence_insert_rolls_back_the_keyed_issue_and_rotation_and_their_reservations("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_tests.rs",
+              "anchor": "async fn a_keyed_token_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery_tests.rs",
+              "anchor": "fn a_keyed_principal_row_of_a_revised_source_is_qualified_under_the_negotiated_format_only("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery_tests.rs",
+              "anchor": "fn a_revised_token_row_with_a_null_revision_stalls("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery_tests.rs",
+              "anchor": "fn a_row_an_older_build_writes_after_the_upgrade_stays_a_legacy_record("
+            },
+            {
+              "path": "gateway/src/auth/tokens.rs",
+              "anchor": "fn standalone_token_revisions_start_at_one_and_legacy_evidence_stays_unrevised("
+            },
+            {
+              "path": "gateway/src/admin_tokens_app_tests.rs",
+              "anchor": "async fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext("
+            },
+            {
+              "path": "gateway/src/admin_tokens_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_the_unkeyed_token_issue_and_rotation_and_admits_the_keyed_principal("
+            },
+            {
+              "path": "gateway/src/admin_tokens_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_a_keyed_token_issue_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink("
+            },
+            {
+              "path": "gateway/src/authority_events/required_tests.rs",
+              "anchor": "fn service_token_issue_and_rotation_admit_only_their_keyed_issuer_bound_form_in_both_modes("
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "token_revoke_standalone",
@@ -2205,12 +2601,12 @@
       "boundary": "SqliteTokenStore rotate/revoke refuse an actor the evidence cannot record exactly (ChangeActor::is_recordable), then run one IMMEDIATE transaction on the SERVICE_TOKEN_SQLITE_PATH database: read the revoked guard, update the guarded row, append one service_token_change_evidence row, reload and commit. An evidence insert failure rolls the change back and is reported as a store failure, never as the rotate conflict. A second connection to the file waits rather than interleaving.",
       "record": "Current hash/revoked_at replaces earlier state and the creator is unchanged. The same database's service_token_change_evidence table (created on open, no foreign key) keeps one append-only row per committed rotate/revoke: actor (subject, kind, auth mode and canonical issuer, the last three in columns the store adds to an older database on open, with the same CHECK as PostgreSQL migration 24), action, event/operation UUIDs and committed_at, never token material. Repeated revoke, rotate of a revoked token and an unknown ID write none. import-standalone does not carry these rows.",
       "actor": "The authenticated principal the admin endpoint passes through ServiceTokenStore as a ChangeActor, committed with the change: the subject (1 to 4096 bytes), actor_kind (principal or service_token), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). Rows written before the store added those columns record none of the three, and none is guessed.",
-      "identity": "Keyed POST revocation binds the caller-supplied UUIDv7 to the revoke action, token ID and recorded actor (subject, kind, canonical issuer and authentication method) in the transaction. A matching retry returns the revoked token without another change or evidence row. A mismatched binding or a fresh key on an already revoked token conflicts. Unkeyed revocation generates its operation UUID. Every event has its own generated event UUID. SQLite records the sequence and process-clock commit time. Token rows have no revision chain.",
+      "identity": "Keyed POST revocation binds the caller-supplied UUIDv7 to the revoke action, token ID and recorded actor (subject, kind, canonical issuer and authentication method) in the transaction, and reserves the key with its evidence. A matching retry returns the revoked token without another change or evidence row. A mismatched binding, a key reserved for another action or a fresh key on an already revoked token conflicts. Unkeyed revocation generates its operation UUID. Every event has its own generated event UUID. SQLite records the sequence, the process-clock commit time and, since plan P5 of #425, the token's revision before and after the revocation.",
       "delivery": "standalone_cursor_dispatch",
       "disposition": [
-        "missing_metadata"
+        "withdrawal_admitted"
       ],
-      "follow_up": "A withdrawal (owner ruling 4 on #425, 2026-11-20): required mode admits every form, because refusing an unkeyed or service-token revoke would leave a leaked token live. Plan P5 of #425 adds a store-owned revision, so the keyed principal form gets a reviewed qualified path and this row then becomes withdrawal_admitted. Delivered from this same database after a cursor created on open (standalone_cursor_dispatch), as authority_event_delivery.v1.",
+      "follow_up": "A withdrawal admitted in every form in required mode (owner ruling 4 on #425, 2026-11-20): refusing the unkeyed DELETE the admin UI sends, or a service-token caller's revoke, would leave a leaked token live, so both stay admitted; they commit their evidence atomically and are delivered at least once as authority_event_delivery.v1, and are not caller-keyed. Since plan P5 the revocation records the token's revision, so only the keyed principal form has the reviewed qualified path below. Keyed revocations recorded before then carry no revision and stay legacy delivery records.",
       "sources": [
         {
           "path": "gateway/src/auth/tokens.rs",
@@ -2289,7 +2685,73 @@
       ],
       "required_durability_supported": false,
       "required_mode": "admitted",
-      "test_claim": "Standalone regression anchors for the transactional revoke evidence in the token store's own database, and the keyed revoke's binding and replay. They do not certify the proposed authority-event contract or delivery."
+      "test_claim": "Standalone regression anchors for the transactional revoke evidence in the token store's own database, and the keyed revoke's binding and replay. The qualified delivery path below lists the tests that certify the keyed principal form; the unkeyed and service-token forms are not certified.",
+      "qualified_delivery_paths": [
+        {
+          "criteria": {
+            "operation": "service_token.revoke",
+            "storage_mode": "standalone",
+            "method": "POST",
+            "route": "/v1{ADMIN_PREFIX}/tokens/{id}/revoke",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The actor-bound keyed revoke, its key's reservation, one revision step of the token row and its revised evidence row commit together in one IMMEDIATE transaction on the token database. The negotiated file sink syncs the qualified event and its parent directory on Unix before cursor advance. Consumers deduplicate on (authority_id, event_id). Unkeyed requests, service-token callers and keyed revocations recorded before the token table recorded revisions do not qualify for this path.",
+          "sources": [
+            {
+              "path": "gateway/src/auth/tokens.rs",
+              "anchor": "fn revoke_with_operation("
+            },
+            {
+              "path": "gateway/src/auth/tokens.rs",
+              "anchor": "crate::storage::standalone_authority_events::reserve_unbound_operation("
+            },
+            {
+              "path": "gateway/src/auth/tokens.rs",
+              "anchor": "const CHANGE_EVIDENCE_REVISION_COLUMNS"
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery.rs",
+              "anchor": "pub(crate) fn project_standalone("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery.rs",
+              "anchor": "pub(super) fn qualify_caller_bound("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/authority_events/standalone_tests.rs",
+              "anchor": "async fn a_keyed_token_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_tests.rs",
+              "anchor": "async fn the_file_sink_holds_the_records_and_no_identifier("
+            },
+            {
+              "path": "gateway/src/storage/contract_tests.rs",
+              "anchor": "async fn caller_bound_revocation_contract("
+            },
+            {
+              "path": "gateway/src/auth/tokens.rs",
+              "anchor": "fn a_keyed_revoke_reserves_its_key_with_its_evidence("
+            },
+            {
+              "path": "gateway/src/admin_tokens_app_tests.rs",
+              "anchor": "async fn required_mode_admits_every_form_of_token_revocation("
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "jwt_postgres",

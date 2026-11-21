@@ -247,6 +247,30 @@ export const QUALIFIED_PATHS = Object.freeze({
     operation: "service_token.revoke", storage_mode: "postgres", method: "POST",
     route: "/v1{ADMIN_PREFIX}/tokens/{id}/revoke", ...KEYED_DELIVERY,
   },
+  // Keyed service-token issue and rotation in both modes (issue #425). The
+  // standalone token database records the token's revision since then.
+  "service_token.issue/postgres": {
+    operation: "service_token.issue", storage_mode: "postgres", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/tokens", ...KEYED_DELIVERY,
+  },
+  "service_token.issue/standalone": {
+    operation: "service_token.issue", storage_mode: "standalone", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/tokens", ...KEYED_DELIVERY,
+  },
+  "service_token.rotate/postgres": {
+    operation: "service_token.rotate", storage_mode: "postgres", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/tokens/{id}/rotate", ...KEYED_DELIVERY,
+  },
+  "service_token.rotate/standalone": {
+    operation: "service_token.rotate", storage_mode: "standalone", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/tokens/{id}/rotate", ...KEYED_DELIVERY,
+  },
+  // Admitted withdrawal, as in PostgreSQL: the containing row also admits
+  // the unkeyed DELETE and service-token callers, unqualified.
+  "service_token.revoke/standalone": {
+    operation: "service_token.revoke", storage_mode: "standalone", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/tokens/{id}/revoke", ...KEYED_DELIVERY,
+  },
   "mutation_approval.prepare/postgres": {
     operation: "mutation_approval.prepare", storage_mode: "postgres", method: "PUT",
     route: "/v1{ADMIN_PREFIX}/tools/{id}/mutation-approvals", ...KEYED_DELIVERY,
