@@ -288,6 +288,42 @@ export const QUALIFIED_PATHS = Object.freeze({
     operation: "connection.delete", storage_mode: "standalone", method: "DELETE",
     route: "/v1{ADMIN_PREFIX}/connections/{id}", ...KEYED_DELIVERY,
   },
+  // Keyed catalog publication and overlay changes in both modes (issue
+  // #425). An OpenAPI publication is made by a registration or by a refresh
+  // of an OpenAPI Connection, under the same action and gate; its path is the
+  // registration's route, and the refresh route is the MCP publication's.
+  "catalog.mcp.publish/postgres": {
+    operation: "catalog.mcp.publish", storage_mode: "postgres", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/connections/{id}/refresh", ...KEYED_DELIVERY,
+  },
+  "catalog.openapi.publish/postgres": {
+    operation: "catalog.openapi.publish", storage_mode: "postgres", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/connections/{id}/openapi/register", ...KEYED_DELIVERY,
+  },
+  "catalog.overlay.replace/postgres": {
+    operation: "catalog.overlay.replace", storage_mode: "postgres", method: "PUT",
+    route: "/v1{ADMIN_PREFIX}/connections/{id}/overlay", ...KEYED_DELIVERY,
+  },
+  "catalog.overlay.delete/postgres": {
+    operation: "catalog.overlay.delete", storage_mode: "postgres", method: "DELETE",
+    route: "/v1{ADMIN_PREFIX}/connections/{id}/overlay", ...KEYED_DELIVERY,
+  },
+  "catalog.mcp.publish/standalone": {
+    operation: "catalog.mcp.publish", storage_mode: "standalone", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/connections/{id}/refresh", ...KEYED_DELIVERY,
+  },
+  "catalog.openapi.publish/standalone": {
+    operation: "catalog.openapi.publish", storage_mode: "standalone", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/connections/{id}/openapi/register", ...KEYED_DELIVERY,
+  },
+  "catalog.overlay.replace/standalone": {
+    operation: "catalog.overlay.replace", storage_mode: "standalone", method: "PUT",
+    route: "/v1{ADMIN_PREFIX}/connections/{id}/overlay", ...KEYED_DELIVERY,
+  },
+  "catalog.overlay.delete/standalone": {
+    operation: "catalog.overlay.delete", storage_mode: "standalone", method: "DELETE",
+    route: "/v1{ADMIN_PREFIX}/connections/{id}/overlay", ...KEYED_DELIVERY,
+  },
 });
 // The dispatcher that delivers a qualified pair in each mode.
 const QUALIFIED_DELIVERY = { postgres: "journaled_dispatch", standalone: "standalone_cursor_dispatch" };

@@ -2469,13 +2469,50 @@ impl SqliteConnectionStore {
         expected_catalog_revision: Option<u64>,
         actor: &ChangeActor,
     ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
+        committed(self.replace_mcp_catalog_expecting_with_operation(
+            id,
+            expected,
+            entries,
+            resources,
+            resource_templates,
+            expected_catalog_revision,
+            actor,
+            None,
+        ))
+    }
+
+    /// [`Self::replace_mcp_catalog_expecting`] under a caller key (issue
+    /// #425): the key is looked up first in the publishing transaction (an
+    /// exact retry of a committed publication is answered with its receipt
+    /// and changes nothing; a key bound to anything else is a conflict),
+    /// reserved once every precondition holds, and recorded as the evidence
+    /// row's operation ID.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_mcp_catalog_expecting_with_operation(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        entries: &[StoredMcpCatalogEntry],
+        resources: &[StoredMcpResource],
+        resource_templates: &[StoredMcpResourceTemplate],
+        expected_catalog_revision: Option<u64>,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<StoredMcpCatalog>, ConnectionStoreError> {
         validate_change_actor(actor)?;
+        ensure_caller_action(caller, CATALOG_EVIDENCE_ACTION_MCP_PUBLISH)?;
         let validated = validate_mcp_catalog(id, entries, resources, resource_templates)?;
         let now = utc_timestamp()?;
         let mut connection = self.connection_guard();
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&self.path, "MCP catalog transaction", source))?;
+        // The key first, under the file's write lock: an exact retry of a
+        // committed publication is answered from its evidence before the
+        // Connection or catalog revision it has since moved is checked.
+        if let Some(receipt) = keyed_receipt(&transaction, &self.path, caller)? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         let current = load_raw_by_id(&transaction, &self.path, id)?
             .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?
             .into_stored()?;
@@ -2566,6 +2603,9 @@ impl SqliteConnectionStore {
             }
         }
         let catalog_revision = increment_revision(id, previous_revision)?;
+        if let Some(receipt) = reserve_caller_key(&transaction, &self.path, caller)? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
 
         transaction
             .execute(
@@ -2722,6 +2762,7 @@ impl SqliteConnectionStore {
             &transaction,
             &self.path,
             &CatalogChangeEvidence {
+                operation_id: &operation_id_for(caller),
                 action: CATALOG_EVIDENCE_ACTION_MCP_PUBLISH,
                 id,
                 prior_version: previous_revision,
@@ -2735,7 +2776,7 @@ impl SqliteConnectionStore {
             .commit()
             .map_err(|source| sqlite_error(&self.path, "MCP catalog transaction commit", source))?;
 
-        Ok(StoredMcpCatalog {
+        Ok(CallerOutcome::Committed(StoredMcpCatalog {
             connection_id: id.clone(),
             catalog_revision,
             observed_etag: expected.clone(),
@@ -2743,7 +2784,7 @@ impl SqliteConnectionStore {
             entries: entries.to_vec(),
             resources: resources.to_vec(),
             resource_templates: resource_templates.to_vec(),
-        })
+        }))
     }
 
     pub fn openapi_catalogs(&self) -> Result<Vec<StoredOpenApiCatalog>, ConnectionStoreError> {
@@ -3125,6 +3166,47 @@ impl SqliteConnectionStore {
         policy_protected_names: &[String],
         enum_values: &[StoredEnumSourceValueWrite],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
+        committed(
+            self.replace_openapi_catalog_with_overlay_and_enum_values_with_operation(
+                id,
+                expected_connection_etag,
+                expected_spec_revision,
+                expected_catalog_revision,
+                spec,
+                spec_digest,
+                entries,
+                overlay,
+                compiled_overlay_revision,
+                actor,
+                policy_protected_names,
+                enum_values,
+                None,
+            ),
+        )
+    }
+
+    /// [`Self::replace_openapi_catalog_with_overlay_and_enum_values`] under
+    /// a caller key (issue #425), in the order
+    /// [`Self::replace_mcp_catalog_expecting_with_operation`] describes. The
+    /// key must be bound to the action the write records -- what it does to
+    /// the overlay -- or the call is refused before anything is read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_openapi_catalog_with_overlay_and_enum_values_with_operation(
+        &self,
+        id: &ConnectionId,
+        expected_connection_etag: &ConnectionEtag,
+        expected_spec_revision: u64,
+        expected_catalog_revision: u64,
+        spec: &str,
+        spec_digest: &str,
+        entries: &[StoredOpenApiCatalogEntry],
+        overlay: Option<&StoredOverlayWrite>,
+        compiled_overlay_revision: u64,
+        actor: &ChangeActor,
+        policy_protected_names: &[String],
+        enum_values: &[StoredEnumSourceValueWrite],
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<StoredOpenApiCatalog>, ConnectionStoreError> {
         validate_change_actor(actor)?;
         let evidence_action = match overlay {
             Some(StoredOverlayWrite::Put { .. }) => CATALOG_EVIDENCE_ACTION_OVERLAY_REPLACE,
@@ -3133,6 +3215,7 @@ impl SqliteConnectionStore {
                 CATALOG_EVIDENCE_ACTION_OPENAPI_PUBLISH
             }
         };
+        ensure_caller_action(caller, evidence_action)?;
         // Standalone SQLite serializes overlay adoption with local policy
         // swaps before this call. PostgreSQL additionally rechecks these
         // names against its authoritative policy under a shared advisory
@@ -3152,6 +3235,11 @@ impl SqliteConnectionStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&self.path, "OpenAPI catalog transaction", source))?;
+        // The key first, as for an MCP publication: an overlay change's
+        // retry is answered before the overlay revision it moved is checked.
+        if let Some(receipt) = keyed_receipt(&transaction, &self.path, caller)? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         let current = load_raw_by_id(&transaction, &self.path, id)?
             .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?
             .into_stored()?;
@@ -3281,6 +3369,9 @@ impl SqliteConnectionStore {
             increment_revision(id, previous_spec_revision)?
         };
         let catalog_revision = increment_revision(id, previous_catalog_revision)?;
+        if let Some(receipt) = reserve_caller_key(&transaction, &self.path, caller)? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
 
         transaction
             .execute(
@@ -3419,6 +3510,7 @@ impl SqliteConnectionStore {
             &transaction,
             &self.path,
             &CatalogChangeEvidence {
+                operation_id: &operation_id_for(caller),
                 action: evidence_action,
                 id,
                 prior_version: previous_catalog_revision,
@@ -3432,7 +3524,7 @@ impl SqliteConnectionStore {
             sqlite_error(&self.path, "OpenAPI catalog transaction commit", source)
         })?;
 
-        Ok(StoredOpenApiCatalog {
+        Ok(CallerOutcome::Committed(StoredOpenApiCatalog {
             connection_id: id.clone(),
             spec_revision,
             catalog_revision,
@@ -3442,7 +3534,7 @@ impl SqliteConnectionStore {
             refreshed_at: now,
             entries: normalized_entries,
             overlay_revision,
-        })
+        }))
     }
 
     pub fn append_status(
@@ -4254,14 +4346,15 @@ impl SqliteConnectionStore {
         crate::storage::standalone_authority_events::read_caller_operation(&connection, caller)
     }
 
-    /// The receipt of the Connection change `caller`'s key committed in this
-    /// database, read from its evidence row, or `None` when there is none.
+    /// The receipt of the Connection or catalog change `caller`'s key
+    /// committed in this database, read from the evidence row of the key's
+    /// action, or `None` when there is none.
     pub(crate) fn caller_operation_receipt(
         &self,
         caller: &CallerOperation,
     ) -> Result<Option<OperationReceipt>, crate::storage::RepositoryError> {
         let connection = self.connection_guard();
-        connection_operation_receipt(&connection, caller).map_err(|source| {
+        operation_receipt_for(&connection, caller).map_err(|source| {
             tracing::error!(error = %source, "a Connection change receipt could not be read");
             crate::storage::RepositoryError::new(
                 crate::storage::RepositoryErrorKind::Unavailable,
@@ -4325,6 +4418,58 @@ fn connection_operation_receipt(
         .optional()
 }
 
+/// The receipt of the catalog publication `caller`'s key committed: its
+/// `catalog_change_evidence` row for the key's action, naming the Connection
+/// and the catalog revision it published, never anything from the request.
+fn catalog_operation_receipt(
+    connection: &Connection,
+    caller: &CallerOperation,
+) -> rusqlite::Result<Option<OperationReceipt>> {
+    connection
+        .query_row(
+            "SELECT connection_id, new_version, committed_at \
+             FROM catalog_change_evidence WHERE operation_id = ?1 AND action = ?2",
+            params![caller.id().to_string(), caller.action()],
+            |row| {
+                Ok(OperationReceipt {
+                    operation_id: caller.id().to_string(),
+                    operation: caller.action().to_owned(),
+                    resource_id: row.get(0)?,
+                    revision: Some(row.get(1)?),
+                    committed_at: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+}
+
+/// Whether `action` is one of the catalog publications this database
+/// records in `catalog_change_evidence`.
+pub(crate) fn is_catalog_action(action: &str) -> bool {
+    matches!(
+        action,
+        CATALOG_EVIDENCE_ACTION_MCP_PUBLISH
+            | CATALOG_EVIDENCE_ACTION_OPENAPI_PUBLISH
+            | CATALOG_EVIDENCE_ACTION_OVERLAY_REPLACE
+            | CATALOG_EVIDENCE_ACTION_OVERLAY_DELETE
+    )
+}
+
+/// The receipt of the change `caller`'s key committed, read from the
+/// evidence table its action is recorded in: a catalog publication's from
+/// `catalog_change_evidence`, a Connection change's from
+/// `connection_change_evidence`.
+fn operation_receipt_for(
+    connection: &Connection,
+    caller: &CallerOperation,
+) -> rusqlite::Result<Option<OperationReceipt>> {
+    if is_catalog_action(caller.action()) {
+        catalog_operation_receipt(connection, caller)
+    } else {
+        connection_operation_receipt(connection, caller)
+    }
+}
+
 /// Step 1 of a keyed change, inside its IMMEDIATE transaction: the key's
 /// reservation judged against this request. `None` for no key or an unused
 /// one; the receipt for an exact retry of a committed change; a conflict for
@@ -4357,11 +4502,11 @@ fn committed_receipt(
     path: &Path,
     caller: &CallerOperation,
 ) -> Result<OperationReceipt, ConnectionStoreError> {
-    connection_operation_receipt(transaction, caller)
+    operation_receipt_for(transaction, caller)
         .map_err(|source| sqlite_error(path, OPERATION_CALLER_OPERATION_READ, source))?
         .ok_or_else(|| {
             tracing::error!(
-                "a caller operation is reserved without its Connection evidence row; the change is refused"
+                "a caller operation is reserved without its evidence row; the change is refused"
             );
             ConnectionStoreError::Unavailable {
                 operation: OPERATION_CALLER_OPERATION_READ,
@@ -4488,6 +4633,8 @@ fn record_change_evidence(
 /// the actor, never specification, overlay, tool definition, endpoint or
 /// secret material.
 struct CatalogChangeEvidence<'a> {
+    /// The caller's key, or one minted once for an unkeyed publication.
+    operation_id: &'a str,
     action: &'static str,
     id: &'a ConnectionId,
     /// The catalog revision the publication replaced; `0` (no catalog of
@@ -4503,7 +4650,8 @@ struct CatalogChangeEvidence<'a> {
 }
 
 /// Append one catalog evidence row inside the caller's transaction. Its
-/// event and operation IDs are minted here, once: a publication is one
+/// event ID is minted here, once, and its operation ID is the publication's
+/// (the caller's key or one minted per store call): a publication is one
 /// store call and one row. The actor is recorded whole, as
 /// [`record_change_evidence`] records it. Any failure is returned for the
 /// caller to roll back, so the publication it describes never commits
@@ -4535,7 +4683,7 @@ fn record_catalog_change_evidence(
             "#,
             params![
                 Uuid::new_v4().to_string(),
-                Uuid::new_v4().to_string(),
+                evidence.operation_id,
                 evidence.actor.subject(),
                 evidence.actor.issuer(),
                 evidence.actor.kind().as_str(),

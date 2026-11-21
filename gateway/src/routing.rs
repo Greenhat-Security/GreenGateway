@@ -709,6 +709,23 @@ pub(super) const KEYED_ROUTES: &[KeyedRoute] = &[
         method: "DELETE",
         route: "/v1{ADMIN_PREFIX}/connections/{id}",
     },
+    // Keyed catalog publication and overlay changes (issue #425).
+    KeyedRoute {
+        method: "POST",
+        route: "/v1{ADMIN_PREFIX}/connections/{id}/refresh",
+    },
+    KeyedRoute {
+        method: "POST",
+        route: "/v1{ADMIN_PREFIX}/connections/{id}/openapi/register",
+    },
+    KeyedRoute {
+        method: "PUT",
+        route: "/v1{ADMIN_PREFIX}/connections/{id}/overlay",
+    },
+    KeyedRoute {
+        method: "DELETE",
+        route: "/v1{ADMIN_PREFIX}/connections/{id}/overlay",
+    },
 ];
 
 /// [`KEYED_ROUTES`] resolved against this router's admin API prefix.

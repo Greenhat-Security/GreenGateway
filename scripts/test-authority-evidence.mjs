@@ -43,10 +43,13 @@ const honouring = (method, route) => (path) => path === routing
   : source(path);
 
 test("a row is supported only when every pair has its reviewed path", () => {
-  // Today three rows qualify: PostgreSQL keyed preparation and keyed
-  // Connection create and replace in both modes.
+  // Today five rows qualify: PostgreSQL keyed preparation, and keyed
+  // Connection create and replace and keyed catalog publication and overlay
+  // changes in both modes.
   const current = validateInventory(inventory());
   assert.deepEqual(current.qualifiedPairs, [
+    "catalog.mcp.publish/postgres", "catalog.mcp.publish/standalone", "catalog.openapi.publish/postgres", "catalog.openapi.publish/standalone",
+    "catalog.overlay.delete/postgres", "catalog.overlay.delete/standalone", "catalog.overlay.replace/postgres", "catalog.overlay.replace/standalone",
     "connection.create/postgres", "connection.create/standalone", "connection.replace/postgres", "connection.replace/standalone", "credential.binding_change/postgres", "credential.binding_change/standalone",
     "mutation_approval.prepare/postgres",
   ]);
@@ -76,14 +79,22 @@ test("a row is supported only when every pair has its reviewed path", () => {
   // A row cannot claim durability, keyed-only admission or sufficiency
   // without the bar, whatever else it says.
   const claimed = inventory();
-  groupOf(claimed, "catalog_postgres").required_durability_supported = true;
-  assert.throws(() => validateInventory(claimed), /catalog_postgres: unproven durability claim/);
+  groupOf(claimed, "mutation_approvals").required_durability_supported = true;
+  assert.throws(() => validateInventory(claimed), /mutation_approvals: unproven durability claim/);
   // A qualified Connection row loses its claim with any one of its paths:
   // the credential binding change a keyed replacement makes has its own.
   for (const id of ["connection_postgres", "connection_standalone"]) {
     const partial = inventory();
     groupOf(partial, id).qualified_delivery_paths = groupOf(partial, id).qualified_delivery_paths
       .filter((path) => path.criteria.operation !== "credential.binding_change");
+    assert.throws(() => validateInventory(partial), new RegExp(`${id}: unproven durability claim`), id);
+  }
+  // So does a qualified catalog row: an overlay removal is a publication
+  // with its own path, not a withdrawal.
+  for (const id of ["catalog_postgres", "catalog_standalone"]) {
+    const partial = inventory();
+    groupOf(partial, id).qualified_delivery_paths = groupOf(partial, id).qualified_delivery_paths
+      .filter((path) => path.criteria.operation !== "catalog.overlay.delete");
     assert.throws(() => validateInventory(partial), new RegExp(`${id}: unproven durability claim`), id);
   }
   const keyedOnly = inventory();
@@ -109,6 +120,8 @@ test("a row is supported only when every pair has its reviewed path", () => {
     qualified_delivery_paths: [{ ...structuredClone(pathOf(flipped, "mutation_approval_prepare_postgres")), criteria: issue }],
   });
   assert.deepEqual(validateInventory(flipped, readSource, table).qualifiedPairs, [
+    "catalog.mcp.publish/postgres", "catalog.mcp.publish/standalone", "catalog.openapi.publish/postgres", "catalog.openapi.publish/standalone",
+    "catalog.overlay.delete/postgres", "catalog.overlay.delete/standalone", "catalog.overlay.replace/postgres", "catalog.overlay.replace/standalone",
     "connection.create/postgres", "connection.create/standalone", "connection.replace/postgres", "connection.replace/standalone", "credential.binding_change/postgres", "credential.binding_change/standalone",
     "mutation_approval.prepare/postgres", "service_token.issue/standalone",
   ]);
@@ -254,7 +267,7 @@ test("a mutation endpoint in the policy draft, policy test and observability han
 test("the summary line is computed from the inventory", () => {
   const line = summary(validateInventory(inventory()));
   assert.match(line, new RegExp(`^Authority evidence inventory valid: ${inventory().groups.length} groups, ${OPERATIONS.length * 2} operation/mode pairs, \\d+ source references\\.`));
-  assert.match(line, / Qualified in required mode: connection\.create\/postgres, .*, mutation_approval\.prepare\/postgres\./);
+  assert.match(line, / Qualified in required mode: catalog\.mcp\.publish\/postgres, .*, connection\.create\/postgres, .*, mutation_approval\.prepare\/postgres\./);
   assert.match(line, / Admitted withdrawals with a reviewed keyed path: connection\.delete\/postgres, connection\.delete\/standalone, service_token\.revoke\/postgres\./);
   assert.equal(summary({ groups: 1, operationModePairs: 2, sourceReferences: 3, qualifiedPairs: [], keyedWithdrawalPairs: [] }),
     "Authority evidence inventory valid: 1 groups, 2 operation/mode pairs, 3 source references. Qualified in required mode: none. Admitted withdrawals with a reviewed keyed path: none.");
@@ -409,7 +422,7 @@ test("no_caller_key is limited to its reviewed pairs", () => {
     assert.equal(group.qualified_delivery_paths, undefined, group.id);
   }
   // A caller-started change that is not a withdrawal cannot be relabelled.
-  for (const id of ["catalog_postgres", "token_rotate_postgres", "local_secrets", "token_issue_standalone", "policy_postgres", "local_secret_delete"]) {
+  for (const id of ["mutation_approvals", "token_rotate_postgres", "local_secrets", "token_issue_standalone", "policy_postgres", "local_secret_delete"]) {
     const relabelled = inventory();
     row(relabelled, id).disposition = ["no_caller_key"];
     assert.throws(() => validateInventory(relabelled), new RegExp(`${id}: no_caller_key is limited to its reviewed pairs`), id);
@@ -443,7 +456,7 @@ test("withdrawal_admitted is limited to its reviewed pairs and needs a reviewed 
   assert.equal(revoke(current).qualified_delivery_paths.length, 1);
   for (const pair of rowsWith(current, "withdrawal_admitted").flatMap(pairsOf)) assert.ok(WITHDRAWALS.includes(pair), pair);
   // A change that grants or replaces authority is never a withdrawal.
-  for (const id of ["token_rotate_postgres", "policy_postgres", "local_secrets", "catalog_postgres", "jwt_postgres"]) {
+  for (const id of ["token_rotate_postgres", "policy_postgres", "local_secrets", "mutation_approvals", "jwt_postgres"]) {
     const relabelled = inventory();
     row(relabelled, id).disposition = ["withdrawal_admitted"];
     assert.throws(() => validateInventory(relabelled), new RegExp(`${id}: withdrawal_admitted is limited to its reviewed pairs`), id);
@@ -538,7 +551,7 @@ test("required mode never admits an unsupported row or waves through a reachable
   assert.equal(byId.local_secret_reencrypt, "admitted");
   // The offline import records evidence for two of its sections only.
   assert.equal(byId.configuration_import, "refused");
-  assert.equal(byId.catalog_standalone, "admitted");
+  assert.equal(byId.catalog_standalone, "caller_key_required");
   assert.equal(byId.configuration_activation, "refused_at_startup");
 
   const unknown = inventory();
@@ -548,7 +561,7 @@ test("required mode never admits an unsupported row or waves through a reachable
   admitted.groups.find((group) => group.id === "policy_standalone").required_mode = "admitted";
   assert.throws(() => validateInventory(admitted), /admits an unsupported operation/);
   const waved = inventory();
-  waved.groups.find((group) => group.id === "catalog_standalone").required_mode = "outside_gateway";
+  waved.groups.find((group) => group.id === "mutation_approvals").required_mode = "outside_gateway";
   assert.throws(() => validateInventory(waved), /reachable entry point/);
 });
 
@@ -556,7 +569,7 @@ test("not_refused is not a required mode", () => {
   // Required mode once ran configuration activation unrefused; owner
   // decision 2 (2026-11-19) made it refuse to start instead, so no row can
   // be waved through by that value any more, with or without entry points.
-  for (const id of ["external_rotation", "configuration_activation", "catalog_standalone"]) {
+  for (const id of ["external_rotation", "configuration_activation", "mutation_approvals"]) {
     const changed = inventory();
     changed.groups.find((group) => group.id === id).required_mode = "not_refused";
     assert.throws(() => validateInventory(changed), /unknown required mode|activation stays refused at startup/, id);

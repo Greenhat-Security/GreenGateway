@@ -712,6 +712,107 @@ that cannot be written is counted on the evidence failure counters
 (`sqlite_a_failed_reservation_rolls_back_the_keyed_change_and_is_counted`, and the
 PostgreSQL fence test).
 
+### Keyed catalog publication and overlay changes
+
+The second operation family on the contract above (issue #425). Rows
+`catalog_postgres` and `catalog_standalone` (`catalog.mcp.publish`,
+`catalog.openapi.publish`, `catalog.overlay.replace`, `catalog.overlay.delete`)
+are qualified. The family has no withdrawal: removing an overlay republishes the
+bare catalog, so `catalog.overlay.delete` is a publication and admits only its
+keyed form, like the others.
+
+- **Routes.** `POST /v1{ADMIN_PREFIX}/connections/{id}/refresh`,
+  `POST /v1{ADMIN_PREFIX}/connections/{id}/openapi/register`, and `PUT` and
+  `DELETE` `/v1{ADMIN_PREFIX}/connections/{id}/overlay`, each with an optional
+  `Idempotency-Key`. They are in `KEYED_ROUTES`. The checker's `QUALIFIED_PATHS`
+  holds one path per operation and mode: the refresh route for
+  `catalog.mcp.publish`, the registration route for `catalog.openapi.publish`,
+  and the overlay routes for the overlay operations. A refresh of a managed
+  OpenAPI Connection is also `catalog.openapi.publish`, under the same admission,
+  gate and store contract; it is named in that path's guarantee, sources and tests
+  rather than by a second path, since the table holds one route per pair.
+- **Binding.** The key is bound to the action (a refresh binds
+  `catalog.mcp.publish` or `catalog.openapi.publish` by the Connection's discovery
+  kind), the recorded actor, the Connection ID, the `If-Match` value as received
+  (the Connection ETag for a refresh or registration, the overlay ETag for an
+  overlay change), and the body as canonical JSON: the specification and its
+  selection for a registration, the overlay document for an overlay put, and
+  nothing for a refresh or an overlay delete. An overlay put that sets
+  `allow_unresolved_enum_sources=true` binds the document and the flag together,
+  so the same key with the flag flipped is a conflict. The digest is stored only
+  in the key's reservation row.
+- **Order of work.** Each handler authorizes the caller and validates the request
+  before it binds the key, asks the gates (the evidence gate as the operation's own
+  code, and in cluster mode the operation gate) and answers an exact retry from the
+  read-only pre-check. Validation covers what can be judged without the upstream:
+  the Connection exists and, for a registration or an overlay change, is an HTTP
+  API Connection with managed OpenAPI discovery; a registration's specification
+  size and preview digest; an overlay put's document and the secret authority its
+  sources need. Whether a registration's specification parses is judged after
+  admission, when the catalog is generated. All of this happens before the
+  upstream is fetched or a catalog is generated, so a replayed refresh or
+  registration contacts no upstream. A refresh or registration compares its
+  `If-Match` with the Connection's current ETag only after the pre-check, as a
+  keyed replacement does, so a committed retry is answered with its receipt even
+  after another writer replaced the Connection, and an unused key with a stale
+  `If-Match` is still `412`. A retry after the Connection was deleted is `404`:
+  a refresh's action is the deleted record's discovery kind, and every catalog
+  route judges the Connection before it binds the key.
+  Two first attempts that race both fetch; only one commits. Inside the store's one
+  transaction (PostgreSQL after its Connection state lock, SQLite under
+  `IMMEDIATE`) the key is looked up first, then the Connection ETag and the catalog
+  (and, for OpenAPI, spec and overlay) revisions are checked, then the key is
+  reserved (PostgreSQL confirms the fence carries `caller_operation_keys`), then the
+  catalog and its `catalog_change_evidence` row are written under the caller's key,
+  and the journal entry last.
+- **Answers.** The first commit answers as the route always has (`200` with the
+  publication summary, `201` for a registration). An exact retry is `200` with the
+  receipt `{operation_id, operation, resource_id, revision, committed_at}`, read from
+  the `catalog_change_evidence` row of the key's action (the store's receipt reader
+  picks the evidence table by the action); `revision` is the catalog revision the
+  publication made. It repeats no fetch, no publication and no audit event. The same
+  key with any other request is `409 caller_operation_conflict`. A stale catalog or
+  overlay revision writes and reserves nothing.
+- **Required mode.** All four operations are `caller_key_required` in both modes:
+  only the keyed request of an issuer-bound principal with `qualified_v1`, the file
+  sink and a Unix build is admitted, and every other form, service-token callers
+  included, is `409 authority_evidence_unsupported` before anything is read or
+  written. The admin UI sends no key, so under `required` it cannot refresh,
+  register or change an overlay (#242 tracks adding keys to it).
+
+Tests. The store contract is written once in
+`gateway/src/connections/catalog_operation_contract.rs` and run against both stores
+(`sqlite_*` there, `postgres_*` in `connections::pg_store::tests`); every case ends
+by asserting that a catalog action's reservation exists exactly when its evidence
+row does: `catalog_caller_operation_contract`,
+`a_reused_catalog_key_with_a_different_binding_conflicts_and_changes_nothing`,
+`a_key_reserved_by_another_action_cannot_take_effect_on_a_catalog`,
+`a_failed_evidence_insert_rolls_back_the_keyed_publication_and_its_reservation`,
+`a_stale_catalog_precondition_under_a_key_writes_no_change_evidence_or_reservation`,
+`two_writers_racing_one_catalog_key_commit_one_change`,
+`two_catalog_keys_racing_one_revision_leave_only_the_winners_rows` and
+`a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record`.
+PostgreSQL adds `a_full_journal_refuses_the_keyed_catalog_publication_and_reserves_nothing`.
+`a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit`
+(in both `authority_events::dispatcher::tests` and
+`authority_events::standalone::tests`) delivers a real keyed registration, overlay
+put, overlay delete and MCP publication as closed v1 events through the file sink
+and redelivers them byte for byte. Through the admin handlers,
+`authority_evidence_app_tests` proves `a_replayed_catalog_change_repeats_no_side_effect`,
+`a_replayed_refresh_does_not_fetch_the_upstream_again_or_audit_a_second_change`,
+`a_replayed_openapi_registration_does_not_fetch_the_upstream_again_or_audit_a_second_change`,
+`required_evidence_refuses_every_unkeyed_standalone_catalog_publication`,
+`required_mode_refuses_the_unkeyed_catalog_publication_and_admits_the_keyed_principal`
+(Unix builds),
+`required_mode_refuses_a_keyed_catalog_publication_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink`
+and `a_keyed_catalog_change_without_the_routes_permission_is_forbidden_and_reserves_nothing`.
+In cluster mode, against PostgreSQL and a real roster,
+`authority_evidence_app_tests::cluster_connection_keys::postgres_keyed_catalog_changes_wait_for_the_fleet_and_authorize_before_the_fence`
+proves that a keyed catalog change is `409 capability_not_advertised` and reserves
+nothing while a live member lacks `caller_operation_keys`, that a keyed request from
+a caller without the route's permission is `403` and leaves `contract_fence`
+unchanged, and that the first keyed change raises the fence once.
+
 ## Keyed safe references
 
 `gateway/src/authority_events/pseudonym.rs` derives the `subject_ref`, `issuer_ref`
@@ -1261,9 +1362,10 @@ its writers record the same kind, auth mode and canonical issuer, and its rows
 committed before then, which recorded a service token as kind `principal` and the
 issuer as the principal carried it, are delivered in this vocabulary without being
 rewritten. Both tables are journal sources since then. The inventory's
-`policy_postgres`, `tools_postgres`, `policy_tests_postgres`, `configuration_import`
-and `catalog_postgres` rows keep `missing_metadata` for their caller-bound operation
-identity and issuer-scoped subject reference; required mode refuses the
+`policy_postgres`, `tools_postgres`, `policy_tests_postgres` and `configuration_import`
+rows keep `missing_metadata` for their caller-bound operation identity and
+issuer-scoped subject reference (`catalog_postgres` is qualified since its keyed
+paths shipped, [above](#keyed-catalog-publication-and-overlay-changes)); required mode refuses the
 `configuration_import` row's writing form.
 
 A `system` actor never authenticated anybody, so it can never bind a caller key.
@@ -1498,8 +1600,8 @@ sink and a Unix build, and names the first of these that fails
 
 | `required_mode` | Rows | What required mode does |
 | --- | --- | --- |
-| `admitted` | Cluster policy, tools, Connection delete, catalogs, token issue, rotation and revocation, JWT revocation, and admin session grant and withdrawal, and standalone Connection delete, local-secret create, rotate, delete and re-encryption, catalog publication and overlays, and token issue, rotation and revocation | Runs it. Its evidence is the row's `record`. Nine of these pairs stay admitted without qualification on purpose ([below](#rows-admitted-without-qualification)) |
-| `caller_key_required` | PostgreSQL mutation approval preparation, and Connection create and replace (with the credential binding change a replacement makes) in both modes | Admits only the issuer-bound keyed request with `qualified_v1`, `AUTHORITY_EVENT_SINK=file` and a Unix build. Required mode refuses the ordinary preparation POST and the unkeyed Connection create and replace. |
+| `admitted` | Cluster policy, tools, Connection delete, token issue, rotation and revocation, JWT revocation, and admin session grant and withdrawal, and standalone Connection delete, local-secret create, rotate, delete and re-encryption, and token issue, rotation and revocation | Runs it. Its evidence is the row's `record`. Nine of these pairs stay admitted without qualification on purpose ([below](#rows-admitted-without-qualification)) |
+| `caller_key_required` | PostgreSQL mutation approval preparation, and Connection create and replace (with the credential binding change a replacement makes) and managed catalog publication and overlay put and delete in both modes | Admits only the issuer-bound keyed request with `qualified_v1`, `AUTHORITY_EVENT_SINK=file` and a Unix build. Required mode refuses the ordinary preparation POST, the unkeyed Connection create and replace, and the unkeyed refresh, OpenAPI registration and overlay put and delete. |
 | `refused` | Standalone mutation approval preparation and mutation approval review, revocation and consumption in both modes. Standalone policy mutations, policy file reloads, and tools publication (admin API and file reloads). The writing form of the offline import (`import-standalone --apply`, with or without `--resume`) in cluster mode | Refuses it when asked, before anything is written |
 | `refused_at_startup` | Standalone admin sessions (`ADMIN_SESSION_MODE=standalone_memory`), and configuration activation in both modes | Refuses to start |
 | `unavailable` | Cluster policy file reload and local secrets, standalone JWT revocation and import, configuration export | Nothing to refuse: the mode or the build has no such operation. A gate that is asked anyway refuses it |
@@ -1600,9 +1702,9 @@ What required mode does not do:
   [Rows admitted without qualification](#rows-admitted-without-qualification) are
   atomic and delivered, but carry no caller key.
 - A standalone gateway in required mode therefore changes its policy and tools only
-  through its startup files, and creates and replaces Connections only with a
-  caller key. Connection deletion, local secrets, master-key re-encryption,
-  managed catalogs and overlays, and service tokens are changed as usual. The
+  through its startup files, and creates and replaces Connections and publishes
+  managed catalogs and overlays only with a caller key. Connection deletion, local
+  secrets, master-key re-encryption and service tokens are changed as usual. The
   standalone evidence slices that write policy and tools records in their owning
   stores change those rows to `admitted` as they land.
 

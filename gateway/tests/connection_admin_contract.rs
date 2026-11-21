@@ -17,10 +17,14 @@ struct ExpectedOperation {
 }
 
 /// The routes that honour an `Idempotency-Key` (issue #425).
-const KEYED_CONNECTION_CHANGES: [(&str, &str); 3] = [
+const KEYED_CONNECTION_CHANGES: [(&str, &str); 7] = [
     ("/v1/admin/connections", "post"),
     ("/v1/admin/connections/{id}", "put"),
     ("/v1/admin/connections/{id}", "delete"),
+    ("/v1/admin/connections/{id}/refresh", "post"),
+    ("/v1/admin/connections/{id}/openapi/register", "post"),
+    ("/v1/admin/connections/{id}/overlay", "put"),
+    ("/v1/admin/connections/{id}/overlay", "delete"),
 ];
 
 const EXPECTED_OPERATIONS: &[ExpectedOperation] = &[
@@ -538,13 +542,19 @@ fn connection_admin_openapi_has_exact_routes_operations_and_safe_contracts() {
     // receipt and their keyed-change conflicts.
     for (path, method) in KEYED_CONNECTION_CHANGES {
         let operation = &paths[path][method];
-        if method == "post" {
-            assert_eq!(
-                operation.pointer("/responses/200/content/application~1json/schema/$ref"),
-                Some(&Value::String(schema_reference("OperationReceipt"))),
-                "a keyed create's exact retry is answered 200 with its receipt"
-            );
-        }
+        // A route whose first commit is not `200` (a create, a registration)
+        // answers its exact retry `200` with the receipt alone; the others
+        // were checked above to answer their detail or the receipt.
+        let exact_retry = operation
+            .pointer("/responses/200/content/application~1json/schema")
+            .unwrap_or(&Value::Null);
+        let receipt = Value::String(schema_reference("OperationReceipt"));
+        assert!(
+            exact_retry.get("$ref") == Some(&receipt)
+                || exact_retry.pointer("/oneOf/1/$ref") == Some(&receipt),
+            "{} {path}: a keyed change's exact retry is answered 200 with its receipt",
+            method.to_ascii_uppercase()
+        );
         assert_eq!(
             operation.pointer("/responses/409/content/application~1json/schema/oneOf/1/$ref"),
             Some(&Value::String(schema_reference("AuthorityEvidenceRefusal"))),

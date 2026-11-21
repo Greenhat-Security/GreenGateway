@@ -474,15 +474,18 @@
           "Connections"
         ],
         "summary": "Refresh a registered managed MCP or OpenAPI catalog",
-        "description": "Requires admin:connections:refresh, an exact resource ETag, and an empty body. An OpenAPI refresh re-resolves the stored overlay's enum and label sources under the previously authorized source plan; failure leaves the prior catalog and enum values as last-known-good.",
+        "description": "Requires admin:connections:refresh, an exact resource ETag, and an empty body. An OpenAPI refresh re-resolves the stored overlay's enum and label sources under the previously authorized source plan; failure leaves the prior catalog and enum values as last-known-good. With an Idempotency-Key (issue #425) the key is bound to the action (catalog.mcp.publish or catalog.openapi.publish, by the Connection's discovery kind), the caller, the Connection ID, the If-Match value and the empty body; the key is reserved in the publication's own transaction with its catalog_change_evidence row. The key is checked after authorization and validation, before If-Match is compared with the Connection's current ETag, and before the upstream is fetched or anything is generated: an exact retry is answered with its receipt even after another writer replaced the Connection (an unused key with a stale If-Match is still 412, and a retry after the Connection was deleted is 404); an exact retry is answered 200 with the receipt {operation_id, operation, resource_id, revision, committed_at} read from the committed evidence (revision is the catalog revision it published), with Cache-Control: no-store, and repeats no fetch, no publication and no audit event; the same key with another request is 409 caller_operation_conflict and changes nothing. With AUTHORITY_EVIDENCE_DURABILITY=required only the keyed request of a provider-authenticated principal with a canonical issuer is admitted, and only with AUTHORITY_EVENT_FORMAT=qualified_v1, AUTHORITY_EVENT_SINK=file and a Unix build; any other form, the admin UI's unkeyed request and service-token callers included, is 409 authority_evidence_unsupported naming the first unmet criterion, before anything is read or written.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/ConnectionIdempotencyKey"
           }
         ],
         "responses": {
           "200": {
-            "description": "Safe catalog publication summary.",
+            "description": "Safe catalog publication summary. Or, for an exact retry under the same Idempotency-Key: the receipt read from the committed evidence, without an ETag. Nothing was published again and no audit event was emitted.",
             "headers": {
               "ETag": {
                 "$ref": "#/components/headers/ETag"
@@ -494,7 +497,36 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/CatalogPublishResult"
+                  "oneOf": [
+                    {
+                      "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/CatalogPublishResult"
+                    },
+                    {
+                      "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OperationReceipt"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A conflict. reason caller_operation_conflict: the Idempotency-Key is bound to a different request (another body, target, If-Match, action or caller); nothing was changed. reason authority_evidence_unsupported: AUTHORITY_EVIDENCE_DURABILITY=required does not admit this form of the change; nothing was read or written. reason capability_not_advertised: in cluster mode a live replica does not advertise caller_operation_keys, so the key cannot be honoured yet; nothing was changed. Other conflicts keep their existing bodies.",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/AdminError"
+                    },
+                    {
+                      "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/AuthorityEvidenceRefusal"
+                    }
+                  ]
                 }
               }
             }
@@ -558,10 +590,13 @@
           "Managed OpenAPI"
         ],
         "summary": "Validate, compile, and atomically publish an OpenAPI overlay",
-        "description": "Requires admin:connections:write and the exact overlay ETag. Declarative request and response transforms are checked against the generated request-body properties and declared JSON 2xx response schemas before publication. Any raw source request.path additionally requires admin:connections:secrets:write; this remains true before or after the Connection gains HTTP, additional-header, or mTLS authority. Validation, source resolution, compilation, catalog publication, overlay persistence, enum last-known-good values, and source-report persistence succeed as one mutation or leave the previous state unchanged.",
+        "description": "Requires admin:connections:write and the exact overlay ETag. Declarative request and response transforms are checked against the generated request-body properties and declared JSON 2xx response schemas before publication. Any raw source request.path additionally requires admin:connections:secrets:write; this remains true before or after the Connection gains HTTP, additional-header, or mTLS authority. Validation, source resolution, compilation, catalog publication, overlay persistence, enum last-known-good values, and source-report persistence succeed as one mutation or leave the previous state unchanged. With an Idempotency-Key (issue #425) the key is bound to the action (catalog.overlay.replace), the caller, the Connection ID, the If-Match value and the overlay document as canonical JSON (allow_unresolved_enum_sources=true is bound with it when set, so the same key with the flag flipped is a conflict); the key is reserved in the publication's own transaction with its catalog_change_evidence row. The key is checked after authorization and validation and before the upstream is fetched or anything is generated: an exact retry is answered 200 with the receipt {operation_id, operation, resource_id, revision, committed_at} read from the committed evidence (revision is the catalog revision it published), with Cache-Control: no-store, and repeats no fetch, no publication and no audit event; the same key with another request is 409 caller_operation_conflict and changes nothing. With AUTHORITY_EVIDENCE_DURABILITY=required only the keyed request of a provider-authenticated principal with a canonical issuer is admitted, and only with AUTHORITY_EVENT_FORMAT=qualified_v1, AUTHORITY_EVENT_SINK=file and a Unix build; any other form, the admin UI's unkeyed request and service-token callers included, is 409 authority_evidence_unsupported naming the first unmet criterion, before anything is read or written.",
         "parameters": [
           {
             "$ref": "#/components/parameters/OpenApiOverlayIfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/ConnectionIdempotencyKey"
           },
           {
             "name": "allow_unresolved_enum_sources",
@@ -586,7 +621,7 @@
         },
         "responses": {
           "200": {
-            "description": "Overlay and compiled catalog publication summary.",
+            "description": "Overlay and compiled catalog publication summary. Or, for an exact retry under the same Idempotency-Key: the receipt read from the committed evidence, without an ETag. Nothing was published again and no audit event was emitted.",
             "headers": {
               "ETag": {
                 "$ref": "#/components/headers/OpenApiOverlayETag"
@@ -598,7 +633,36 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiOverlayMutationResponse"
+                  "oneOf": [
+                    {
+                      "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiOverlayMutationResponse"
+                    },
+                    {
+                      "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OperationReceipt"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A conflict. reason caller_operation_conflict: the Idempotency-Key is bound to a different request (another body, target, If-Match, action or caller); nothing was changed. reason authority_evidence_unsupported: AUTHORITY_EVIDENCE_DURABILITY=required does not admit this form of the change; nothing was read or written. reason capability_not_advertised: in cluster mode a live replica does not advertise caller_operation_keys, so the key cannot be honoured yet; nothing was changed. Other conflicts keep their existing bodies.",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/AdminError"
+                    },
+                    {
+                      "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/AuthorityEvidenceRefusal"
+                    }
+                  ]
                 }
               }
             }
@@ -633,15 +697,18 @@
           "Managed OpenAPI"
         ],
         "summary": "Remove an OpenAPI overlay and republish the bare catalog",
-        "description": "Requires admin:connections:write and the exact overlay ETag. Bare generation, catalog replacement, overlay deletion, and source-report/value cleanup occur in one transaction; failure leaves the prior compiled catalog and overlay intact.",
+        "description": "Requires admin:connections:write and the exact overlay ETag. Bare generation, catalog replacement, overlay deletion, and source-report/value cleanup occur in one transaction; failure leaves the prior compiled catalog and overlay intact. With an Idempotency-Key (issue #425) the key is bound to the action (catalog.overlay.delete; removing an overlay republishes the catalog, so it is not a withdrawal), the caller, the Connection ID, the If-Match value and the empty body; the key is reserved in the publication's own transaction with its catalog_change_evidence row. The key is checked after authorization and validation and before the upstream is fetched or anything is generated: an exact retry is answered 200 with the receipt {operation_id, operation, resource_id, revision, committed_at} read from the committed evidence (revision is the catalog revision it published), with Cache-Control: no-store, and repeats no fetch, no publication and no audit event; the same key with another request is 409 caller_operation_conflict and changes nothing. With AUTHORITY_EVIDENCE_DURABILITY=required only the keyed request of a provider-authenticated principal with a canonical issuer is admitted, and only with AUTHORITY_EVENT_FORMAT=qualified_v1, AUTHORITY_EVENT_SINK=file and a Unix build; any other form, the admin UI's unkeyed request and service-token callers included, is 409 authority_evidence_unsupported naming the first unmet criterion, before anything is read or written.",
         "parameters": [
           {
             "$ref": "#/components/parameters/OpenApiOverlayIfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/ConnectionIdempotencyKey"
           }
         ],
         "responses": {
           "200": {
-            "description": "Bare catalog publication summary; overlay_revision is 0.",
+            "description": "Bare catalog publication summary; overlay_revision is 0. Or, for an exact retry under the same Idempotency-Key: the receipt read from the committed evidence, without an ETag. Nothing was published again and no audit event was emitted.",
             "headers": {
               "ETag": {
                 "$ref": "#/components/headers/OpenApiOverlayETag"
@@ -653,7 +720,36 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiOverlayMutationResponse"
+                  "oneOf": [
+                    {
+                      "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiOverlayMutationResponse"
+                    },
+                    {
+                      "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OperationReceipt"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A conflict. reason caller_operation_conflict: the Idempotency-Key is bound to a different request (another body, target, If-Match, action or caller); nothing was changed. reason authority_evidence_unsupported: AUTHORITY_EVIDENCE_DURABILITY=required does not admit this form of the change; nothing was read or written. reason capability_not_advertised: in cluster mode a live replica does not advertise caller_operation_keys, so the key cannot be honoured yet; nothing was changed. Other conflicts keep their existing bodies.",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/AdminError"
+                    },
+                    {
+                      "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/AuthorityEvidenceRefusal"
+                    }
+                  ]
                 }
               }
             }
@@ -750,10 +846,13 @@
           "Managed OpenAPI"
         ],
         "summary": "Persist and publish an explicit OpenAPI selection",
-        "description": "Requires admin:tools:write and the exact Connection ETag. The repeated spec/digest/revisions bind registration to the reviewed preview. The request shape is unchanged; registration compiles and publishes the stored overlay when one exists.",
+        "description": "Requires admin:tools:write and the exact Connection ETag. The repeated spec/digest/revisions bind registration to the reviewed preview. The request shape is unchanged; registration compiles and publishes the stored overlay when one exists. With an Idempotency-Key (issue #425) the key is bound to the action (catalog.openapi.publish), the caller, the Connection ID, the If-Match value and the request body as canonical JSON (the specification and its selection); the key is reserved in the publication's own transaction with its catalog_change_evidence row. The key is checked after authorization and validation, before If-Match is compared with the Connection's current ETag, and before the upstream is fetched or anything is generated: an exact retry is answered with its receipt even after another writer replaced the Connection (an unused key with a stale If-Match is still 412, and a retry after the Connection was deleted is 404); an exact retry is answered 200 with the receipt {operation_id, operation, resource_id, revision, committed_at} read from the committed evidence (revision is the catalog revision it published), with Cache-Control: no-store, and repeats no fetch, no publication and no audit event; the same key with another request is 409 caller_operation_conflict and changes nothing. With AUTHORITY_EVIDENCE_DURABILITY=required only the keyed request of a provider-authenticated principal with a canonical issuer is admitted, and only with AUTHORITY_EVENT_FORMAT=qualified_v1, AUTHORITY_EVENT_SINK=file and a Unix build; any other form, the admin UI's unkeyed request and service-token callers included, is 409 authority_evidence_unsupported naming the first unmet criterion, before anything is read or written.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/ConnectionIdempotencyKey"
           }
         ],
         "requestBody": {
@@ -767,6 +866,21 @@
           }
         },
         "responses": {
+          "200": {
+            "description": "An exact retry under the same Idempotency-Key: the receipt read from the committed evidence. Nothing was published again, the upstream was not contacted and no audit event was emitted.",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OperationReceipt"
+                }
+              }
+            }
+          },
           "201": {
             "description": "Safe managed OpenAPI catalog publication summary.",
             "headers": {
@@ -781,6 +895,28 @@
               "application/json": {
                 "schema": {
                   "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/CatalogPublishResult"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A conflict. reason caller_operation_conflict: the Idempotency-Key is bound to a different request (another body, target, If-Match, action or caller); nothing was changed. reason authority_evidence_unsupported: AUTHORITY_EVIDENCE_DURABILITY=required does not admit this form of the change; nothing was read or written. reason capability_not_advertised: in cluster mode a live replica does not advertise caller_operation_keys, so the key cannot be honoured yet; nothing was changed. Other conflicts keep their existing bodies.",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/AdminError"
+                    },
+                    {
+                      "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/AuthorityEvidenceRefusal"
+                    }
+                  ]
                 }
               }
             }
@@ -1665,7 +1801,7 @@
         "name": "Idempotency-Key",
         "in": "header",
         "required": false,
-        "description": "Optional caller key (issue #425): one canonical lowercase UUIDv7, bound to the action, the authenticated caller, the Connection ID (none for a create), the If-Match value and the request body as canonical JSON, credential aliases included. A malformed or repeated key is 400; a principal without a canonical issuer cannot own one (403). In cluster mode a key is honoured only once every live replica advertises caller_operation_keys.",
+        "description": "Optional caller key (issue #425): one canonical lowercase UUIDv7, bound to the action, the authenticated caller, the Connection ID (none for a create), the If-Match value and the request body as canonical JSON (credential aliases included; a refresh or an overlay removal has none). A malformed or repeated key is 400; a principal without a canonical issuer cannot own one (403). In cluster mode a key is honoured only once every live replica advertises caller_operation_keys.",
         "schema": {
           "type": "string",
           "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"

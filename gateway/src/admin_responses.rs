@@ -453,6 +453,10 @@ pub(super) fn connection_refresh_error_response(
     error: connections::mcp::McpCatalogRefreshError,
 ) -> Response {
     let status = match error {
+        // The refresh's caller key is bound to another request (issue #425).
+        connections::mcp::McpCatalogRefreshError::CallerOperationConflict => {
+            return caller_operation_conflict();
+        }
         connections::mcp::McpCatalogRefreshError::InvalidConnectionId
         | connections::mcp::McpCatalogRefreshError::ConnectionNotFound => StatusCode::NOT_FOUND,
         connections::mcp::McpCatalogRefreshError::PreconditionFailed => {
@@ -499,6 +503,8 @@ pub(super) fn openapi_catalog_error_response(
     use connections::openapi::OpenApiCatalogError;
 
     let status = match error {
+        // The write's caller key is bound to another request (issue #425).
+        OpenApiCatalogError::CallerOperationConflict => return caller_operation_conflict(),
         OpenApiCatalogError::InvalidConnectionId | OpenApiCatalogError::ConnectionNotFound => {
             StatusCode::NOT_FOUND
         }
