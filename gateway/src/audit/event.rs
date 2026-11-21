@@ -23,6 +23,13 @@ pub const POLICY_SUGGESTION_DRAFTED: &str = "policy.suggestion_drafted";
 pub const SIGNAL_OPENED: &str = "signal.opened";
 pub const SIGNAL_LIFECYCLE_CHANGED: &str = "signal.lifecycle_changed";
 pub const SUGGESTION_LIFECYCLE_CHANGED: &str = "suggestion.lifecycle_changed";
+/// A suggestion generation run wrote suggestions (issue #243, item 19): it
+/// inserted new ones or rebound open ones, which moves their revision and
+/// so refuses reviews and acceptances that read the earlier one. Records
+/// the counts, the policy ETag and generator version the run bound to;
+/// never a path, principal or proposed rule. A run that wrote nothing emits
+/// nothing.
+pub const SUGGESTIONS_GENERATED: &str = "suggestion.generated";
 /// A policy test suite was run (issue #243, slice 11). Records the policy
 /// ETag, suite digest and counts of a completed run, never its cases.
 pub const POLICY_TESTS_RUN: &str = "policy.tests_run";

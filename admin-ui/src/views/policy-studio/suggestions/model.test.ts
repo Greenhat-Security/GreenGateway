@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest';
 import { projectSuggestion, type RuleSuggestion } from '../../../lib/suggestions';
 import {
   evidenceFacts,
+  freshnessLabels,
+  generationFacts,
   matchingRulePosition,
   reviewCase,
   routingFacts,
@@ -72,6 +74,68 @@ describe('suggestion presentation', () => {
       'The audit scan stopped at its row bound after 100000 records, so the window was not read completely.',
     );
     expect(evidenceFacts(suggestion({ evidence: {} })).availability).toBe('not_recorded');
+  });
+
+  it('freshnessLabels shows each stale reason in text', () => {
+    const stale = suggestion({
+      freshness: {
+        status: 'stale',
+        reasons: [
+          'policy_changed',
+          'generator_changed',
+          'evidence_schema_changed',
+          'configuration_changed',
+          'tools_changed',
+          'connections_changed',
+          'egress_changed',
+          'evaluator_changed',
+          'gateway_build_changed',
+          'resource_snapshot_incomplete',
+        ],
+      },
+    });
+    const [label] = freshnessLabels(stale);
+    expect(label.badge).toBe('warning');
+    expect(label.text).toBe(
+      'Stale: the live policy changed; the suggestion generator changed; the evidence schema changed; the gateway configuration changed; the registered tools changed; the Connections changed; the egress controls changed; the policy evaluator changed; the gateway build changed; not every policy resource could be read',
+    );
+    expect(label.detail).toMatch(/Review in draft re-checks it/);
+    expect(
+      freshnessLabels(suggestion({ freshness: { status: 'current', reasons: [] } })).map(
+        (entry) => entry.text,
+      ),
+    ).toEqual(['Current']);
+    // Not open: the state says what it is.
+    expect(
+      freshnessLabels(
+        suggestion({ state: 'accepted', revision: 2, freshness: { status: null, reasons: [] } }),
+      ),
+    ).toEqual([]);
+  });
+
+  it('an unbound suggestion says the binding was not recorded', () => {
+    const unbound = suggestion({
+      generation: null,
+      freshness: { status: 'unbound', reasons: ['binding_not_recorded'] },
+    });
+    expect(freshnessLabels(unbound).map((label) => label.text)).toEqual([
+      'Unbound: no generation binding recorded',
+    ]);
+    // The label names no cause the gateway did not report; the detail line
+    // lists the possible ones.
+    expect(freshnessLabels(unbound)[0]?.detail).toMatch(/imported from a standalone gateway/);
+    expect(generationFacts(unbound).generator).toBe('Not recorded.');
+  });
+
+  it('a superseded suggestion comes from the server, not only from a 409', () => {
+    const superseded = suggestion({
+      freshness: { status: 'superseded', reasons: ['rule_already_live'] },
+    });
+    expect(freshnessLabels(superseded).map((label) => label.text)).toEqual([
+      'Superseded: rule already live',
+    ]);
+    // No mark from an earlier answer is needed.
+    expect(stateLabels(superseded, null).map((label) => label.text)).toEqual(['Open']);
   });
 
   it('labels stale and superseded suggestions in text', () => {

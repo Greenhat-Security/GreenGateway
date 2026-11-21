@@ -955,7 +955,7 @@ const OPERATOR_EDIT_SHADOW_ENFORCED_AS_DENY: &str = "shadow_enforced_as_deny";
 /// A rule's meaning without its identity: what two rules must agree on to
 /// decide the same requests the same way. The id is ignored, and the method
 /// and principal lists compare as sets.
-fn rule_semantics(rule: &rbac::Rule) -> rbac::Rule {
+pub(super) fn rule_semantics(rule: &rbac::Rule) -> rbac::Rule {
     let mut rule = rule.clone();
     rule.id = None;
     for list in [
@@ -1451,6 +1451,11 @@ struct SuggestionDraftRequest {
 struct SuggestionDraftView<'a> {
     draft: PolicyDraftView<'a>,
     suggestion: &'a discovery::suggestions::RuleSuggestion,
+    /// Whether the suggestion is still bound to the live policy and
+    /// resources it was generated against (issue #243, item 19). Drafting
+    /// is itself the review that re-checks it, so a stale or unbound
+    /// suggestion is still drafted; this says what changed.
+    freshness: &'a discovery::suggestion_binding::SuggestionFreshness,
     rule: &'a rbac::Rule,
     position: usize,
 }
@@ -1533,6 +1538,12 @@ fn candidate_with_suggested_rule(
 /// whose body binds the suggestion moves it, accepting it with the commit.
 /// A written draft emits `policy.draft_changed` and
 /// `policy.suggestion_drafted`; a refusal writes and emits nothing.
+///
+/// The answer and the `policy.suggestion_drafted` event carry the
+/// suggestion's generation freshness against the live policy and resources
+/// (issue #243, item 19), as a status and reason codes only. Drafting never
+/// refuses on it: opening a stale or unbound suggestion in a draft is the
+/// review that re-checks it.
 pub(super) async fn rule_suggestion_draft_endpoint(
     State(state): State<SuggestionsAdminState>,
     Path(id): Path<String>,
@@ -1634,6 +1645,11 @@ pub(super) async fn rule_suggestion_draft_endpoint(
     if presented_policy != live_etag {
         return PolicyDraftRefusal::PolicyEtagMismatch.response();
     }
+    let freshness = discovery::suggestion_binding::suggestion_freshness(
+        suggestion.generation.as_ref(),
+        Some(&live_generation_state(&live_etag, rbac_state)),
+        rule_is_live(&live_rule_semantics(&live_policy), &rule),
+    );
 
     let owner = policy_draft_owner(&principal);
     let existing = match target {
@@ -1755,6 +1771,8 @@ pub(super) async fn rule_suggestion_draft_endpoint(
             "candidate_etag": record.summary.candidate_etag,
             "rule_id": rule.and_then(|rule| rule.id.as_deref()),
             "position": position,
+            "generation_freshness": freshness.status,
+            "generation_freshness_reasons": freshness.reasons,
         }),
     );
     // The store hands back the candidate it wrote, which is the one built
@@ -1774,6 +1792,7 @@ pub(super) async fn rule_suggestion_draft_endpoint(
         SuggestionDraftView {
             draft,
             suggestion: &suggestion,
+            freshness: &freshness,
             rule,
             position,
         },

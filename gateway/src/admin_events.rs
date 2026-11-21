@@ -642,6 +642,41 @@ pub(super) fn emit_suggestion_lifecycle_changed(
     ));
 }
 
+/// `suggestion.generated` for a generation run that inserted or rebound
+/// anything (issue #243, item 19): who ran it, how many rows it inserted
+/// and rebound, and the policy ETag and generator version it bound them
+/// to. Counts only: no path, principal or proposed rule.
+pub(super) fn emit_suggestions_generated(
+    state: &SuggestionsAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    run: &discovery::suggestions::RuleSuggestionRun,
+    policy_etag: &str,
+) {
+    if run.inserted_count == 0 && run.rebound_count == 0 {
+        return;
+    }
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip = client_ip::canonical_client_ip(
+        &parts.headers,
+        &parts.extensions,
+        &state.policy.client_ip_policy,
+    );
+    state.policy.audit.emit(audit::AuditEvent::new(
+        audit::event::SUGGESTIONS_GENERATED,
+        request_id,
+        source_ip,
+        Some(auth::actor_from_principal(principal)),
+        json!({
+            "inserted_count": run.inserted_count,
+            "rebound_count": run.rebound_count,
+            "policy_etag": policy_etag,
+            "generator_version":
+                discovery::suggestion_binding::RULE_SUGGESTION_GENERATOR_VERSION,
+        }),
+    ));
+}
+
 /// `suggestion.lifecycle_changed` for a standalone acceptance the
 /// reconciler completed (issue #243): its policy was committed by a request
 /// that ended before it could move the suggestion. No request asks for this

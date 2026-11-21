@@ -59,6 +59,69 @@ describe('suggestions client', () => {
     await expect(dismissSuggestion('../policy', 1)).rejects.toThrow('Invalid suggestion identifier.');
   });
 
+  it('rejects malformed generation digests and oversize versions', async () => {
+    const generation = {
+      generator_version: 'rule-suggestions.v1',
+      evidence_schema_version: 'rule-suggestion-evidence.v1',
+      evidence_cutoff: '2026-11-01T10:00:00Z',
+      evidence_digest: `sha256:${'a'.repeat(64)}`,
+      resource_snapshot_digest: `sha256:${'b'.repeat(64)}`,
+      resource_snapshot_complete: true,
+    };
+    stubFetch(() =>
+      jsonResponse(200, {
+        suggestions: [
+          { ...suggestion(), generation, freshness: { status: 'current', reasons: [] } },
+        ],
+      }),
+    );
+    const page = await fetchSuggestions({ state: null });
+    expect(page.suggestions[0].generation).toEqual(generation);
+    expect(page.suggestions[0].freshness).toEqual({ status: 'current', reasons: [] });
+
+    for (const malformed of [
+      { ...generation, evidence_digest: 'sha256:short' },
+      { ...generation, resource_snapshot_digest: `sha256:${'B'.repeat(64)}` },
+      { ...generation, generator_version: 'v'.repeat(65) },
+      { ...generation, resource_snapshot_complete: 'yes' },
+    ]) {
+      stubFetch(() =>
+        jsonResponse(200, { suggestions: [{ ...suggestion(), generation: malformed }] }),
+      );
+      await expect(fetchSuggestions({ state: null })).rejects.toThrow(
+        'Invalid suggestion list response.',
+      );
+    }
+    stubFetch(() =>
+      jsonResponse(200, {
+        suggestions: [{ ...suggestion(), freshness: { status: 'fresh-ish', reasons: [] } }],
+      }),
+    );
+    await expect(fetchSuggestions({ state: null })).rejects.toThrow(
+      'Invalid suggestion list response.',
+    );
+  });
+
+  it('keeps an unknown freshness code visible as unrecognised', async () => {
+    stubFetch(() =>
+      jsonResponse(200, {
+        suggestions: [
+          {
+            ...suggestion(),
+            generation: null,
+            freshness: { status: 'stale', reasons: ['policy_changed', 'brand_new_code', 'Not A Code!'] },
+          },
+        ],
+      }),
+    );
+    const page = await fetchSuggestions({ state: null });
+    expect(page.suggestions[0].generation).toBeNull();
+    expect(page.suggestions[0].freshness).toEqual({
+      status: 'stale',
+      reasons: ['policy_changed', 'brand_new_code', 'unrecognised'],
+    });
+  });
+
   it('opens a suggestion in a new draft bound to the live ETag and the revision read', async () => {
     const fetch = stubFetch(() =>
       jsonResponse(

@@ -302,6 +302,7 @@ async fn required_evidence_refuses_a_standalone_suggestion_acceptance_before_the
         audit_log,
     );
     let disk_before = fs::read(&policy.path).expect("policy file should read");
+    bind_seeded_suggestions(&router, &discovery_db.path).await;
     let current_etag = suggestions_policy_etag(&router).await;
 
     let accepted = router
