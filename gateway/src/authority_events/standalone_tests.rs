@@ -1171,3 +1171,153 @@ async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_befo
         assert!(!contents.contains(marker), "{marker} reached the file");
     }
 }
+
+/// A keyed OpenAPI registration, overlay put and overlay delete (issue #425)
+/// are delivered under the negotiated format as closed `authority_event.v1`
+/// events through the file sink, produced from real commits, each under its
+/// own caller key. A crash after the sink accepted and before the cursor
+/// advance redelivers the same records byte for byte, so consumers
+/// deduplicate on `(authority_id, event_id)`. No identifier, actor, issuer,
+/// specification, overlay text or binding digest reaches the file.
+#[tokio::test]
+async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit()
+{
+    use crate::authority_events::caller_operation::{CallerOperation, CallerOutcome};
+    use crate::config::AuthorityEventFormat;
+    use crate::connections::catalog_operation_contract::{
+        openapi_candidate, openapi_key, overlay_delete, overlay_delete_key, overlay_document,
+        overlay_put, overlay_put_key, spec_digest, SPEC,
+    };
+    use crate::connections::store::StoredOverlayWrite;
+
+    const OVERLAY_MARKER: &str = "standalone-keyed-overlay-marker";
+    let scratch = Scratch::new("keyed-catalogs");
+    let path = scratch.path("connections.sqlite");
+    let connections = SqliteConnectionStore::open(&path).expect("the Connections store opens");
+    let actor = actor();
+    let api = connections
+        .create(openapi_candidate(CONNECTION_NAME_MARKER), &actor)
+        .expect("the Connection creates");
+    let publish = |(spec, catalog): (u64, u64),
+                   overlay: Option<&StoredOverlayWrite>,
+                   compiled: u64,
+                   caller: &CallerOperation| {
+        match connections
+            .replace_openapi_catalog_with_overlay_and_enum_values_with_operation(
+                &api.id,
+                &api.etag(),
+                spec,
+                catalog,
+                SPEC,
+                &spec_digest(),
+                &[],
+                overlay,
+                compiled,
+                &actor,
+                &[],
+                &[],
+                Some(caller),
+            )
+            .expect("the keyed publication commits")
+        {
+            CallerOutcome::Committed(_) => {}
+            CallerOutcome::Replayed(receipt) => panic!("a first use replayed: {receipt:?}"),
+        }
+    };
+    let register = openapi_key(54, &actor, &api);
+    publish((0, 0), None, 0, &register);
+    let document = overlay_document(OVERLAY_MARKER);
+    let put = overlay_put_key(55, &actor, &api, 0, &document);
+    publish((1, 1), Some(&overlay_put(&document, 0)), 1, &put);
+    let delete = overlay_delete_key(56, &actor, &api, 1);
+    publish((1, 2), Some(&overlay_delete(1)), 0, &delete);
+
+    let material = generated_key_hex();
+    let events = scratch.path("keyed-catalogs.jsonl");
+    let sink = FileSink::new(events.clone(), AuthorityEventFormat::QualifiedV1);
+    let stop = CancellationToken::new();
+    let crashing: Arc<dyn StandaloneEvidenceAuthority> = Arc::new(CrashingAdvance {
+        inner: connections,
+        crash: AtomicBool::new(true),
+    });
+    let mut crashed = 0;
+    for mut lane in lanes_for(&crashing, &material).await {
+        // The Connection lane holds the unkeyed create, the catalog lane the
+        // three keyed publications; each advance fails after the sink
+        // accepted its rows.
+        match lane.step(&sink, 100, &stop).await {
+            Err(StepError::Cursor(_)) => crashed += 1,
+            Ok(_) => {}
+            other => panic!("only the cursor advance fails: {other:?}"),
+        }
+    }
+    assert_eq!(crashed, 2, "both lanes crashed before their cursors moved");
+    // The process dies here.
+    drop(crashing);
+    assert_eq!(cursor(&path, StandaloneEvidenceSource::CatalogChange), 0);
+
+    let restarted: Arc<dyn StandaloneEvidenceAuthority> =
+        Arc::new(SqliteConnectionStore::open(&path).expect("the Connections store reopens"));
+    for mut lane in lanes_for(&restarted, &material).await {
+        lane.deliver_until_caught_up(&sink, test_config(100), &stop)
+            .await
+            .expect("delivery succeeds");
+    }
+    assert_eq!(cursor(&path, StandaloneEvidenceSource::CatalogChange), 3);
+
+    let contents = std::fs::read_to_string(&events).expect("the event file reads");
+    let lines: Vec<&str> = contents.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), 8);
+    assert_eq!(
+        &lines[..4],
+        &lines[4..],
+        "recovery must redeliver byte-identical records"
+    );
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/schemas/authority_event.v1.schema.json"
+    ))
+    .expect("the schema parses");
+    let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
+    let delivered: Vec<serde_json::Value> = lines[..4]
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("every line is JSON"))
+        .filter(|event: &serde_json::Value| {
+            event["operation"]
+                .as_str()
+                .is_some_and(|operation| operation.starts_with("catalog."))
+        })
+        .collect();
+    for event in &delivered {
+        assert_eq!(event["schema_version"], "authority_event.v1", "{event}");
+        validator.validate(event).expect("a closed v1 event");
+    }
+    assert_eq!(
+        delivered
+            .iter()
+            .map(|event| event["operation"].as_str().expect("an operation"))
+            .collect::<Vec<_>>(),
+        [
+            "catalog.openapi.publish",
+            "catalog.overlay.replace",
+            "catalog.overlay.delete"
+        ]
+    );
+    for (event, key) in delivered.iter().zip([&register, &put, &delete]) {
+        assert_eq!(event["operation_id"], key.id().to_string(), "{event}");
+    }
+    let api_id = api.id.to_string();
+    for marker in [
+        ACTOR_MARKER,
+        ACTOR_ISSUER_MARKER,
+        CONNECTION_NAME_MARKER,
+        OVERLAY_MARKER,
+        "keyed-openapi.example.test",
+        "keyed-openapi-token",
+        api_id.as_str(),
+        register.binding_digest(),
+        put.binding_digest(),
+        delete.binding_digest(),
+    ] {
+        assert!(!contents.contains(marker), "{marker} reached the file");
+    }
+}
