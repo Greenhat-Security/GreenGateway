@@ -685,12 +685,17 @@ mod cluster_document_keys {
             })
             .contains(&(key.clone(), "policy.publish".to_owned()))
         };
-        super::super::authority_evidence_app_tests::abandon_once_committed(
-            &router,
-            put(),
-            reserved,
-        )
-        .await;
+        // The request is dropped unanswered, or this test proves nothing
+        // about a client that goes away.
+        assert!(
+            super::super::authority_evidence_app_tests::abandon_once_committed(
+                &router,
+                put(),
+                reserved,
+            )
+            .await,
+            "the change was answered before its commit was observed, so nothing was abandoned"
+        );
 
         // The replica installs what committed, and audits it once.
         assert_eventually(Duration::from_secs(5), || {
@@ -868,8 +873,12 @@ mod cluster_document_keys {
 
         // The unkeyed form of the other routes is refused the same way, by
         // the gate `admit_keyed_document_change` asks for it, before the
-        // authority is read: the rollback, a rule create, the tools
-        // registration and the suite write.
+        // authority is read: the rollback, each rule edit, the tools
+        // registration and the suite write. These are the cluster form of
+        // the policy-family rows of `KEYED_ROUTES`, which the standalone
+        // route walk (`authority_evidence_route_app_tests`) sees refused in
+        // every form; suggestion acceptance and draft publication are
+        // `cluster_discovery_tests`' (they need the discovery store).
         let (router, _) = keyed_replica(pool, false, test_audit_log(), |config| {
             config.authority_events.durability = config::AuthorityEvidenceDurability::Required;
             config.authority_events.format = qualified;
@@ -890,6 +899,24 @@ mod cluster_document_keys {
                 POLICY_RULES_ADMIN_ROUTE,
                 Some(json!({"id": "unkeyed", "path": "/unkeyed", "action": "allow"}).to_string()),
                 "policy.rule.create",
+            ),
+            (
+                Method::PATCH,
+                "/v1/admin/policy/rules/unkeyed",
+                Some(json!({"action": "deny"}).to_string()),
+                "policy.rule.update",
+            ),
+            (
+                Method::DELETE,
+                "/v1/admin/policy/rules/unkeyed",
+                None,
+                "policy.rule.delete",
+            ),
+            (
+                Method::PUT,
+                POLICY_RULES_ORDER_ADMIN_ROUTE,
+                Some(json!(["unkeyed", "other"]).to_string()),
+                "policy.rule.reorder",
             ),
             (
                 Method::POST,
@@ -925,6 +952,7 @@ mod cluster_document_keys {
             assert_eq!(refused["operation"], json!(operation), "{refused}");
         }
         assert!(document_reservations(pool).await.is_empty());
+        assert_eq!(policy_etag(&router, &admin).await, etag);
 
         let (status, body) = required_mode_policy_put(pool, 61, qualified, Some(file), true).await;
         if cfg!(unix) {

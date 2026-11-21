@@ -103,27 +103,33 @@ or unconfigured individual stores.
 
 | Authority | Already atomic in PostgreSQL | Remaining evidence work |
 | --- | --- | --- |
-| Policy publish, rollback, rule edits and suggestion acceptance | Immutable document/history, actor subject, action/diff, active pointer, shared revision and outbox, plus one non-cascading `document_change_evidence` row (operation code, event/operation UUIDs, actor kind, subject, issuer and auth mode, prior/new version, the outbox row's shared revision, database-clock time) in the same transaction, journaled and delivered since migration 32, its actor in migration 24's vocabulary; suggestion acceptance composes its own state, and so its evidence, in the same transaction | A caller-bound operation identity and an issuer-scoped subject reference; standalone policy writes are refused under `required` |
-| Tools publication | Shared document transaction plus name reservations and the same `document_change_evidence` row, journaled and delivered since migration 32; the first-boot seed and the import's activation are recorded as system actors | Same as policy |
-| Stored policy test suite (`policy_tests.publish`, migration 29) | Shared document transaction over its own versions and active pointer, plus the same `document_change_evidence` row, with resource type `policy_tests` | Same as policy. The proposed event names it as a `policy` resource on its own `policy_tests` revision axis, because its versions are not policy versions. Standalone records only the writer's subject on the version row, so `required` refuses the write there |
+| Policy publish, rollback, rule edits and suggestion acceptance | Immutable document/history, actor subject, action/diff, active pointer, shared revision and outbox, plus one non-cascading `document_change_evidence` row (operation code, event/operation UUIDs, actor kind, subject, issuer and auth mode, prior/new version, the outbox row's shared revision, database-clock time) in the same transaction, journaled and delivered since migration 32, its actor in migration 24's vocabulary; suggestion acceptance composes its own state, and so its evidence, in the same transaction | Since #425 a keyed change (draft publication included) binds the caller's UUIDv7 in the change's transaction and is delivered as `authority_event.v1` under `qualified_v1` ([Keyed policy, tools and policy test changes](#keyed-policy-tools-and-policy-test-changes)); unkeyed changes keep a generated operation identity. Standalone policy writes record no caller key, refuse a key and are refused under `required` until #242 |
+| Tools publication | Shared document transaction plus name reservations and the same `document_change_evidence` row, journaled and delivered since migration 32; the first-boot seed and the import's activation are recorded as system actors | Since #425 a keyed OpenAPI registration binds the caller's UUIDv7 in the change's transaction and is delivered as `authority_event.v1` under `qualified_v1`; unkeyed changes keep a generated operation identity. Standalone publication (admin API and file reloads) is refused under `required` until #242 |
+| Stored policy test suite (`policy_tests.publish`, migration 29) | Shared document transaction over its own versions and active pointer, plus the same `document_change_evidence` row, with resource type `policy_tests` | Since #425 a keyed suite write binds the caller's UUIDv7 in the change's transaction and is delivered as `authority_event.v1` under `qualified_v1`, as a `policy` resource on its own `policy_tests` revision axis, because its versions are not policy versions; unkeyed writes keep a generated operation identity. Standalone records only the writer's subject on the version row, so `required` refuses the write there until #242 |
 | Connection and credential binding changes | Record, bindings, immutable version, shared revision and outbox, plus since migration 28 a non-cascading `connection_change_evidence` row per committed create (`connection.create`, no prior version and version 1) and replace (`connection.replace`, prior and new specification version), and a `credential.binding_change` row on the credential axis (prior and new credential revision) under the same operation ID and shared revision when a replace advances the credential revision: actor (subject, kind, auth mode, canonical issuer), event/operation UUIDs, the outbox row's shared revision, database-clock time, journaled and delivered in the change's transaction. An identical replace records nothing. No binding, secret ID or locator enters a row. Standalone writes the same rows, without a shared revision, in the Connections database's own transaction ([Standalone evidence](#standalone-evidence)) | Since #425 a keyed create or replace binds the caller's UUIDv7 in the change's transaction and is delivered as `authority_event.v1` under `qualified_v1` ([Keyed Connection changes](#keyed-connection-create-replace-and-delete)); unkeyed changes keep a generated operation identity. Connections created or replaced before migration 28 keep only their cascading version history; standalone records are delivered without a shared security revision |
 | Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) and its journal row in the same transaction; delivered with keyed safe references since PR 3; since migration 24 the actor's kind, auth mode and canonical issuer too. Standalone writes the same deletion evidence, without a shared revision, in the Connections database's own transaction | Since #425 a keyed delete binds the caller's UUIDv7 in the deletion's transaction and is delivered as `authority_event.v1` under `qualified_v1`; unkeyed and service-token deletions stay admitted and keep a generated operation identity ([Keyed Connection changes](#keyed-connection-create-replace-and-delete)); standalone records are delivered without a shared security revision |
-| Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox, plus one non-cascading `catalog_change_evidence` row (action derived from the write, event/operation UUIDs, the actor's subject, kind, auth mode and canonical issuer, catalog revision transition, compiled overlay revision, shared revision, database-clock time) that outlives the replacement and the Connection's deletion, journaled and delivered since migration 32. Standalone writes the same evidence, without a shared revision, in the Connections database's own transaction (its migration 13) | Caller-bound operation identity and an issuer-scoped subject reference; standalone records are delivered without a shared security revision |
-| Service-token issue | Token row with creator, row/shared revisions and outbox, plus since migration 27 a `service_token_change_evidence` row with action `service_token.issue` (actor, event/operation UUIDs, no prior revision and row revision 1, the create outbox row's shared revision, database-clock time) in the create's transaction, journaled and delivered. Standalone writes the same row in the token database's own create transaction. Neither store records the returned plaintext or its hash | A caller-bound operation identity and an issuer-scoped subject reference; tokens issued before the evidence existed keep only `created_by`; standalone records are delivered without a shared security revision |
-| Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction. In PostgreSQL the change also journals its evidence and is delivered since PR 3. Both stores record the actor's kind, auth mode and canonical issuer (migration 24 and the token database's own columns). The keyed revoke endpoint binds the caller, action and target to the supplied operation UUID in that same transaction | Rotation and unkeyed revocation lack caller-bound operation identities. Issuer-scoped subject references and the qualified event are available for the negotiated PostgreSQL keyed-revoke path only; standalone records are delivered without a shared security revision |
+| Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox, plus one non-cascading `catalog_change_evidence` row (action derived from the write, event/operation UUIDs, the actor's subject, kind, auth mode and canonical issuer, catalog revision transition, compiled overlay revision, shared revision, database-clock time) that outlives the replacement and the Connection's deletion, journaled and delivered since migration 32. Standalone writes the same evidence, without a shared revision, in the Connections database's own transaction (its migration 13) | Since #425 a keyed refresh, OpenAPI registration, overlay put or overlay delete binds the caller's UUIDv7 in the change's transaction and is delivered as `authority_event.v1` under `qualified_v1`, in both modes ([Keyed catalog publication and overlay changes](#keyed-catalog-publication-and-overlay-changes)); unkeyed changes keep a generated operation identity and are refused under `required`. Standalone records are delivered without a shared security revision |
+| Service-token issue | Token row with creator, row/shared revisions and outbox, plus since migration 27 a `service_token_change_evidence` row with action `service_token.issue` (actor, event/operation UUIDs, no prior revision and row revision 1, the create outbox row's shared revision, database-clock time) in the create's transaction, journaled and delivered. Standalone writes the same row in the token database's own create transaction. Neither store records the returned plaintext or its hash | Since #425 a keyed issue binds the caller's UUIDv7 in the create's transaction and is delivered as `authority_event.v1` under `qualified_v1`, in both modes ([Keyed service-token issue and rotation](#keyed-service-token-issue-and-rotation)); unkeyed issues keep a generated operation identity and are refused under `required`. Tokens issued before the evidence existed keep only `created_by`; standalone records are delivered without a shared security revision |
+| Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction. In PostgreSQL the change also journals its evidence and is delivered since PR 3. Both stores record the actor's kind, auth mode and canonical issuer (migration 24 and the token database's own columns). The keyed revoke endpoint binds the caller, action and target to the supplied operation UUID in that same transaction | Since #425 a keyed rotation binds the caller's UUIDv7 in the change's transaction and is delivered as `authority_event.v1` under `qualified_v1`, in both modes; an unkeyed rotation keeps a generated operation identity and is refused under `required`. Revocation is a withdrawal: the keyed revoke binds its key in both modes, and the unkeyed `DELETE` stays admitted with a generated operation identity ([Rows admitted without qualification](#rows-admitted-without-qualification)). Standalone records are delivered without a shared security revision |
 | Approval preparation | The PostgreSQL keyed PUT commits a pending occurrence, its caller-bound receipt, and its journal record in one transaction. Required mode admits this operation with `qualified_v1`. | The ordinary POST is available in best-effort mode. Standalone preparation and subsequent review, revocation and consumption in either backend have no durable authority journal. |
 | JWT revocation | Scoped JTI digest, actor row, shared revision and outbox, plus one non-cascading `jwt_revocation_evidence` row per effective revoke (actor, JTI digest, resulting expiry, shared revision) that extension, reactivation and expiry cleanup never rewrite, journaled in the same transaction and delivered since PR 3; since migration 24 the CLI's actor is recorded as kind `system`, auth mode `system` and no issuer | The CLI actor stays system provenance, not a named human; a caller-bound operation identity |
 | Admin session grant/withdrawal (#424) | With `ADMIN_SESSION_MODE=cluster_postgres`, the session row, one non-cascading `admin_session_evidence` row (event/operation UUIDs, session ID, action, reason, subject and issuer, absolute deadline, database-clock time) and, since migration 26, its journal row commit together in one statement for each grant and each withdrawal; a replacement's withdrawal and grant share one operation ID. Delivered since migration 26 on the `session` axis with keyed safe references; a grant holds journal capacity for its withdrawal, so no withdrawal is refused at capacity ([Admin session withdrawals and journal capacity](#admin-session-withdrawals-and-journal-capacity)) | Migration 33 records and delivers the verified login on grant and replacement and the system on rejection and expiry. Logout accepts a cookie or login binding without authenticating a caller. An issuer-scoped subject reference, delivery of the withdrawal reason and a caller-bound operation identity remain open. Standalone sessions are process-local memory with no durable record and stay `unsupported_future_operation` |
 
 These foundations are already sufficient for their **existing atomic change-record
-purpose**. The inventory uses `missing_metadata` and `missing_delivery` for
-remaining requirements of the proposed event contract. It does not label all
-control-plane writes lossy or ask for a second reconciliation outbox.
-`already_sufficient` covers one operation and storage mode here. Every
-PostgreSQL approval preparation admitted by required mode has a caller-bound
-receipt and a journaled `authority_event.v1`. The inventory also records the
-specific Unix file delivery guarantees for this operation and the keyed revoke
-path. [Authority event v1](#authority-event-v1)
+purpose**. The inventory does not label all control-plane writes lossy or ask for a second
+reconciliation outbox. Thirteen inventory rows are `already_sufficient` and
+qualified: each admits a keyed request whose caller-bound receipt and journaled
+or file-delivered `authority_event.v1` commit with the change. They are
+`policy_postgres`, `tools_postgres` and `policy_tests_postgres` (cluster mode
+only); `connection_postgres`, `connection_standalone`, `catalog_postgres` and
+`catalog_standalone`; `token_issue_postgres`, `token_issue_standalone`,
+`token_rotate_postgres` and `token_rotate_standalone`; `local_secrets`
+(standalone only); and `mutation_approval_prepare_postgres`.
+`missing_metadata` and `missing_delivery` now appear only on rows required mode
+refuses: `configuration_import`, `mutation_approvals` and
+`mutation_approval_prepare_standalone`. The inventory also records the specific
+Unix file delivery guarantees for the qualified rows and the keyed revoke path.
+[Authority event v1](#authority-event-v1)
 
 Important standalone and operator boundaries:
 
@@ -340,8 +346,12 @@ ciphertext, nonce, provider/key locator and raw-response field injections at
 every object boundary. They also reject malformed categories, actor modes,
 timestamps, imprecise numeric revisions and invalid transitions. These schema
 tests alone do not prove runtime redaction. The producer tests of each keyed
-family do: they drive real keyed changes whose inputs carry synthetic sensitive
-markers and inspect what the gateway stores and emits. Service tokens:
+family drive real keyed changes whose inputs carry synthetic sensitive markers
+and inspect what the gateway stores, and for two families what it logs and
+measures too: service tokens and local secrets are checked in stored records,
+receipts, log lines and metrics; Connections, catalogs, and policy, tools and
+policy tests in stored records and receipts only, so log-line and metric-label
+redaction (I5) is proven only for tokens and local secrets. Service tokens:
 `a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext`
 (no plaintext or binding digest in any handler log line) and
 `storage::contract_tests::sqlite_a_failed_token_reservation_is_counted_and_no_secret_reaches_logs_or_metrics`.
@@ -1241,12 +1251,15 @@ policy test suite: the receipt after the ETag moved, `409` on another binding,
 `412` for an unused key with a stale `If-Match`),
 `a_replayed_tools_registration_fetches_no_specification_again`,
 `required_mode_refuses_the_unkeyed_policy_change_and_admits_the_keyed_principal`
-(admission on Unix builds),
+(the unkeyed rollback, rule create, update, delete and reorder, tools
+registration and suite write refused, and admission on Unix builds),
 `required_mode_refuses_a_keyed_policy_change_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink`,
 `required_mode_preflight_refuses_to_seed_an_empty_tools_document`,
 `required_mode_preflight_passes_when_the_tools_document_exists` and
 `an_admitted_policy_change_finishes_after_its_client_goes_away` (a keyed
-`PUT .../policy` whose client disconnects commits, and its retry gets the receipt).
+`PUT .../policy` whose client disconnects commits, and its retry gets the receipt;
+the test fails if the request was answered before its commit was observed, so it
+cannot pass without a disconnect).
 The acceptance and draft publication routes are proved through the suggestion
 admin handlers of a cluster replica, against PostgreSQL, by
 `admin_observability_app_tests::cluster_discovery_tests::`
@@ -2055,8 +2068,10 @@ editing its policy and every cluster replica without a pseudonym key from starti
 The contract is the inventory's `required_mode` for each row, and
 `gateway/src/authority_events/required.rs` enforces it. A change is `admitted` only
 where the row's record shows that the change's own transaction durably names who
-made it, beside the change; the evidence may still lack metadata or delivery, and
-the row's other dispositions identify the gaps. A `caller_key_required` row admits
+made it, beside the change. An admitted row carries exactly one of the two
+reviewed unqualified dispositions, `no_caller_key` or `withdrawal_admitted`; its
+evidence is atomic with the change and delivered as `authority_event_delivery.v1`,
+and the checker refuses any other disposition on an admitted row. A `caller_key_required` row admits
 only a keyed request by an issuer-bound principal with `qualified_v1`, the file
 sink and a Unix build, and names the first of these that fails
 ([Keyed authority changes](#keyed-authority-changes)).
@@ -2106,20 +2121,29 @@ Enforcement:
   test suite write (`PUT .../policy/tests`) asks once the caller is authorized and
   the request validated, before the authority is read, with the request's form
   ([Keyed policy, tools and policy test changes](#keyed-policy-tools-and-policy-test-changes)).
-  An unkeyed draft publication asks at `commit_policy_mutation`, the commit path
-  the policy mutations share (as `policy.publish`, so its own
-  `policy.draft_publish_refused` record carries the same reason); a draft
-  publication bound to a suggestion asks as `policy.suggestion.accept` before its
-  acceptance intent or its rule is written, and a keyed one asks before the draft
-  is read. Connection create and replace ask as `connection.create` and
+  Every draft publication, keyed or not, asks before the draft, the policy or
+  the suggestion is read: as `policy.publish`, or as `policy.suggestion.accept`
+  when it is bound to a suggestion. An unkeyed refusal is also recorded as the
+  draft's own `policy.draft_publish_refused` with the same reason.
+  `commit_policy_mutation`, the commit path the policy mutations share, asks a
+  second time. Connection create and replace ask as `connection.create` and
   `connection.replace` once the caller is authorized and the body validated, with
   the request's form ([Keyed Connection changes](#keyed-connection-create-replace-and-delete)).
   Local-secret create and rotation ask as `secret.create` and `secret.rotate` in
   the same place ([Keyed local-secret changes](#keyed-local-secret-create-rotation-and-delete)).
-  Connection and local-secret deletion, the `connection-secrets
-  reencrypt` command, catalog refreshes, OpenAPI catalog registrations and
-  overlay writes and removals never ask: the Connections database records each
-  of them in the change's own transaction
+  A catalog refresh, an OpenAPI catalog registration and an overlay put and
+  delete ask as `catalog.mcp.publish` or `catalog.openapi.publish` (a refresh
+  publishes the catalog kind the Connection has), `catalog.overlay.replace` and
+  `catalog.overlay.delete`, with the request's form
+  ([Keyed catalog publication and overlay changes](#keyed-catalog-publication-and-overlay-changes)).
+  Service-token issue and rotation ask as `service_token.issue` and
+  `service_token.rotate`, with the request's form
+  ([Keyed service-token issue and rotation](#keyed-service-token-issue-and-rotation)).
+  Connection deletion, local-secret deletion, token revocation and the
+  `connection-secrets reencrypt` command never ask: they are withdrawals or
+  unqualified system changes that stay admitted
+  ([Rows admitted without qualification](#rows-admitted-without-qualification)),
+  and the store records each of them in the change's own transaction
   ([Standalone evidence](#standalone-evidence)).
 - **Background activations.** A watched or `SIGHUP` reload of `POLICY_FILE` or
   `TOOLS_FILE` asks the gate first; a refused reload keeps the active policy or
@@ -2266,8 +2290,16 @@ The family changes recorded these further limits:
   guard is the route-enumerating test
   `required_mode_refuses_the_unkeyed_form_of_every_gated_keyed_route`
   (`gateway/src/authority_evidence_route_app_tests.rs`), which drives every route in
-  `KEYED_ROUTES` and requires each gated one to refuse its unkeyed form in required
-  mode.
+  `KEYED_ROUTES` on a standalone gateway in required mode: each gated route but the
+  keyed preparation (which takes no unkeyed request and answers `400` naming the
+  key) must refuse its unkeyed form with `409` and write nothing to any store, and
+  each of the three withdrawals is named with the test that covers it. In
+  standalone mode the policy, tools and policy test routes are refused in every
+  form, so for their cluster rows the unkeyed form is covered instead by
+  `document_keys_app_tests::cluster_document_keys::required_mode_refuses_the_unkeyed_policy_change_and_admits_the_keyed_principal`
+  (policy `PUT`, rollback, every rule edit, tools registration and suite write)
+  and, for suggestion acceptance and draft publication,
+  `required_mode_refuses_the_unkeyed_cluster_acceptance_and_draft_publication_before_reading`.
 - The router-level log capture in the service-token replay test is per thread, so
   it does not see what the token store logs on the blocking pool; a separate store
   test driven on its own thread
@@ -2277,7 +2309,23 @@ The family changes recorded these further limits:
   `admin_observability_app_tests::cluster_discovery_tests` build their own
   PostgreSQL pool with TLS disabled, so they run only in the loopback PostgreSQL
   jobs and not in the verified-TLS shard
-  ([Verified-TLS storage tests](#verified-tls-storage-tests)).
+  ([Verified-TLS storage tests](#verified-tls-storage-tests)). Four of them are
+  proof anchors of the qualified `policy_postgres` row for `policy.publish` and
+  `policy.suggestion.accept`:
+  `a_keyed_cluster_draft_publication_reserves_policy_publish_and_replays_its_receipt`,
+  `a_keyed_cluster_acceptance_is_answered_from_its_receipt_once_the_suggestion_is_closed`,
+  `a_keyed_cluster_bound_draft_publication_reserves_the_acceptance_and_replays_its_receipt`
+  and
+  `required_mode_refuses_the_unkeyed_cluster_acceptance_and_draft_publication_before_reading`.
+  The same harness keeps the #835 test of that module off the shard too. The
+  store-level proof of those operations
+  (`storage::postgres_documents`, including
+  `a_keyed_suggestion_acceptance_reserves_inside_the_acceptance_transaction`)
+  does run over verified TLS; what is loopback-only is the handler-level replay
+  and required-mode refusal on the two routes. Until the harness takes its TLS
+  mode from the same environment as `cluster_document_keys`, this leaves the
+  #425 closing item that the verified-TLS shard lists every new individually
+  named test unmet.
 
 ### Rows admitted without qualification
 

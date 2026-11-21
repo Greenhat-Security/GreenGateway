@@ -20,8 +20,9 @@ enum Unkeyed {
     /// Admitted in every form: a withdrawal (owner decision, plan section 8
     /// item 4). The named test proves it still records its evidence.
     Withdrawal(&'static str),
-    /// `400` before any gate: the route takes no request without a key, in
-    /// any mode (issue #794).
+    /// `400` naming the missing key, before any gate, before the tool is
+    /// looked up and before the body is read: the route takes no request
+    /// without a key, in any mode (issue #794).
     KeyRequired,
 }
 
@@ -268,6 +269,30 @@ fn route_request(
     request
 }
 
+/// Every table of a standalone SQLite database with its row count: equal
+/// before and after means nothing was written to it.
+fn rows_by_table(path: &FsPath) -> Vec<(String, i64)> {
+    let connection = rusqlite::Connection::open(path).expect("the database opens");
+    let tables = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .expect("the table list prepares")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("the tables list")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("the table names read");
+    tables
+        .into_iter()
+        .map(|table| {
+            let rows = connection
+                .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("the table counts");
+            (table, rows)
+        })
+        .collect()
+}
+
 /// Every reservation in a standalone SQLite database.
 fn reservations_in(path: &FsPath) -> usize {
     rusqlite::Connection::open(path)
@@ -381,6 +406,13 @@ async fn required_mode_refuses_the_unkeyed_form_of_every_gated_keyed_route() {
     let mut required = config;
     qualified_required(&mut required, &events);
     let router = router_with(required, audit_log);
+    let databases = [
+        &connection_db.path,
+        &token_db.path,
+        &history_db.path,
+        &discovery_db.path,
+    ];
+    let stored_before = databases.map(|path| rows_by_table(path));
     let mut refused = Vec::new();
     let mut withdrawals = Vec::new();
     for route in KEYED_ROUTES {
@@ -398,6 +430,13 @@ async fn required_mode_refuses_the_unkeyed_form_of_every_gated_keyed_route() {
                 )
                 .await;
                 assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {answer}");
+                // The key is checked before the tool or the body, so this
+                // answer cannot come from the body or the unknown tool.
+                assert_eq!(
+                    answer["error"],
+                    json!("Idempotency-Key must be one canonical lowercase UUIDv7"),
+                    "{label}: {answer}"
+                );
             }
             Unkeyed::Refused(operation) => {
                 let (status, _, answer) = exchange(
@@ -416,7 +455,11 @@ async fn required_mode_refuses_the_unkeyed_form_of_every_gated_keyed_route() {
             }
         }
     }
-    // Nothing is reserved or written, and each refusal is audited once.
+    // Nothing is reserved or written, and each refusal is audited once: no
+    // table of any store (Connections, catalogs, overlays, local secrets,
+    // evidence, tokens, policy history, suggestions) gained or lost a row,
+    // and neither document file changed.
+    assert_eq!(databases.map(|path| rows_by_table(path)), stored_before);
     assert_eq!(
         (
             reservations_in(&connection_db.path),
