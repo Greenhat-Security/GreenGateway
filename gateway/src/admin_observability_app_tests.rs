@@ -8542,103 +8542,12 @@ mod cluster_discovery_tests {
     use crate::storage::postgres_policy::PostgresPolicyStore;
     use crate::storage::PolicyControlPlane;
 
-    fn locator() -> Option<String> {
-        let key = "GATEWAY_TEST_POSTGRES_URL_FILE".to_owned();
-        let file = std::env::var(&key).ok()?;
-        if file.trim().is_empty() {
-            return None;
-        }
-        let contents = std::fs::read_to_string(file).ok()?;
-        let trimmed = contents.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_owned())
-    }
-
-    struct DsnFile {
-        path: String,
-        directory: std::path::PathBuf,
-    }
-
-    impl Drop for DsnFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.directory);
-        }
-    }
-
-    fn write_dsn_file(dsn: &str) -> DsnFile {
-        let directory = std::env::temp_dir().join(format!(
-            "greengateway-cluster-discovery-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&directory).expect("temp directory should create");
-        let path = directory.join("database-url");
-        std::fs::write(&path, format!("{dsn}\n")).expect("DSN file should write");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .expect("DSN permissions should set");
-        }
-        DsnFile {
-            path: path.display().to_string(),
-            directory,
-        }
-    }
-
-    struct TestDatabase {
-        dsn: String,
-        admin_dsn: String,
-        name: String,
-    }
-
-    impl Drop for TestDatabase {
-        fn drop(&mut self) {
-            let admin_dsn = self.admin_dsn.clone();
-            let name = self.name.clone();
-            std::thread::spawn(move || {
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                runtime.block_on(async move {
-                    let Ok((client, connection)) =
-                        tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls).await
-                    else {
-                        return;
-                    };
-                    let connection = tokio::spawn(connection);
-                    let _ = client
-                        .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
-                        .await;
-                    let _ = connection.await;
-                });
-            });
-        }
-    }
-
-    async fn create_test_database(admin_dsn: &str) -> TestDatabase {
-        let name = format!("ggw_discovery_test_{}", uuid::Uuid::new_v4().simple());
-        let (client, connection) = tokio_postgres::connect(admin_dsn, tokio_postgres::NoTls)
-            .await
-            .expect("admin connection");
-        let connection_task = tokio::spawn(connection);
-        client
-            .batch_execute(&format!("CREATE DATABASE {name}"))
-            .await
-            .expect("test database should create");
-        drop(client);
-        let _ = connection_task.await;
-        let database_start = admin_dsn
-            .rfind('/')
-            .expect("locator DSN has a database path segment");
-        let dsn = format!("{}/{}", &admin_dsn[..database_start], name);
-        TestDatabase {
-            dsn,
-            admin_dsn: admin_dsn.to_owned(),
-            name,
-        }
-    }
+    // The locator, the disposable databases, the DSN files and the TLS
+    // policy every connection here takes are the shared harness's, so
+    // `postgres-foundation-pg` runs these suites against its plain server
+    // and `postgres-foundation-tls` over verified TLS (issue #425).
+    use crate::storage::contract_tests::postgres_audit_tests::create_test_database;
+    use crate::storage::postgres::test_support::{locator, use_test_tls, write_dsn_file};
 
     const CLUSTER_DISCOVERY_DEPLOYMENT_ID: &str = "deploy-cluster-discovery";
 
@@ -8648,7 +8557,7 @@ mod cluster_discovery_tests {
         config.state_backend = config::StateBackend::Postgres;
         config.deployment_id = Some(CLUSTER_DISCOVERY_DEPLOYMENT_ID.to_owned());
         config.database.url_file = Some(dsn_file.path.clone());
-        config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("test database should establish");
