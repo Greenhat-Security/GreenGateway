@@ -532,7 +532,8 @@ impl ClusterMembership {
     /// from an unlocked read of the same records and takes no row lock and
     /// no exclusive lock, so admissions running at the same time -- every
     /// keyed admin change asks this gate (issue #425) -- admit each other
-    /// rather than refuse as `migration_in_progress`.
+    /// rather than refuse as `migration_in_progress`. A refusal is answered
+    /// from that same unlocked read; only a raise is decided under the lock.
     async fn admit_by_raising_the_fence(
         &self,
         requirement: &OperationRequirement,

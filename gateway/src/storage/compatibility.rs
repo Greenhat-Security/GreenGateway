@@ -1020,9 +1020,11 @@ mod gate {
     /// Pure, so every refusal is unit-tested without a database; the
     /// caller reads the fence, the backfill and the roster immediately
     /// before the write. For an [`Activation::DurableFence`] operation the
-    /// caller reads them under the fence's row lock and raises the fence to
-    /// [`fence_target`] in the same transaction (`ClusterMembership`); an
-    /// admission here alone never raises anything.
+    /// caller first reads them without a lock and answers a refusal, or an
+    /// admission the fence already carries, from that read; only when it
+    /// goes on to raise does it read them again under the fence's row lock
+    /// and raise the fence to [`fence_target`] in the same transaction
+    /// (`ClusterMembership`). An admission here alone never raises anything.
     pub(crate) fn evaluate(
         requirement: &OperationRequirement,
         binary: &BinaryContract,

@@ -819,9 +819,9 @@ pub(super) enum KeyedChange {
 /// - `change` names the change for the evidence gate: a
 ///   [`KeyedChange::Gated`] operation asks it, a [`KeyedChange::Withdrawal`]
 ///   never does. A refusal is `409 authority_evidence_unsupported`, audited.
-///   A key reserved for a withdrawal's action on a gated change, or for
-///   another action on a withdrawal, is a handler defect: `500`, and
-///   nothing is asked or read.
+///   A gated change's key must be reserved for that operation's code, and a
+///   withdrawal's for that withdrawal's code: a key reserved for anything
+///   else is a handler defect, `500`, and nothing is asked or read.
 /// - A keyed request (`caller` is `Some`) in cluster mode then asks the
 ///   operation gate for [`storage::compatibility::CALLER_OPERATION_KEYS`]:
 ///   the key is honoured only while every live member advertises
@@ -843,15 +843,16 @@ pub(super) async fn admit_keyed_authority_change(
     use authority_events::required::Withdrawal;
 
     if let Some(caller) = caller {
-        let bound_withdrawal = Withdrawal::from_code(caller.action());
         let consistent = match change {
-            KeyedChange::Gated(_) => bound_withdrawal.is_none(),
-            KeyedChange::Withdrawal(withdrawal) => bound_withdrawal == Some(withdrawal),
+            KeyedChange::Gated(operation) => caller.action() == operation.code(),
+            KeyedChange::Withdrawal(withdrawal) => {
+                Withdrawal::from_code(caller.action()) == Some(withdrawal)
+            }
         };
         if !consistent {
             tracing::error!(
                 action = caller.action(),
-                "a keyed admin change named a withdrawal its caller key is not bound to, or a gated change bound to a withdrawal; it is refused"
+                "a keyed admin change named an operation or withdrawal its caller key is not bound to; it is refused"
             );
             return Err(Box::new(internal_server_error(
                 "the keyed change could not be admitted",

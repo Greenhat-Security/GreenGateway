@@ -191,8 +191,9 @@ pub enum HeartbeatOutcome {
     Fenced,
 }
 
-/// What [`PostgresMembershipStore::raise_contract_fence`] read under the
-/// fence's row lock, for the caller's decision.
+/// What [`PostgresMembershipStore::raise_contract_fence`] read for the
+/// caller's decision: on the first pass without the fence row lock, and on
+/// the second, for a raise, under it.
 pub(crate) struct FenceDecision<'a> {
     pub(crate) fence: &'a ContractFence,
     /// The ledger's `(version, checksum)` rows, bounded as the readiness
@@ -636,13 +637,17 @@ impl PostgresMembershipStore {
     /// moves forward, and a member it excludes can neither boot nor
     /// heartbeat, so a repeat admission -- every keyed admin change once
     /// `caller_operation_keys` is fenced -- neither queues behind nor holds
-    /// up a heartbeat or another admission. Anything else (a raise to make,
-    /// or a refusal) is decided again by the second pass, which locks the
-    /// fence row `FOR UPDATE`, which every heartbeat's `FOR SHARE` waits
-    /// behind, and reads everything again under it. The raise is written
-    /// only when `decide` names a target that differs from the fence as
-    /// read, and the trigger refuses anything that would lower it. So every
-    /// refusal and every raise is decided under the row lock.
+    /// up a heartbeat or another admission. A refusal is answered from the
+    /// same read ([`FenceRaise::Refused`]): it writes nothing and is never
+    /// sticky, so it is a valid answer for the instant it was read, and
+    /// while the gate refuses, keyed requests do not queue on the fence row
+    /// or hold up heartbeats either. Only a raise to make is decided again,
+    /// by the second pass, which locks the fence row `FOR UPDATE`, which
+    /// every heartbeat's `FOR SHARE` waits behind, and reads everything
+    /// again under it; it may still refuse, or find the raise already made.
+    /// The raise is written only when `decide` names a target that differs
+    /// from the fence as read, and the trigger refuses anything that would
+    /// lower it. So every raise is decided under the row lock.
     ///
     /// Every statement runs under the pooled session's statement and lock
     /// timeouts, and a transaction rolls back if the future is dropped
@@ -744,20 +749,30 @@ impl PostgresMembershipStore {
                     members: &members,
                 });
                 if !locked {
-                    // Only an admission that raises nothing is answered
-                    // without the row lock.
-                    if let Ok((decided, None)) = decision {
-                        transaction
-                            .commit()
-                            .await
-                            .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?;
-                        return Ok(FenceRaise::Unchanged { decided });
+                    // An admission that raises nothing, and a refusal, are
+                    // answered without the row lock: neither writes. Only a
+                    // raise takes it.
+                    match decision {
+                        Ok((decided, None)) => {
+                            transaction
+                                .commit()
+                                .await
+                                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?;
+                            return Ok(FenceRaise::Unchanged { decided });
+                        }
+                        // Nothing was written, so the refusal is the answer
+                        // whatever the rollback does: the transaction's drop
+                        // rolls it back, as on the locked pass, and a failed
+                        // rollback cannot turn a decided refusal into a 503.
+                        Err(refusal) => return Ok(FenceRaise::Refused(refusal)),
+                        Ok((_, Some(_))) => {
+                            transaction
+                                .rollback()
+                                .await
+                                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?;
+                            continue;
+                        }
                     }
-                    transaction
-                        .rollback()
-                        .await
-                        .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?;
-                    continue;
                 }
                 let (decided, target) = match decision {
                     Ok(decided) => decided,

@@ -542,7 +542,9 @@ reserves the key (`reserve_bound_operation`). Once the fence carries the
 capability, the gate answers from an unlocked read of the fence and the roster
 and takes no exclusive lock, so keyed requests running at the same time, exact
 retries included, admit each other; only a migrator holding the schema lock
-refuses them (`503 migration_in_progress`). The keyed revoke and keyed
+refuses them (`503 migration_in_progress`). A refusal is answered from the same
+unlocked read, so while the gate refuses, keyed requests do not queue on the
+fence row or hold up heartbeats. The keyed revoke and keyed
 preparation predate the capability and do not ask the gate.
 
 **The request.** The method and route are the route's own, plus one
@@ -583,9 +585,9 @@ evidence rows under the caller's operation ID, appends to the journal last
 (PostgreSQL), and commits. These helpers are in `gateway/src/admin_responses.rs`;
 `operation_receipt` and `caller_operation_conflict` build the two answers above.
 A handler names its change to the gate as `KeyedChange::Gated(operation)` or,
-for one of the three withdrawals, `KeyedChange::Withdrawal(...)`; a key bound to
-a withdrawal on a gated change, or to anything else on a withdrawal, is refused
-as a handler defect (`500`) before any gate is asked. Each family's tests include
+for one of the three withdrawals, `KeyedChange::Withdrawal(...)`. The key must
+be bound to that operation's or withdrawal's code; a key bound to anything else
+is refused as a handler defect (`500`) before any gate is asked. Each family's tests include
 a keyed request from a caller without the route's permission, which is `403`
 and leaves the contract fence unchanged.
 
