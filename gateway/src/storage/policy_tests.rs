@@ -82,7 +82,9 @@ pub enum PolicyTestSuiteCommitError {
     Store(RepositoryError),
     /// The caller's operation ID (`Idempotency-Key`, issue #425) is already
     /// reserved for another action or another binding of this one; nothing
-    /// was written.
+    /// was written. Only the cluster store binds keys, so only it answers
+    /// this.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     CallerOperationConflict,
 }
 
@@ -164,6 +166,7 @@ pub(crate) trait PolicyTestSuiteStore: Send + Sync {
     /// [`PolicyTestSuiteCommitError::CallerOperationConflict`]. A store that
     /// cannot bind keys (the standalone store, whose row stays refused until
     /// #242) refuses a keyed commit before writing anything.
+    #[cfg_attr(not(test), allow(dead_code))] // Called by the P9 handler.
     async fn commit_with_operation(
         &self,
         precondition: PolicyTestSuitePrecondition,
@@ -202,6 +205,7 @@ pub(crate) trait PolicyTestSuiteStore: Send + Sync {
 
 /// A caller key offered to a suite store that cannot bind one: refused as an
 /// invalid parameter, so it is never ignored.
+#[cfg_attr(not(test), allow(dead_code))] // Reached through the P9 handler.
 fn keys_unsupported() -> RepositoryError {
     RepositoryError::invalid_parameter(OPERATION_COMMIT, "caller_operation")
 }
