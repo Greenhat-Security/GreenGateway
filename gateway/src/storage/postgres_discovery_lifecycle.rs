@@ -64,6 +64,7 @@ use std::sync::{
 
 use tokio_postgres::{types::FromSql, Row};
 
+use crate::authority_events::caller_operation::{CallerOperation, CallerOutcome};
 use crate::discovery::{
     lifecycle::{TransitionOutcome, TransitionPrecondition, TransitionRefused},
     query::{decode_cursor, encode_cursor, query_limit, utc_timestamp_rfc3339},
@@ -545,17 +546,45 @@ impl PostgresDiscoveryLifecycleStore {
     /// so the caller can emit the audit events for both changes knowing
     /// they happened. `Err` means nothing was written.
     ///
+    #[cfg_attr(not(test), allow(dead_code))] // The handler accepts with its optional key.
     pub async fn accept_suggestion(
         &self,
         request: AcceptSuggestionRequest<'_>,
     ) -> Result<SuggestionAccepted, AcceptRefused> {
+        match self.accept_suggestion_with_operation(request, None).await? {
+            CallerOutcome::Committed(accepted) => Ok(accepted),
+            // An unkeyed acceptance cannot be answered from a receipt; fail
+            // closed rather than report a change this request did not make.
+            CallerOutcome::Replayed(_) => Err(store_error(RepositoryError::new(
+                RepositoryErrorKind::Internal,
+                OPERATION_ACCEPT_SUGGESTION,
+            ))),
+        }
+    }
+
+    /// [`Self::accept_suggestion`] under the caller's operation ID (issue
+    /// #425). The key is judged right after the suggestion row is locked and
+    /// before the suggestion's predicate, so an exact retry of a committed
+    /// acceptance gets its receipt ([`CallerOutcome::Replayed`]) instead of
+    /// a refusal for a suggestion that is no longer open; a key bound to
+    /// anything else is refused as
+    /// [`PolicyCommitError::CallerOperationConflict`] (inside
+    /// [`AcceptRefused::Policy`]). Otherwise the key is reserved, and its
+    /// evidence row written, by the policy commit inside this transaction,
+    /// so the reservation, the rule, the evidence, the journal entry and the
+    /// transition commit together or not at all.
+    pub async fn accept_suggestion_with_operation(
+        &self,
+        request: AcceptSuggestionRequest<'_>,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<SuggestionAccepted>, AcceptRefused> {
         let operation = OPERATION_ACCEPT_SUGGESTION;
         let client = self.client().await?;
         postgres_documents::begin(&client, operation)
             .await
             .map_err(store_error)?;
         let crash_before_transition = self.crash_before_transition_armed();
-        let outcome = accept_suggestion_in(&client, request, crash_before_transition).await;
+        let outcome = accept_suggestion_in(&client, request, caller, crash_before_transition).await;
         let outcome = match outcome {
             Ok(accepted) => Ok(accepted),
             Err(AcceptStep::Refused(refused)) => Err(refused),
@@ -572,7 +601,7 @@ impl PostgresDiscoveryLifecycleStore {
                 )));
             }
         };
-        postgres_documents::end_transaction(&client, operation, outcome, store_error).await
+        postgres_documents::end_keyed_transaction(&client, operation, outcome, store_error).await
     }
 
     async fn client(&self) -> Result<deadpool_postgres::Object, RuleSuggestionError> {
@@ -682,8 +711,9 @@ pub(crate) async fn transition_suggestion_with(
 async fn accept_suggestion_in(
     client: &deadpool_postgres::Object,
     request: AcceptSuggestionRequest<'_>,
+    caller: Option<&CallerOperation>,
     crash_before_transition: bool,
-) -> Result<SuggestionAccepted, AcceptStep> {
+) -> Result<CallerOutcome<SuggestionAccepted>, AcceptStep> {
     let operation = OPERATION_ACCEPT_SUGGESTION;
     let refused = |refused: AcceptRefused| AcceptStep::Refused(refused);
 
@@ -700,6 +730,17 @@ async fn accept_suggestion_in(
         )
         .await
         .map_err(|error| classify_query(error, operation))?;
+
+    // 1b. A keyed acceptance: the key judged under the lock and before the
+    // predicate, so an exact retry of a committed acceptance (whose
+    // suggestion is no longer open) is answered from its receipt.
+    if let Some(receipt) = postgres_documents::keyed_receipt(client, caller)
+        .await
+        .map_err(|error| refused(AcceptRefused::Policy(error)))?
+    {
+        return Ok(CallerOutcome::Replayed(receipt));
+    }
+
     let Some(row) = row else {
         return Err(refused(AcceptRefused::NotFound));
     };
@@ -721,9 +762,13 @@ async fn accept_suggestion_in(
     }
 
     // 3. The policy commit, inside this transaction.
-    let policy = postgres_policy::commit_policy_in(client, request.policy_commit)
+    let policy = match postgres_policy::commit_policy_in(client, request.policy_commit, caller)
         .await
-        .map_err(|error| refused(AcceptRefused::Policy(error)))?;
+        .map_err(|error| refused(AcceptRefused::Policy(error)))?
+    {
+        CallerOutcome::Committed(policy) => policy,
+        CallerOutcome::Replayed(receipt) => return Ok(CallerOutcome::Replayed(receipt)),
+    };
 
     #[cfg(test)]
     if crash_before_transition {
@@ -744,7 +789,12 @@ async fn accept_suggestion_in(
     )
     .await?
     {
-        TransitionOutcome::Applied(suggestion) => Ok(SuggestionAccepted { suggestion, policy }),
+        TransitionOutcome::Applied(suggestion) => {
+            Ok(CallerOutcome::Committed(SuggestionAccepted {
+                suggestion,
+                policy,
+            }))
+        }
         TransitionOutcome::Refused(_) | TransitionOutcome::NotFound => {
             // The row is locked by this transaction and was verified Open
             // at this revision; the statement cannot see anything else.

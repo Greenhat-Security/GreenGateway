@@ -920,3 +920,6 @@ async fn unattributable_or_mislabeled_changes_are_refused_and_principal_bounds_a
         Some(longest_issuer.as_str())
     );
 }
+
+#[path = "postgres_documents_caller_tests.rs"]
+mod caller;

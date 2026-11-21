@@ -109,6 +109,10 @@ pub enum PolicyCommitError {
         lane: String,
         owner_id: String,
     },
+    /// The caller's operation ID (`Idempotency-Key`, issue #425) is already
+    /// reserved for another action or another binding of this one. The
+    /// caller surfaces `409`; nothing committed.
+    CallerOperationConflict,
 }
 
 #[cfg(feature = "postgres")]
@@ -126,6 +130,9 @@ impl fmt::Display for PolicyCommitError {
             } => write!(
                 formatter,
                 "tool name '{tool_name}' is already published by the {lane} lane ({owner_id}); nothing was written"
+            ),
+            Self::CallerOperationConflict => formatter.write_str(
+                "the caller operation ID is bound to a different request; nothing was written",
             ),
         }
     }
@@ -150,11 +157,61 @@ pub trait PolicyControlPlane: PolicyHistory {
     /// control plane has never been initialized.
     async fn active(&self) -> Result<Option<ActivePolicy>, RepositoryError>;
 
-    /// Commit a mutation under a compare-and-swap precondition.
+    /// Commit a mutation under a compare-and-swap precondition and, when
+    /// `caller` is given, under the caller's operation ID (issue #425): the
+    /// key is reserved with its binding digest in the commit's transaction
+    /// and the evidence row carries it as `operation_id`. An exact retry of
+    /// a committed key returns its receipt and changes nothing; a key bound
+    /// to anything else is [`PolicyCommitError::CallerOperationConflict`].
+    async fn commit_with_operation(
+        &self,
+        request: PolicyCommitRequest<'_>,
+        caller: Option<&crate::authority_events::caller_operation::CallerOperation>,
+    ) -> Result<
+        crate::authority_events::caller_operation::CallerOutcome<ActivePolicy>,
+        PolicyCommitError,
+    >;
+
+    /// [`Self::commit_with_operation`] without a caller key.
+    #[cfg_attr(not(test), allow(dead_code))] // Every handler commits with its optional key.
     async fn commit(
         &self,
         request: PolicyCommitRequest<'_>,
-    ) -> Result<ActivePolicy, PolicyCommitError>;
+    ) -> Result<ActivePolicy, PolicyCommitError> {
+        unkeyed_commit(self.commit_with_operation(request, None).await)
+    }
+
+    /// What the reservation table says about `caller`'s key: the read-only
+    /// pre-check a handler asks before any work outside the transaction.
+    /// Advisory; the commit's own transaction decides again.
+    async fn caller_operation_state(
+        &self,
+        caller: &crate::authority_events::caller_operation::CallerOperation,
+    ) -> Result<crate::authority_events::caller_operation::CallerKeyState, RepositoryError>;
+
+    /// The receipt of the policy change `caller`'s key committed, read from
+    /// its evidence row, or `None` when there is none.
+    async fn caller_operation_receipt(
+        &self,
+        caller: &crate::authority_events::caller_operation::CallerOperation,
+    ) -> Result<Option<crate::authority_events::caller_operation::OperationReceipt>, RepositoryError>;
+}
+
+/// The committed value of an unkeyed commit. A commit without a key cannot
+/// be answered from a receipt; if one ever were, it fails closed rather than
+/// report a change this request did not make.
+#[cfg(feature = "postgres")]
+pub(crate) fn unkeyed_commit<T, E: From<PolicyCommitError>>(
+    outcome: Result<crate::authority_events::caller_operation::CallerOutcome<T>, E>,
+) -> Result<T, E> {
+    use crate::authority_events::caller_operation::CallerOutcome;
+    match outcome? {
+        CallerOutcome::Committed(value) => Ok(value),
+        CallerOutcome::Replayed(_) => Err(E::from(PolicyCommitError::Store(RepositoryError::new(
+            RepositoryErrorKind::Internal,
+            "unkeyed_document_commit",
+        )))),
+    }
 }
 
 /// The standalone SQLite history store satisfies the contract by running

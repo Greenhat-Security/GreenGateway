@@ -194,7 +194,11 @@ impl From<DocumentAction> for AuthorityOperation {
 /// deployment mode, as the inventory's `required_mode` spells it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RequiredMode {
-    /// The change's own transaction durably records who made it.
+    /// The change's own transaction durably records who made it. Since the
+    /// policy, tools and policy test changes bind caller keys (issue #425),
+    /// no gated operation is admitted unqualified; the rows the inventory
+    /// admits without a gate keep the spelling.
+    #[allow(dead_code)]
     Admitted,
     /// Only the keyed form is admitted, and only when every
     /// [`KeyedAdmission`] criterion holds: the change, its evidence, its
@@ -263,7 +267,10 @@ impl AuthorityOperation {
     /// PostgreSQL transaction, and has no policy file to reload. Standalone
     /// mode records none of them: the policy and tools files, their reloads
     /// and their optional history are separate steps, and the stored
-    /// policy test suite's versions name only the writer's subject. The
+    /// policy test suite's versions name only the writer's subject. In
+    /// PostgreSQL the policy, tools and policy test changes bind a caller
+    /// key in the document commit's transaction (issue #425), so only their
+    /// keyed form is admitted; the standalone rows stay refused (#242). The
     /// offline import is refused in cluster mode because it records evidence
     /// for only two of its sections. Connection create and replace, and
     /// managed catalog publication and overlay changes, bind a caller key in
@@ -288,10 +295,6 @@ impl AuthorityOperation {
                 | Self::CatalogOpenapiPublish
                 | Self::CatalogOverlayReplace
                 | Self::CatalogOverlayDelete => RequiredMode::CallerKeyRequired,
-                Self::MutationApprovalConsume
-                | Self::MutationApprovalReview
-                | Self::MutationApprovalRevoke
-                | Self::ConfigurationImport => RequiredMode::Refused,
                 Self::PolicyPublish
                 | Self::PolicyRollback
                 | Self::PolicyRuleCreate
@@ -300,7 +303,11 @@ impl AuthorityOperation {
                 | Self::PolicyRuleReorder
                 | Self::PolicySuggestionAccept
                 | Self::ToolsPublish
-                | Self::PolicyTestsPublish => RequiredMode::Admitted,
+                | Self::PolicyTestsPublish => RequiredMode::CallerKeyRequired,
+                Self::MutationApprovalConsume
+                | Self::MutationApprovalReview
+                | Self::MutationApprovalRevoke
+                | Self::ConfigurationImport => RequiredMode::Refused,
             },
             StateBackend::Sqlite => match self {
                 Self::ServiceTokenIssue | Self::ServiceTokenRotate => {

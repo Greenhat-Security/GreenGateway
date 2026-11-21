@@ -2835,6 +2835,7 @@ mod cluster_tools_tests {
             &active.etag,
             &principal,
             merged,
+            None,
         )
         .await
         .expect("register should commit");
@@ -2869,6 +2870,7 @@ mod cluster_tools_tests {
             &active.etag,
             &principal,
             stale,
+            None,
         )
         .await
         .expect_err("the stale ETag must lose");

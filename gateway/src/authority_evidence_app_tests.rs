@@ -242,6 +242,26 @@ async fn required_evidence_refuses_every_standalone_policy_change_and_writes_not
         .expect("draft publish should complete");
     assert_refused(publish, "policy.publish").await;
     expected.push("policy.publish".to_owned());
+    // The gate is asked before the draft is read (I4): publishing a draft
+    // that does not exist is the same refusal, not `404`.
+    let missing = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("{POLICY_DRAFTS_ADMIN_ROUTE}/no-such-draft/publish"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .header(header::IF_MATCH, &live_etag)
+                .header(POLICY_DRAFT_ETAG_HEADER, &draft_etag)
+                .extension(test_principal(&["admin"]))
+                .body(Body::empty())
+                .expect("publish request should build"),
+        )
+        .await
+        .expect("draft publish should complete");
+    assert_refused(missing, "policy.publish").await;
+    expected.push("policy.publish".to_owned());
 
     // Nothing moved: the file, the live policy and its history.
     assert_eq!(
@@ -251,8 +271,9 @@ async fn required_evidence_refuses_every_standalone_policy_change_and_writes_not
     assert_eq!(current_policy(&router).await, (live_etag, live_policy));
     assert_eq!(policy_history_entries(&router, None).await, history_before);
     assert_eq!(refused_operations(&capture, expected.len()), expected);
-    // The draft publication records its own refusal under the same reason,
-    // after the gate's.
+    // Each draft publication records its own refusal under the same reason,
+    // after the gate's, naming the draft from its path; the draft was not
+    // read, so nothing else about it is recorded.
     let draft_refusals = || {
         capture
             .events()
@@ -260,13 +281,22 @@ async fn required_evidence_refuses_every_standalone_policy_change_and_writes_not
             .filter(|event| event.event_type == audit::event::POLICY_DRAFT_PUBLISH_REFUSED)
             .collect::<Vec<_>>()
     };
-    assert_eventually(Duration::from_secs(5), || !draft_refusals().is_empty());
+    assert_eventually(Duration::from_secs(5), || draft_refusals().len() >= 2);
     let draft_refusals = draft_refusals();
-    assert_eq!(draft_refusals.len(), 1, "{draft_refusals:?}");
-    assert_eq!(
-        draft_refusals[0].payload["reason"],
-        json!("authority_evidence_unsupported")
-    );
+    assert_eq!(draft_refusals.len(), 2, "{draft_refusals:?}");
+    let mut refused_ids = Vec::new();
+    for refusal in &draft_refusals {
+        assert_eq!(
+            refusal.payload["reason"],
+            json!("authority_evidence_unsupported")
+        );
+        assert_eq!(refusal.payload["draft_revision"], Value::Null);
+        refused_ids.push(refusal.payload["draft_id"].clone());
+    }
+    refused_ids.sort_by_key(|id| id.to_string());
+    let mut expected_ids = vec![json!(draft_id), json!("no-such-draft")];
+    expected_ids.sort_by_key(|id| id.to_string());
+    assert_eq!(refused_ids, expected_ids);
 }
 
 #[tokio::test]
@@ -1538,10 +1568,20 @@ async fn a_keyed_change_is_admitted_through_the_evidence_gate_then_the_operation
 
     // Cluster mode: an unkeyed change does not ask the operation gate; a
     // keyed one with no membership to ask is refused.
+    // (Required mode admits a policy publication only keyed since issue
+    // #425, so the unkeyed one is asked under best effort.)
     let cluster = required(config::StateBackend::Postgres);
-    admit_keyed(cluster, publish, None, request)
-        .await
-        .expect("cluster mode admits an unkeyed policy publication");
+    admit_keyed(
+        AuthorityEvidenceGate::new(
+            config::AuthorityEvidenceDurability::BestEffort,
+            config::StateBackend::Postgres,
+        ),
+        publish,
+        None,
+        request,
+    )
+    .await
+    .expect("cluster mode admits an unkeyed policy publication");
     let refused = admit_keyed(cluster, withdrawal, Some(&delete), request)
         .await
         .expect_err("a keyed change with no membership to ask is refused");

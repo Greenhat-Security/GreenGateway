@@ -773,6 +773,7 @@ jobs:
             tests::issue_757_mutation_approvals::postgres::
             tests::authority_evidence_app_tests::cluster_connection_keys::
             tests::authority_evidence_app_tests::cluster_token_keys::
+            tests::document_keys_app_tests::cluster_document_keys::
             storage::postgres_documents::tests::
             storage::postgres_admin_sessions::tests::
             authority_events::dispatcher::tests::

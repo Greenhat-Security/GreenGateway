@@ -1283,6 +1283,8 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
         tool_control_plane,
         #[cfg(feature = "postgres")]
         tools_resource,
+        #[cfg(feature = "postgres")]
+        membership: build_overrides.pg_membership.clone(),
     };
     let schema_admin_state = SchemaAdminState {
         coverage: schema_coverage,

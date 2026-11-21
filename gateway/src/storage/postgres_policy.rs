@@ -57,6 +57,10 @@ use crate::rbac::{
     Policy,
 };
 
+use crate::authority_events::caller_operation::{
+    CallerKeyState, CallerOperation, CallerOutcome, OperationReceipt,
+};
+
 use super::{
     log_classified,
     policy_history::{
@@ -288,18 +292,34 @@ impl PolicyControlPlane for PostgresPolicyStore {
         .await
     }
 
-    async fn commit(
+    async fn commit_with_operation(
         &self,
         request: PolicyCommitRequest<'_>,
-    ) -> Result<ActivePolicy, PolicyCommitError> {
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<ActivePolicy>, PolicyCommitError> {
         let client = checkout(&self.pool, CheckoutClass::ControlPlaneWrite)
             .await
             .map_err(store_error)?;
         postgres_documents::begin(&client, OPERATION_COMMIT)
             .await
             .map_err(store_error)?;
-        let outcome = commit_policy_in(&client, request).await;
-        postgres_documents::end_transaction(&client, OPERATION_COMMIT, outcome, store_error).await
+        let outcome = commit_policy_in(&client, request, caller).await;
+        postgres_documents::end_keyed_transaction(&client, OPERATION_COMMIT, outcome, store_error)
+            .await
+    }
+
+    async fn caller_operation_state(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<CallerKeyState, RepositoryError> {
+        postgres_documents::caller_operation_state(&self.pool, caller).await
+    }
+
+    async fn caller_operation_receipt(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<Option<OperationReceipt>, RepositoryError> {
+        postgres_documents::caller_operation_receipt(&self.pool, caller).await
     }
 }
 
@@ -310,11 +330,14 @@ impl PolicyControlPlane for PostgresPolicyStore {
 /// pointer, append the outbox row. A `PreconditionFailed` -- the caller's
 /// expected ETag is not the active one -- is returned before anything is
 /// written, so the caller's `ROLLBACK` has nothing of the policy's to undo
-/// and everything of its own.
+/// and everything of its own. Under a caller key the commit follows the
+/// keyed contract of [`postgres_documents::commit_in`]; an exact retry of a
+/// committed key returns its receipt having written nothing.
 pub(crate) async fn commit_policy_in(
     client: &deadpool_postgres::Object,
     request: PolicyCommitRequest<'_>,
-) -> Result<ActivePolicy, PolicyCommitError> {
+    caller: Option<&CallerOperation>,
+) -> Result<CallerOutcome<ActivePolicy>, PolicyCommitError> {
     // The commit paths refuse such a candidate before they get here; this
     // keeps the authority from ever holding a document no replica reads.
     if !request.candidate.cluster_serves_document_format() {
@@ -343,16 +366,21 @@ pub(crate) async fn commit_policy_in(
             change: request.change,
             diff_summary_json: &diff_summary_json,
             tool_names: None,
+            caller,
         },
     )
     .await?;
+    let committed = match committed {
+        CallerOutcome::Committed(committed) => committed,
+        CallerOutcome::Replayed(receipt) => return Ok(CallerOutcome::Replayed(receipt)),
+    };
 
-    Ok(ActivePolicy {
+    Ok(CallerOutcome::Committed(ActivePolicy {
         policy: request.candidate.clone(),
         version: committed.version,
         etag,
         security_revision: committed.security_revision,
-    })
+    }))
 }
 
 /// One standalone policy-history row as the import writes it (issue #241,

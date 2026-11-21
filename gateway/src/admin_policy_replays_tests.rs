@@ -1491,13 +1491,35 @@ impl storage::PolicyControlPlane for UnconsultedControlPlane {
         Err(self.refuse("policy_control_plane_active"))
     }
 
-    async fn commit(
+    async fn commit_with_operation(
         &self,
         _request: storage::PolicyCommitRequest<'_>,
-    ) -> Result<storage::ActivePolicy, storage::PolicyCommitError> {
+        _caller: Option<&crate::authority_events::caller_operation::CallerOperation>,
+    ) -> Result<
+        crate::authority_events::caller_operation::CallerOutcome<storage::ActivePolicy>,
+        storage::PolicyCommitError,
+    > {
         Err(storage::PolicyCommitError::Store(
             self.refuse("policy_control_plane_commit"),
         ))
+    }
+
+    async fn caller_operation_state(
+        &self,
+        _caller: &crate::authority_events::caller_operation::CallerOperation,
+    ) -> Result<crate::authority_events::caller_operation::CallerKeyState, storage::RepositoryError>
+    {
+        Err(self.refuse("policy_control_plane_caller_operation"))
+    }
+
+    async fn caller_operation_receipt(
+        &self,
+        _caller: &crate::authority_events::caller_operation::CallerOperation,
+    ) -> Result<
+        Option<crate::authority_events::caller_operation::OperationReceipt>,
+        storage::RepositoryError,
+    > {
+        Err(self.refuse("policy_control_plane_caller_operation"))
     }
 }
 

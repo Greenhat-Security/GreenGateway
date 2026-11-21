@@ -1057,6 +1057,27 @@ pub(super) async fn policy_draft_publish_endpoint(
     Path(draft_id): Path<String>,
     request: AxumRequest,
 ) -> Response {
+    let pins = request.extensions().clone();
+    document_change_to_completion(
+        pins,
+        Box::pin(policy_draft_publish(suggestions, draft_id, request)),
+    )
+    .await
+}
+
+/// The precondition headers a draft publication reads: the draft's ETag,
+/// the live policy ETag and the optional resource snapshot binding.
+const DRAFT_PUBLISH_PRECONDITIONS: &[&str] = &[
+    POLICY_DRAFT_ETAG_HEADER,
+    "if-match",
+    RESOURCE_SNAPSHOT_HEADER,
+];
+
+async fn policy_draft_publish(
+    suggestions: SuggestionsAdminState,
+    draft_id: String,
+    request: AxumRequest,
+) -> Response {
     record_request(POLICY_DRAFT_PUBLISH_ADMIN_ROUTE);
 
     let state = &suggestions.policy;
@@ -1086,15 +1107,19 @@ pub(super) async fn policy_draft_publish_endpoint(
     if let Err(response) = expected_resource_snapshot(&parts.headers) {
         return *response;
     }
-    let request = match read_request_body(body, state.max_body_size).await {
-        Ok(body) if body.is_empty() => PolicyDraftPublishRequest::default(),
-        Ok(body) => match serde_json::from_slice::<PolicyDraftPublishRequest>(&body) {
+    let raw_body = match read_request_body(body, state.max_body_size).await {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
+    let request = if raw_body.is_empty() {
+        PolicyDraftPublishRequest::default()
+    } else {
+        match serde_json::from_slice::<PolicyDraftPublishRequest>(&raw_body) {
             Ok(request) => request,
             Err(error) => {
                 return bad_request(&format!("invalid policy draft publication JSON: {error}"));
             }
-        },
-        Err(response) => return *response,
+        }
     };
     let bound = match request.suggestion {
         None => None,
@@ -1123,6 +1148,51 @@ pub(super) async fn policy_draft_publish_endpoint(
                 revision: binding.revision,
                 engine,
             })
+        }
+    };
+    // Every publication is admitted, a keyed one bound first and an exact
+    // retry of a committed one answered with its receipt, before the draft,
+    // the policy or the suggestion is read or the suggestion lifecycle is
+    // reconciled (issue #425, I4). A bound publication is the suggestion's
+    // acceptance and is keyed and gated as one. An unkeyed publication asks
+    // only the evidence gate; its refusal is also recorded against the
+    // draft the path names, which was not read.
+    let keyed = parts.headers.contains_key("idempotency-key");
+    let admitted = admit_keyed_policy_change(
+        state,
+        &parts,
+        &principal,
+        DocumentChangeBinding {
+            action: if bound.is_some() {
+                storage::DocumentAction::PolicySuggestionAccept
+            } else {
+                storage::DocumentAction::PolicyPublish
+            },
+            target: &draft_id,
+            preconditions: DRAFT_PUBLISH_PRECONDITIONS,
+            request: &raw_body,
+        },
+    )
+    .await;
+    let caller = match admitted {
+        Ok(caller) => caller,
+        Err(response) if keyed => return *response,
+        Err(response) => {
+            emit_policy_draft_event(
+                state,
+                &parts,
+                &principal,
+                audit::event::POLICY_DRAFT_PUBLISH_REFUSED,
+                json!({
+                    "draft_id": draft_id,
+                    "draft_revision": null,
+                    "reason": authority_events::required::REFUSAL_REASON,
+                    "base_etag": null,
+                    "candidate_etag": null,
+                    "current_policy_etag": null,
+                }),
+            );
+            return *response;
         }
     };
 
@@ -1296,6 +1366,7 @@ pub(super) async fn policy_draft_publish_endpoint(
                     principal: &principal,
                     rbac_state,
                     policy_write_guard: &policy_write_guard,
+                    caller: caller.as_ref(),
                 },
                 lifecycle,
                 bound.engine,
@@ -1330,6 +1401,9 @@ pub(super) async fn policy_draft_publish_endpoint(
                 // The policy was committed, so this is not a refusal and is
                 // not recorded as one.
                 Err(SuggestionAcceptanceFailure::Incomplete(response)) => return *response,
+                // An exact keyed retry answered with its receipt: this
+                // request wrote nothing and records nothing.
+                Err(SuggestionAcceptanceFailure::Replayed(response)) => return *response,
             }
         }
         _ => {
@@ -1340,6 +1414,7 @@ pub(super) async fn policy_draft_publish_endpoint(
                     policy_write_guard: &policy_write_guard,
                     parts: &parts,
                     principal: &principal,
+                    caller: caller.as_ref(),
                 },
                 storage::DocumentAction::PolicyPublish,
                 &live_policy,
@@ -1365,6 +1440,9 @@ pub(super) async fn policy_draft_publish_endpoint(
                 // Something was written before a later step failed, so this
                 // is not a refusal and is not recorded as one.
                 Err(PolicyMutationFailure::Incomplete(response)) => return *response,
+                // An exact keyed retry answered with its receipt: this
+                // request wrote nothing and records nothing.
+                Err(PolicyMutationFailure::Replayed(response)) => return *response,
             }
         }
     };

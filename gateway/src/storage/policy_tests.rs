@@ -32,6 +32,9 @@
 //! A stored suite is not enforced and activates nothing: requiring a passing
 //! suite before a policy change is a later slice.
 
+use crate::authority_events::caller_operation::{
+    CallerKeyState, CallerOperation, CallerOutcome, OperationReceipt,
+};
 use std::{
     fmt,
     path::{Path, PathBuf},
@@ -77,6 +80,12 @@ pub enum PolicyTestSuiteCommitError {
     /// The precondition no longer (or never) held.
     PreconditionFailed,
     Store(RepositoryError),
+    /// The caller's operation ID (`Idempotency-Key`, issue #425) is already
+    /// reserved for another action or another binding of this one; nothing
+    /// was written. Only the cluster store binds keys, so only it answers
+    /// this.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    CallerOperationConflict,
 }
 
 impl fmt::Display for PolicyTestSuiteCommitError {
@@ -86,6 +95,9 @@ impl fmt::Display for PolicyTestSuiteCommitError {
                 "the stored policy test suite changed before the write committed; nothing was written",
             ),
             Self::Store(error) => write!(formatter, "policy test suite commit failed: {error}"),
+            Self::CallerOperationConflict => formatter.write_str(
+                "the caller operation ID is bound to a different request; nothing was written",
+            ),
         }
     }
 }
@@ -146,6 +158,52 @@ pub(crate) trait PolicyTestSuiteStore: Send + Sync {
         document: &Value,
         actor: &Principal,
     ) -> Result<PolicyTestSuiteRecord, PolicyTestSuiteCommitError>;
+
+    /// [`Self::commit`] under the caller's operation ID (issue #425): the
+    /// cluster store reserves the key with its binding digest in the
+    /// commit's transaction, answers an exact retry of a committed key with
+    /// its receipt, and refuses a key bound to anything else as
+    /// [`PolicyTestSuiteCommitError::CallerOperationConflict`]. A store that
+    /// cannot bind keys (the standalone store, whose row stays refused until
+    /// #242) refuses a keyed commit before writing anything.
+    async fn commit_with_operation(
+        &self,
+        precondition: PolicyTestSuitePrecondition,
+        document: &Value,
+        actor: &Principal,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<PolicyTestSuiteRecord>, PolicyTestSuiteCommitError> {
+        if caller.is_some() {
+            return Err(PolicyTestSuiteCommitError::Store(keys_unsupported()));
+        }
+        self.commit(precondition, document, actor)
+            .await
+            .map(CallerOutcome::Committed)
+    }
+
+    /// What the reservation table says about `caller`'s key: the handler's
+    /// read-only pre-check. A store that cannot bind keys refuses.
+    async fn caller_operation_state(
+        &self,
+        _caller: &CallerOperation,
+    ) -> Result<CallerKeyState, RepositoryError> {
+        Err(keys_unsupported())
+    }
+
+    /// The receipt of the suite change `caller`'s key committed, or `None`.
+    /// A store that cannot bind keys refuses.
+    async fn caller_operation_receipt(
+        &self,
+        _caller: &CallerOperation,
+    ) -> Result<Option<OperationReceipt>, RepositoryError> {
+        Err(keys_unsupported())
+    }
+}
+
+/// A caller key offered to a suite store that cannot bind one: refused as an
+/// invalid parameter, so it is never ignored.
+fn keys_unsupported() -> RepositoryError {
+    RepositoryError::invalid_parameter(OPERATION_COMMIT, "caller_operation")
 }
 
 /// The strong ETag of a suite whose semantic digest is `digest`.

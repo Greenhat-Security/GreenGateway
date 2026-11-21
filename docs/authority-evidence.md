@@ -488,10 +488,12 @@ Every admin change that binds an `Idempotency-Key` through the shared helpers
 in `gateway/src/admin_responses.rs` follows one contract. Connection create,
 replace and delete do ([below](#keyed-connection-create-replace-and-delete)), and
 so do service-token issue and rotation
-([below](#keyed-service-token-issue-and-rotation)) and managed catalog publication
-and overlay changes ([below](#keyed-catalog-publication-and-overlay-changes)) and
+([below](#keyed-service-token-issue-and-rotation)), managed catalog publication
+and overlay changes ([below](#keyed-catalog-publication-and-overlay-changes)),
 standalone local-secret create, rotation and delete
-([below](#keyed-local-secret-create-rotation-and-delete)); each
+([below](#keyed-local-secret-create-rotation-and-delete)) and, in cluster mode,
+policy, tools and policy test changes
+([below](#keyed-policy-tools-and-policy-test-changes)); each
 other operation family
 adopts the contract in its own change, and the inventory qualifies its rows when
 it does. The two routes that took a key first, the
@@ -1101,6 +1103,145 @@ proves that a keyed rotation and delete on a cluster replica, once the operation
 gate would raise the fence, answer as their unkeyed forms, leave the contract
 fence unchanged and reserve nothing.
 
+### Keyed policy, tools and policy test changes
+
+Another operation family on the contract above (issue #425), in cluster mode
+only. Rows `policy_postgres` (`policy.publish`, `policy.rollback`,
+`policy.rule.create`, `policy.rule.update`, `policy.rule.delete`,
+`policy.rule.reorder`, `policy.suggestion.accept`), `tools_postgres`
+(`tools.publish`) and `policy_tests_postgres` (`policy_tests.publish`) are
+qualified. The standalone rows stay refused: the standalone policy files and suite
+store record no caller key, so a standalone route refuses a key with
+`400 standalone_caller_key_unsupported` before anything is read, and #242 tracks
+standalone evidence for them. The family has no withdrawal: deleting a rule
+publishes the policy without it.
+
+- **Routes.** `PUT /v1{ADMIN_PREFIX}/policy`,
+  `POST /v1{ADMIN_PREFIX}/policy/rollback/{version}`,
+  `POST /v1{ADMIN_PREFIX}/policy/rules`, `PATCH` and `DELETE`
+  `/v1{ADMIN_PREFIX}/policy/rules/{id}`, `PUT /v1{ADMIN_PREFIX}/policy/rules/order`,
+  `POST /v1{ADMIN_PREFIX}/suggestions/{id}/accept`,
+  `POST /v1{ADMIN_PREFIX}/policy/drafts/{id}/publish`,
+  `POST /v1{ADMIN_PREFIX}/tools/openapi/register` and
+  `PUT /v1{ADMIN_PREFIX}/policy/tests`, each with an optional `Idempotency-Key`.
+  They are in `KEYED_ROUTES`. The checker's `QUALIFIED_PATHS` holds one path per
+  operation: the policy `PUT` for `policy.publish`, the suggestion route for
+  `policy.suggestion.accept`, and each other route for its own operation. A draft
+  publication commits `policy.publish`, or `policy.suggestion.accept` when the draft
+  names a suggestion, under the same admission, gate and store contract; its route
+  is in the checker's `SHARED_KEYED_ROUTES`, which names the pairs a route commits
+  when it is not a reviewed path's own route, and the checker holds every such pair
+  to its reviewed path.
+- **Binding.** The key is bound to the action, the recorded actor, the target (the
+  version for a rollback, the rule ID for a rule update or delete, the suggestion ID
+  for an acceptance, the draft ID for a draft publication, empty otherwise), the
+  precondition headers as received (for the policy routes `If-Match` and the
+  resource snapshot header; for an acceptance those and the suggestion revision
+  header; for a draft publication the draft ETag, `If-Match` and resource snapshot
+  headers; for a tools registration `If-Match`; for the policy test suite `If-Match`
+  and `If-None-Match`), and the request: a JSON body as canonical JSON, a YAML policy
+  as received, nothing for a rollback, a rule delete or an acceptance. A draft
+  publication binds its body as received and the action it will commit. An
+  acceptance's generation binding (issue #243) is not in the digest: it is
+  server-side state, judged afresh on every attempt. The digest is stored only in
+  the key's reservation row.
+- **Order of work.** Each handler authorizes the caller and validates the request
+  before it binds the key, asks the gates (the evidence gate as the operation's own
+  code, and the operation gate) and answers an exact retry from the read-only
+  pre-check. All of this happens before the handler reads the authority, compares
+  `If-Match` with the current ETag, reads the suggestion or the draft, or fetches
+  an OpenAPI specification, so a committed keyed retry is answered with its receipt
+  after another writer has moved the ETag, and a replayed registration fetches
+  nothing; an unused key with a stale `If-Match` is still `412`. Inside the commit's
+  one PostgreSQL transaction the key is looked up first, then the active document's
+  ETag is checked, then the key is reserved (after confirming the fence carries
+  `caller_operation_keys`), then the version, its `document_change_evidence` row
+  under the caller's key and the journal entry are written. An acceptance does all
+  of this inside the acceptance transaction, and looks the key up before its
+  open-suggestion predicate. An unkeyed draft publication asks the evidence gate in
+  its unkeyed form at the same point, before the draft is read or the suggestion
+  lifecycle reconciled; its refusal is also recorded as
+  `policy.draft_publish_refused` naming the draft ID from the path, with the fields
+  that need the draft null. Each admitted
+  change runs on a task of its own (`document_change_to_completion`), so a client
+  disconnect cannot separate the commit from its install and audit event.
+- **Answers.** The first commit answers as the route always has. An exact retry is
+  `200` with the receipt `{operation_id, operation, resource_id, revision, committed_at}`,
+  read from the change's `document_change_evidence` row; `resource_id` is the
+  document (`policy`, `tools` or `policy_tests`) and `revision` the version the
+  change committed. This holds for an acceptance after its suggestion is no longer
+  open and for a draft publication after the policy ETag has moved. A replay writes and
+  audits nothing. A policy, acceptance or suite replay answered by the pre-check
+  changes nothing on the replica; one answered inside the commit transaction (a
+  writer that raced the original) reinstalls the active policy. A tools replay
+  reconciles the replica's tools lane either way. A replayed draft publication does
+  not mark the draft published: if the original's process stopped after its commit
+  and before that step, the draft stays open on a stale base (its later publication
+  is `policy_draft_base_stale`) and can be deleted. The same key with any other
+  request is `409 caller_operation_conflict`. Two writers racing on one key commit
+  one change. Across replicas the loser gets the receipt from the commit
+  transaction; on one replica the loser waits on the policy write lane and may then
+  be answered `412` (or `409 suggestion_not_open` for an acceptance), and a retry
+  under the same key gets the receipt.
+- **Required mode.** The nine operations are `caller_key_required` in cluster mode:
+  only the keyed request of an issuer-bound principal with `qualified_v1`, the file
+  sink and a Unix build is admitted, and every other form, service-token callers
+  included, is `409 authority_evidence_unsupported` before anything is read or
+  written (an unkeyed draft publication included). The admin UI sends no key, so
+  under `required` it cannot change policy, register tools or store a policy test suite (#242 tracks adding keys to it). The
+  first-boot tools seed is an unkeyed system-actor `tools.publish`: when the tools
+  document does not exist, cluster preflight asks the gate for that form before
+  seeding, so under `required` it refuses to start and says how to provision the
+  document (start once, or run the import, with `best_effort`). When the document
+  exists the seed is a no-op and nothing is asked.
+
+Tests. The store contract is in
+`gateway/src/storage/postgres_documents_caller_tests.rs` (run under
+`storage::postgres_documents::tests::`), and every case ends by asserting that a
+document action's reservation exists exactly when its evidence row does:
+`policy_tools_and_policy_tests_caller_operation_contract` (every action of the
+family), `a_reused_key_with_a_different_binding_conflicts_and_changes_nothing`,
+`a_key_reserved_by_another_action_cannot_take_effect_here`,
+`a_failed_evidence_insert_rolls_back_the_keyed_document_commit_and_its_reservation`,
+`a_full_journal_refuses_the_keyed_document_commit_and_reserves_nothing`,
+`a_stale_etag_under_a_key_writes_no_change_evidence_or_reservation`,
+`two_writers_racing_one_key_commit_one_change`,
+`two_keys_racing_one_revision_leave_only_the_winners_rows`,
+`a_keyed_document_commit_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record`,
+`a_keyed_suggestion_acceptance_reserves_inside_the_acceptance_transaction` and
+`the_first_boot_seed_stays_a_system_record_and_reserves_nothing`.
+`authority_events::dispatcher::tests::a_keyed_document_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit`
+delivers real keyed policy, tools and policy test suite commits (the suite's first
+write, with no prior version) as closed v1 events through the file sink and
+redelivers them byte for byte. Through the admin handlers of a cluster
+replica, against PostgreSQL and a real roster,
+`document_keys_app_tests::cluster_document_keys::` proves
+`a_keyed_policy_change_is_refused_while_a_live_member_lacks_the_capability` (with
+the `403` and malformed-request `400` cases that leave `contract_fence` unchanged),
+`a_replayed_policy_change_repeats_no_side_effect` (the six policy routes and the
+policy test suite: the receipt after the ETag moved, `409` on another binding,
+`412` for an unused key with a stale `If-Match`),
+`a_replayed_tools_registration_fetches_no_specification_again`,
+`required_mode_refuses_the_unkeyed_policy_change_and_admits_the_keyed_principal`
+(admission on Unix builds),
+`required_mode_refuses_a_keyed_policy_change_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink`,
+`required_mode_preflight_refuses_to_seed_an_empty_tools_document` and
+`required_mode_preflight_passes_when_the_tools_document_exists`.
+The acceptance and draft publication routes are proved through the suggestion
+admin handlers of a cluster replica, against PostgreSQL, by
+`admin_observability_app_tests::cluster_discovery_tests::`
+`a_keyed_cluster_acceptance_is_answered_from_its_receipt_once_the_suggestion_is_closed`
+(the receipt after the suggestion closed, `409` on another revision, `If-Match` or
+resource snapshot binding),
+`a_keyed_cluster_draft_publication_reserves_policy_publish_and_replays_its_receipt`,
+`a_keyed_cluster_bound_draft_publication_reserves_the_acceptance_and_replays_its_receipt`
+and
+`required_mode_refuses_the_unkeyed_cluster_acceptance_and_draft_publication_before_reading`.
+`document_keys_app_tests::a_keyed_standalone_policy_change_is_refused_and_writes_nothing`
+covers the standalone refusal, and
+`authority_events::required::tests::policy_tools_and_policy_test_changes_admit_only_their_keyed_issuer_bound_form_in_cluster_mode`
+the gate.
+
 ## Keyed safe references
 
 `gateway/src/authority_events/pseudonym.rs` derives the `subject_ref`, `issuer_ref`
@@ -1650,10 +1791,11 @@ its writers record the same kind, auth mode and canonical issuer, and its rows
 committed before then, which recorded a service token as kind `principal` and the
 issuer as the principal carried it, are delivered in this vocabulary without being
 rewritten. Both tables are journal sources since then. The inventory's
-`policy_postgres`, `tools_postgres`, `policy_tests_postgres` and `configuration_import`
-rows keep `missing_metadata` for their caller-bound operation identity and
-issuer-scoped subject reference (`catalog_postgres` is qualified since its keyed
-paths shipped, [above](#keyed-catalog-publication-and-overlay-changes)); required mode refuses the
+`configuration_import` row keeps `missing_metadata` for its caller-bound operation
+identity and issuer-scoped subject reference (`catalog_postgres` is qualified since
+its keyed paths shipped, [above](#keyed-catalog-publication-and-overlay-changes),
+and `policy_postgres`, `tools_postgres` and `policy_tests_postgres` since theirs did,
+[above](#keyed-policy-tools-and-policy-test-changes)); required mode refuses the
 `configuration_import` row's writing form.
 
 A `system` actor never authenticated anybody, so it can never bind a caller key.
@@ -1896,8 +2038,8 @@ sink and a Unix build, and names the first of these that fails
 
 | `required_mode` | Rows | What required mode does |
 | --- | --- | --- |
-| `admitted` | Cluster policy, tools, Connection delete, token revocation, JWT revocation, and admin session grant and withdrawal, and standalone Connection delete, local-secret delete and re-encryption, and token revocation | Runs it. Its evidence is the row's `record`. Nine of these pairs stay admitted without qualification on purpose ([below](#rows-admitted-without-qualification)) |
-| `caller_key_required` | PostgreSQL mutation approval preparation, and in both modes Connection create and replace (with the credential binding change a replacement makes), managed catalog publication and overlay put and delete, and service-token issue and rotation, and standalone local-secret create and rotation | Admits only the issuer-bound keyed request with `qualified_v1`, `AUTHORITY_EVENT_SINK=file` and a Unix build. Required mode refuses the ordinary preparation POST, the unkeyed Connection create and replace, the unkeyed refresh, OpenAPI registration and overlay put and delete, and the unkeyed token issue and rotation. |
+| `admitted` | Cluster Connection delete, token revocation, JWT revocation, and admin session grant and withdrawal, and standalone Connection delete, local-secret delete and re-encryption, and token revocation | Runs it. Its evidence is the row's `record`. Nine of these pairs stay admitted without qualification on purpose ([below](#rows-admitted-without-qualification)) |
+| `caller_key_required` | PostgreSQL mutation approval preparation, and in both modes Connection create and replace (with the credential binding change a replacement makes), managed catalog publication and overlay put and delete, and service-token issue and rotation, and standalone local-secret create and rotation, and in cluster mode policy mutations, OpenAPI tools registration and stored policy test suite writes | Admits only the issuer-bound keyed request with `qualified_v1`, `AUTHORITY_EVENT_SINK=file` and a Unix build. Required mode refuses the ordinary preparation POST, the unkeyed Connection create and replace, the unkeyed refresh, OpenAPI registration and overlay put and delete, the unkeyed token issue and rotation, and the unkeyed cluster policy, tools and policy test changes. |
 | `refused` | Standalone mutation approval preparation and mutation approval review, revocation and consumption in both modes. Standalone policy mutations, policy file reloads, and tools publication (admin API and file reloads). The writing form of the offline import (`import-standalone --apply`, with or without `--resume`) in cluster mode | Refuses it when asked, before anything is written |
 | `refused_at_startup` | Standalone admin sessions (`ADMIN_SESSION_MODE=standalone_memory`), and configuration activation in both modes | Refuses to start |
 | `unavailable` | Cluster policy file reload and local secrets, standalone JWT revocation and import, configuration export | Nothing to refuse: the mode or the build has no such operation. A gate that is asked anyway refuses it |
@@ -1935,12 +2077,15 @@ Enforcement:
 - **Admin API.** Each endpoint of a `refused` row asks the gate once the
   caller is authorized. A refusal is `409 {"error":"...","reason":"authority_evidence_unsupported","operation":"<code>"}`,
   naming the inventory operation code and nothing from the request. Every policy
-  mutation asks at `commit_policy_mutation`, the commit path they share (so draft
-  publication asks as `policy.publish`, and its own `policy.draft_publish_refused`
-  record carries the same reason), suggestion acceptance, including a draft
-  publication bound to a suggestion, asks as `policy.suggestion.accept` before
-  its acceptance intent or its rule is written, and a stored policy test suite
-  write (`PUT .../policy/tests`) asks as `policy_tests.publish` before its body
+  mutation, suggestion acceptance, OpenAPI tools registration and stored policy
+  test suite write (`PUT .../policy/tests`) asks once the caller is authorized and
+  the request validated, before the authority is read, with the request's form
+  ([Keyed policy, tools and policy test changes](#keyed-policy-tools-and-policy-test-changes)).
+  An unkeyed draft publication asks at `commit_policy_mutation`, the commit path
+  the policy mutations share (as `policy.publish`, so its own
+  `policy.draft_publish_refused` record carries the same reason); a draft
+  publication bound to a suggestion asks as `policy.suggestion.accept` before its
+  acceptance intent or its rule is written, and a keyed one asks before the draft
   is read. Connection create and replace ask as `connection.create` and
   `connection.replace` once the caller is authorized and the body validated, with
   the request's form ([Keyed Connection changes](#keyed-connection-create-replace-and-delete)).
@@ -2123,13 +2268,16 @@ disposable PostgreSQL 16, the same pinned image, that accepts TLS and nothing el
   `extending_a_jwt_revocation_records_exactly_one_more_evidence_row`), the keyed
   service-token issue and rotation (`postgres_audit_tests::keyed_token_changes::`, and
   through the handlers of a cluster replica
-  `authority_evidence_app_tests::cluster_token_keys::`), the suggestion acceptance's
+  `authority_evidence_app_tests::cluster_token_keys::`), the keyed policy, tools and
+  policy test changes through the handlers of a cluster replica
+  (`document_keys_app_tests::cluster_document_keys::`), the suggestion acceptance's
   document evidence (`an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction`)
   and `a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity`;
 - the whole PostgreSQL Connection store suite (`connections::pg_store`), its create,
   replace, credential binding change, deletion and catalog evidence and the keyed
   Connection contract included;
-- `storage::postgres_documents` and `storage::postgres_admin_sessions`;
+- `storage::postgres_documents`, the keyed policy, tools and policy test contract
+  included, and `storage::postgres_admin_sessions`;
 - the dispatcher (`authority_events::dispatcher`);
 - journal retention without a cursor, in `storage::postgres_authority_events`:
   `retention_under_required_never_prunes_a_journal_with_no_cursor`,

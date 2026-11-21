@@ -295,6 +295,74 @@ async fn sqlite_refuses_suites_it_must_not_store() {
     exercise_refusals(&store).await;
 }
 
+/// The standalone suite store cannot bind a caller operation ID (its row
+/// stays refused until #242), so a keyed commit is refused before anything
+/// is written, never committed as if unkeyed, and the pre-check refuses too.
+/// An unkeyed commit through the same method is the plain commit.
+#[tokio::test]
+async fn sqlite_refuses_a_caller_key_and_writes_nothing() {
+    use crate::authority_events::caller_operation::{
+        test_caller_key, CallerOperationBinding, CallerOutcome,
+    };
+
+    let db = TempDb::new("caller-key");
+    let store = SqlitePolicyTestSuiteStore::open(&db.path).expect("store opens");
+    let actor = crate::auth::change_actor::ChangeActor::for_test_with_issuer(
+        "suite-writer",
+        "https://issuer.example.test",
+    );
+    let caller = CallerOperation::bind(
+        test_caller_key(1),
+        &CallerOperationBinding {
+            action: "policy_tests.publish",
+            actor: &actor,
+            target: "",
+            precondition: "",
+            request: b"{}",
+        },
+    )
+    .expect("the key binds");
+    let refused_as_unsupported = |error: &RepositoryError| {
+        error.kind() == RepositoryErrorKind::InvalidData
+            && error.invalid_parameter_name() == Some("caller_operation")
+    };
+
+    let keyed = store
+        .commit_with_operation(
+            PolicyTestSuitePrecondition::Absent,
+            &suite("keyed"),
+            &writer(),
+            Some(&caller),
+        )
+        .await;
+    assert!(
+        matches!(&keyed, Err(PolicyTestSuiteCommitError::Store(error)) if refused_as_unsupported(error)),
+        "{keyed:?}"
+    );
+    assert!(store.active().await.expect("read").is_none());
+    assert!(matches!(
+        store.caller_operation_state(&caller).await,
+        Err(error) if refused_as_unsupported(&error)
+    ));
+    assert!(matches!(
+        store.caller_operation_receipt(&caller).await,
+        Err(error) if refused_as_unsupported(&error)
+    ));
+
+    let unkeyed = store
+        .commit_with_operation(
+            PolicyTestSuitePrecondition::Absent,
+            &suite("unkeyed"),
+            &writer(),
+            None,
+        )
+        .await;
+    let Ok(CallerOutcome::Committed(record)) = unkeyed else {
+        panic!("an unkeyed commit stores the suite: {unkeyed:?}");
+    };
+    assert_eq!(record.version, 1);
+}
+
 /// A row edited out of band no longer reproduces its ETag, or no longer
 /// parses: either way it is refused, never served or run.
 #[tokio::test]

@@ -364,6 +364,54 @@ export const QUALIFIED_PATHS = Object.freeze({
     operation: "secret.delete", storage_mode: "standalone", method: "DELETE",
     route: "/v1{ADMIN_PREFIX}/connection-secrets/{id}", ...KEYED_DELIVERY,
   },
+  // Keyed policy, tools and policy test changes in PostgreSQL (issue #425);
+  // standalone mode refuses the key and stays refused (#242). A draft
+  // publication commits policy.publish, or policy.suggestion.accept when
+  // the draft names a suggestion, under the same action and gate: its route
+  // is in SHARED_KEYED_ROUTES.
+  "policy.publish/postgres": {
+    operation: "policy.publish", storage_mode: "postgres", method: "PUT",
+    route: "/v1{ADMIN_PREFIX}/policy", ...KEYED_DELIVERY,
+  },
+  "policy.rollback/postgres": {
+    operation: "policy.rollback", storage_mode: "postgres", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/policy/rollback/{version}", ...KEYED_DELIVERY,
+  },
+  "policy.rule.create/postgres": {
+    operation: "policy.rule.create", storage_mode: "postgres", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/policy/rules", ...KEYED_DELIVERY,
+  },
+  "policy.rule.update/postgres": {
+    operation: "policy.rule.update", storage_mode: "postgres", method: "PATCH",
+    route: "/v1{ADMIN_PREFIX}/policy/rules/{id}", ...KEYED_DELIVERY,
+  },
+  "policy.rule.delete/postgres": {
+    operation: "policy.rule.delete", storage_mode: "postgres", method: "DELETE",
+    route: "/v1{ADMIN_PREFIX}/policy/rules/{id}", ...KEYED_DELIVERY,
+  },
+  "policy.rule.reorder/postgres": {
+    operation: "policy.rule.reorder", storage_mode: "postgres", method: "PUT",
+    route: "/v1{ADMIN_PREFIX}/policy/rules/order", ...KEYED_DELIVERY,
+  },
+  "policy.suggestion.accept/postgres": {
+    operation: "policy.suggestion.accept", storage_mode: "postgres", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/suggestions/{id}/accept", ...KEYED_DELIVERY,
+  },
+  "tools.publish/postgres": {
+    operation: "tools.publish", storage_mode: "postgres", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/tools/openapi/register", ...KEYED_DELIVERY,
+  },
+  "policy_tests.publish/postgres": {
+    operation: "policy_tests.publish", storage_mode: "postgres", method: "PUT",
+    route: "/v1{ADMIN_PREFIX}/policy/tests", ...KEYED_DELIVERY,
+  },
+});
+// Routes KEYED_ROUTES honours that are not a reviewed path's own route, each
+// with the pairs it can commit. Each pair has its reviewed path, and the
+// route commits it under that path's action, gate and key binding, so it
+// needs no path of its own (one path per pair).
+export const SHARED_KEYED_ROUTES = Object.freeze({
+  "POST /v1{ADMIN_PREFIX}/policy/drafts/{id}/publish": Object.freeze(["policy.publish/postgres", "policy.suggestion.accept/postgres"]),
 });
 // The dispatcher that delivers a qualified pair in each mode.
 const QUALIFIED_DELIVERY = { postgres: "journaled_dispatch", standalone: "standalone_cursor_dispatch" };
@@ -416,7 +464,7 @@ export function summary(result) {
     + ` Admitted withdrawals with a reviewed keyed path: ${list(result.keyedWithdrawalPairs)}.`;
 }
 
-export function validateInventory(inventory, readSource = (path) => readFileSync(resolve(ROOT, path), "utf8"), qualifiedPaths = QUALIFIED_PATHS) {
+export function validateInventory(inventory, readSource = (path) => readFileSync(resolve(ROOT, path), "utf8"), qualifiedPaths = QUALIFIED_PATHS, sharedRoutes = SHARED_KEYED_ROUTES) {
   check(inventory.version === 1 && inventory.issue === 425, "unknown inventory contract");
   check(/^[0-9a-f]{40}$/.test(inventory.reviewed_revision), "missing reviewed revision");
   assert.deepEqual(inventory.storage_modes, MODES, "storage modes changed without contract review");
@@ -567,7 +615,8 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
   }
   // The router honours a key on exactly the reviewed routes: every reviewed
   // path's route is in KEYED_ROUTES, and every KEYED_ROUTES entry is named by
-  // a reviewed path. Elsewhere the router refuses the key.
+  // a reviewed path or is a shared route whose pairs all have one. Elsewhere
+  // the router refuses the key.
   const declared = withoutLineComments(source(ROUTING_PATH)).match(KEYED_ROUTES_DECLARED);
   check(declared !== null, `${ROUTING_PATH} declares no KEYED_ROUTES table`);
   const honoured = keyedRoutes(declared[1]);
@@ -576,8 +625,17 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
     check(honoured.has(`${criteria.method} ${criteria.route}`),
       `qualified path ${key} (${criteria.method} ${criteria.route}) is not honoured by KEYED_ROUTES in ${ROUTING_PATH}`);
   }
+  for (const [route, pairs] of Object.entries(sharedRoutes)) {
+    check(honoured.has(route), `shared keyed route ${route} is not honoured by KEYED_ROUTES in ${ROUTING_PATH}`);
+    check(!reviewed.has(route), `shared keyed route ${route} is a reviewed path's own route`);
+    check(Array.isArray(pairs) && pairs.length > 0, `shared keyed route ${route} names no pair`);
+    for (const pair of pairs) {
+      check(Object.hasOwn(qualifiedPaths, pair), `shared keyed route ${route} names ${pair}, which has no reviewed qualified path`);
+    }
+  }
   for (const route of honoured) {
-    check(reviewed.has(route), `KEYED_ROUTES in ${ROUTING_PATH} honours ${route}, which no reviewed qualified path names`);
+    check(reviewed.has(route) || Object.hasOwn(sharedRoutes, route),
+      `KEYED_ROUTES in ${ROUTING_PATH} honours ${route}, which no reviewed qualified path names`);
   }
   assert.deepEqual([...schema.properties.operation.enum].sort(), [...OPERATIONS].sort(), "event schema and coverage operations diverged");
   // Asked even when no row holds the activation, so a rename never passes.

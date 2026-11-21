@@ -827,6 +827,24 @@ pub(super) async fn rule_suggestion_accept_endpoint(
     Path(id): Path<String>,
     request: AxumRequest,
 ) -> Response {
+    let pins = request.extensions().clone();
+    document_change_to_completion(pins, Box::pin(rule_suggestion_accept(state, id, request))).await
+}
+
+/// The precondition headers a suggestion acceptance reads: the live policy
+/// ETag, the suggestion revision and the optional resource snapshot
+/// binding its policy commit compares.
+pub(super) const SUGGESTION_ACCEPT_PRECONDITIONS: &[&str] = &[
+    "if-match",
+    SUGGESTION_REVISION_HEADER,
+    RESOURCE_SNAPSHOT_HEADER,
+];
+
+async fn rule_suggestion_accept(
+    state: SuggestionsAdminState,
+    id: String,
+    request: AxumRequest,
+) -> Response {
     record_request(SUGGESTION_ACCEPT_ADMIN_ROUTE);
 
     let (parts, _body) = request.into_parts();
@@ -856,6 +874,27 @@ pub(super) async fn rule_suggestion_accept_endpoint(
     };
     let expected_revision = match expected_suggestion_revision(&parts.headers) {
         Ok(expected_revision) => expected_revision,
+        Err(response) => return *response,
+    };
+    // The key is bound and admitted, and an exact retry of a committed
+    // acceptance answered with its receipt, before the suggestion is read
+    // (issue #425): the suggestion is no longer open once it was accepted.
+    // The generation binding is not part of the key's binding; it is
+    // server-side state, judged afresh on every attempt.
+    let caller = match admit_keyed_policy_change(
+        &state.policy,
+        &parts,
+        &principal,
+        DocumentChangeBinding {
+            action: storage::DocumentAction::PolicySuggestionAccept,
+            target: id,
+            preconditions: SUGGESTION_ACCEPT_PRECONDITIONS,
+            request: &[],
+        },
+    )
+    .await
+    {
+        Ok(caller) => caller,
         Err(response) => return *response,
     };
     // Held until this request has both written the policy and moved the
@@ -910,6 +949,7 @@ pub(super) async fn rule_suggestion_accept_endpoint(
             principal: &principal,
             rbac_state,
             policy_write_guard: &policy_write_guard,
+            caller: caller.as_ref(),
         },
         &mut lifecycle,
         suggestion_engine,
@@ -984,6 +1024,9 @@ pub(super) enum SuggestionAcceptanceFailure {
     /// before the next suggestion request (standalone), or was moved in the
     /// same transaction (cluster, where only the replica install can fail).
     Incomplete(Box<Response>),
+    /// An exact keyed retry of a committed acceptance, answered with its
+    /// receipt (issue #425): this request wrote and audits nothing.
+    Replayed(Box<Response>),
 }
 
 impl SuggestionAcceptanceFailure {
@@ -996,7 +1039,9 @@ impl SuggestionAcceptanceFailure {
 
     pub(super) fn into_response(self) -> Response {
         match self {
-            Self::Refused { response, .. } | Self::Incomplete(response) => *response,
+            Self::Refused { response, .. }
+            | Self::Incomplete(response)
+            | Self::Replayed(response) => *response,
         }
     }
 }
@@ -1059,12 +1104,17 @@ async fn commit_suggestion_acceptance_standalone(
         principal,
         rbac_state,
         policy_write_guard,
+        caller,
     } = context;
     let suggestion_id = acceptance.suggestion.id.as_str();
 
-    admit_authority_change(
+    admit_authority_change_for(
         &state.policy.authority_evidence,
         authority_events::required::AuthorityOperation::PolicySuggestionAccept,
+        authority_events::required::RequestForm::of(
+            caller.is_some(),
+            &auth::change_actor::ChangeActor::from_principal(principal),
+        ),
         &state.policy.audit,
         parts,
         principal,
@@ -1134,6 +1184,7 @@ async fn commit_suggestion_acceptance_standalone(
             policy_write_guard,
             parts,
             principal,
+            caller,
         },
         storage::DocumentAction::PolicySuggestionAccept,
         acceptance.before_policy,
@@ -1158,6 +1209,17 @@ async fn commit_suggestion_acceptance_standalone(
                 reason: commit_refusal_reason(refusal),
                 response,
             });
+        }
+        // Standalone mode refuses a key before anything is read, so no
+        // retry is answered here; were one, nothing was written.
+        Err(PolicyMutationFailure::Replayed(response)) => {
+            if let Err(error) = engine
+                .discard_acceptance_intent(key.0.clone(), key.1.clone())
+                .await
+            {
+                tracing::error!(error = %error, "a replayed suggestion acceptance's intent could not be dropped; the reconciler drops it");
+            }
+            return Err(SuggestionAcceptanceFailure::Replayed(response));
         }
         // The policy file was written and a later step failed: the
         // candidate is committed even though this replica may not serve it
@@ -1565,6 +1627,7 @@ pub(super) async fn commit_suggestion_acceptance_in_cluster(
         principal,
         rbac_state,
         policy_write_guard,
+        caller,
     } = context;
     let SuggestionAcceptanceCandidate {
         origin,
@@ -1575,9 +1638,13 @@ pub(super) async fn commit_suggestion_acceptance_in_cluster(
         diff_summary,
     } = acceptance;
 
-    admit_authority_change(
+    admit_authority_change_for(
         &state.policy.authority_evidence,
         authority_events::required::AuthorityOperation::PolicySuggestionAccept,
+        authority_events::required::RequestForm::of(
+            caller.is_some(),
+            &auth::change_actor::ChangeActor::from_principal(principal),
+        ),
         &state.policy.audit,
         parts,
         principal,
@@ -1630,6 +1697,9 @@ pub(super) async fn commit_suggestion_acceptance_in_cluster(
         PolicyMutationFailure::Incomplete(response) => {
             SuggestionAcceptanceFailure::Incomplete(response)
         }
+        PolicyMutationFailure::Replayed(response) => {
+            SuggestionAcceptanceFailure::Replayed(response)
+        }
     })?;
     // [`admit_policy_document`] in its two halves, so a refusal says which
     // one refused: the format, then the operation gate (a role description
@@ -1650,7 +1720,7 @@ pub(super) async fn commit_suggestion_acceptance_in_cluster(
 
     let accepted = engine
         .suggestion_store()
-        .accept_suggestion(
+        .accept_suggestion_with_operation(
             storage::postgres_discovery_lifecycle::AcceptSuggestionRequest {
                 suggestion_id: &suggestion.id,
                 expected_revision: Some(suggestion.revision),
@@ -1667,10 +1737,22 @@ pub(super) async fn commit_suggestion_acceptance_in_cluster(
                     diff_summary: &diff_summary,
                 },
             },
+            caller,
         )
         .await;
     let accepted = match accepted {
-        Ok(accepted) => accepted,
+        Ok(authority_events::caller_operation::CallerOutcome::Committed(accepted)) => accepted,
+        // A writer racing this request under the same key committed first:
+        // its receipt, after the install the original made, and no audit.
+        Ok(authority_events::caller_operation::CallerOutcome::Replayed(receipt)) => {
+            if let Some(control_plane) = state.policy.control_plane.as_ref() {
+                reinstall_active_policy(control_plane.as_ref(), rbac_state, policy_write_guard)
+                    .await;
+            }
+            return Err(SuggestionAcceptanceFailure::Replayed(Box::new(
+                operation_receipt(&receipt),
+            )));
+        }
         Err(refused) => return Err(suggestion_acceptance_refused(origin, refused)),
     };
     if crashes_at(&suggestion.id, AcceptanceBoundary::PolicyCommitted) {
@@ -1777,6 +1859,9 @@ pub(super) fn suggestion_acceptance_refused_response(
             conflict(&format!(
                 "policy commit reported a reserved tool name '{tool_name}'"
             ))
+        }
+        AcceptRefused::Policy(storage::PolicyCommitError::CallerOperationConflict) => {
+            caller_operation_conflict()
         }
         AcceptRefused::Policy(storage::PolicyCommitError::Store(error)) => {
             tracing::error!(

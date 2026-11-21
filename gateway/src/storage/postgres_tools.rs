@@ -20,6 +20,10 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::authority_events::caller_operation::{
+    CallerKeyState, CallerOperation, CallerOutcome, OperationReceipt,
+};
+
 use super::{
     change_evidence::{DocumentAction, DocumentChange},
     policy_history::{PolicyCommitError, PolicyCommitPrecondition},
@@ -48,13 +52,48 @@ pub trait ToolControlPlane: Send + Sync {
     /// Commit a new version of the document under a compare-and-swap
     /// precondition, advancing the shared security revision and writing
     /// the outbox record and the change's evidence in the same transaction.
+    /// Under a caller key (issue #425) the key is reserved with its binding
+    /// digest in that transaction and the evidence row carries it; an exact
+    /// retry of a committed key returns its receipt and changes nothing, and
+    /// a key bound to anything else is
+    /// [`PolicyCommitError::CallerOperationConflict`].
+    async fn commit_tools_with_operation(
+        &self,
+        precondition: PolicyCommitPrecondition,
+        document: &Value,
+        change: DocumentChange,
+        diff_summary: &Value,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<ActiveToolDocument>, PolicyCommitError>;
+
+    /// [`Self::commit_tools_with_operation`] without a caller key.
     async fn commit_tools(
         &self,
         precondition: PolicyCommitPrecondition,
         document: &Value,
         change: DocumentChange,
         diff_summary: &Value,
-    ) -> Result<ActiveToolDocument, PolicyCommitError>;
+    ) -> Result<ActiveToolDocument, PolicyCommitError> {
+        super::policy_history::unkeyed_commit(
+            self.commit_tools_with_operation(precondition, document, change, diff_summary, None)
+                .await,
+        )
+    }
+
+    /// What the reservation table says about `caller`'s key: the read-only
+    /// pre-check a handler asks before any external work (an OpenAPI
+    /// fetch). Advisory; the commit's own transaction decides again.
+    async fn caller_operation_state(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<CallerKeyState, RepositoryError>;
+
+    /// The receipt of the tools change `caller`'s key committed, read from
+    /// its evidence row, or `None` when there is none.
+    async fn caller_operation_receipt(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<Option<OperationReceipt>, RepositoryError>;
 }
 
 const TOOLS_DOCUMENT_RESOURCE: DocumentResource = DocumentResource {
@@ -136,6 +175,9 @@ impl PostgresToolStore {
                 change: DocumentChange::system(DocumentAction::ToolsPublish, SEED_ACTOR),
                 diff_summary_json: r#"{"action":"tools_seeded"}"#,
                 tool_names: None,
+                // The seed is the gateway's own unkeyed write: a system
+                // actor cannot bind a key, and it reserves none.
+                caller: None,
             },
         )
         .await
@@ -210,13 +252,14 @@ impl ToolControlPlane for PostgresToolStore {
         self.read_active().await
     }
 
-    async fn commit_tools(
+    async fn commit_tools_with_operation(
         &self,
         precondition: PolicyCommitPrecondition,
         document: &Value,
         change: DocumentChange,
         diff_summary: &Value,
-    ) -> Result<ActiveToolDocument, PolicyCommitError> {
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<ActiveToolDocument>, PolicyCommitError> {
         let etag = crate::tools_file_etag(document).map_err(|_| {
             PolicyCommitError::Store(invalid_data(TOOLS_DOCUMENT_RESOURCE.operation))
         })?;
@@ -238,14 +281,33 @@ impl ToolControlPlane for PostgresToolStore {
                 change,
                 diff_summary_json: &diff_summary.to_string(),
                 tool_names: Some(&tool_names),
+                caller,
             },
         )
         .await?;
-        Ok(ActiveToolDocument {
+        let committed = match committed {
+            CallerOutcome::Committed(committed) => committed,
+            CallerOutcome::Replayed(receipt) => return Ok(CallerOutcome::Replayed(receipt)),
+        };
+        Ok(CallerOutcome::Committed(ActiveToolDocument {
             document: document.clone(),
             version: committed.version,
             etag,
             security_revision: committed.security_revision,
-        })
+        }))
+    }
+
+    async fn caller_operation_state(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<CallerKeyState, RepositoryError> {
+        postgres_documents::caller_operation_state(&self.pool, caller).await
+    }
+
+    async fn caller_operation_receipt(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<Option<OperationReceipt>, RepositoryError> {
+        postgres_documents::caller_operation_receipt(&self.pool, caller).await
     }
 }
