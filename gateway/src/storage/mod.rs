@@ -117,6 +117,8 @@ pub use change_evidence::DocumentAction;
 #[cfg(feature = "postgres")]
 pub use change_evidence::DocumentChange;
 pub use policy_drafts::{PolicyDraftStore, SqlitePolicyDraftStore};
+#[cfg(feature = "postgres")]
+pub(crate) use policy_history::unkeyed_commit;
 pub use policy_history::PolicyHistory;
 #[cfg(feature = "postgres")]
 pub use policy_history::{

@@ -776,6 +776,9 @@ pub(super) async fn register_tools_via_control_plane(
         }) => Err(Box::new(conflict(&format!(
             "tool name '{tool_name}' is already published by the {lane} lane ({owner_id})"
         )))),
+        Err(storage::PolicyCommitError::CallerOperationConflict) => {
+            Err(Box::new(caller_operation_conflict()))
+        }
         Err(storage::PolicyCommitError::Store(error)) => {
             tracing::error!(
                 error = %error,

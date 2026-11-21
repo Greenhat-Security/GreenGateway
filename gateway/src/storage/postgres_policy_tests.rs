@@ -21,6 +21,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::auth::Principal;
+use crate::authority_events::caller_operation::{
+    CallerKeyState, CallerOperation, CallerOutcome, OperationReceipt,
+};
 
 use super::{
     change_evidence::{DocumentAction, DocumentChange},
@@ -90,6 +93,26 @@ impl PolicyTestSuiteStore for PostgresPolicyTestSuiteStore {
         document: &Value,
         actor: &Principal,
     ) -> Result<PolicyTestSuiteRecord, PolicyTestSuiteCommitError> {
+        match self
+            .commit_with_operation(precondition, document, actor, None)
+            .await?
+        {
+            CallerOutcome::Committed(record) => Ok(record),
+            // An unkeyed commit cannot be answered from a receipt; fail
+            // closed rather than report a change this request did not make.
+            CallerOutcome::Replayed(_) => Err(PolicyTestSuiteCommitError::Store(
+                RepositoryError::new(RepositoryErrorKind::Internal, OPERATION_COMMIT),
+            )),
+        }
+    }
+
+    async fn commit_with_operation(
+        &self,
+        precondition: PolicyTestSuitePrecondition,
+        document: &Value,
+        actor: &Principal,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<PolicyTestSuiteRecord>, PolicyTestSuiteCommitError> {
         let stored = storable_suite(document, OPERATION_COMMIT).map_err(store_error)?;
         // Counts only: the version row is also the history entry, and its
         // diff summary never carries a case.
@@ -123,10 +146,11 @@ impl PolicyTestSuiteStore for PostgresPolicyTestSuiteStore {
                 change: DocumentChange::by_principal(DocumentAction::PolicyTestsPublish, actor),
                 diff_summary_json: &diff_summary_json,
                 tool_names: None,
+                caller,
             },
         )
         .await;
-        let committed = postgres_documents::end_transaction(
+        let committed = postgres_documents::end_keyed_transaction(
             &client,
             OPERATION_COMMIT,
             outcome,
@@ -136,12 +160,34 @@ impl PolicyTestSuiteStore for PostgresPolicyTestSuiteStore {
         .map_err(|error| match error {
             PolicyCommitError::PreconditionFailed => PolicyTestSuiteCommitError::PreconditionFailed,
             PolicyCommitError::Store(error) => PolicyTestSuiteCommitError::Store(error),
+            PolicyCommitError::CallerOperationConflict => {
+                PolicyTestSuiteCommitError::CallerOperationConflict
+            }
             // A suite reserves no tool names, so the core cannot refuse one;
             // fail closed rather than report a conflict that cannot be.
             PolicyCommitError::ToolNameTaken { .. } => PolicyTestSuiteCommitError::Store(
                 RepositoryError::new(RepositoryErrorKind::Internal, OPERATION_COMMIT),
             ),
         })?;
-        Ok(stored.into_record(committed.version, Some(committed.security_revision)))
+        Ok(match committed {
+            CallerOutcome::Committed(committed) => CallerOutcome::Committed(
+                stored.into_record(committed.version, Some(committed.security_revision)),
+            ),
+            CallerOutcome::Replayed(receipt) => CallerOutcome::Replayed(receipt),
+        })
+    }
+
+    async fn caller_operation_state(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<CallerKeyState, RepositoryError> {
+        postgres_documents::caller_operation_state(&self.pool, caller).await
+    }
+
+    async fn caller_operation_receipt(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<Option<OperationReceipt>, RepositoryError> {
+        postgres_documents::caller_operation_receipt(&self.pool, caller).await
     }
 }

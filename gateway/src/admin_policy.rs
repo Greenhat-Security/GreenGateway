@@ -2671,6 +2671,12 @@ pub(super) async fn commit_policy_mutation(
                     )),
                 ))
             }
+            Err(storage::PolicyCommitError::CallerOperationConflict) => {
+                Err(PolicyMutationFailure::refused(
+                    PolicyCommitRefusal::Failed,
+                    caller_operation_conflict(),
+                ))
+            }
             Err(storage::PolicyCommitError::Store(error)) => {
                 tracing::error!(
                     error = %error,

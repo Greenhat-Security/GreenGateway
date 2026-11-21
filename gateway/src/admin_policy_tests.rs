@@ -481,5 +481,6 @@ pub(super) async fn policy_tests_put_endpoint(
             }
         }
         Err(PolicyTestSuiteCommitError::Store(error)) => suite_store_failed(&error),
+        Err(PolicyTestSuiteCommitError::CallerOperationConflict) => caller_operation_conflict(),
     }
 }

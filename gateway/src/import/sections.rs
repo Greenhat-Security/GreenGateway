@@ -214,16 +214,19 @@ impl PolicySection {
         diff_summary: &Value,
     ) -> Result<(u64, crate::storage::ActivePolicy), ImportError> {
         let inserted = insert_imported_policy_versions_in(client, &self.versions).await?;
-        let active = commit_policy_in(
-            client,
-            PolicyCommitRequest {
-                precondition: PolicyCommitPrecondition::Initialize,
-                candidate: &self.policy,
-                change: import_change(),
-                diff_summary,
-            },
+        let active = crate::storage::unkeyed_commit(
+            commit_policy_in(
+                client,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Initialize,
+                    candidate: &self.policy,
+                    change: import_change(),
+                    diff_summary,
+                },
+                None,
+            )
+            .await,
         )
-        .await
         .map_err(|error| commit_failure(POLICY_SECTION, error))?;
         Ok((inserted, active))
     }
@@ -1130,5 +1133,11 @@ fn commit_failure(section: &'static str, error: PolicyCommitError) -> ImportErro
             ),
         },
         PolicyCommitError::Store(error) => ImportError::Store(error),
+        // The import binds no caller key, so the core cannot report one
+        // taken; fail closed rather than describe a conflict that cannot be.
+        PolicyCommitError::CallerOperationConflict => ImportError::SectionFailed {
+            section,
+            detail: "the commit reported a caller operation conflict".to_owned(),
+        },
     }
 }

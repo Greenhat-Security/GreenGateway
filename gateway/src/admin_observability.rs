@@ -1778,6 +1778,9 @@ pub(super) fn suggestion_acceptance_refused_response(
                 "policy commit reported a reserved tool name '{tool_name}'"
             ))
         }
+        AcceptRefused::Policy(storage::PolicyCommitError::CallerOperationConflict) => {
+            caller_operation_conflict()
+        }
         AcceptRefused::Policy(storage::PolicyCommitError::Store(error)) => {
             tracing::error!(
                 error = %error,

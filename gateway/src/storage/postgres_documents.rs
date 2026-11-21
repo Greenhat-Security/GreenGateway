@@ -49,6 +49,24 @@
 //! policy commit) opens the transaction itself, runs `commit_in` between
 //! its own statements, and commits once -- so the seven steps still exist
 //! exactly once and a failure anywhere rolls the whole workflow back.
+//!
+//! A keyed commit (issue #425, plan P9) carries the caller's operation ID
+//! ([`DocumentCommit::caller`]) and follows the keyed contract inside the
+//! same transaction: after step 1's lock the key is looked up, and an exact
+//! retry of a committed key is answered from its evidence row
+//! ([`CallerOutcome::Replayed`]) before the precondition is judged, so a
+//! retry whose `If-Match` another writer has since moved still gets its
+//! receipt; a key bound to anything else is
+//! [`PolicyCommitError::CallerOperationConflict`]. Once the precondition
+//! holds, the key is reserved with its binding digest (the reservation
+//! confirms the contract fence carries `caller_operation_keys`) before the
+//! new version is written, and the evidence row carries the caller's ID as
+//! its `operation_id`. A stale precondition or a refused commit reserves
+//! nothing, and a failed reservation rolls the commit back like a failed
+//! evidence insert.
+use crate::authority_events::caller_operation::{
+    CallerKeyReservation, CallerKeyState, CallerOperation, CallerOutcome, OperationReceipt,
+};
 
 use super::{
     change_evidence::DocumentChange, log_classified, policy_history::PolicyCommitError,
@@ -88,6 +106,10 @@ pub(crate) struct DocumentCommit<'a> {
     /// reserved at the authority in the same transaction. `None` for
     /// documents that publish no tools (policies).
     pub tool_names: Option<&'a [String]>,
+    /// The caller's operation ID, bound to this commit's action, actor,
+    /// target, precondition and request (issue #425). `None` for an unkeyed
+    /// commit, whose evidence row gets a fresh operation ID.
+    pub caller: Option<&'a CallerOperation>,
 }
 
 /// The committed state, mirroring `ActivePolicy`'s facts.
@@ -153,10 +175,31 @@ fn validate_change(
     Ok(())
 }
 
+/// A caller key bound to another action cannot describe this commit: it is
+/// refused as the conflict it is, before the transaction writes anything.
+fn validate_caller(
+    resource: DocumentResource,
+    change: &DocumentChange,
+    caller: Option<&CallerOperation>,
+) -> Result<(), PolicyCommitError> {
+    match caller {
+        Some(caller) if caller.action() != change.action.code() => {
+            tracing::error!(
+                resource = resource.resource_type,
+                bound = caller.action(),
+                action = change.action.code(),
+                "a document commit was passed a caller key bound to another action; it is refused"
+            );
+            Err(PolicyCommitError::CallerOperationConflict)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Append the commit's evidence row inside the caller's transaction, and
-/// journal it for delivery (migration 32). Its `event_id` and
-/// `operation_id` are minted here, once, and the journal carries the same
-/// event ID; `committed_at` is the database clock's. The actor is recorded
+/// journal it for delivery (migration 32). Its `event_id` is minted here,
+/// once, and the journal carries the same event ID; its `operation_id` is
+/// the caller's key for a keyed commit and minted here otherwise; `committed_at` is the database clock's. The actor is recorded
 /// whole, in migration 24's vocabulary: its subject, canonical issuer, kind
 /// and auth mode. Any failure is returned for the caller to roll back, so
 /// the commit it describes never happens without both rows. A full journal
@@ -167,12 +210,15 @@ async fn record_document_change(
     client: &deadpool_postgres::Object,
     resource: DocumentResource,
     change: &DocumentChange,
+    caller: Option<&CallerOperation>,
     prior_version: Option<i64>,
     new_version: i64,
     security_revision: i64,
 ) -> Result<(), PolicyCommitError> {
     let event_id = uuid::Uuid::new_v4().to_string();
-    let operation_id = uuid::Uuid::new_v4().to_string();
+    let operation_id = caller
+        .map_or_else(uuid::Uuid::new_v4, CallerOperation::id)
+        .to_string();
     client
         .execute(
             r#"
@@ -301,6 +347,33 @@ pub(crate) async fn end_transaction<T, E>(
     }
 }
 
+/// Close the transaction of a keyed commit: `COMMIT` a committed change,
+/// and `ROLLBACK` both a failure and an exact retry answered from its
+/// receipt (which wrote nothing). A failed COMMIT is lifted by `store_error`
+/// like [`end_transaction`]'s.
+pub(crate) async fn end_keyed_transaction<T, E>(
+    client: &deadpool_postgres::Object,
+    operation: &'static str,
+    outcome: Result<CallerOutcome<T>, E>,
+    store_error: impl FnOnce(RepositoryError) -> E,
+) -> Result<CallerOutcome<T>, E> {
+    match outcome {
+        Ok(CallerOutcome::Committed(value)) => client
+            .batch_execute("COMMIT")
+            .await
+            .map_err(|error| store_error(classify_query(error, operation)))
+            .map(|_| CallerOutcome::Committed(value)),
+        Ok(CallerOutcome::Replayed(receipt)) => {
+            let _ = client.batch_execute("ROLLBACK").await;
+            Ok(CallerOutcome::Replayed(receipt))
+        }
+        Err(error) => {
+            let _ = client.batch_execute("ROLLBACK").await;
+            Err(error)
+        }
+    }
+}
+
 /// Run the section-2 transaction for one document resource. See the module
 /// documentation for the step-by-step contract.
 pub(crate) async fn commit(
@@ -308,7 +381,7 @@ pub(crate) async fn commit(
     resource: DocumentResource,
     precondition: DocumentPrecondition,
     commit: DocumentCommit<'_>,
-) -> Result<DocumentCommitted, PolicyCommitError> {
+) -> Result<CallerOutcome<DocumentCommitted>, PolicyCommitError> {
     let client = pool
         .get()
         .await
@@ -318,20 +391,23 @@ pub(crate) async fn commit(
         .await
         .map_err(store_error)?;
     let outcome = commit_in(&client, resource, precondition, commit).await;
-    end_transaction(&client, resource.operation, outcome, store_error).await
+    end_keyed_transaction(&client, resource.operation, outcome, store_error).await
 }
 
 /// Steps 1-6 of the section-2 transaction, over a client whose transaction
 /// the caller opened and will close. Returns `Err` with nothing to undo on
 /// the caller's side beyond `ROLLBACK`: every write is inside the
-/// transaction.
+/// transaction. A keyed exact retry returns [`CallerOutcome::Replayed`]
+/// having written nothing; the caller rolls back
+/// ([`end_keyed_transaction`]).
 pub(crate) async fn commit_in(
     client: &deadpool_postgres::Object,
     resource: DocumentResource,
     precondition: DocumentPrecondition,
     commit: DocumentCommit<'_>,
-) -> Result<DocumentCommitted, PolicyCommitError> {
+) -> Result<CallerOutcome<DocumentCommitted>, PolicyCommitError> {
     validate_change(resource, &commit.change)?;
+    validate_caller(resource, &commit.change, commit.caller)?;
     {
         // 1. Lock the pointer and verify its self-consistency.
         let lock_sql = format!(
@@ -367,12 +443,27 @@ pub(crate) async fn commit_in(
             }
         }
 
+        // 1b. A keyed commit: the key judged under the lock, before the
+        // precondition, so an exact retry of a committed change gets its
+        // receipt even after another writer moved the ETag.
+        if let Some(receipt) = keyed_receipt(client, commit.caller).await? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
+
         // 2. Re-verify the precondition against the authority.
         match (&precondition, &current) {
             (DocumentPrecondition::Expected { etag: expected }, Some((_, current_etag, _)))
                 if current_etag == expected => {}
             (DocumentPrecondition::Initialize, None) => {}
             _ => return Err(PolicyCommitError::PreconditionFailed),
+        }
+
+        // 2b. Reserve the key with its binding digest, after this store's
+        // lock and before the shared revision and the journal state row (the
+        // lock order). A writer that committed the same key in the meantime
+        // is answered from its receipt.
+        if let Some(receipt) = reserve_caller_key(client, commit.caller).await? {
+            return Ok(CallerOutcome::Replayed(receipt));
         }
 
         // 3. The new immutable version (also the history row).
@@ -536,16 +627,159 @@ pub(crate) async fn commit_in(
             client,
             resource,
             &commit.change,
+            commit.caller,
             prior_version,
             new_version,
             new_revision,
         )
         .await?;
 
-        Ok(DocumentCommitted {
+        Ok(CallerOutcome::Committed(DocumentCommitted {
             version: new_version,
             security_revision: new_revision,
+        }))
+    }
+}
+
+/// The classified operation label of a caller key's lookup, reservation and
+/// receipt read.
+const OPERATION_CALLER_OPERATION: &str = "document_caller_operation";
+
+fn caller_operation_unavailable() -> RepositoryError {
+    RepositoryError::new(RepositoryErrorKind::Unavailable, OPERATION_CALLER_OPERATION)
+}
+
+/// A key that could not be read or reserved -- the reservation table
+/// unreachable, or the contract fence below `caller_operation_keys` -- is
+/// unavailable (`503`), never a conflict or a stale precondition.
+fn reservation_failure(error: &RepositoryError) -> PolicyCommitError {
+    tracing::warn!(
+        kind = ?error.kind(),
+        "a document commit's caller key could not be read or reserved; nothing was changed"
+    );
+    store_error(caller_operation_unavailable())
+}
+
+/// What the reservation table says about `caller`'s key, read outside any
+/// transaction: the handler's read-only pre-check (step 0 of the keyed
+/// contract). Advisory; the commit's own transaction decides again.
+#[cfg_attr(not(test), allow(dead_code))] // Asked by the P9 handlers' pre-check.
+pub(crate) async fn caller_operation_state(
+    pool: &deadpool_postgres::Pool,
+    caller: &CallerOperation,
+) -> Result<CallerKeyState, RepositoryError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|_| caller_operation_unavailable())?;
+    super::postgres_authority_events::read_caller_operation(&client, caller).await
+}
+
+/// The receipt of the document change `caller`'s key committed, or `None`
+/// when no evidence row carries it, read outside any transaction.
+#[cfg_attr(not(test), allow(dead_code))] // Asked by the P9 handlers' pre-check.
+pub(crate) async fn caller_operation_receipt(
+    pool: &deadpool_postgres::Pool,
+    caller: &CallerOperation,
+) -> Result<Option<OperationReceipt>, RepositoryError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|_| caller_operation_unavailable())?;
+    document_operation_receipt(&client, caller).await
+}
+
+/// The receipt of the document change `caller`'s key committed: its
+/// `document_change_evidence` row for the key's action, naming the document
+/// (`policy`, `tools` or `policy_tests`) and the version the change
+/// committed, never anything from the request.
+pub(crate) async fn document_operation_receipt(
+    client: &tokio_postgres::Client,
+    caller: &CallerOperation,
+) -> Result<Option<OperationReceipt>, RepositoryError> {
+    let row = client
+        .query_opt(
+            "SELECT resource_type, new_version, \
+                    to_char(committed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
+             FROM greengateway.document_change_evidence \
+             WHERE operation_id = $1::text::uuid AND action = $2",
+            &[&caller.id().to_string(), &caller.action()],
+        )
+        .await
+        .map_err(|error| classify_query(error, OPERATION_CALLER_OPERATION))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let read = |error: tokio_postgres::Error| classify_query(error, OPERATION_CALLER_OPERATION);
+    Ok(Some(OperationReceipt {
+        operation_id: caller.id().to_string(),
+        operation: caller.action().to_owned(),
+        resource_id: row.try_get(0).map_err(read)?,
+        revision: Some(row.try_get(1).map_err(read)?),
+        committed_at: row.try_get(2).map_err(read)?,
+    }))
+}
+
+/// The committed receipt of an exact retry, or unavailable when the
+/// reservation has no evidence row (an orphan the invariant forbids).
+async fn committed_receipt(
+    client: &tokio_postgres::Client,
+    caller: &CallerOperation,
+) -> Result<OperationReceipt, PolicyCommitError> {
+    document_operation_receipt(client, caller)
+        .await
+        .map_err(|error| reservation_failure(&error))?
+        .ok_or_else(|| {
+            tracing::error!(
+                "a document caller operation is reserved without its evidence row; the change is refused"
+            );
+            store_error(caller_operation_unavailable())
         })
+}
+
+/// Step 1 of a keyed commit, after the store's serializing lock: the key's
+/// reservation judged against this request. `None` for no key or an unused
+/// one; the receipt for an exact retry of a committed change; a conflict for
+/// a key reserved for anything else.
+pub(crate) async fn keyed_receipt(
+    client: &tokio_postgres::Client,
+    caller: Option<&CallerOperation>,
+) -> Result<Option<OperationReceipt>, PolicyCommitError> {
+    let Some(caller) = caller else {
+        return Ok(None);
+    };
+    let state = super::postgres_authority_events::read_caller_operation(client, caller)
+        .await
+        .map_err(|error| reservation_failure(&error))?;
+    match state {
+        CallerKeyState::Unused => Ok(None),
+        CallerKeyState::OtherBinding => Err(PolicyCommitError::CallerOperationConflict),
+        CallerKeyState::SameBinding => committed_receipt(client, caller).await.map(Some),
+    }
+}
+
+/// Step 3 of a keyed commit: reserve the key with its binding digest once
+/// the contract fence is confirmed to carry `caller_operation_keys`. A
+/// reservation that cannot be written rolls the commit back and is counted
+/// with failed evidence inserts (I2); a conflict is an answer, not a
+/// failure.
+async fn reserve_caller_key(
+    client: &tokio_postgres::Client,
+    caller: Option<&CallerOperation>,
+) -> Result<Option<OperationReceipt>, PolicyCommitError> {
+    let Some(caller) = caller else {
+        return Ok(None);
+    };
+    let reservation = super::postgres_authority_events::reserve_bound_operation(client, caller)
+        .await
+        .map_err(|error| {
+            super::postgres_authority_events::record_evidence_failure();
+            reservation_failure(&error)
+        })?;
+    match reservation {
+        CallerKeyReservation::Reserved => Ok(None),
+        CallerKeyReservation::OtherBinding => Err(PolicyCommitError::CallerOperationConflict),
+        CallerKeyReservation::SameBinding => committed_receipt(client, caller).await.map(Some),
     }
 }
 
