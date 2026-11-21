@@ -1469,7 +1469,7 @@
         },
         {
           "path": "gateway/src/admin_connections.rs",
-          "anchor": "&auth::change_actor::ChangeActor::from_principal(&principal),"
+          "anchor": "auth::change_actor::ChangeActor::from_principal(&principal);"
         }
       ],
       "tests": [
@@ -1797,12 +1797,12 @@
       "boundary": "MCP/OpenAPI replacements and overlay updates share the Connection-state transaction and revision/CAS checks; entries, reservations, dependencies, outbox, one catalog_change_evidence row and its authority_event_journal row commit together. Registration, refresh and overlay put/delete all reach the OpenAPI replacement. An actor evidence cannot record exactly (an empty or oversized subject or issuer, or an issuer on a service token) is refused before the transaction opens; an evidence insert or journal append failure rolls the publication back; a full journal refuses it with 503 and is counted.",
       "record": "Current catalog/overlay rows keep their actor's subject and are still replaced or cascaded. catalog_change_evidence (migration 23, with migration 25's actor columns) has no foreign key and keeps one row per publication: action, event/operation UUIDs, the whole actor, Connection ID, prior/new catalog revision, the overlay revision the catalog was compiled from, the outbox row's shared revision and committed_at. A stale catalog or overlay revision, a conflict or a limit writes none.",
       "actor": "Every catalog writer is an admin endpoint, which builds the ChangeActor from the authenticated Principal; the store records it whole, as Connection deletion does: actor_user_id (the subject, 1 to 4096 bytes, the principal bound), actor_kind, actor_auth_mode and, for a principal that has one, the canonical actor_issuer, in migration 25's columns under migration 24's pairing CHECK. They survive replacement and Connection deletion. Rows committed before this build record none of the three new columns, and nothing is backfilled. A keyed safe actor reference exists only in what is delivered.",
-      "identity": "Generated event/operation UUIDs; catalog.mcp.publish, catalog.openapi.publish, catalog.overlay.replace or catalog.overlay.delete, derived from the write; the catalog revision transition of the connection_catalog outbox row (its 0 stored as NULL), overlay revision and shared revision. Catalog revisions restart when a Connection re-enters a managed kind, so evidence is ordered by security revision. No client-bound operation ID.",
+      "identity": "With an Idempotency-Key (issue #425) the caller's UUIDv7 is the publication's operation_id, reserved with its binding digest in authority_caller_operation_ids in the publication's transaction; an exact retry is answered from its catalog_change_evidence row (picked by the key's action), and a key bound to anything else is 409. Without one, generated event/operation UUIDs. catalog.mcp.publish, catalog.openapi.publish, catalog.overlay.replace or catalog.overlay.delete, derived from the write; the catalog revision transition of the connection_catalog outbox row (its 0 stored as NULL), overlay revision and shared revision. Catalog revisions restart when a Connection re-enters a managed kind, so evidence is ordered by security revision.",
       "delivery": "journaled_dispatch",
       "disposition": [
-        "missing_metadata"
+        "already_sufficient"
       ],
-      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the Connection store's catalog writers and derive an issuer-scoped subject reference; a scheduled refresh, if one is added, records a system actor, which the table can now express. Catalogs removed by a Connection kind change are connection.replace evidence. Since migration 32 each row is journaled in the publication's transaction and dispatched as a catalog resource referenced by its Connection on the catalog axis; the overlay revision stays in the row.",
+      "follow_up": "Qualified in required mode by issue #425: only the keyed form of an issuer-bound provider principal under AUTHORITY_EVENT_FORMAT=qualified_v1 with the synced file sink on a Unix build is admitted; the unkeyed form and service-token callers are refused before anything is read or written, and a keyed refresh or registration is admitted before the upstream is fetched. An overlay removal is a publication, not a withdrawal. A scheduled refresh, if one is added, records a system actor and binds no key. Catalogs removed by a Connection kind change are connection.replace evidence. Since migration 32 each row is journaled in the publication's transaction and dispatched as a catalog resource referenced by its Connection on the catalog axis; the overlay revision stays in the row.",
       "sources": [
         {
           "path": "gateway/src/connections/pg_store.rs",
@@ -1891,9 +1891,427 @@
           "anchor": "async fn migration_thirty_two_journals_document_and_catalog_evidence_and_aligns_the_actor("
         }
       ],
-      "required_durability_supported": false,
-      "required_mode": "admitted",
-      "test_claim": "PostgreSQL-gated regression anchors for the transactional catalog evidence and its journaled delivery: a full journal refusing a publication with nothing committed, commit-order delivery and migration 32's backfill. They do not certify the proposed authority_event.v1 contract."
+      "required_durability_supported": true,
+      "required_mode": "caller_key_required",
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional catalog evidence and its journaled delivery, and, through the qualified delivery paths, the keyed contract run on the same database (exact retries answered from the receipt, conflicting and cross-action keys, rollback of the reservation with the evidence, stale preconditions, races, a full journal, synthetic markers kept out), v1 delivery and redelivery through the file sink, and the cluster capability gate and authorization before the fence.",
+      "qualified_delivery_paths": [
+        {
+          "criteria": {
+            "operation": "catalog.mcp.publish",
+            "storage_mode": "postgres",
+            "method": "POST",
+            "route": "/v1{ADMIN_PREFIX}/connections/{id}/refresh",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed POST refresh of a managed MCP Connection binds the caller's UUIDv7 to the action, the recorded actor, the Connection ID, the If-Match ETag and the empty body. In one PostgreSQL transaction the key is looked up, the Connection ETag and catalog (and overlay) revisions are checked (a stale one writes nothing), the key is reserved with its binding digest after confirming the contract fence carries caller_operation_keys, and the catalog, its catalog_change_evidence row under the caller's key and the journal entry commit together. An exact retry is answered 200 with the receipt read from its catalog_change_evidence row, before any upstream fetch or catalog generation, and changes and audits nothing; any other use of the key is 409. The journaled dispatcher delivers it as authority_event.v1 under the negotiated format; the file sink syncs the event and its parent directory on Unix before the cursor advances. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn replace_mcp_catalog_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn replace_openapi_catalog_with_overlay_and_enum_values_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn catalog_operation_receipt("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "pub(super) async fn admit_keyed_connection_change("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery.rs",
+              "anchor": "pub(super) fn qualify_caller_bound("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            },
+            {
+              "path": "gateway/src/connections/mcp.rs",
+              "anchor": "pub async fn refresh_with_operation("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_catalog_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_reused_catalog_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_key_reserved_by_another_action_cannot_take_effect_on_a_catalog("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_failed_evidence_insert_rolls_back_the_keyed_publication_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_stale_catalog_precondition_under_a_key_writes_no_change_evidence_or_reservation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_two_writers_racing_one_catalog_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_two_catalog_keys_racing_one_revision_leave_only_the_winners_rows("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn a_full_journal_refuses_the_keyed_catalog_publication_and_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/authority_events/dispatcher_tests.rs",
+              "anchor": "async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn postgres_keyed_catalog_changes_wait_for_the_fleet_and_authorize_before_the_fence("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_replayed_refresh_does_not_fetch_the_upstream_again_or_audit_a_second_change("
+            }
+          ]
+        },
+        {
+          "criteria": {
+            "operation": "catalog.openapi.publish",
+            "storage_mode": "postgres",
+            "method": "POST",
+            "route": "/v1{ADMIN_PREFIX}/connections/{id}/openapi/register",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed POST registration binds the caller's UUIDv7 to the action, the recorded actor, the Connection ID, the If-Match ETag and the canonical body (the specification and its selection); a keyed refresh of a managed OpenAPI Connection reaches the same action and path with its empty body, through the same admission. In one PostgreSQL transaction the key is looked up, the Connection ETag and catalog (and overlay) revisions are checked (a stale one writes nothing), the key is reserved with its binding digest after confirming the contract fence carries caller_operation_keys, and the catalog, its catalog_change_evidence row under the caller's key and the journal entry commit together. An exact retry is answered 200 with the receipt read from its catalog_change_evidence row, before any upstream fetch or catalog generation, and changes and audits nothing; any other use of the key is 409. The journaled dispatcher delivers it as authority_event.v1 under the negotiated format; the file sink syncs the event and its parent directory on Unix before the cursor advances. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn replace_mcp_catalog_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn replace_openapi_catalog_with_overlay_and_enum_values_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn catalog_operation_receipt("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "pub(super) async fn admit_keyed_connection_change("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery.rs",
+              "anchor": "pub(super) fn qualify_caller_bound("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            },
+            {
+              "path": "gateway/src/connections/openapi.rs",
+              "anchor": "pub async fn register_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/openapi.rs",
+              "anchor": "pub async fn refresh_with_operation("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_catalog_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_reused_catalog_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_key_reserved_by_another_action_cannot_take_effect_on_a_catalog("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_failed_evidence_insert_rolls_back_the_keyed_publication_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_stale_catalog_precondition_under_a_key_writes_no_change_evidence_or_reservation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_two_writers_racing_one_catalog_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_two_catalog_keys_racing_one_revision_leave_only_the_winners_rows("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn a_full_journal_refuses_the_keyed_catalog_publication_and_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/authority_events/dispatcher_tests.rs",
+              "anchor": "async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn postgres_keyed_catalog_changes_wait_for_the_fleet_and_authorize_before_the_fence("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_replayed_openapi_registration_does_not_fetch_the_upstream_again_or_audit_a_second_change("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_replayed_refresh_does_not_fetch_the_upstream_again_or_audit_a_second_change("
+            }
+          ]
+        },
+        {
+          "criteria": {
+            "operation": "catalog.overlay.replace",
+            "storage_mode": "postgres",
+            "method": "PUT",
+            "route": "/v1{ADMIN_PREFIX}/connections/{id}/overlay",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed PUT binds the caller's UUIDv7 to the action, the recorded actor, the Connection ID, the exact overlay If-Match ETag and the canonical overlay document, after the document and the secret authority it needs are validated. In one PostgreSQL transaction the key is looked up, the Connection ETag and catalog (and overlay) revisions are checked (a stale one writes nothing), the key is reserved with its binding digest after confirming the contract fence carries caller_operation_keys, and the catalog, its catalog_change_evidence row under the caller's key and the journal entry commit together. An exact retry is answered 200 with the receipt read from its catalog_change_evidence row, before any upstream fetch or catalog generation, and changes and audits nothing; any other use of the key is 409. The journaled dispatcher delivers it as authority_event.v1 under the negotiated format; the file sink syncs the event and its parent directory on Unix before the cursor advances. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn replace_mcp_catalog_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn replace_openapi_catalog_with_overlay_and_enum_values_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn catalog_operation_receipt("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "pub(super) async fn admit_keyed_connection_change("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery.rs",
+              "anchor": "pub(super) fn qualify_caller_bound("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            },
+            {
+              "path": "gateway/src/connections/openapi.rs",
+              "anchor": "pub async fn put_overlay_with_operation("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_catalog_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_reused_catalog_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_key_reserved_by_another_action_cannot_take_effect_on_a_catalog("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_failed_evidence_insert_rolls_back_the_keyed_publication_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_stale_catalog_precondition_under_a_key_writes_no_change_evidence_or_reservation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_two_writers_racing_one_catalog_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_two_catalog_keys_racing_one_revision_leave_only_the_winners_rows("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn a_full_journal_refuses_the_keyed_catalog_publication_and_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/authority_events/dispatcher_tests.rs",
+              "anchor": "async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn postgres_keyed_catalog_changes_wait_for_the_fleet_and_authorize_before_the_fence("
+            }
+          ]
+        },
+        {
+          "criteria": {
+            "operation": "catalog.overlay.delete",
+            "storage_mode": "postgres",
+            "method": "DELETE",
+            "route": "/v1{ADMIN_PREFIX}/connections/{id}/overlay",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed DELETE binds the caller's UUIDv7 to the action, the recorded actor, the Connection ID, the exact overlay If-Match ETag and the empty body. Removing an overlay republishes the bare catalog: it is a publication, not a withdrawal, so only its keyed form is admitted. In one PostgreSQL transaction the key is looked up, the Connection ETag and catalog (and overlay) revisions are checked (a stale one writes nothing), the key is reserved with its binding digest after confirming the contract fence carries caller_operation_keys, and the catalog, its catalog_change_evidence row under the caller's key and the journal entry commit together. An exact retry is answered 200 with the receipt read from its catalog_change_evidence row, before any upstream fetch or catalog generation, and changes and audits nothing; any other use of the key is 409. The journaled dispatcher delivers it as authority_event.v1 under the negotiated format; the file sink syncs the event and its parent directory on Unix before the cursor advances. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn replace_mcp_catalog_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn replace_openapi_catalog_with_overlay_and_enum_values_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn catalog_operation_receipt("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "pub(super) async fn admit_keyed_connection_change("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery.rs",
+              "anchor": "pub(super) fn qualify_caller_bound("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            },
+            {
+              "path": "gateway/src/connections/openapi.rs",
+              "anchor": "pub async fn delete_overlay_with_operation("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_catalog_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_reused_catalog_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_key_reserved_by_another_action_cannot_take_effect_on_a_catalog("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_failed_evidence_insert_rolls_back_the_keyed_publication_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_stale_catalog_precondition_under_a_key_writes_no_change_evidence_or_reservation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_two_writers_racing_one_catalog_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_two_catalog_keys_racing_one_revision_leave_only_the_winners_rows("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn a_full_journal_refuses_the_keyed_catalog_publication_and_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/authority_events/dispatcher_tests.rs",
+              "anchor": "async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn postgres_keyed_catalog_changes_wait_for_the_fleet_and_authorize_before_the_fence("
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "catalog_standalone",
@@ -1927,12 +2345,12 @@
       "boundary": "SqliteConnectionStore::replace_mcp_catalog_expecting and replace_openapi_catalog_with_overlay_and_enum_values refuse an actor the evidence cannot record exactly (ChangeActor::is_recordable) before anything is read, then run one IMMEDIATE transaction on the CONNECTIONS_SQLITE_PATH database: check the Connection ETag and the catalog (for OpenAPI also the spec and overlay) revisions, write the catalog, its dependencies, the overlay and the enum values its compile resolved, append one catalog_change_evidence row and commit once. Registration, refresh and overlay put/delete all reach the OpenAPI replacement. The action is named by what the write did to the overlay, as the PostgreSQL writer names it: an overlay put is catalog.overlay.replace, an overlay delete catalog.overlay.delete, an MCP publication catalog.mcp.publish, and an OpenAPI registration or refresh (no overlay change, or only refreshed source reports) catalog.openapi.publish. The catalog services install the published catalog only after that commit. An evidence insert failure rolls the publication back and is reported as a store failure (503), never as a validation problem, a conflict or an invalid upstream response. Enum-value refreshes and status observations publish no catalog and write no row.",
       "record": "Current catalog revisions, entries and dependencies and the overlay (with its last writer's subject) are replaced atomically. The same database's catalog_change_evidence table (Connections schema migration 13, no foreign key) keeps one append-only row per committed publication: actor (subject, kind, auth mode and, for a principal that has one, canonical issuer, with migration 12's bounds and pairing CHECK and every column required), action, event/operation UUIDs, Connection ID, the catalog revision before (none for a first catalog) and after, the overlay revision the published catalog was compiled from (0 for none; none for MCP), a commit-ordered sequence and the publication's own committed_at, under PostgreSQL migration 23's action vocabulary and revision CHECKs. No specification, digest, tool or resource name, definition, overlay document, source report, enum value, endpoint or binding. A stale Connection ETag, a stale catalog, spec or overlay revision, a mismatched compiled overlay revision, a bound, a kind mismatch and an unrecordable actor write none. Rows outlive the catalogs they replaced and the Connection whose deletion cascades the current ones; they are never pruned, and import-standalone does not carry them.",
       "actor": "The authenticated principal the refresh, OpenAPI registration and overlay endpoints pass through the MCP and OpenAPI catalog services and the managed-store adapter as a ChangeActor, committed with the publication: the subject (1 to 4096 bytes), actor_kind (principal or service_token), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). A keyed safe actor reference is absent.",
-      "identity": "Generated event_id/operation_id UUIDs per store call (not bound to a client idempotency key), Connection ID, the catalog revision transition and compiled overlay revision, store sequence and the process-clock committed_at (the catalog's refreshed_at). Standalone mode has no shared security revision and no database clock; catalog revisions restart when a Connection re-enters a managed kind, so a Connection's rows are ordered by sequence.",
+      "identity": "With an Idempotency-Key (issue #425) the caller's UUIDv7 is the publication's operation_id, reserved in this file's authority_caller_operation_ids with its binding digest in the same IMMEDIATE transaction; an exact retry is answered from its catalog_change_evidence row (picked by the key's action), and a key bound to anything else is 409. Without one, event_id and operation_id are generated UUIDv4s per store call. Connection ID, the catalog revision transition and compiled overlay revision, store sequence and the process-clock committed_at (the catalog's refreshed_at). Standalone mode has no shared security revision and no database clock; catalog revisions restart when a Connection re-enters a managed kind, so a Connection's rows are ordered by sequence.",
       "delivery": "standalone_cursor_dispatch",
       "disposition": [
-        "missing_metadata"
+        "already_sufficient"
       ],
-      "follow_up": "PR4 follow-up: a caller-bound operation identity at the store. Delivered from this same database since Connections schema migration 14 (standalone_cursor_dispatch), with no audit-database dual write, on the catalog axis under a reference to the Connection's catalog; the compiled overlay revision stays in the row. Catalogs removed by a Connection kind change are connection.replace evidence (connection_standalone). Issuer, actor kind and auth mode are recorded.",
+      "follow_up": "Qualified in required mode by issue #425: only the keyed form of an issuer-bound provider principal under AUTHORITY_EVENT_FORMAT=qualified_v1 with the synced file sink on a Unix build is admitted; the unkeyed form and service-token callers are refused before anything is read or written. An overlay removal is a publication, not a withdrawal. Delivered from this same database since Connections schema migration 14 (standalone_cursor_dispatch), with no audit-database dual write, on the catalog axis under a reference to the Connection's catalog; the compiled overlay revision stays in the row. Catalogs removed by a Connection kind change are connection.replace evidence (connection_standalone). Issuer, actor kind and auth mode are recorded.",
       "sources": [
         {
           "path": "gateway/src/connections/store.rs",
@@ -1964,7 +2382,7 @@
         },
         {
           "path": "gateway/src/connections/managed_store.rs",
-          "anchor": "store.replace_mcp_catalog_expecting("
+          "anchor": "store.replace_mcp_catalog_expecting_with_operation("
         }
       ],
       "tests": [
@@ -2002,7 +2420,7 @@
         },
         {
           "path": "gateway/src/authority_evidence_app_tests.rs",
-          "anchor": "async fn required_evidence_admits_standalone_catalog_publication_and_records_it("
+          "anchor": "async fn required_evidence_refuses_every_unkeyed_standalone_catalog_publication("
         },
         {
           "path": "gateway/src/connections/store_tests.rs",
@@ -2017,9 +2435,459 @@
           "anchor": "async fn an_unprojectable_row_stalls_its_table_and_is_never_skipped("
         }
       ],
-      "required_durability_supported": false,
-      "required_mode": "admitted",
-      "test_claim": "Standalone regression anchors for the catalog and overlay publication evidence in the Connections database's own transactions: every action with three actor shapes, survival of replacement, Connection deletion and restart, refused and stale publications and unrecordable actors, forced insert failure and rollback with its store-failure classification, the migration onto an existing database, the CHECKs pinned to migration 12 and PostgreSQL migration 23, synthetic-marker exclusion, and the required-mode admin endpoints recording the authenticated principal. They do not certify the proposed authority-event contract or delivery."
+      "required_durability_supported": true,
+      "required_mode": "caller_key_required",
+      "test_claim": "Standalone regression anchors for the catalog and overlay publication evidence in the Connections database's own transactions, and, through the qualified delivery paths, the keyed contract run on the same database (exact retries, conflicting and cross-action keys, rollback, stale preconditions, races, synthetic markers kept out), v1 delivery and redelivery through the file sink, and required mode end to end through the admin handlers, which refuse every unkeyed form.",
+      "qualified_delivery_paths": [
+        {
+          "criteria": {
+            "operation": "catalog.mcp.publish",
+            "storage_mode": "standalone",
+            "method": "POST",
+            "route": "/v1{ADMIN_PREFIX}/connections/{id}/refresh",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed POST refresh of a managed MCP Connection binds the caller's UUIDv7 to the action, the recorded actor, the Connection ID, the If-Match ETag and the empty body. In one IMMEDIATE transaction on the Connections database the key is looked up, the Connection ETag and catalog (and overlay) revisions are checked (a stale one writes nothing), the key is reserved with its binding digest, and the catalog and its catalog_change_evidence row under the caller's key commit together. An exact retry is answered 200 with the receipt read from its catalog_change_evidence row, before any upstream fetch or catalog generation, and changes and audits nothing; any other use of the key is 409. The standalone dispatcher delivers it from the same Connections database under that file's own authority; the negotiated file sink syncs the qualified event and its parent directory on Unix before the cursor advances. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "pub fn replace_mcp_catalog_expecting_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "pub fn replace_openapi_catalog_with_overlay_and_enum_values_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn catalog_operation_receipt("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "pub(super) async fn admit_keyed_connection_change("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery.rs",
+              "anchor": "pub(crate) fn project_standalone("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            },
+            {
+              "path": "gateway/src/connections/mcp.rs",
+              "anchor": "pub async fn refresh_with_operation("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_catalog_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_reused_catalog_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_key_reserved_by_another_action_cannot_take_effect_on_a_catalog("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_failed_evidence_insert_rolls_back_the_keyed_publication_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_stale_catalog_precondition_under_a_key_writes_no_change_evidence_or_reservation("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_two_writers_racing_one_catalog_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_two_catalog_keys_racing_one_revision_leave_only_the_winners_rows("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_tests.rs",
+              "anchor": "async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_the_unkeyed_catalog_publication_and_admits_the_keyed_principal("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_a_keyed_catalog_publication_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_keyed_catalog_change_without_the_routes_permission_is_forbidden_and_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_replayed_catalog_change_repeats_no_side_effect("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_replayed_refresh_does_not_fetch_the_upstream_again_or_audit_a_second_change("
+            }
+          ]
+        },
+        {
+          "criteria": {
+            "operation": "catalog.openapi.publish",
+            "storage_mode": "standalone",
+            "method": "POST",
+            "route": "/v1{ADMIN_PREFIX}/connections/{id}/openapi/register",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed POST registration binds the caller's UUIDv7 to the action, the recorded actor, the Connection ID, the If-Match ETag and the canonical body (the specification and its selection); a keyed refresh of a managed OpenAPI Connection reaches the same action and path with its empty body, through the same admission. In one IMMEDIATE transaction on the Connections database the key is looked up, the Connection ETag and catalog (and overlay) revisions are checked (a stale one writes nothing), the key is reserved with its binding digest, and the catalog and its catalog_change_evidence row under the caller's key commit together. An exact retry is answered 200 with the receipt read from its catalog_change_evidence row, before any upstream fetch or catalog generation, and changes and audits nothing; any other use of the key is 409. The standalone dispatcher delivers it from the same Connections database under that file's own authority; the negotiated file sink syncs the qualified event and its parent directory on Unix before the cursor advances. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "pub fn replace_mcp_catalog_expecting_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "pub fn replace_openapi_catalog_with_overlay_and_enum_values_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn catalog_operation_receipt("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "pub(super) async fn admit_keyed_connection_change("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery.rs",
+              "anchor": "pub(crate) fn project_standalone("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            },
+            {
+              "path": "gateway/src/connections/openapi.rs",
+              "anchor": "pub async fn register_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/openapi.rs",
+              "anchor": "pub async fn refresh_with_operation("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_catalog_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_reused_catalog_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_key_reserved_by_another_action_cannot_take_effect_on_a_catalog("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_failed_evidence_insert_rolls_back_the_keyed_publication_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_stale_catalog_precondition_under_a_key_writes_no_change_evidence_or_reservation("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_two_writers_racing_one_catalog_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_two_catalog_keys_racing_one_revision_leave_only_the_winners_rows("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_tests.rs",
+              "anchor": "async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_the_unkeyed_catalog_publication_and_admits_the_keyed_principal("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_a_keyed_catalog_publication_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_keyed_catalog_change_without_the_routes_permission_is_forbidden_and_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_replayed_catalog_change_repeats_no_side_effect("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_replayed_openapi_registration_does_not_fetch_the_upstream_again_or_audit_a_second_change("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_replayed_refresh_does_not_fetch_the_upstream_again_or_audit_a_second_change("
+            }
+          ]
+        },
+        {
+          "criteria": {
+            "operation": "catalog.overlay.replace",
+            "storage_mode": "standalone",
+            "method": "PUT",
+            "route": "/v1{ADMIN_PREFIX}/connections/{id}/overlay",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed PUT binds the caller's UUIDv7 to the action, the recorded actor, the Connection ID, the exact overlay If-Match ETag and the canonical overlay document, after the document and the secret authority it needs are validated. In one IMMEDIATE transaction on the Connections database the key is looked up, the Connection ETag and catalog (and overlay) revisions are checked (a stale one writes nothing), the key is reserved with its binding digest, and the catalog and its catalog_change_evidence row under the caller's key commit together. An exact retry is answered 200 with the receipt read from its catalog_change_evidence row, before any upstream fetch or catalog generation, and changes and audits nothing; any other use of the key is 409. The standalone dispatcher delivers it from the same Connections database under that file's own authority; the negotiated file sink syncs the qualified event and its parent directory on Unix before the cursor advances. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "pub fn replace_mcp_catalog_expecting_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "pub fn replace_openapi_catalog_with_overlay_and_enum_values_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn catalog_operation_receipt("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "pub(super) async fn admit_keyed_connection_change("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery.rs",
+              "anchor": "pub(crate) fn project_standalone("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            },
+            {
+              "path": "gateway/src/connections/openapi.rs",
+              "anchor": "pub async fn put_overlay_with_operation("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_catalog_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_reused_catalog_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_key_reserved_by_another_action_cannot_take_effect_on_a_catalog("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_failed_evidence_insert_rolls_back_the_keyed_publication_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_stale_catalog_precondition_under_a_key_writes_no_change_evidence_or_reservation("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_two_writers_racing_one_catalog_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_two_catalog_keys_racing_one_revision_leave_only_the_winners_rows("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_tests.rs",
+              "anchor": "async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_the_unkeyed_catalog_publication_and_admits_the_keyed_principal("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_a_keyed_catalog_publication_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_keyed_catalog_change_without_the_routes_permission_is_forbidden_and_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_replayed_catalog_change_repeats_no_side_effect("
+            }
+          ]
+        },
+        {
+          "criteria": {
+            "operation": "catalog.overlay.delete",
+            "storage_mode": "standalone",
+            "method": "DELETE",
+            "route": "/v1{ADMIN_PREFIX}/connections/{id}/overlay",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed DELETE binds the caller's UUIDv7 to the action, the recorded actor, the Connection ID, the exact overlay If-Match ETag and the empty body. Removing an overlay republishes the bare catalog: it is a publication, not a withdrawal, so only its keyed form is admitted. In one IMMEDIATE transaction on the Connections database the key is looked up, the Connection ETag and catalog (and overlay) revisions are checked (a stale one writes nothing), the key is reserved with its binding digest, and the catalog and its catalog_change_evidence row under the caller's key commit together. An exact retry is answered 200 with the receipt read from its catalog_change_evidence row, before any upstream fetch or catalog generation, and changes and audits nothing; any other use of the key is 409. The standalone dispatcher delivers it from the same Connections database under that file's own authority; the negotiated file sink syncs the qualified event and its parent directory on Unix before the cursor advances. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "pub fn replace_mcp_catalog_expecting_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "pub fn replace_openapi_catalog_with_overlay_and_enum_values_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn catalog_operation_receipt("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "pub(super) async fn admit_keyed_connection_change("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery.rs",
+              "anchor": "pub(crate) fn project_standalone("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            },
+            {
+              "path": "gateway/src/connections/openapi.rs",
+              "anchor": "pub async fn delete_overlay_with_operation("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_catalog_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_reused_catalog_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_key_reserved_by_another_action_cannot_take_effect_on_a_catalog("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_failed_evidence_insert_rolls_back_the_keyed_publication_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_stale_catalog_precondition_under_a_key_writes_no_change_evidence_or_reservation("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_two_writers_racing_one_catalog_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_two_catalog_keys_racing_one_revision_leave_only_the_winners_rows("
+            },
+            {
+              "path": "gateway/src/connections/catalog_operation_contract.rs",
+              "anchor": "async fn sqlite_a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_tests.rs",
+              "anchor": "async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_the_unkeyed_catalog_publication_and_admits_the_keyed_principal("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_a_keyed_catalog_publication_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_keyed_catalog_change_without_the_routes_permission_is_forbidden_and_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_replayed_catalog_change_repeats_no_side_effect("
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "local_secrets",
