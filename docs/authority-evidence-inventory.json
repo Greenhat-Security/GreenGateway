@@ -355,6 +355,10 @@
               "anchor": "async fn a_keyed_document_commit_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record("
             },
             {
+              "path": "gateway/src/document_keys_app_tests.rs",
+              "anchor": "fn a_keyed_document_change_keeps_its_digest_and_key_out_of_the_receipt_audit_logs_and_metrics("
+            },
+            {
               "path": "gateway/src/authority_events/dispatcher_tests.rs",
               "anchor": "async fn a_keyed_document_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
             },
@@ -1565,6 +1569,10 @@
               "anchor": "async fn a_keyed_document_commit_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record("
             },
             {
+              "path": "gateway/src/document_keys_app_tests.rs",
+              "anchor": "fn a_keyed_document_change_keeps_its_digest_and_key_out_of_the_receipt_audit_logs_and_metrics("
+            },
+            {
               "path": "gateway/src/authority_events/dispatcher_tests.rs",
               "anchor": "async fn a_keyed_document_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
             },
@@ -1811,6 +1819,10 @@
             {
               "path": "gateway/src/storage/postgres_documents_caller_tests.rs",
               "anchor": "async fn a_keyed_document_commit_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record("
+            },
+            {
+              "path": "gateway/src/document_keys_app_tests.rs",
+              "anchor": "fn a_keyed_document_change_keeps_its_digest_and_key_out_of_the_receipt_audit_logs_and_metrics("
             },
             {
               "path": "gateway/src/authority_events/dispatcher_tests.rs",
@@ -2111,6 +2123,10 @@
               "anchor": "async fn postgres_the_binding_digest_is_stored_only_in_the_reservation_row("
             },
             {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "fn postgres_keyed_connection_and_catalog_changes_keep_synthetic_markers_out_of_the_logs_and_metrics("
+            },
+            {
               "path": "gateway/src/authority_events/dispatcher_tests.rs",
               "anchor": "async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
             }
@@ -2191,6 +2207,10 @@
               "anchor": "async fn postgres_the_binding_digest_is_stored_only_in_the_reservation_row("
             },
             {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "fn postgres_keyed_connection_and_catalog_changes_keep_synthetic_markers_out_of_the_logs_and_metrics("
+            },
+            {
               "path": "gateway/src/authority_events/dispatcher_tests.rs",
               "anchor": "async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
             }
@@ -2269,6 +2289,10 @@
             {
               "path": "gateway/src/connections/pg_store_tests.rs",
               "anchor": "async fn postgres_the_binding_digest_is_stored_only_in_the_reservation_row("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "fn postgres_keyed_connection_and_catalog_changes_keep_synthetic_markers_out_of_the_logs_and_metrics("
             },
             {
               "path": "gateway/src/authority_events/dispatcher_tests.rs",
@@ -2482,6 +2506,10 @@
               "anchor": "async fn sqlite_the_binding_digest_is_stored_only_in_the_reservation_row("
             },
             {
+              "path": "gateway/src/authority_evidence_marker_app_tests.rs",
+              "anchor": "fn a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics("
+            },
+            {
               "path": "gateway/src/authority_events/standalone_tests.rs",
               "anchor": "async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
             },
@@ -2566,6 +2594,10 @@
               "anchor": "async fn sqlite_the_binding_digest_is_stored_only_in_the_reservation_row("
             },
             {
+              "path": "gateway/src/authority_evidence_marker_app_tests.rs",
+              "anchor": "fn a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics("
+            },
+            {
               "path": "gateway/src/authority_events/standalone_tests.rs",
               "anchor": "async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
             },
@@ -2648,6 +2680,10 @@
             {
               "path": "gateway/src/connections/caller_operation_contract.rs",
               "anchor": "async fn sqlite_the_binding_digest_is_stored_only_in_the_reservation_row("
+            },
+            {
+              "path": "gateway/src/authority_evidence_marker_app_tests.rs",
+              "anchor": "fn a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics("
             },
             {
               "path": "gateway/src/authority_events/standalone_tests.rs",
@@ -3336,6 +3372,10 @@
               "anchor": "async fn postgres_a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record("
             },
             {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "fn postgres_keyed_connection_and_catalog_changes_keep_synthetic_markers_out_of_the_logs_and_metrics("
+            },
+            {
               "path": "gateway/src/connections/pg_store_tests.rs",
               "anchor": "async fn a_full_journal_refuses_the_keyed_catalog_publication_and_reserves_nothing("
             },
@@ -3442,6 +3482,10 @@
             {
               "path": "gateway/src/connections/pg_store_tests.rs",
               "anchor": "async fn postgres_a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "fn postgres_keyed_connection_and_catalog_changes_keep_synthetic_markers_out_of_the_logs_and_metrics("
             },
             {
               "path": "gateway/src/connections/pg_store_tests.rs",
@@ -3888,6 +3932,10 @@
               "anchor": "async fn sqlite_a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record("
             },
             {
+              "path": "gateway/src/authority_evidence_marker_app_tests.rs",
+              "anchor": "fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics("
+            },
+            {
               "path": "gateway/src/authority_events/standalone_tests.rs",
               "anchor": "async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
             },
@@ -4002,6 +4050,10 @@
             {
               "path": "gateway/src/connections/catalog_operation_contract.rs",
               "anchor": "async fn sqlite_a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record("
+            },
+            {
+              "path": "gateway/src/authority_evidence_marker_app_tests.rs",
+              "anchor": "fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics("
             },
             {
               "path": "gateway/src/authority_events/standalone_tests.rs",
