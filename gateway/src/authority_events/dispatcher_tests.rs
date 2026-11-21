@@ -2495,3 +2495,225 @@ async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_
         assert!(!contents.contains(marker), "{marker} reached the file");
     }
 }
+
+/// Keyed policy and tools publications (issue #425, plan PR 9) are
+/// delivered under the negotiated format as closed `authority_event.v1`
+/// events through the file sink, produced from real document commits, each
+/// under its own caller key. A crash after the sink accepted the batch and
+/// before the cursor commit redelivers the same records byte for byte, so
+/// consumers deduplicate on `(authority_id, event_id)`. No document text,
+/// subject, issuer or binding digest reaches the file.
+#[tokio::test]
+async fn a_keyed_document_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit()
+{
+    use crate::authority_events::caller_operation::{
+        test_caller_key, CallerOperation, CallerOperationBinding, CallerOutcome,
+    };
+    use crate::config::{AuthorityEventFormat, AuthorityEventSinkSetting};
+
+    const POLICY_MARKER: &str = "keyed-dispatch-policy-marker";
+    const TOOL_MARKER: &str = "keyed_dispatch_tool_marker";
+    let (_guard, database) = database_or_skip!();
+    let pool = migrated_pool(&database).await;
+    let requirement = &crate::storage::compatibility::CALLER_OPERATION_KEYS;
+    pool.get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE greengateway.contract_fence
+             SET generation = generation + 1,
+                 minimum_schema = GREATEST(minimum_schema, $1),
+                 capabilities = $2,
+                 raised_at = now(),
+                 raised_by = 'fixture.caller_operation_keys'
+             WHERE singleton",
+            &[
+                &requirement.minimum_schema,
+                &requirement.capability.as_str(),
+            ],
+        )
+        .await
+        .unwrap();
+    let producers = Producers::new(&pool);
+    let initial = producers
+        .publish_policy(
+            None,
+            "keyed-dispatch-initial",
+            DocumentChange::test_policy("installer"),
+        )
+        .await
+        .unwrap();
+    producers.tools.seed_empty_document().await.unwrap();
+    let principal = crate::auth::Principal {
+        user_id: "keyed-document-admin".to_owned(),
+        issuer: Some(ACTOR_ISSUER.to_owned()),
+        email: None,
+        org_id: None,
+        roles: vec!["admin".to_owned()],
+        session_id: "session".to_owned(),
+        auth_method: crate::auth::AuthMethod::Bearer,
+        scopes: None,
+        verified_claims: Vec::new(),
+    };
+    let actor = ChangeActor::from_principal(&principal);
+    let bind = |seed: u8, action: DocumentAction, precondition: &str, request: &str| {
+        CallerOperation::bind(
+            test_caller_key(seed),
+            &CallerOperationBinding {
+                action: action.code(),
+                actor: &actor,
+                target: "",
+                precondition,
+                request: request.as_bytes(),
+            },
+        )
+        .expect("the key binds")
+    };
+
+    let candidate = crate::rbac::Policy::validate_json_value(serde_json::json!({
+        "schema_version": "0.1.0",
+        "id": POLICY_MARKER,
+        "default_action": "deny",
+        "roles": { "reader": { "permissions": ["data:read"] } }
+    }))
+    .unwrap();
+    let publish = bind(
+        80,
+        DocumentAction::PolicyPublish,
+        &initial.etag,
+        POLICY_MARKER,
+    );
+    let outcome = PolicyControlPlane::commit_with_operation(
+        &producers.policies,
+        PolicyCommitRequest {
+            precondition: PolicyCommitPrecondition::Expected {
+                etag: initial.etag.clone(),
+            },
+            candidate: &candidate,
+            change: DocumentChange::by_principal(DocumentAction::PolicyPublish, &principal),
+            diff_summary: &serde_json::json!({ "action": "dispatcher_fixture" }),
+        },
+        Some(&publish),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, CallerOutcome::Committed(_)),
+        "a first use commits"
+    );
+    let tools = crate::storage::ToolControlPlane::active_tools(&producers.tools)
+        .await
+        .unwrap()
+        .unwrap();
+    let register = bind(81, DocumentAction::ToolsPublish, &tools.etag, TOOL_MARKER);
+    let outcome = crate::storage::ToolControlPlane::commit_tools_with_operation(
+        &producers.tools,
+        PolicyCommitPrecondition::Expected {
+            etag: tools.etag.clone(),
+        },
+        &serde_json::json!({
+            "schema_version": "0.1.0",
+            "tools": [{
+                "name": TOOL_MARKER,
+                "description": "Dispatcher fixture tool.",
+                "input_json_schema": { "type": "object", "properties": {} },
+                "upstream": { "method": "GET", "path_template": "/fixture" }
+            }]
+        }),
+        DocumentChange::by_principal(DocumentAction::ToolsPublish, &principal),
+        &serde_json::json!({ "action": "dispatcher_fixture" }),
+        Some(&register),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, CallerOutcome::Committed(_)),
+        "a first use commits"
+    );
+
+    let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
+    let keyring = keyring_for(&store).await;
+    let path = std::env::temp_dir().join(format!("gg-keyed-document-{}.jsonl", Uuid::new_v4()));
+    let setting = AuthorityEventSinkSetting::File(path.to_str().unwrap().to_owned());
+    let sink =
+        crate::authority_events::sink::configured_sink(&setting, AuthorityEventFormat::QualifiedV1)
+            .await
+            .unwrap()
+            .unwrap();
+    let mut crashed = DispatcherTerm::begin(
+        store.clone(),
+        sink.clone(),
+        keyring.clone(),
+        test_config(10),
+        1,
+        Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    assert!(crashed.fill().await.unwrap());
+    crashed.offer().await.unwrap();
+    // The process dies here: the sink accepted, the cursor did not move.
+    drop(crashed);
+    assert_eq!(store.stats().await.unwrap().cursor, Some(0));
+    let mut successor = DispatcherTerm::begin(
+        store.clone(),
+        sink,
+        keyring.clone(),
+        test_config(10),
+        2,
+        Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    let delivered = successor
+        .deliver_until_caught_up(&CancellationToken::new())
+        .await
+        .unwrap()
+        .expect("the successor delivers");
+
+    let contents = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let lines: Vec<_> = contents.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len() as u64, 2 * delivered as u64);
+    let (first, second) = lines.split_at(lines.len() / 2);
+    assert_eq!(
+        first, second,
+        "recovery must redeliver byte-identical records"
+    );
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/schemas/authority_event.v1.schema.json"
+    ))
+    .unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let keyed: Vec<serde_json::Value> = first
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &serde_json::Value| {
+            [publish.id().to_string(), register.id().to_string()]
+                .iter()
+                .any(|key| event["operation_id"] == *key)
+        })
+        .collect();
+    assert_eq!(keyed.len(), 2, "{contents}");
+    for event in &keyed {
+        assert_eq!(event["schema_version"], "authority_event.v1", "{event}");
+        validator.validate(event).unwrap();
+    }
+    assert_eq!(
+        keyed
+            .iter()
+            .map(|event| event["operation"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["policy.publish", "tools.publish"]
+    );
+    for marker in [
+        POLICY_MARKER,
+        TOOL_MARKER,
+        "keyed-document-admin",
+        ACTOR_ISSUER,
+        publish.binding_digest(),
+        register.binding_digest(),
+    ] {
+        assert!(!contents.contains(marker), "{marker} reached the file");
+    }
+}

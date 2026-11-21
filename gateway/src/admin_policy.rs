@@ -77,6 +77,11 @@ pub(super) async fn policy_put_endpoint(
     State(state): State<PolicyAdminState>,
     request: AxumRequest,
 ) -> Response {
+    let pins = request.extensions().clone();
+    document_change_to_completion(pins, Box::pin(policy_put(state, request))).await
+}
+
+async fn policy_put(state: PolicyAdminState, request: AxumRequest) -> Response {
     record_request(POLICY_ADMIN_ROUTE);
 
     let (parts, body) = request.into_parts();
@@ -99,6 +104,22 @@ pub(super) async fn policy_put_endpoint(
     let candidate = match parse_policy_body(&body) {
         Ok(policy) => policy,
         Err(errors) => return policy_validation_failed(errors),
+    };
+    let caller = match admit_keyed_policy_change(
+        &state,
+        &parts,
+        &principal,
+        DocumentChangeBinding {
+            action: storage::DocumentAction::PolicyPublish,
+            target: "",
+            preconditions: POLICY_PRECONDITIONS,
+            request: &body,
+        },
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return *response,
     };
 
     let _policy_write_guard = rbac_state.policy_write_guard().await;
@@ -127,6 +148,7 @@ pub(super) async fn policy_put_endpoint(
             policy_write_guard: &_policy_write_guard,
             parts: &parts,
             principal: &principal,
+            caller: caller.as_ref(),
         },
         storage::DocumentAction::PolicyPublish,
         &before_policy,
@@ -189,6 +211,15 @@ pub(super) async fn policy_rollback_endpoint(
     Path(version): Path<String>,
     request: AxumRequest,
 ) -> Response {
+    let pins = request.extensions().clone();
+    document_change_to_completion(pins, Box::pin(policy_rollback(state, version, request))).await
+}
+
+async fn policy_rollback(
+    state: PolicyAdminState,
+    version: String,
+    request: AxumRequest,
+) -> Response {
     record_request(POLICY_ROLLBACK_ADMIN_ROUTE);
 
     let target_version = match parse_policy_history_version(&version) {
@@ -209,6 +240,22 @@ pub(super) async fn policy_rollback_endpoint(
     }
     let Some(history_store) = state.history_store.as_ref() else {
         return policy_history_not_configured();
+    };
+    let caller = match admit_keyed_policy_change(
+        &state,
+        &parts,
+        &principal,
+        DocumentChangeBinding {
+            action: storage::DocumentAction::PolicyRollback,
+            target: &version,
+            preconditions: POLICY_PRECONDITIONS,
+            request: &[],
+        },
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return *response,
     };
 
     let target = match history_store.get_version(target_version).await {
@@ -249,6 +296,7 @@ pub(super) async fn policy_rollback_endpoint(
             policy_write_guard: &_policy_write_guard,
             parts: &parts,
             principal: &principal,
+            caller: caller.as_ref(),
         },
         storage::DocumentAction::PolicyRollback,
         &before_policy,
@@ -466,6 +514,11 @@ pub(super) async fn policy_rule_post_endpoint(
     State(state): State<PolicyAdminState>,
     request: AxumRequest,
 ) -> Response {
+    let pins = request.extensions().clone();
+    document_change_to_completion(pins, Box::pin(policy_rule_post(state, request))).await
+}
+
+async fn policy_rule_post(state: PolicyAdminState, request: AxumRequest) -> Response {
     record_request(POLICY_RULES_ADMIN_ROUTE);
 
     let (parts, body, principal, rbac_state) =
@@ -482,8 +535,33 @@ pub(super) async fn policy_rule_post_endpoint(
         Ok(rule) => rule,
         Err(errors) => return policy_validation_failed(errors),
     };
+    let caller = match admit_keyed_policy_change(
+        &state,
+        &parts,
+        &principal,
+        DocumentChangeBinding {
+            action: storage::DocumentAction::PolicyRuleCreate,
+            target: "",
+            preconditions: POLICY_PRECONDITIONS,
+            request: &body,
+        },
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return *response,
+    };
 
-    let created = match create_policy_rule(&state, &parts, &principal, rbac_state, rule).await {
+    let created = match create_policy_rule(
+        &state,
+        &parts,
+        &principal,
+        rbac_state,
+        rule,
+        caller.as_ref(),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(response) => return *response,
     };
@@ -500,6 +578,15 @@ pub(super) async fn policy_rule_post_endpoint(
 pub(super) async fn policy_rule_patch_endpoint(
     State(state): State<PolicyAdminState>,
     Path(rule_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    let pins = request.extensions().clone();
+    document_change_to_completion(pins, Box::pin(policy_rule_patch(state, rule_id, request))).await
+}
+
+async fn policy_rule_patch(
+    state: PolicyAdminState,
+    rule_id: String,
     request: AxumRequest,
 ) -> Response {
     record_request(POLICY_RULE_ADMIN_ROUTE);
@@ -523,6 +610,22 @@ pub(super) async fn policy_rule_patch_endpoint(
             "rule patch must include at least one of enabled, methods, path, tool_name, principal, action",
         );
     }
+    let caller = match admit_keyed_policy_change(
+        &state,
+        &parts,
+        &principal,
+        DocumentChangeBinding {
+            action: storage::DocumentAction::PolicyRuleUpdate,
+            target: &rule_id,
+            preconditions: POLICY_PRECONDITIONS,
+            request: &body,
+        },
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return *response,
+    };
     // A patch without a binding is an ordinary rule edit, exactly as before.
     // With one, it is a promotion or disable from the shadow review, and it
     // is applied only to the policy revision and evidence that were reviewed.
@@ -626,6 +729,7 @@ pub(super) async fn policy_rule_patch_endpoint(
             policy_write_guard: &_policy_write_guard,
             parts: &parts,
             principal: &principal,
+            caller: caller.as_ref(),
         },
         storage::DocumentAction::PolicyRuleUpdate,
         &before_policy,
@@ -660,6 +764,15 @@ pub(super) async fn policy_rule_delete_endpoint(
     Path(rule_id): Path<String>,
     request: AxumRequest,
 ) -> Response {
+    let pins = request.extensions().clone();
+    document_change_to_completion(pins, Box::pin(policy_rule_delete(state, rule_id, request))).await
+}
+
+async fn policy_rule_delete(
+    state: PolicyAdminState,
+    rule_id: String,
+    request: AxumRequest,
+) -> Response {
     record_request(POLICY_RULE_ADMIN_ROUTE);
 
     let (parts, _body, principal, rbac_state) =
@@ -667,6 +780,22 @@ pub(super) async fn policy_rule_delete_endpoint(
             Ok(context) => context,
             Err(response) => return *response,
         };
+    let caller = match admit_keyed_policy_change(
+        &state,
+        &parts,
+        &principal,
+        DocumentChangeBinding {
+            action: storage::DocumentAction::PolicyRuleDelete,
+            target: &rule_id,
+            preconditions: POLICY_PRECONDITIONS,
+            request: &[],
+        },
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return *response,
+    };
 
     let _policy_write_guard = rbac_state.policy_write_guard().await;
 
@@ -700,6 +829,7 @@ pub(super) async fn policy_rule_delete_endpoint(
             policy_write_guard: &_policy_write_guard,
             parts: &parts,
             principal: &principal,
+            caller: caller.as_ref(),
         },
         storage::DocumentAction::PolicyRuleDelete,
         &before_policy,
@@ -728,6 +858,11 @@ pub(super) async fn policy_rules_order_put_endpoint(
     State(state): State<PolicyAdminState>,
     request: AxumRequest,
 ) -> Response {
+    let pins = request.extensions().clone();
+    document_change_to_completion(pins, Box::pin(policy_rules_order_put(state, request))).await
+}
+
+async fn policy_rules_order_put(state: PolicyAdminState, request: AxumRequest) -> Response {
     record_request(POLICY_RULES_ORDER_ADMIN_ROUTE);
 
     let (parts, body, principal, rbac_state) =
@@ -743,6 +878,22 @@ pub(super) async fn policy_rules_order_put_endpoint(
     let requested_order = match parse_rule_order_body(&body) {
         Ok(order) => order,
         Err(errors) => return policy_validation_failed(errors),
+    };
+    let caller = match admit_keyed_policy_change(
+        &state,
+        &parts,
+        &principal,
+        DocumentChangeBinding {
+            action: storage::DocumentAction::PolicyRuleReorder,
+            target: "",
+            preconditions: POLICY_PRECONDITIONS,
+            request: &body,
+        },
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return *response,
     };
 
     let _policy_write_guard = rbac_state.policy_write_guard().await;
@@ -776,6 +927,7 @@ pub(super) async fn policy_rules_order_put_endpoint(
             policy_write_guard: &_policy_write_guard,
             parts: &parts,
             principal: &principal,
+            caller: caller.as_ref(),
         },
         storage::DocumentAction::PolicyRuleReorder,
         &before_policy,
@@ -2206,6 +2358,7 @@ pub(super) async fn create_policy_rule(
     principal: &auth::Principal,
     rbac_state: &middleware::rbac::RbacState,
     rule: rbac::Rule,
+    caller: Option<&authority_events::caller_operation::CallerOperation>,
 ) -> ResponseResult<PolicyRuleCreateResult> {
     let _policy_write_guard = rbac_state.policy_write_guard().await;
 
@@ -2217,6 +2370,7 @@ pub(super) async fn create_policy_rule(
             policy_write_guard: &_policy_write_guard,
             parts,
             principal,
+            caller,
         },
         storage::DocumentAction::PolicyRuleCreate,
         &prepared.before_policy,
@@ -2496,6 +2650,11 @@ pub(super) enum PolicyMutationFailure {
     /// The commit (in standalone mode, the policy file) was written, and a
     /// step after it failed: the reload, the replica install or the ETag.
     Incomplete(Box<Response>),
+    /// An exact keyed retry of a committed change, answered with its
+    /// receipt (issue #425): this request wrote nothing and audits nothing.
+    /// Only cluster mode binds a key.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    Replayed(Box<Response>),
 }
 
 impl PolicyMutationFailure {
@@ -2509,7 +2668,237 @@ impl PolicyMutationFailure {
 
     pub(super) fn into_response(self) -> Box<Response> {
         match self {
-            Self::Refused(_, response) | Self::Incomplete(response) => response,
+            Self::Refused(_, response) | Self::Incomplete(response) | Self::Replayed(response) => {
+                response
+            }
+        }
+    }
+}
+
+/// What a policy, tools or policy test change binds its caller key to
+/// (issue #425), besides the action and the recorded actor.
+pub(super) struct DocumentChangeBinding<'a> {
+    pub(super) action: storage::DocumentAction,
+    /// The resource the change names: the rule id, the rollback version,
+    /// the draft or suggestion id; empty for the document itself or a
+    /// create.
+    pub(super) target: &'a str,
+    /// The precondition headers the route reads, each bound with every
+    /// value it carries, in this order.
+    pub(super) preconditions: &'a [&'a str],
+    /// The request body as received; a JSON body is bound in its canonical
+    /// form.
+    pub(super) request: &'a [u8],
+}
+
+/// The precondition a keyed change presents: each named header with its
+/// values in order, one `name: value` line each. A header that is not
+/// visible ASCII is `400`; the route's own check reads the same headers.
+fn precondition_binding(headers: &HeaderMap, names: &[&str]) -> ResponseResult<String> {
+    let mut binding = String::new();
+    for name in names {
+        for value in headers.get_all(*name) {
+            let value = value
+                .to_str()
+                .map_err(|_| Box::new(bad_request("invalid precondition header")))?;
+            binding.push_str(name);
+            binding.push_str(": ");
+            binding.push_str(value);
+            binding.push('\n');
+        }
+    }
+    Ok(binding)
+}
+
+/// The request bytes a key binds: a JSON body in canonical form (objects
+/// with sorted members, as a Connection change binds its body), any other
+/// body (a YAML policy) exactly as received. These documents carry no
+/// secret value.
+fn canonical_document_request(body: &[u8]) -> Vec<u8> {
+    canonical_connection_request(body).unwrap_or_else(|_| body.to_vec())
+}
+
+/// Bind a policy, tools or policy test change's caller key and admit it
+/// (issue #425). Called once the handler has authorized the caller and
+/// validated the request, and before it reads the authority or compares
+/// any precondition: the key is bound to the action, the recorded actor,
+/// the target, the precondition headers and the canonical request, then
+/// the evidence gate and, for a keyed request in cluster mode, the
+/// operation gate are asked. `honours_keys` is false where the change's
+/// store records no caller key (standalone mode, #242): a key there is
+/// refused with `400 standalone_caller_key_unsupported` before anything is
+/// read,
+/// never ignored. `Ok(None)` is an unkeyed request the gates admitted;
+/// `Ok(Some(_))` a keyed one, whose handler next runs the pre-check
+/// ([`replayed_receipt`]) against its store.
+pub(super) async fn admit_keyed_document_change(
+    gates: &KeyedChangeGates<'_>,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    binding: DocumentChangeBinding<'_>,
+    honours_keys: bool,
+) -> ResponseResult<Option<authority_events::caller_operation::CallerOperation>> {
+    let operation = authority_events::required::AuthorityOperation::from(binding.action);
+    let actor = auth::change_actor::ChangeActor::from_principal(principal);
+    let caller = if parts.headers.contains_key("idempotency-key") {
+        if !honours_keys {
+            return Err(Box::new(standalone_caller_key_unsupported()));
+        }
+        caller_operation(
+            &parts.headers,
+            &actor,
+            operation.code(),
+            binding.target,
+            &precondition_binding(&parts.headers, binding.preconditions)?,
+            &canonical_document_request(binding.request),
+        )?
+    } else {
+        None
+    };
+    admit_keyed_authority_change(
+        gates,
+        KeyedChange::Gated(operation),
+        caller.as_ref(),
+        &actor,
+        parts,
+        principal,
+    )
+    .await?;
+    Ok(caller)
+}
+
+/// The stable reason of [`standalone_caller_key_unsupported`].
+pub(super) const STANDALONE_CALLER_KEY_UNSUPPORTED_REASON: &str =
+    "standalone_caller_key_unsupported";
+
+/// A caller key on a policy, tools or policy test change in standalone
+/// mode: the route honours a key in cluster mode, but the standalone files
+/// and suite store record none (#242), so the key is refused, never
+/// ignored. `400`, and nothing was read or written.
+pub(super) fn standalone_caller_key_unsupported() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "standalone mode records no Idempotency-Key for this change; nothing was changed",
+            "reason": STANDALONE_CALLER_KEY_UNSUPPORTED_REASON,
+        })),
+    )
+        .into_response()
+}
+
+/// The precondition headers every policy route reads.
+pub(super) const POLICY_PRECONDITIONS: &[&str] = &["if-match"];
+
+/// The gates a keyed policy change asks.
+pub(super) fn policy_change_gates(state: &PolicyAdminState) -> KeyedChangeGates<'_> {
+    KeyedChangeGates {
+        evidence: &state.authority_evidence,
+        #[cfg(feature = "postgres")]
+        membership: state.membership.as_deref(),
+        audit: &state.audit,
+        client_ip_policy: &state.client_ip_policy,
+    }
+}
+
+/// Whether this deployment's policy store records a caller key: only
+/// cluster mode's control plane does (standalone mode is #242).
+pub(super) fn policy_store_honours_keys(state: &PolicyAdminState) -> bool {
+    #[cfg(feature = "postgres")]
+    {
+        state.control_plane.is_some()
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = state;
+        false
+    }
+}
+
+/// [`admit_keyed_document_change`] for a policy change, with the pre-check:
+/// an exact retry of a committed change is answered with its receipt, a key
+/// bound to anything else with `409`, before the authority is read.
+pub(super) async fn admit_keyed_policy_change(
+    state: &PolicyAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    binding: DocumentChangeBinding<'_>,
+) -> ResponseResult<Option<authority_events::caller_operation::CallerOperation>> {
+    let caller = admit_keyed_document_change(
+        &policy_change_gates(state),
+        parts,
+        principal,
+        binding,
+        policy_store_honours_keys(state),
+    )
+    .await?;
+    #[cfg(feature = "postgres")]
+    if let (Some(caller), Some(control_plane)) = (&caller, state.control_plane.as_ref()) {
+        replayed_receipt(
+            control_plane.caller_operation_state(caller),
+            control_plane.caller_operation_receipt(caller),
+        )
+        .await?;
+    }
+    Ok(caller)
+}
+
+/// Install the authority's active policy on this replica, as the commit an
+/// exact keyed retry answers for did (issue #425). The install never rolls
+/// the snapshot back to an older revision; a failure is logged and left to
+/// reconciliation, since the change itself is durable.
+#[cfg(feature = "postgres")]
+pub(super) async fn reinstall_active_policy(
+    control_plane: &dyn storage::PolicyControlPlane,
+    rbac_state: &middleware::rbac::RbacState,
+    policy_write_guard: &middleware::rbac::PolicyWriteGuard<'_>,
+) {
+    match control_plane.active().await {
+        Ok(Some(active)) => {
+            if rbac_state
+                .install_revision_snapshot_locked(
+                    active.policy,
+                    active.security_revision,
+                    policy_write_guard,
+                )
+                .is_err()
+            {
+                tracing::error!(
+                    "a replayed policy change could not install the active policy; reconciliation will retry"
+                );
+            }
+        }
+        Ok(None) => tracing::error!("policy control plane has no active document"),
+        Err(error) => {
+            tracing::error!(error = %error, "a replayed policy change could not read the active policy")
+        }
+    }
+}
+
+/// Runs an admitted policy, tools or policy test change on a task of its
+/// own, so it finishes whether or not anyone is still waiting for the
+/// response (issue #425), as `admin_connections` runs a Connection change.
+/// axum drops a handler's future when the client disconnects, while a
+/// PostgreSQL `COMMIT` already sent completes: dropped there, a change
+/// would be committed but never installed on this replica or audited,
+/// while a keyed retry is answered from its receipt. The request's pinned
+/// snapshots are re-entered on the task and its span carried over; a panic
+/// is resumed here.
+pub(super) async fn document_change_to_completion(
+    pins: http::Extensions,
+    change: std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>,
+) -> Response {
+    use tracing::Instrument as _;
+
+    let task = tokio::spawn(
+        async move { crate::middleware::rbac::with_request_pins(Some(&pins), change).await }
+            .instrument(tracing::Span::current()),
+    );
+    match task.await {
+        Ok(response) => response,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => {
+            tracing::error!(error = %error, "a policy, tools or policy test change task was cancelled");
+            service_unavailable("the change could not be completed")
         }
     }
 }
@@ -2549,9 +2938,16 @@ pub(super) async fn commit_policy_mutation(
     // the reload and the optional history are separate steps. Required
     // authority evidence refuses them here, the one commit path every
     // policy mutation shares, before anything is validated or written.
-    admit_authority_change(
+    // A keyed request was admitted before anything was read
+    // ([`admit_keyed_document_change`]); asking again in its form refuses
+    // nothing it admitted and keeps every path through here gated.
+    admit_authority_change_for(
         &context.state.authority_evidence,
         authority_events::required::AuthorityOperation::from(action),
+        authority_events::required::RequestForm::of(
+            context.caller.is_some(),
+            &auth::change_actor::ChangeActor::from_principal(context.principal),
+        ),
         &context.state.audit,
         context.parts,
         context.principal,
@@ -2613,17 +3009,34 @@ pub(super) async fn commit_policy_mutation(
                 PolicyMutationFailure::Refused(PolicyCommitRefusal::OperationRefused, response)
             })?;
         let commit = control_plane
-            .commit(storage::PolicyCommitRequest {
-                precondition: storage::PolicyCommitPrecondition::Expected {
-                    etag: expected_etag.to_owned(),
+            .commit_with_operation(
+                storage::PolicyCommitRequest {
+                    precondition: storage::PolicyCommitPrecondition::Expected {
+                        etag: expected_etag.to_owned(),
+                    },
+                    candidate,
+                    change: storage::DocumentChange::by_principal(action, context.principal),
+                    diff_summary: &diff_summary,
                 },
-                candidate,
-                change: storage::DocumentChange::by_principal(action, context.principal),
-                diff_summary: &diff_summary,
-            })
+                context.caller,
+            )
             .await;
         return match commit {
-            Ok(active) => {
+            // A writer racing this request under the same key committed
+            // first: answer with its receipt, after the reload the original
+            // made, and audit nothing.
+            Ok(authority_events::caller_operation::CallerOutcome::Replayed(receipt)) => {
+                reinstall_active_policy(
+                    control_plane.as_ref(),
+                    context.rbac_state,
+                    context.policy_write_guard,
+                )
+                .await;
+                Err(PolicyMutationFailure::Replayed(Box::new(
+                    operation_receipt(&receipt),
+                )))
+            }
+            Ok(authority_events::caller_operation::CallerOutcome::Committed(active)) => {
                 let installed = context.rbac_state.install_revision_snapshot_locked(
                     active.policy.clone(),
                     active.security_revision,

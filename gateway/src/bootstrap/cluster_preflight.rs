@@ -20,6 +20,43 @@ pub(crate) struct ClusterBootSeeds {
         Option<Arc<storage::postgres_authority_events::PostgresAuthorityEventStore>>,
 }
 
+/// The tools half of cluster preflight: the authority's active tools
+/// document, seeded empty on a first boot. The seed is an unkeyed
+/// `tools.publish` by the system, which cluster mode admits only in its
+/// keyed form under required evidence (issue #425), so preflight asks the
+/// evidence gate itself before seeding, and only when there is no document
+/// yet: under `AUTHORITY_EVIDENCE_DURABILITY=required` an empty deployment
+/// refuses to start, naming `tools.publish` and how to provision the
+/// document. When the document exists the seed is a no-op and nothing is
+/// asked. This holds whatever else refuses required mode at startup.
+pub(crate) async fn seed_cluster_tools(
+    store: Arc<storage::PostgresToolStore>,
+    evidence: &authority_events::required::AuthorityEvidenceGate,
+) -> Result<ClusterToolsSeed, ClusterToolsStartupError> {
+    let existing = ToolControlPlane::active_tools(&*store)
+        .await
+        .map_err(ClusterToolsStartupError::Store)?;
+    if existing.is_none() {
+        if let Some(refusal) = evidence.refusal_for(
+            authority_events::required::AuthorityOperation::ToolsPublish,
+            authority_events::required::RequestForm::UNKEYED,
+        ) {
+            return Err(ClusterToolsStartupError::SeedRefused(refusal.message()));
+        }
+        store
+            .seed_empty_document()
+            .await
+            .map_err(ClusterToolsStartupError::Seeding)?;
+    }
+    match ToolControlPlane::active_tools(&*store).await {
+        Ok(Some(active)) => Ok(ClusterToolsSeed { store, active }),
+        // Unreachable after a successful seed (ours or a racing replica's):
+        // the pointer exists. Defensive fail closed.
+        Ok(None) => Err(ClusterToolsStartupError::NotSeeded),
+        Err(error) => Err(ClusterToolsStartupError::Store(error)),
+    }
+}
+
 /// Cluster mode's preflight against the authority the database foundation
 /// established: the boot seeds, read and checked in the order startup has
 /// always read them, and this boot's membership row, which goes into
@@ -62,27 +99,14 @@ pub(super) async fn preflight_cluster_authority(
     // racing replicas produce exactly one seeded document, later boots
     // no-op. The seed loads the authoritative local lane for the builder.
     let tools = match database_foundation {
-        Some(foundation) => {
-            let store = Arc::new(storage::PostgresToolStore::new(foundation.pool().clone()));
-            if let Err(error) = store.seed_empty_document().await {
-                return Err(Box::new(ClusterToolsStartupError::Seeding(error))
-                    as Box<dyn std::error::Error>);
-            }
-            match ToolControlPlane::active_tools(&*store).await {
-                Ok(Some(active)) => Some(ClusterToolsSeed { store, active }),
-                // Unreachable after a successful seed (ours or a racing
-                // replica's): the pointer exists. Defensive fail closed.
-                Ok(None) => {
-                    return Err(
-                        Box::new(ClusterToolsStartupError::NotSeeded) as Box<dyn std::error::Error>
-                    )
-                }
-                Err(error) => {
-                    return Err(Box::new(ClusterToolsStartupError::Store(error))
-                        as Box<dyn std::error::Error>)
-                }
-            }
-        }
+        Some(foundation) => Some(
+            seed_cluster_tools(
+                Arc::new(storage::PostgresToolStore::new(foundation.pool().clone())),
+                &authority_events::required::AuthorityEvidenceGate::from_config(config),
+            )
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?,
+        ),
         None => None,
     };
     // The Connection control plane rides the same pool. Unlike policy and

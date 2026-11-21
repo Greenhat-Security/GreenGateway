@@ -726,6 +726,48 @@ pub(super) const KEYED_ROUTES: &[KeyedRoute] = &[
         method: "DELETE",
         route: "/v1{ADMIN_PREFIX}/connections/{id}/overlay",
     },
+    // Keyed policy, tools and policy test changes (issue #425). Cluster
+    // mode honours the key; standalone mode refuses it.
+    KeyedRoute {
+        method: "PUT",
+        route: "/v1{ADMIN_PREFIX}/policy",
+    },
+    KeyedRoute {
+        method: "POST",
+        route: "/v1{ADMIN_PREFIX}/policy/rollback/{version}",
+    },
+    KeyedRoute {
+        method: "POST",
+        route: "/v1{ADMIN_PREFIX}/policy/rules",
+    },
+    KeyedRoute {
+        method: "PATCH",
+        route: "/v1{ADMIN_PREFIX}/policy/rules/{id}",
+    },
+    KeyedRoute {
+        method: "DELETE",
+        route: "/v1{ADMIN_PREFIX}/policy/rules/{id}",
+    },
+    KeyedRoute {
+        method: "PUT",
+        route: "/v1{ADMIN_PREFIX}/policy/rules/order",
+    },
+    KeyedRoute {
+        method: "POST",
+        route: "/v1{ADMIN_PREFIX}/suggestions/{id}/accept",
+    },
+    KeyedRoute {
+        method: "POST",
+        route: "/v1{ADMIN_PREFIX}/policy/drafts/{id}/publish",
+    },
+    KeyedRoute {
+        method: "POST",
+        route: "/v1{ADMIN_PREFIX}/tools/openapi/register",
+    },
+    KeyedRoute {
+        method: "PUT",
+        route: "/v1{ADMIN_PREFIX}/policy/tests",
+    },
 ];
 
 /// [`KEYED_ROUTES`] resolved against this router's admin API prefix.

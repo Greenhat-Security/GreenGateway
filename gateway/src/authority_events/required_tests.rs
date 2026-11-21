@@ -47,6 +47,21 @@ const KEYED_CATALOG_OPERATIONS: [AuthorityOperation; 4] = [
     AuthorityOperation::CatalogOverlayDelete,
 ];
 
+/// The policy, tools and policy test changes cluster mode admits only in
+/// their keyed form; standalone mode records no evidence of them (issue
+/// #425; the standalone rows belong to #242).
+const KEYED_DOCUMENT_OPERATIONS: [AuthorityOperation; 9] = [
+    AuthorityOperation::PolicyPublish,
+    AuthorityOperation::PolicyRollback,
+    AuthorityOperation::PolicyRuleCreate,
+    AuthorityOperation::PolicyRuleUpdate,
+    AuthorityOperation::PolicyRuleDelete,
+    AuthorityOperation::PolicyRuleReorder,
+    AuthorityOperation::PolicySuggestionAccept,
+    AuthorityOperation::ToolsPublish,
+    AuthorityOperation::PolicyTestsPublish,
+];
+
 /// The operation whose gate covers an inventory operation code, or `None`
 /// for one no gate asks about. A credential binding change is never asked on
 /// its own: the Connection replacement that makes it is.
@@ -146,22 +161,11 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
         .into_iter()
         .filter(|operation| cluster.refusal(*operation).is_some())
         .collect();
+    // Since the policy, tools and policy test changes bind caller keys
+    // (issue #425), cluster mode admits no gated operation unkeyed.
     assert_eq!(
         refused_in_cluster,
-        [
-            AuthorityOperation::PolicyFileReload,
-            AuthorityOperation::ConfigurationImport,
-            AuthorityOperation::MutationApprovalPrepare,
-            AuthorityOperation::MutationApprovalConsume,
-            AuthorityOperation::MutationApprovalReview,
-            AuthorityOperation::MutationApprovalRevoke,
-            AuthorityOperation::ConnectionCreate,
-            AuthorityOperation::ConnectionReplace,
-            AuthorityOperation::CatalogMcpPublish,
-            AuthorityOperation::CatalogOpenapiPublish,
-            AuthorityOperation::CatalogOverlayReplace,
-            AuthorityOperation::CatalogOverlayDelete,
-        ],
+        EVERY_OPERATION,
         "cluster mode refuses operations without durable authority evidence, and the unkeyed form of keyed ones"
     );
     for operation in refused_in_cluster {
@@ -179,6 +183,9 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
             | AuthorityOperation::CatalogOpenapiPublish
             | AuthorityOperation::CatalogOverlayReplace
             | AuthorityOperation::CatalogOverlayDelete => {
+                "admits it only with an Idempotency-Key, on a route that honours one"
+            }
+            operation if KEYED_DOCUMENT_OPERATIONS.contains(&operation) => {
                 "admits it only with an Idempotency-Key, on a route that honours one"
             }
             _ => "records no durable evidence of it",
@@ -338,13 +345,9 @@ fn caller_key_required_admits_only_a_keyed_issuer_bound_principal_under_qualifie
     }
 
     // The form never changes what the mode decides for any other operation:
-    // an admitted operation stays admitted unkeyed, and a refused one stays
-    // refused keyed by an issuer-bound principal with every criterion met.
+    // a refused one stays refused keyed by an issuer-bound principal with
+    // every criterion met.
     let gate = keyed_cluster_gate();
-    assert_eq!(
-        gate.refusal_for(AuthorityOperation::PolicyPublish, RequestForm::UNKEYED),
-        None
-    );
     let refused = gate
         .refusal_for(AuthorityOperation::MutationApprovalReview, keyed)
         .expect("review is refused in every form");
@@ -461,16 +464,14 @@ fn withdrawals_never_ask_the_evidence_gate() {
 #[test]
 fn an_admitted_operation_records_nothing() {
     let (audit, capture) = capture_log();
-    let gate = AuthorityEvidenceGate::new(
-        AuthorityEvidenceDurability::Required,
-        StateBackend::Postgres,
-    );
-    gate.admit(
-        AuthorityOperation::PolicyPublish,
-        &audit,
-        RefusalOrigin::Background("signal"),
-    )
-    .expect("cluster mode evidences a policy publication");
+    keyed_cluster_gate()
+        .admit_for(
+            AuthorityOperation::PolicyPublish,
+            RequestForm::of(true, &issuer_bound_principal()),
+            &audit,
+            RefusalOrigin::Background("signal"),
+        )
+        .expect("cluster mode evidences a keyed policy publication");
     BackgroundEvidenceGate::new(AuthorityEvidenceGate::best_effort(), audit.clone())
         .admits(AuthorityOperation::PolicyFileReload, "file_watch")
         .then_some(())
@@ -685,6 +686,96 @@ fn the_gate_enforces_exactly_what_the_evidence_inventory_says() {
                 "{code} in {mode}"
             );
         }
+    }
+    // The policy, tools and policy test changes bind caller keys in the
+    // PostgreSQL document commit (issue #425); standalone mode records no
+    // evidence of them and stays refused (#242).
+    for operation in KEYED_DOCUMENT_OPERATIONS {
+        let code = operation.code();
+        assert_eq!(
+            by_mode.get(&(code, "postgres")),
+            Some(&"caller_key_required"),
+            "{code} in postgres"
+        );
+        assert_eq!(
+            by_mode.get(&(code, "standalone")),
+            Some(&"refused"),
+            "{code} in standalone"
+        );
+    }
+}
+
+/// The policy, tools and policy test changes (issue #425): cluster mode
+/// admits only the keyed request of an issuer-bound principal under
+/// `qualified_v1` with the file sink on a Unix build, and the refusal of
+/// every other form names the first criterion it misses; standalone mode
+/// refuses every form. None of them is a withdrawal.
+#[test]
+fn policy_tools_and_policy_test_changes_admit_only_their_keyed_issuer_bound_form_in_cluster_mode() {
+    use crate::auth::change_actor::ChangeActor;
+    use crate::config::AuthorityEventFormat;
+
+    let keyed = RequestForm::of(true, &issuer_bound_principal());
+    let service_token = ChangeActor::service_token_for_test("service-token:1");
+    let gate = keyed_cluster_gate();
+    let standalone =
+        AuthorityEvidenceGate::new(AuthorityEvidenceDurability::Required, StateBackend::Sqlite)
+            .with_delivery(AuthorityEventFormat::QualifiedV1, true, true);
+    for operation in KEYED_DOCUMENT_OPERATIONS {
+        assert_eq!(
+            operation.required_mode(StateBackend::Postgres),
+            RequiredMode::CallerKeyRequired,
+            "{operation:?}"
+        );
+        assert_eq!(gate.refusal_for(operation, keyed), None, "{operation:?}");
+        for (gate, form, expected) in [
+            (gate, RequestForm::UNKEYED, KeyedAdmission::CallerKey),
+            (
+                gate,
+                RequestForm::of(true, &service_token),
+                KeyedAdmission::IssuerBoundPrincipal,
+            ),
+            (
+                gate.with_delivery(AuthorityEventFormat::DeliveryV1, true, true),
+                keyed,
+                KeyedAdmission::QualifiedFormat,
+            ),
+            (
+                gate.with_delivery(AuthorityEventFormat::QualifiedV1, false, true),
+                keyed,
+                KeyedAdmission::FileSink,
+            ),
+            (
+                gate.with_delivery(AuthorityEventFormat::QualifiedV1, true, false),
+                keyed,
+                KeyedAdmission::SyncedFilesystem,
+            ),
+        ] {
+            assert_eq!(
+                gate.refusal_for(operation, form)
+                    .and_then(|refusal| refusal.unmet()),
+                Some(expected),
+                "{operation:?} {form:?}"
+            );
+        }
+        assert_eq!(
+            operation.required_mode(StateBackend::Sqlite),
+            RequiredMode::Refused,
+            "{operation:?}"
+        );
+        let refused = standalone
+            .refusal_for(operation, keyed)
+            .expect("standalone mode refuses every form");
+        assert_eq!(refused.unmet(), None, "{operation:?}");
+        for backend in [StateBackend::Sqlite, StateBackend::Postgres] {
+            assert_eq!(
+                AuthorityEvidenceGate::new(AuthorityEvidenceDurability::BestEffort, backend)
+                    .refusal(operation),
+                None,
+                "best_effort admits the unkeyed form"
+            );
+        }
+        assert_eq!(Withdrawal::from_code(operation.code()), None);
     }
 }
 

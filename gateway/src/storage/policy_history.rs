@@ -173,6 +173,7 @@ pub trait PolicyControlPlane: PolicyHistory {
     >;
 
     /// [`Self::commit_with_operation`] without a caller key.
+    #[cfg_attr(not(test), allow(dead_code))] // Every handler commits with its optional key.
     async fn commit(
         &self,
         request: PolicyCommitRequest<'_>,
@@ -183,7 +184,6 @@ pub trait PolicyControlPlane: PolicyHistory {
     /// What the reservation table says about `caller`'s key: the read-only
     /// pre-check a handler asks before any work outside the transaction.
     /// Advisory; the commit's own transaction decides again.
-    #[cfg_attr(not(test), allow(dead_code))] // Asked by the P9 handlers' pre-check.
     async fn caller_operation_state(
         &self,
         caller: &crate::authority_events::caller_operation::CallerOperation,
@@ -191,7 +191,6 @@ pub trait PolicyControlPlane: PolicyHistory {
 
     /// The receipt of the policy change `caller`'s key committed, read from
     /// its evidence row, or `None` when there is none.
-    #[cfg_attr(not(test), allow(dead_code))] // Asked by the P9 handlers' pre-check.
     async fn caller_operation_receipt(
         &self,
         caller: &crate::authority_events::caller_operation::CallerOperation,

@@ -1564,10 +1564,20 @@ async fn a_keyed_change_is_admitted_through_the_evidence_gate_then_the_operation
 
     // Cluster mode: an unkeyed change does not ask the operation gate; a
     // keyed one with no membership to ask is refused.
+    // (Required mode admits a policy publication only keyed since issue
+    // #425, so the unkeyed one is asked under best effort.)
     let cluster = required(config::StateBackend::Postgres);
-    admit_keyed(cluster, publish, None, request)
-        .await
-        .expect("cluster mode admits an unkeyed policy publication");
+    admit_keyed(
+        AuthorityEvidenceGate::new(
+            config::AuthorityEvidenceDurability::BestEffort,
+            config::StateBackend::Postgres,
+        ),
+        publish,
+        None,
+        request,
+    )
+    .await
+    .expect("cluster mode admits an unkeyed policy publication");
     let refused = admit_keyed(cluster, withdrawal, Some(&delete), request)
         .await
         .expect_err("a keyed change with no membership to ask is refused");

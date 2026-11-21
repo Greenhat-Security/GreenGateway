@@ -518,6 +518,11 @@ pub(super) async fn tools_openapi_register_endpoint(
     State(state): State<ToolAdminState>,
     request: AxumRequest,
 ) -> Response {
+    let pins = request.extensions().clone();
+    document_change_to_completion(pins, Box::pin(tools_openapi_register(state, request))).await
+}
+
+async fn tools_openapi_register(state: ToolAdminState, request: AxumRequest) -> Response {
     record_request(TOOLS_OPENAPI_REGISTER_ADMIN_ROUTE);
 
     let (parts, body) = request.into_parts();
@@ -527,18 +532,6 @@ pub(super) async fn tools_openapi_register_endpoint(
     if let Err(error) = authorized_tool_rbac_state(&state, &principal, ADMIN_TOOLS_WRITE_PERMISSION)
     {
         return tool_admin_authz_error_response(error);
-    }
-    // A standalone registration writes the tools file with no evidence of
-    // who did (issue #425, PR 4).
-    if let Err(response) = admit_authority_change(
-        &state.authority_evidence,
-        authority_events::required::AuthorityOperation::ToolsPublish,
-        &state.audit,
-        &parts,
-        &principal,
-        &state.client_ip_policy,
-    ) {
-        return *response;
     }
     let authority = match tools_authority(&state) {
         Ok(authority) => authority,
@@ -556,6 +549,19 @@ pub(super) async fn tools_openapi_register_endpoint(
     if requested.selected_tool_names.is_empty() {
         return bad_request("selected_tool_names must include at least one tool name");
     }
+    // Once the request is authorized and well formed, and before the
+    // specification is turned into tools or the authority read: bind the
+    // caller key and ask the gates (a standalone registration writes the
+    // tools file with no evidence of who did, issue #425), then answer an
+    // exact retry of a committed registration with its receipt.
+    let caller =
+        match admit_keyed_tools_registration(&state, &authority, &parts, &principal, &body).await {
+            Ok(caller) => caller,
+            Err(response) => return *response,
+        };
+    // Only cluster mode's authority takes the key; standalone refused one.
+    #[cfg(not(feature = "postgres"))]
+    let _ = &caller;
 
     let generation = match tools::openapi::generate_tools_from_openapi_str(
         "admin-openapi-register",
@@ -675,6 +681,7 @@ pub(super) async fn tools_openapi_register_endpoint(
                 &current_etag,
                 &principal,
                 merged,
+                caller.as_ref(),
             )
             .await
             {
@@ -704,6 +711,7 @@ pub(super) async fn register_tools_via_control_plane(
     current_etag: &str,
     principal: &auth::Principal,
     merged: MergedToolsCandidate,
+    caller: Option<&authority_events::caller_operation::CallerOperation>,
 ) -> Result<MergedToolsCandidate, Box<Response>> {
     if let Err(error) = registry.validate_local_definitions(&merged.candidate_local_tools) {
         tracing::warn!(
@@ -719,17 +727,24 @@ pub(super) async fn register_tools_via_control_plane(
         "registered_tool_names": merged.registered_tool_names,
     });
     match control_plane
-        .commit_tools(
+        .commit_tools_with_operation(
             storage::PolicyCommitPrecondition::Expected {
                 etag: current_etag.to_owned(),
             },
             &merged.candidate_value,
             storage::DocumentChange::by_principal(storage::DocumentAction::ToolsPublish, principal),
             &diff_summary,
+            caller,
         )
         .await
     {
-        Ok(committed) => {
+        // A writer racing this request under the same key committed first:
+        // its receipt, after the install the original made, and no audit.
+        Ok(authority_events::caller_operation::CallerOutcome::Replayed(receipt)) => {
+            reconcile_committed_tools(tools_resource).await;
+            Err(Box::new(operation_receipt(&receipt)))
+        }
+        Ok(authority_events::caller_operation::CallerOutcome::Committed(committed)) => {
             // Through the gate's adapter when there is one: the install is
             // then a compare-and-swap on the security revision, so a
             // commit that paused here while another replica's newer commit
@@ -788,6 +803,85 @@ pub(super) async fn register_tools_via_control_plane(
                 "tools mutation could not be committed",
             )))
         }
+    }
+}
+
+/// Bind an OpenAPI tools registration's caller key, ask the gates, and in
+/// cluster mode answer an exact retry of a committed registration with its
+/// receipt, after the install the original made (issue #425). Only cluster
+/// mode's tools authority records a key; a standalone registration refuses
+/// one before anything is read.
+async fn admit_keyed_tools_registration(
+    state: &ToolAdminState,
+    authority: &ToolsAuthority<'_>,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    body: &[u8],
+) -> ResponseResult<Option<authority_events::caller_operation::CallerOperation>> {
+    let gates = KeyedChangeGates {
+        evidence: &state.authority_evidence,
+        #[cfg(feature = "postgres")]
+        membership: state.membership.as_deref(),
+        audit: &state.audit,
+        client_ip_policy: &state.client_ip_policy,
+    };
+    #[cfg(feature = "postgres")]
+    let honours_keys = matches!(authority, ToolsAuthority::Postgres(_));
+    #[cfg(not(feature = "postgres"))]
+    let honours_keys = {
+        let _ = authority;
+        false
+    };
+    let caller = admit_keyed_document_change(
+        &gates,
+        parts,
+        principal,
+        DocumentChangeBinding {
+            action: storage::DocumentAction::ToolsPublish,
+            target: "",
+            preconditions: POLICY_PRECONDITIONS,
+            request: body,
+        },
+        honours_keys,
+    )
+    .await?;
+    #[cfg(feature = "postgres")]
+    if let (Some(caller), ToolsAuthority::Postgres(control_plane)) = (&caller, authority) {
+        if let Err(answer) = replayed_receipt(
+            control_plane.caller_operation_state(caller),
+            control_plane.caller_operation_receipt(caller),
+        )
+        .await
+        {
+            if answer.status() == StatusCode::OK {
+                reconcile_committed_tools(state.tools_resource.as_ref()).await;
+            }
+            return Err(answer);
+        }
+    }
+    Ok(caller)
+}
+
+/// Bring this replica's tools lane up to the authority's activation, as the
+/// registration an exact keyed retry answers for did (issue #425). The
+/// install never rolls the lane back; a failure is logged and left to
+/// reconciliation, since the change itself is durable.
+#[cfg(feature = "postgres")]
+async fn reconcile_committed_tools(tools_resource: Option<&Arc<security_cluster::ToolsResource>>) {
+    use security_cluster::ReconciledResource as _;
+
+    let Some(resource) = tools_resource else {
+        return;
+    };
+    let reconciled = match resource.activation_revision().await {
+        Ok(activation) => resource.reconcile(activation).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = reconciled {
+        tracing::error!(
+            error = ?error,
+            "a replayed tools registration could not install the active tools document; reconciliation will retry"
+        );
     }
 }
 

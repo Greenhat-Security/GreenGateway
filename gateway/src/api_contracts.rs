@@ -965,6 +965,10 @@ pub(super) struct PolicyMutationCommitContext<'a, 'guard> {
     pub(super) policy_write_guard: &'a middleware::rbac::PolicyWriteGuard<'guard>,
     pub(super) parts: &'a http::request::Parts,
     pub(super) principal: &'a auth::Principal,
+    /// The request's caller key, bound and admitted by
+    /// `admit_keyed_document_change` (issue #425); `None` for an unkeyed
+    /// request.
+    pub(super) caller: Option<&'a authority_events::caller_operation::CallerOperation>,
 }
 
 pub(super) enum PolicyAdminAuthzError {
@@ -1283,6 +1287,10 @@ pub(super) enum ClusterToolsStartupError {
     Store(storage::RepositoryError),
     /// Unreachable after a successful seed; defensive fail closed.
     NotSeeded,
+    /// The tools document does not exist yet and required authority
+    /// evidence refuses the unkeyed system seed (issue #425); the message is
+    /// the gate's refusal.
+    SeedRefused(String),
     /// The active document failed validation: this binary refuses to
     /// activate a tools document it cannot fully parse and enforce.
     InvalidDocument(String),
@@ -1300,6 +1308,10 @@ impl std::fmt::Display for ClusterToolsStartupError {
             Self::Store(error) => write!(
                 formatter,
                 "the cluster-mode tools control plane could not be read at startup: {error}"
+            ),
+            Self::SeedRefused(refusal) => write!(
+                formatter,
+                "the cluster-mode tools control plane has no document and will not seed one:                  {refusal}. Provision it first: start once with                  AUTHORITY_EVIDENCE_DURABILITY=best_effort, or import it with import-standalone"
             ),
             Self::NotSeeded => write!(
                 formatter,
@@ -1687,6 +1699,8 @@ pub(super) struct SuggestionAcceptContext<'a, 'guard> {
     pub(super) principal: &'a auth::Principal,
     pub(super) rbac_state: &'a middleware::rbac::RbacState,
     pub(super) policy_write_guard: &'a middleware::rbac::PolicyWriteGuard<'guard>,
+    /// The request's caller key (issue #425); `None` for an unkeyed request.
+    pub(super) caller: Option<&'a authority_events::caller_operation::CallerOperation>,
 }
 
 /// How many stream rows one durable poll fetches: large enough that a

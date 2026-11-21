@@ -663,7 +663,6 @@ fn reservation_failure(error: &RepositoryError) -> PolicyCommitError {
 /// What the reservation table says about `caller`'s key, read outside any
 /// transaction: the handler's read-only pre-check (step 0 of the keyed
 /// contract). Advisory; the commit's own transaction decides again.
-#[cfg_attr(not(test), allow(dead_code))] // Asked by the P9 handlers' pre-check.
 pub(crate) async fn caller_operation_state(
     pool: &deadpool_postgres::Pool,
     caller: &CallerOperation,
@@ -677,7 +676,6 @@ pub(crate) async fn caller_operation_state(
 
 /// The receipt of the document change `caller`'s key committed, or `None`
 /// when no evidence row carries it, read outside any transaction.
-#[cfg_attr(not(test), allow(dead_code))] // Asked by the P9 handlers' pre-check.
 pub(crate) async fn caller_operation_receipt(
     pool: &deadpool_postgres::Pool,
     caller: &CallerOperation,

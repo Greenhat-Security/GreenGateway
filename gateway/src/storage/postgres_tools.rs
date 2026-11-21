@@ -83,7 +83,6 @@ pub trait ToolControlPlane: Send + Sync {
     /// What the reservation table says about `caller`'s key: the read-only
     /// pre-check a handler asks before any external work (an OpenAPI
     /// fetch). Advisory; the commit's own transaction decides again.
-    #[cfg_attr(not(test), allow(dead_code))] // Asked by the P9 handlers' pre-check.
     async fn caller_operation_state(
         &self,
         caller: &CallerOperation,
@@ -91,7 +90,6 @@ pub trait ToolControlPlane: Send + Sync {
 
     /// The receipt of the tools change `caller`'s key committed, read from
     /// its evidence row, or `None` when there is none.
-    #[cfg_attr(not(test), allow(dead_code))] // Asked by the P9 handlers' pre-check.
     async fn caller_operation_receipt(
         &self,
         caller: &CallerOperation,

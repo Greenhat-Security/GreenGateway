@@ -166,7 +166,6 @@ pub(crate) trait PolicyTestSuiteStore: Send + Sync {
     /// [`PolicyTestSuiteCommitError::CallerOperationConflict`]. A store that
     /// cannot bind keys (the standalone store, whose row stays refused until
     /// #242) refuses a keyed commit before writing anything.
-    #[cfg_attr(not(test), allow(dead_code))] // Called by the P9 handler.
     async fn commit_with_operation(
         &self,
         precondition: PolicyTestSuitePrecondition,
@@ -184,7 +183,6 @@ pub(crate) trait PolicyTestSuiteStore: Send + Sync {
 
     /// What the reservation table says about `caller`'s key: the handler's
     /// read-only pre-check. A store that cannot bind keys refuses.
-    #[cfg_attr(not(test), allow(dead_code))] // Asked by the P9 handlers' pre-check.
     async fn caller_operation_state(
         &self,
         _caller: &CallerOperation,
@@ -194,7 +192,6 @@ pub(crate) trait PolicyTestSuiteStore: Send + Sync {
 
     /// The receipt of the suite change `caller`'s key committed, or `None`.
     /// A store that cannot bind keys refuses.
-    #[cfg_attr(not(test), allow(dead_code))] // Asked by the P9 handlers' pre-check.
     async fn caller_operation_receipt(
         &self,
         _caller: &CallerOperation,
@@ -205,7 +202,6 @@ pub(crate) trait PolicyTestSuiteStore: Send + Sync {
 
 /// A caller key offered to a suite store that cannot bind one: refused as an
 /// invalid parameter, so it is never ignored.
-#[cfg_attr(not(test), allow(dead_code))] // Reached through the P9 handler.
 fn keys_unsupported() -> RepositoryError {
     RepositoryError::invalid_parameter(OPERATION_COMMIT, "caller_operation")
 }

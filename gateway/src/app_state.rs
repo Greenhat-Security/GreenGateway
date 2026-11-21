@@ -660,6 +660,11 @@ pub(super) struct ToolAdminState {
     /// live lane back to an older commit.
     #[cfg(feature = "postgres")]
     pub(super) tools_resource: Option<Arc<security_cluster::ToolsResource>>,
+    /// Cluster mode's roster, for the operation gate a keyed registration
+    /// asks for `caller_operation_keys` (issue #425). In cluster mode a
+    /// keyed registration with no roster to ask is refused.
+    #[cfg(feature = "postgres")]
+    pub(super) membership: Option<Arc<cluster_membership::ClusterMembership>>,
 }
 
 #[derive(Clone)]

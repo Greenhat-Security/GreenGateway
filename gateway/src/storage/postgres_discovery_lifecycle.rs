@@ -546,6 +546,7 @@ impl PostgresDiscoveryLifecycleStore {
     /// so the caller can emit the audit events for both changes knowing
     /// they happened. `Err` means nothing was written.
     ///
+    #[cfg_attr(not(test), allow(dead_code))] // The handler accepts with its optional key.
     pub async fn accept_suggestion(
         &self,
         request: AcceptSuggestionRequest<'_>,

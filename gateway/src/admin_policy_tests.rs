@@ -37,6 +37,7 @@
 //!   database standalone and in migration 29's tables in cluster mode, never
 //!   in client storage.
 use super::*;
+use crate::authority_events::caller_operation::CallerOutcome;
 
 use storage::policy_tests::{
     contains_nul_character, PolicyTestSuiteCommitError, PolicyTestSuitePrecondition,
@@ -378,6 +379,14 @@ pub(super) async fn policy_tests_put_endpoint(
     State(state): State<PolicyAdminState>,
     request: AxumRequest,
 ) -> Response {
+    let pins = request.extensions().clone();
+    document_change_to_completion(pins, Box::pin(policy_tests_put(state, request))).await
+}
+
+/// The precondition headers a suite write reads.
+const POLICY_TESTS_PRECONDITIONS: &[&str] = &["if-match", "if-none-match"];
+
+async fn policy_tests_put(state: PolicyAdminState, request: AxumRequest) -> Response {
     record_request(POLICY_TESTS_ADMIN_ROUTE);
 
     let (parts, body) = request.into_parts();
@@ -392,19 +401,6 @@ pub(super) async fn policy_tests_put_endpoint(
         Ok(precondition) => precondition,
         Err(refusal) => return refusal.response(),
     };
-    // Standalone mode records no evidence of the write beyond the writer's
-    // subject on the version row, so required evidence refuses it here,
-    // before anything is read or written.
-    if let Err(response) = admit_authority_change(
-        &state.authority_evidence,
-        authority_events::required::AuthorityOperation::PolicyTestsPublish,
-        &state.audit,
-        &parts,
-        &principal,
-        &state.client_ip_policy,
-    ) {
-        return *response;
-    }
     let body_limit = state.max_body_size.min(MAX_POLICY_TESTS_BODY_BYTES);
     let body_deadline = tokio::time::Instant::now() + POLICY_TESTS_BODY_DEADLINE;
     let body = match read_request_body_before(body, body_limit, body_deadline).await {
@@ -437,6 +433,39 @@ pub(super) async fn policy_tests_put_endpoint(
         );
         return suite_invalid(&diagnostics);
     }
+    // Once the request is authorized and well formed, and before anything
+    // is read or written: bind the caller key and ask the gates (standalone
+    // mode records no evidence of the write beyond the writer's subject on
+    // the version row, so required evidence refuses it), then answer an
+    // exact retry of a committed write with its receipt (issue #425). Only
+    // cluster mode's suite store records a key.
+    let caller = match admit_keyed_document_change(
+        &policy_change_gates(&state),
+        &parts,
+        &principal,
+        DocumentChangeBinding {
+            action: storage::DocumentAction::PolicyTestsPublish,
+            target: "",
+            preconditions: POLICY_TESTS_PRECONDITIONS,
+            request: &body,
+        },
+        policy_store_honours_keys(&state),
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return *response,
+    };
+    if let Some(caller) = caller.as_ref() {
+        if let Err(response) = replayed_receipt(
+            store.caller_operation_state(caller),
+            store.caller_operation_receipt(caller),
+        )
+        .await
+        {
+            return *response;
+        }
+    }
 
     let replaced = match &precondition {
         PolicyTestSuitePrecondition::Expected { etag } => Some(etag.clone()),
@@ -450,8 +479,14 @@ pub(super) async fn policy_tests_put_endpoint(
         Some(rbac_state) => Some(rbac_state.policy_write_guard().await),
         None => None,
     };
-    match store.commit(precondition, &document, &principal).await {
-        Ok(record) => {
+    match store
+        .commit_with_operation(precondition, &document, &principal, caller.as_ref())
+        .await
+    {
+        // A writer racing this request under the same key committed first:
+        // its receipt, and no second event.
+        Ok(CallerOutcome::Replayed(receipt)) => operation_receipt(&receipt),
+        Ok(CallerOutcome::Committed(record)) => {
             let status = if replaced.is_some() {
                 StatusCode::OK
             } else {
