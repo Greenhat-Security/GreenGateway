@@ -18159,8 +18159,9 @@ pub(crate) mod postgres_audit_tests {
     /// #243, item 19): a run against the same inputs writes nothing, a run
     /// against a changed policy rebinds every open row once, two replicas
     /// running that at once rebind each row exactly once between them
-    /// (the batch is identity-sorted, so they cannot deadlock), and a
-    /// transition that read the revision before the rebind loses to it.
+    /// (the batch is identity-sorted, so they cannot deadlock), a
+    /// transition that read the revision before the rebind loses to it, and
+    /// a present but malformed binding is repaired by an unchanged run.
     #[tokio::test]
     async fn postgres_regeneration_rebinds_open_suggestions_by_compare_and_set() {
         let Some(admin_dsn) = locator() else {
@@ -18295,6 +18296,41 @@ pub(crate) mod postgres_audit_tests {
             }
             other => panic!("the stale revision must be refused: {other:?}"),
         }
+
+        // A binding that is present but malformed in a column no comparison
+        // sees (a cutoff the CHECK accepts but that is not RFC 3339) reads
+        // as unbound, and the next run against the same inputs repairs it.
+        let client = pool.get().await.expect("client checkout");
+        client
+            .execute(
+                "UPDATE greengateway.discovery_rule_suggestions
+                 SET evidence_cutoff = 'yesterday' WHERE id = $1",
+                &[&rebound_id],
+            )
+            .await
+            .expect("the binding is damaged");
+        let damaged = replica_a
+            .get_suggestion(&rebound_id)
+            .await
+            .expect("the row reads")
+            .expect("the row exists");
+        assert!(damaged.generation.is_none(), "{damaged:?}");
+        let repaired_run = replica_b
+            .generate_bound(&policy, &context_b)
+            .await
+            .expect("the repairing run generates");
+        assert_eq!(
+            (repaired_run.inserted_count, repaired_run.rebound_count),
+            (0, 1),
+            "only the damaged row is rebound: {repaired_run:?}"
+        );
+        let repaired = replica_a
+            .get_suggestion(&rebound_id)
+            .await
+            .expect("the row reads")
+            .expect("the row exists");
+        assert_eq!(repaired.revision, 3);
+        assert!(repaired.generation.is_some(), "{repaired:?}");
     }
 
     /// A regeneration rebind and an acceptance through the real cluster

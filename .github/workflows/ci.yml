@@ -761,6 +761,7 @@ jobs:
             storage::contract_tests::postgres_audit_tests::revoke_and_rotate_race_never_leaves_a_live_plaintext
             storage::contract_tests::postgres_audit_tests::an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction
             storage::contract_tests::postgres_audit_tests::postgres_regeneration_rebinds_open_suggestions_by_compare_and_set
+            storage::contract_tests::postgres_audit_tests::postgres_a_rebind_and_an_acceptance_race_have_one_winner
             storage::contract_tests::postgres_audit_tests::a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity
             storage::contract_tests::postgres_audit_tests::postgres_caller_operation_reservation_contract
             storage::contract_tests::postgres_audit_tests::postgres_a_rolled_back_transaction_leaves_no_reservation

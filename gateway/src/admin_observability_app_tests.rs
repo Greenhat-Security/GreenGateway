@@ -4785,6 +4785,83 @@ async fn a_policy_change_marks_listed_suggestions_stale_and_regeneration_makes_t
     assert_eq!(accepted.status(), StatusCode::CREATED);
 }
 
+/// A generation run that inserted or rebound rows emits one counts-only
+/// `suggestion.generated` naming who ran it; a run that wrote nothing emits
+/// nothing.
+#[tokio::test]
+async fn a_generation_run_that_writes_is_audited_with_counts_only() {
+    let discovery_db = TempDb::new("suggestions-generation-audit-discovery");
+    let audit_db = TempDb::new("suggestions-generation-audit-audit");
+    seed_two_generated_callers(&discovery_db.path, &audit_db.path);
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()));
+    let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+    let router = suggestions_admin_router_with_policy(
+        Some(&discovery_db.path),
+        Some(&audit_db.path),
+        &policy,
+        audit_log,
+    );
+    let generated_events = || {
+        capture
+            .events()
+            .into_iter()
+            .filter(|event| event.event_type == audit::event::SUGGESTIONS_GENERATED)
+            .collect::<Vec<_>>()
+    };
+
+    let first_etag = suggestions_policy_etag(&router).await;
+    let (reader, _writer) = generate_two_bound_suggestions(&router).await;
+    assert_eventually(Duration::from_secs(1), || generated_events().len() == 1);
+    let first = generated_events().remove(0);
+    assert_eq!(
+        first.payload,
+        json!({
+            "inserted_count": 2,
+            "rebound_count": 0,
+            "policy_etag": first_etag,
+            "generator_version": "rule-suggestions.v1",
+        })
+    );
+    assert_eq!(
+        first.actor.as_ref().map(|actor| actor.user_id.as_str()),
+        Some("user-123")
+    );
+
+    // An unchanged run writes nothing and emits nothing.
+    let unchanged = regenerate(&router).await;
+    assert_eq!(unchanged["rebound_count"], json!(0), "{unchanged}");
+
+    // A policy change and a run that rebinds the other row.
+    let accepted = router
+        .clone()
+        .oneshot(suggestions_admin_request(
+            Method::POST,
+            &format!("/v1/admin/suggestions/{reader}/accept"),
+            Some(test_principal(&["suggestions-policy-writer"])),
+            None,
+            Some(&first_etag),
+        ))
+        .await
+        .expect("accept request should complete");
+    assert_eq!(accepted.status(), StatusCode::CREATED);
+    let second_etag = policy_etag_header(&accepted);
+    let rebound = regenerate(&router).await;
+    assert_eq!(rebound["rebound_count"], json!(1), "{rebound}");
+    assert_eventually(Duration::from_secs(1), || generated_events().len() >= 2);
+    let events = generated_events();
+    assert_eq!(events.len(), 2, "the unchanged run emitted nothing");
+    assert_eq!(
+        events[1].payload,
+        json!({
+            "inserted_count": 0,
+            "rebound_count": 1,
+            "policy_etag": second_etag,
+            "generator_version": "rule-suggestions.v1",
+        })
+    );
+}
+
 #[tokio::test]
 async fn a_generation_run_planned_against_an_older_policy_writes_nothing() {
     let discovery_db = TempDb::new("suggestions-generation-race-discovery");

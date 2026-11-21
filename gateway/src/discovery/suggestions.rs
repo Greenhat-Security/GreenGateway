@@ -133,6 +133,9 @@ const RULE_SUGGESTION_BINDING_COLUMNS: [(&str, &str); 9] = [
 /// refreshed with it (so `source_signal_id` always names the signal the
 /// evidence names) and never trigger it on their own, so regenerating over
 /// moving traffic against an unchanged policy and resources writes nothing.
+/// An open row whose binding is present but malformed (it reads as unbound,
+/// see `StoredGenerationBinding::decode`) is rebound too: the caller passes
+/// that as `?21`.
 /// A planned row without a binding never overwrites one. Accepted and
 /// dismissed rows are never touched. `RETURNING id` names the planned id for
 /// an insert, the existing id for a rebind, and nothing when the statement
@@ -197,9 +200,21 @@ WHERE discovery_rule_suggestions.state = 'open'
     OR discovery_rule_suggestions.binding_resource_snapshot_complete
         IS NOT excluded.binding_resource_snapshot_complete
     OR discovery_rule_suggestions.proposed_rule_json IS NOT excluded.proposed_rule_json
+    OR ?21
   )
 RETURNING id
 "#;
+
+/// The stored binding of the open row with one identity, read before that
+/// identity is upserted so that a binding which is present but does not
+/// decode (a bad cutoff or digest, which no column comparison above sees)
+/// is repaired by the rebind (`?21`) instead of staying unbound forever.
+const OPEN_ROW_BINDING_SQL: &str = "SELECT generator_version, evidence_schema_version, \
+     evidence_cutoff, evidence_digest, binding_policy_etag, binding_policy_semantic_digest, \
+     binding_resource_snapshot_digest, binding_resource_snapshot_complete, \
+     binding_resource_components FROM discovery_rule_suggestions \
+     WHERE suggestion_type = ?1 AND method = ?2 AND path_pattern = ?3 AND principal_key = ?4 \
+     AND state = 'open'";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuleSuggestionLifecycleState {
@@ -1670,7 +1685,25 @@ impl RuleSuggestionStore {
             let mut statement = transaction
                 .prepare_cached(UPSERT_RULE_SUGGESTION_SQL)
                 .map_err(|source| self.sqlite_error(source))?;
+            let mut open_binding = transaction
+                .prepare_cached(OPEN_ROW_BINDING_SQL)
+                .map_err(|source| self.sqlite_error(source))?;
             for suggestion in suggestions {
+                // An open row whose stored binding does not decode is
+                // repaired by this run's rebind.
+                let malformed_binding = open_binding
+                    .query_row(
+                        params![
+                            suggestion.suggestion_type.as_str(),
+                            suggestion.method.as_str(),
+                            suggestion.path_pattern.as_str(),
+                            suggestion.principal_key.as_str(),
+                        ],
+                        |row| Ok(stored_binding_at(row, 0)),
+                    )
+                    .optional()
+                    .map_err(|source| self.sqlite_error(source))?
+                    .is_some_and(|stored| stored.decode().is_none());
                 let proposed_rule_json =
                     serde_json::to_string(&suggestion.proposed_rule).map_err(|source| {
                         RuleSuggestionError::Json {
@@ -1709,6 +1742,7 @@ impl RuleSuggestionStore {
                             binding.resource_snapshot_digest,
                             binding.resource_snapshot_complete,
                             binding.resource_components,
+                            malformed_binding,
                         ],
                         |row| row.get::<_, String>(0),
                     )
@@ -2100,6 +2134,24 @@ pub(crate) const RULE_SUGGESTION_COLUMNS: &str = "id, suggestion_type, method, p
      binding_policy_semantic_digest, binding_resource_snapshot_digest, \
      binding_resource_snapshot_complete, binding_resource_components";
 
+/// The nine binding columns of a SQLite row, starting at column `first`, in
+/// the order [`RULE_SUGGESTION_COLUMNS`] lists them. A column that does not
+/// read as its type is a malformed binding, which reads as none rather than
+/// failing the row.
+fn stored_binding_at(row: &rusqlite::Row<'_>, first: usize) -> StoredGenerationBinding {
+    StoredGenerationBinding {
+        generator_version: row.get(first).ok().flatten(),
+        evidence_schema_version: row.get(first + 1).ok().flatten(),
+        evidence_cutoff: row.get(first + 2).ok().flatten(),
+        evidence_digest: row.get(first + 3).ok().flatten(),
+        policy_etag: row.get(first + 4).ok().flatten(),
+        policy_semantic_digest: row.get(first + 5).ok().flatten(),
+        resource_snapshot_digest: row.get(first + 6).ok().flatten(),
+        resource_snapshot_complete: row.get(first + 7).ok().flatten(),
+        resource_components: row.get(first + 8).ok().flatten(),
+    }
+}
+
 impl RawRuleSuggestion {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
@@ -2118,20 +2170,7 @@ impl RawRuleSuggestion {
             transitioned_by: row.get(12)?,
             source_signal_id: row.get(13)?,
             revision: row.get(14)?,
-            // A binding column that does not read as its type is a
-            // malformed binding, which reads as none rather than failing
-            // the row.
-            generation: StoredGenerationBinding {
-                generator_version: row.get(15).ok().flatten(),
-                evidence_schema_version: row.get(16).ok().flatten(),
-                evidence_cutoff: row.get(17).ok().flatten(),
-                evidence_digest: row.get(18).ok().flatten(),
-                policy_etag: row.get(19).ok().flatten(),
-                policy_semantic_digest: row.get(20).ok().flatten(),
-                resource_snapshot_digest: row.get(21).ok().flatten(),
-                resource_snapshot_complete: row.get(22).ok().flatten(),
-                resource_components: row.get(23).ok().flatten(),
-            },
+            generation: stored_binding_at(row, 15),
         })
     }
 
@@ -4420,14 +4459,33 @@ mod tests {
 
     #[test]
     fn a_partial_or_malformed_stored_binding_reads_as_unbound() {
-        let (discovery_db, audit_db) =
-            seed_bound_generation_fixture("malformed", &["/invoices", "/orders"]);
+        let (discovery_db, audit_db) = seed_bound_generation_fixture(
+            "malformed",
+            &["/invoices", "/orders", "/refunds", "/receipts"],
+        );
         let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
         engine
             .generate_bound(&empty_policy(), &binding_context('a'))
             .expect("generation should succeed");
         let connection =
             Connection::open(&discovery_db.path).expect("discovery database should open");
+        // Present but malformed, in columns the rebind trigger does not
+        // compare: every column is non-NULL and the compared ones still
+        // equal what the next run records.
+        connection
+            .execute(
+                "UPDATE discovery_rule_suggestions SET evidence_digest = 'sha256:not-a-digest'
+                 WHERE path_pattern = '/refunds/{id}'",
+                [],
+            )
+            .expect("the binding should be damaged");
+        connection
+            .execute(
+                "UPDATE discovery_rule_suggestions SET evidence_cutoff = 'yesterday'
+                 WHERE path_pattern = '/receipts/{id}'",
+                [],
+            )
+            .expect("the binding should be damaged");
         connection
             .execute(
                 "UPDATE discovery_rule_suggestions SET evidence_digest = NULL
@@ -4445,15 +4503,29 @@ mod tests {
 
         // Neither row fails the listing or reads as bound.
         let suggestions = engine.list_suggestions().expect("suggestions should query");
-        assert_eq!(suggestions.len(), 2);
+        assert_eq!(suggestions.len(), 4);
         assert!(suggestions
             .iter()
             .all(|suggestion| suggestion.generation.is_none()));
-        // A later run rebinds both: a damaged binding is no binding.
+        // A later run against the same inputs rebinds all four: a damaged
+        // binding is no binding, and is repaired even where no compared
+        // column differs.
         let run = engine
             .generate_bound(&empty_policy(), &binding_context('a'))
             .expect("regeneration should succeed");
-        assert_eq!(run.rebound_count, 2, "{run:?}");
+        assert_eq!(run.rebound_count, 4, "{run:?}");
+        let repaired = engine.list_suggestions().expect("suggestions should query");
+        assert!(
+            repaired
+                .iter()
+                .all(|suggestion| suggestion.revision == 2 && suggestion.generation.is_some()),
+            "{repaired:?}"
+        );
+        // Once repaired, an unchanged run writes nothing again.
+        let unchanged = engine
+            .generate_bound(&empty_policy(), &binding_context('a'))
+            .expect("regeneration should succeed");
+        assert_eq!(unchanged.rebound_count, 0, "{unchanged:?}");
     }
 
     #[test]

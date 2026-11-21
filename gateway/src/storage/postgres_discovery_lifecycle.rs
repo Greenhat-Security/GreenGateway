@@ -99,7 +99,8 @@ const OPERATION_ACCEPT_SUGGESTION: &str = "discovery_accept_suggestion";
 /// their completeness) or proposes a different rule. The evidence,
 /// rationale, cutoff and source signal are refreshed with a rebind and
 /// never trigger one, so the row's `source_signal_id` always names the
-/// signal its evidence names.
+/// signal its evidence names. An open row whose binding is present but
+/// malformed is rebound too (`$21`, see [`OPEN_ROW_BINDINGS_SQL`]).
 /// Accepted and dismissed rows are never touched, and a planned row
 /// without a binding never overwrites one. `RETURNING id` names the
 /// planned id for an insert and the existing id for a rebind.
@@ -160,8 +161,31 @@ WHERE t.state = 'open'
     OR t.binding_resource_snapshot_complete
         IS DISTINCT FROM EXCLUDED.binding_resource_snapshot_complete
     OR t.proposed_rule_json IS DISTINCT FROM EXCLUDED.proposed_rule_json
+    OR t.id = ANY($21::text[])
   )
 RETURNING id
+"#;
+
+/// The ids and stored bindings of the open rows a batch's identities hold,
+/// read before the upsert: a row whose binding is present but does not
+/// decode (a cutoff that is not RFC 3339, a components document that is not
+/// an object: shapes the CHECKs do not reject and no column comparison
+/// sees) is named in `$21` of [`UPSERT_SUGGESTIONS_SQL`] and repaired by the
+/// rebind instead of staying unbound forever. A concurrent run may repair
+/// it first; this run then rebinds it once more, which is harmless.
+const OPEN_ROW_BINDINGS_SQL: &str = r#"
+SELECT t.id, t.generator_version, t.evidence_schema_version, t.evidence_cutoff,
+       t.evidence_digest, t.binding_policy_etag, t.binding_policy_semantic_digest,
+       t.binding_resource_snapshot_digest, t.binding_resource_snapshot_complete,
+       t.binding_resource_components
+FROM greengateway.discovery_rule_suggestions AS t
+JOIN UNNEST($1::text[], $2::text[], $3::text[], $4::text[])
+    AS batch(suggestion_type, method, path_pattern, principal_key)
+  ON t.suggestion_type = batch.suggestion_type
+ AND t.method = batch.method
+ AND t.path_pattern = batch.path_pattern
+ AND t.principal_key = batch.principal_key
+WHERE t.state = 'open'
 "#;
 
 /// Everything one atomic acceptance needs: which suggestion, what the
@@ -393,6 +417,17 @@ impl PostgresDiscoveryLifecycleStore {
         }
 
         let client = self.client().await?;
+        let malformed_bindings = client
+            .query(
+                OPEN_ROW_BINDINGS_SQL,
+                &[&suggestion_types, &methods, &path_patterns, &principal_keys],
+            )
+            .await
+            .map_err(|error| classify_query(error, operation))?
+            .iter()
+            .filter(|row| stored_binding_at(row, 1).decode().is_none())
+            .map(|row| column::<String>(row, 0, operation))
+            .collect::<Result<Vec<_>, _>>()?;
         let rows = client
             .query(
                 UPSERT_SUGGESTIONS_SQL,
@@ -417,6 +452,7 @@ impl PostgresDiscoveryLifecycleStore {
                     &snapshot_digests,
                     &snapshot_completes,
                     &components,
+                    &malformed_bindings,
                 ],
             )
             .await
@@ -814,20 +850,26 @@ fn raw_suggestion(
         transitioned_by: column(row, 12, operation)?,
         source_signal_id: column(row, 13, operation)?,
         revision: column(row, 14, operation)?,
-        // A binding column that does not decode is a malformed binding,
-        // which reads as none rather than failing the row.
-        generation: StoredGenerationBinding {
-            generator_version: row.try_get(15).ok().flatten(),
-            evidence_schema_version: row.try_get(16).ok().flatten(),
-            evidence_cutoff: row.try_get(17).ok().flatten(),
-            evidence_digest: row.try_get(18).ok().flatten(),
-            policy_etag: row.try_get(19).ok().flatten(),
-            policy_semantic_digest: row.try_get(20).ok().flatten(),
-            resource_snapshot_digest: row.try_get(21).ok().flatten(),
-            resource_snapshot_complete: row.try_get(22).ok().flatten(),
-            resource_components: row.try_get(23).ok().flatten(),
-        },
+        generation: stored_binding_at(row, 15),
     })
+}
+
+/// The nine binding columns of a row, starting at column `first`, in the
+/// order [`RULE_SUGGESTION_COLUMNS`] lists them. A column that does not
+/// decode is a malformed binding, which reads as none rather than failing
+/// the row.
+fn stored_binding_at(row: &Row, first: usize) -> StoredGenerationBinding {
+    StoredGenerationBinding {
+        generator_version: row.try_get(first).ok().flatten(),
+        evidence_schema_version: row.try_get(first + 1).ok().flatten(),
+        evidence_cutoff: row.try_get(first + 2).ok().flatten(),
+        evidence_digest: row.try_get(first + 3).ok().flatten(),
+        policy_etag: row.try_get(first + 4).ok().flatten(),
+        policy_semantic_digest: row.try_get(first + 5).ok().flatten(),
+        resource_snapshot_digest: row.try_get(first + 6).ok().flatten(),
+        resource_snapshot_complete: row.try_get(first + 7).ok().flatten(),
+        resource_components: row.try_get(first + 8).ok().flatten(),
+    }
 }
 
 /// Read one column; a row that does not decode is data this binary cannot

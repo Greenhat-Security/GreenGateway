@@ -596,7 +596,7 @@ fn generation_refusal_reason(
     match status {
         Some(FreshnessStatus::Unbound) => (
             "suggestion_binding_unrecorded",
-            "suggestion was generated before this gateway recorded what it was generated against; regenerate suggestions, or review it in a draft",
+            "no generation binding is recorded for this suggestion; regenerate suggestions, or review it in a draft",
         ),
         Some(FreshnessStatus::Superseded) => (
             "suggestion_rule_already_present",
@@ -809,6 +809,15 @@ pub(super) async fn rule_suggestions_generate_endpoint(
             return internal_server_error("suggestion generation failed");
         }
     };
+    // A run that inserted or rebound rows moved what reviewers and callers
+    // of `/accept` read, so it is audited, counts only.
+    emit_suggestions_generated(
+        &state,
+        &parts,
+        &principal,
+        &generation,
+        &planned_against.policy_etag,
+    );
 
     (StatusCode::OK, Json(generation)).into_response()
 }

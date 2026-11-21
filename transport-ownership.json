@@ -10160,8 +10160,18 @@
       "reasons": [
         "network-or-process-reference"
       ],
+      "scope": "gateway::discovery::suggestions::stored_binding_at#1",
+      "sha256": "5b62749f7bf7e175fc4a876ef0c1ae0a94102f91f3d29fd5def07d81e4801314",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reads stored suggestion binding columns from a local SQLite row; no transport authority."
+    },
+    {
+      "file": "gateway/src/discovery/suggestions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
       "scope": "gateway::discovery::suggestions::impl  RawRuleSuggestion::from_row#1",
-      "sha256": "b263d1ae5f7553ba14f2b96cba5d46a9652b6ce6ffb90ba7994cc56a80733e8a",
+      "sha256": "cff5432674dac3ee0a3242a99f5e3639b8c03eb291e6ecd23893dde742f0ec82",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -13735,8 +13745,18 @@
       "reasons": [
         "network-or-process-reference"
       ],
+      "scope": "gateway::storage::postgres_discovery_lifecycle::stored_binding_at#1",
+      "sha256": "f758d08f554fa182c6619eb17576f7562841311177010121d33c15dbefadefe0",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_discovery_lifecycle.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
       "scope": "gateway::storage::postgres_discovery_lifecycle::raw_suggestion#1",
-      "sha256": "b76613d1a9e18b3e9719ecc32511993633eb360486625290aee611054c8db10d",
+      "sha256": "add8ed2b029ba58aa05337eeac178044ee385398a3e0224b3e7ca8bbdfa0e4aa",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
