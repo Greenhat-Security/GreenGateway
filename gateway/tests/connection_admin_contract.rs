@@ -16,6 +16,13 @@ struct ExpectedOperation {
     response_definition: &'static str,
 }
 
+/// The routes that honour an `Idempotency-Key` (issue #425).
+const KEYED_CONNECTION_CHANGES: [(&str, &str); 3] = [
+    ("/v1/admin/connections", "post"),
+    ("/v1/admin/connections/{id}", "put"),
+    ("/v1/admin/connections/{id}", "delete"),
+];
+
 const EXPECTED_OPERATIONS: &[ExpectedOperation] = &[
     ExpectedOperation {
         path: "/v1/admin/connections",
@@ -487,17 +494,83 @@ fn connection_admin_openapi_has_exact_routes_operations_and_safe_contracts() {
             ),
         }
 
-        assert_eq!(
-            operation_value.pointer(&format!(
-                "/responses/{}/content/application~1json/schema/$ref",
+        // A keyed Connection replace or delete answers an exact retry `200`
+        // with its receipt, so its `200` is the detail or the receipt.
+        let success = operation_value
+            .pointer(&format!(
+                "/responses/{}/content/application~1json/schema",
                 operation.success_status
-            )),
+            ))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} {} has no success schema",
+                    operation.method.to_ascii_uppercase(),
+                    operation.path
+                )
+            });
+        let primary = if KEYED_CONNECTION_CHANGES.contains(&(operation.path, operation.method))
+            && operation.success_status == "200"
+        {
+            assert_eq!(
+                success.pointer("/oneOf/1/$ref"),
+                Some(&Value::String(schema_reference("OperationReceipt"))),
+                "{} {} should also answer an exact retry with its receipt",
+                operation.method.to_ascii_uppercase(),
+                operation.path
+            );
+            assert_eq!(success.pointer("/oneOf/2"), None);
+            success.pointer("/oneOf/0/$ref")
+        } else {
+            success.get("$ref")
+        };
+        assert_eq!(
+            primary,
             Some(&Value::String(schema_reference(
                 operation.response_definition
             ))),
             "{} {} should use the documented safe response schema",
             operation.method.to_ascii_uppercase(),
             operation.path
+        );
+    }
+
+    // Issue #425: the keyed Connection changes describe the exact retry's
+    // receipt and their keyed-change conflicts.
+    for (path, method) in KEYED_CONNECTION_CHANGES {
+        let operation = &paths[path][method];
+        if method == "post" {
+            assert_eq!(
+                operation.pointer("/responses/200/content/application~1json/schema/$ref"),
+                Some(&Value::String(schema_reference("OperationReceipt"))),
+                "a keyed create's exact retry is answered 200 with its receipt"
+            );
+        }
+        assert_eq!(
+            operation.pointer("/responses/409/content/application~1json/schema/oneOf/1/$ref"),
+            Some(&Value::String(schema_reference("AuthorityEvidenceRefusal"))),
+            "{} {path} documents the required-mode refusal",
+            method.to_ascii_uppercase()
+        );
+        let conflict = operation
+            .pointer("/responses/409/description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        for reason in [
+            "caller_operation_conflict",
+            "authority_evidence_unsupported",
+            "capability_not_advertised",
+        ] {
+            assert!(
+                conflict.contains(reason),
+                "{} {path} documents {reason}",
+                method.to_ascii_uppercase()
+            );
+        }
+        assert_eq!(
+            operation.pointer("/parameters/1/$ref"),
+            Some(&Value::String(
+                "#/components/parameters/ConnectionIdempotencyKey".to_owned()
+            ))
         );
     }
 
@@ -743,6 +816,8 @@ fn connection_admin_json_schema_is_strict_resolvable_and_secret_safe() {
         "ToolInputValidationProblem",
         "ToolPlaygroundValidationError",
         "DependencyConflict",
+        "OperationReceipt",
+        "AuthorityEvidenceRefusal",
     ] {
         assert_closed_object(&schema, name);
     }
@@ -760,6 +835,7 @@ fn connection_admin_json_schema_is_strict_resolvable_and_secret_safe() {
         "CapabilityList",
         "CapabilityDetail",
         "MutationPrepareReceipt",
+        "OperationReceipt",
         "PlaygroundResult",
         "Error",
         "ReasonedError",

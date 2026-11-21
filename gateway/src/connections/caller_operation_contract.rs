@@ -39,6 +39,8 @@ pub(crate) trait ContractDatabase {
     async fn reservations(&self) -> Vec<Reservation>;
     /// The text of every row of every table except the reservation table.
     async fn text_outside_reservations(&self) -> String;
+    /// The text of every column of every Connection evidence row.
+    async fn evidence_text(&self) -> String;
     /// Make every Connection evidence insert fail, or stop doing so.
     async fn fail_evidence_inserts(&self, fail: bool);
     /// Reserve `key` the way a keyed service-token revoke does: no digest.
@@ -47,6 +49,15 @@ pub(crate) trait ContractDatabase {
 
 pub(crate) const ISSUER: &str = "https://keyed-connections.example.test";
 pub(crate) const SECRET_MARKER: &str = "keyed-connection-secret-alias-marker";
+/// One synthetic marker per credential reference a Connection body can
+/// carry: the authentication alias, an additional header's alias, and the
+/// TLS client certificate and private key aliases.
+const REFERENCE_MARKERS: [&str; 4] = [
+    SECRET_MARKER,
+    "keyed-connection-header-alias-marker",
+    "keyed-connection-tls-certificate-marker",
+    "keyed-connection-tls-key-marker",
+];
 
 pub(crate) fn operator() -> ChangeActor {
     ChangeActor::for_test_with_issuer("keyed-connection-operator", ISSUER)
@@ -683,17 +694,36 @@ pub(crate) async fn two_keys_racing_one_revision_leave_only_the_winners_rows(
     assert_reservations_match_evidence(db).await;
 }
 
+/// A Connection whose every credential reference names a synthetic marker,
+/// each suffixed with `suffix`.
+fn marked_candidate(suffix: &str) -> ConnectionWrite {
+    let [authentication, header, certificate, private_key] =
+        REFERENCE_MARKERS.map(|marker| format!("{marker}{suffix}"));
+    serde_json::from_value(json!({
+        "display_name": "Marked API",
+        "enabled": false,
+        "kind": "http_api",
+        "endpoint": {"base_url": "https://keyed.example.test", "base_path": "/v1"},
+        "authentication": {"type": "static_bearer", "secret_id": authentication},
+        "additional_headers": [{"header_name": "x-proxy-token", "secret_id": header}],
+        "tls": {"client_certificate_id": certificate, "client_private_key_id": private_key}
+    }))
+    .expect("the marked candidate deserializes")
+}
+
 /// I5: the binding digest is stored only in the reservation row, and the
-/// credential alias the request names (a synthetic marker) stays out of the
-/// receipt and of the evidence; it is stored only where the Connection
-/// itself keeps its binding.
+/// credential references the request names (one synthetic marker in each
+/// reference field) stay out of the receipts and of every column of the
+/// evidence, for a create and for a replacement that changes every
+/// reference; they are stored only where the Connection itself keeps its
+/// binding.
 pub(crate) async fn the_binding_digest_is_stored_only_in_the_reservation_row(
     db: &impl ContractDatabase,
 ) {
     let actor = operator();
-    let marked = candidate("Marked API", SECRET_MARKER);
+    let marked = marked_candidate("");
     let create_op = create_key(80, &actor, &marked);
-    committed(
+    let created = committed(
         create(db, marked.clone(), Some(&create_op)).await,
         "the keyed create",
     );
@@ -701,30 +731,76 @@ pub(crate) async fn the_binding_digest_is_stored_only_in_the_reservation_row(
         create(db, marked, Some(&create_op)).await,
         "the retried create",
     );
-    let digest = create_op.binding_digest().to_owned();
+    let remarked = marked_candidate("-next");
+    let replace_op = replace_key(81, &actor, &created, &remarked);
+    committed(
+        replace(
+            db,
+            &created,
+            &created.etag(),
+            remarked.clone(),
+            Some(&replace_op),
+        )
+        .await,
+        "the keyed replace",
+    );
+    let replace_receipt = replayed(
+        replace(db, &created, &created.etag(), remarked, Some(&replace_op)).await,
+        "the retried replace",
+    );
     assert_eq!(
-        db.reservations().await,
-        [(
+        rows_for(db, &replace_op).await,
+        ["connection.replace", "credential.binding_change"]
+    );
+    let digests = [
+        create_op.binding_digest().to_owned(),
+        replace_op.binding_digest().to_owned(),
+    ];
+    let mut reserved = db.reservations().await;
+    reserved.sort();
+    let mut expected = vec![
+        (
             create_op.id().to_string(),
             "connection.create".to_owned(),
-            Some(digest.clone())
-        )]
+            Some(digests[0].clone()),
+        ),
+        (
+            replace_op.id().to_string(),
+            "connection.replace".to_owned(),
+            Some(digests[1].clone()),
+        ),
+    ];
+    expected.sort();
+    assert_eq!(reserved, expected);
+    let receipts = format!(
+        "{}{}",
+        serde_json::to_string(&receipt).expect("the receipt serializes"),
+        serde_json::to_string(&replace_receipt).expect("the receipt serializes")
     );
-    let receipt = serde_json::to_string(&receipt).expect("the receipt serializes");
     let outside = db.text_outside_reservations().await;
-    for marker in [digest.as_str(), SECRET_MARKER] {
-        assert!(!receipt.contains(marker), "{marker} reached the receipt");
+    let evidence = db.evidence_text().await;
+    assert!(!evidence.is_empty(), "the evidence rows were read");
+    for digest in &digests {
+        assert!(
+            !receipts.contains(digest.as_str()),
+            "a digest reached a receipt"
+        );
+        assert!(
+            !outside.contains(digest.as_str()),
+            "a digest is stored outside the reservation"
+        );
     }
-    assert!(
-        !outside.contains(&digest),
-        "the digest is stored outside the reservation"
-    );
-    let evidence = format!("{:?}", db.evidence().await);
-    assert!(!evidence.contains(SECRET_MARKER));
-    assert!(
-        !format!("{create_op:?}").contains(&digest),
-        "a key's Debug never shows its digest"
-    );
+    // Each marker is a prefix of its `-next` form too.
+    for marker in REFERENCE_MARKERS {
+        assert!(!receipts.contains(marker), "{marker} reached a receipt");
+        assert!(!evidence.contains(marker), "{marker} reached the evidence");
+    }
+    for key in [&create_op, &replace_op] {
+        assert!(
+            !format!("{key:?}").contains(key.binding_digest()),
+            "a key's Debug never shows its digest"
+        );
+    }
     assert_reservations_match_evidence(db).await;
 }
 
@@ -831,6 +907,22 @@ mod sqlite {
             text
         }
 
+        async fn evidence_text(&self) -> String {
+            let connection = self.open();
+            let mut statement = connection
+                .prepare("SELECT * FROM connection_change_evidence")
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows = statement.query([]).unwrap();
+            let mut text = String::new();
+            while let Some(row) = rows.next().unwrap() {
+                for index in 0..columns {
+                    text.push_str(&format!("{:?}|", row.get_ref(index).unwrap()));
+                }
+            }
+            text
+        }
+
         async fn fail_evidence_inserts(&self, fail: bool) {
             let statement = if fail {
                 "CREATE TRIGGER fail_connection_change_evidence \
@@ -914,5 +1006,59 @@ mod sqlite {
     async fn sqlite_the_binding_digest_is_stored_only_in_the_reservation_row() {
         the_binding_digest_is_stored_only_in_the_reservation_row(&SqliteDatabase::new("digest"))
             .await;
+    }
+
+    /// I2: a reservation that cannot be written rolls the keyed change back
+    /// and is counted on the standalone evidence failure counter, as a
+    /// failed evidence insert is. The store is called directly so that it
+    /// runs on this thread, where this thread's recorder sees it.
+    #[test]
+    fn sqlite_a_failed_reservation_rolls_back_the_keyed_change_and_is_counted() {
+        use crate::connections::store::ConnectionStore;
+
+        let db = SqliteDatabase::new("reservation-fault");
+        let store = SqliteConnectionStore::open(&db.path).expect("the store opens");
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        let _recording = ::metrics::set_default_local_recorder(&recorder);
+        let failures = || {
+            recorder.count(
+                crate::metrics::STANDALONE_EVIDENCE_FAILURES_TOTAL,
+                &[("store", "connections")],
+            )
+        };
+        // Test-only fault injection through a second connection.
+        db.open()
+            .execute_batch(
+                "CREATE TRIGGER fail_caller_key_reservation \
+                 BEFORE INSERT ON authority_caller_operation_ids \
+                 BEGIN SELECT RAISE(ABORT, 'injected reservation failure'); END;",
+            )
+            .expect("the fault installs");
+        let actor = operator();
+        let fresh = candidate("Unreserved API", "unreserved-token");
+        let key = create_key(90, &actor, &fresh);
+        let outcome = store.create_with_operation(fresh.clone(), &actor, Some(&key));
+        assert!(
+            matches!(outcome, Err(ConnectionStoreError::Unavailable { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(failures(), 1);
+        assert!(ConnectionStore::list(&store).expect("lists").is_empty());
+        let evidence: i64 = db
+            .open()
+            .query_row(
+                "SELECT COUNT(*) FROM connection_change_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .expect("evidence counts");
+        assert_eq!(evidence, 0, "the change and its evidence rolled back");
+
+        // An unkeyed change reserves nothing and counts nothing.
+        committed(
+            store.create_with_operation(fresh, &actor, None),
+            "the unkeyed create",
+        );
+        assert_eq!(failures(), 1);
     }
 }

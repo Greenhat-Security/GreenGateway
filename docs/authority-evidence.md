@@ -641,12 +641,20 @@ The first operation family on the contract above (issue #425). Rows
 - **Answers.** The first commit answers as the route always has (`201` with the
   detail, `200` with the detail, `200` with the deleted ID). An exact retry is `200`
   with the receipt `{operation_id, operation, resource_id, revision, committed_at}`
-  and changes nothing: no second evidence row, no audit event, no catalog
-  reconcile or removal. A replacement's receipt is its `connection.replace` row;
-  a deletion's carries the revision it removed, and is answered after the record is
-  gone because its evidence outlives the record. An identical replacement is
-  answered before the key is reserved, so it records and reserves nothing and is not
-  reconcilable by its key.
+  and repeats no change and no audit event. A replacement's receipt is its
+  `connection.replace` row; a deletion's carries the revision it removed. Both are
+  answered after the record is gone, because the evidence outlives the record (a
+  keyed `PUT` or `DELETE` for a missing Connection binds its key and asks the
+  pre-check before it answers `404`). An identical replacement is answered before
+  the key is reserved, so it records and reserves nothing and is not reconcilable
+  by its key.
+- **Completion.** Once admitted, a create, replace or delete runs on a task of its
+  own, so a client that disconnects while the store commits does not cut the
+  change short: the replica still publishes it to its runtime snapshot, reconciles
+  or removes its catalogs and emits its audit event. A retry's receipt therefore
+  never describes a change the replica is not serving. (A process that stops
+  between the commit and the publish reloads the record from its store when it
+  starts, and in cluster mode the Connections reconciler installs it.)
 - **A replacement that changes credentials** writes the `connection.replace` row and
   a `credential.binding_change` row under the one caller key; under `qualified_v1`
   both are delivered as `authority_event.v1` sharing `operation_id`, the second
@@ -686,8 +694,23 @@ byte for byte. Through the admin handlers, `authority_evidence_app_tests` proves
 `required_mode_refuses_the_unkeyed_connection_create_and_replace_and_admits_the_keyed_principal`
 (Unix builds),
 `required_mode_refuses_a_keyed_connection_change_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink`,
-`required_mode_admits_every_form_of_connection_delete` and
-`a_keyed_connection_change_without_the_routes_permission_is_forbidden_and_reserves_nothing`.
+`required_mode_admits_every_form_of_connection_delete`,
+`a_keyed_connection_change_without_the_routes_permission_is_forbidden_and_reserves_nothing`
+(each key first committed by an authorized caller, so a handler that consulted the
+key before authorizing would answer `409`),
+`required_mode_authorizes_a_connection_change_before_it_asks_the_evidence_gate` and
+`an_admitted_connection_change_finishes_after_its_client_goes_away`. In cluster
+mode, against PostgreSQL and a real roster,
+`authority_evidence_app_tests::cluster_connection_keys::postgres_keyed_connection_changes_wait_for_the_fleet_and_authorize_before_the_fence`
+proves that a keyed create, replace and delete are `409 capability_not_advertised`
+and reserve nothing while a live member lacks `caller_operation_keys` (the unkeyed
+forms still commit), that a keyed request from a caller without the route's
+permission is `403` and leaves `contract_fence` unchanged, and that once the
+lacking member is stale the first keyed change raises the fence once and each
+exact retry, a deletion's included, is answered from its receipt. A reservation
+that cannot be written is counted on the evidence failure counters
+(`sqlite_a_failed_reservation_rolls_back_the_keyed_change_and_is_counted`, and the
+PostgreSQL fence test).
 
 ## Keyed safe references
 

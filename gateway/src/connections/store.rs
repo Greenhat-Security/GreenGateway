@@ -4381,10 +4381,17 @@ fn reserve_caller_key(
     let Some(caller) = caller else {
         return Ok(None);
     };
+    // A reservation that cannot be written rolls the change back like a
+    // failed evidence insert, and is counted with them (I2).
     let reservation =
         crate::storage::standalone_authority_events::reserve_bound_operation(transaction, caller)
-            .map_err(|_| ConnectionStoreError::Unavailable {
-            operation: OPERATION_CALLER_OPERATION_RESERVE,
+            .map_err(|_| {
+            crate::storage::record_standalone_evidence_failure(
+                crate::storage::StandaloneEvidenceStore::Connections,
+            );
+            ConnectionStoreError::Unavailable {
+                operation: OPERATION_CALLER_OPERATION_RESERVE,
+            }
         })?;
     match reservation {
         CallerKeyReservation::Reserved => Ok(None),

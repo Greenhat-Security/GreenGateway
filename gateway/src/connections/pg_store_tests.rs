@@ -7162,6 +7162,21 @@ mod keyed_connection_changes {
             text
         }
 
+        async fn evidence_text(&self) -> String {
+            self.pool
+                .get()
+                .await
+                .expect("evidence dump checkout")
+                .query_one(
+                    "SELECT coalesce(string_agg(row_to_json(t)::text, '|'), '') \
+                     FROM greengateway.connection_change_evidence t",
+                    &[],
+                )
+                .await
+                .expect("the evidence dumps")
+                .get(0)
+        }
+
         async fn fail_evidence_inserts(&self, fail: bool) {
             let sql = if fail {
                 r#"
@@ -7392,6 +7407,12 @@ mod keyed_connection_changes {
         };
         let database = create_test_database(&admin_dsn).await;
         let (store, pool) = migrated_store(&database.dsn, 64).await;
+        // The recorder is this thread's, and the test's current-thread
+        // runtime runs the store on this thread.
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        let _recording = ::metrics::set_default_local_recorder(&recorder);
+        let evidence_failures =
+            || recorder.count(crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL, &[]);
         let actor = contract::operator();
         let fresh = contract::candidate("Unfenced API", "unfenced-token");
         let create_op = contract::keyed(
@@ -7419,9 +7440,13 @@ mod keyed_connection_changes {
             .await,
             0
         );
+        // A reservation that could not be written is counted with the
+        // evidence write failures (I2).
+        assert_eq!(evidence_failures(), 1);
         store
             .create(fresh, &actor, None)
             .await
             .expect("the unkeyed form commits below the fence");
+        assert_eq!(evidence_failures(), 1, "an unkeyed change reserves nothing");
     }
 }

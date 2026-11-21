@@ -1250,6 +1250,32 @@ async fn a_replayed_connection_change_repeats_no_side_effect() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    // A committed replacement is answered from its receipt after the record
+    // is gone too; unkeyed, the same replacement finds no record.
+    let (status, _, receipt) = exchange(&router, replace(&replacement)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a committed replacement is answered after the record is gone: {receipt}"
+    );
+    assert_eq!(receipt["operation"], json!("connection.replace"));
+    assert_eq!(receipt["operation_id"], json!(replace_key));
+    assert_eq!(receipt["resource_id"], json!(id));
+    let (status, _, conflict) = exchange(&router, replace(&other)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    let (status, _, _) = exchange(
+        &router,
+        keyed_connection_request(
+            Method::PUT,
+            &route,
+            admin.clone(),
+            Some(replacement.clone()),
+            Some(&etag),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     let (evidence, _) =
         standalone_change_evidence(&connection_db.path, "connection_change_evidence");
@@ -1647,46 +1673,847 @@ async fn required_mode_admits_every_form_of_connection_delete() {
 
 /// Authorization comes before the key: a keyed request from a caller without
 /// the route's permission is `403` and asks no gate, reads no key and
-/// reserves nothing (in cluster mode it would leave the contract fence
-/// unchanged).
+/// reserves nothing (in cluster mode it leaves the contract fence unchanged;
+/// `cluster_connection_keys` proves that against PostgreSQL). Each key below
+/// was first committed by an authorized caller with another body, so a
+/// handler that bound and pre-checked the key before authorizing would
+/// answer `409 caller_operation_conflict` instead.
 #[tokio::test]
 async fn a_keyed_connection_change_without_the_routes_permission_is_forbidden_and_reserves_nothing()
 {
     let connection_db = TempDb::new("keyed-connection-forbidden");
     let policy = TempPolicyFile::new(&connection_policy_document_string());
     let router = keyed_connection_router(&connection_db, &policy, test_audit_log(), |_| {});
+    let admin = keyed_admin(&["connections-superadmin"]);
     let reader = keyed_admin(&["connections-reader"]);
     let editor = keyed_admin(&["connections-editor"]);
+    let plain_key = caller_key(50);
+    let aliased_key = caller_key(51);
+    let mut committed = Vec::new();
+    for (key, body) in [
+        (&plain_key, plain_connection_body("Committed API")),
+        (
+            &aliased_key,
+            aliased_connection_body("Committed aliased API", "alias", "header"),
+        ),
+    ] {
+        let collection_etag = connection_collection_etag(&router).await;
+        let (status, etag, created) = exchange(
+            &router,
+            keyed_connection_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                admin.clone(),
+                Some(body),
+                Some(&collection_etag),
+                Some(key),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        committed.push((
+            format!(
+                "{CONNECTIONS_ADMIN_ROUTE}/{}",
+                created["id"].as_str().unwrap()
+            ),
+            etag.expect("an ETag"),
+        ));
+    }
+    let reserved = standalone_reservations(&connection_db.path);
+    assert_eq!(reserved.len(), 2);
     let collection_etag = connection_collection_etag(&router).await;
-    let (status, _, body) = exchange(
-        &router,
+    let (route, etag) = &committed[1];
+    let forbidden = [
+        // No write permission at all.
         keyed_connection_request(
             Method::POST,
             CONNECTIONS_ADMIN_ROUTE,
-            reader,
+            reader.clone(),
             Some(plain_connection_body("Forbidden API")),
             Some(&collection_etag),
-            Some(&caller_key(50)),
+            Some(&plain_key),
         ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    // Binding a credential needs secret authority too.
-    let (status, _, body) = exchange(
+        keyed_connection_request(
+            Method::PUT,
+            route,
+            reader.clone(),
+            Some(plain_connection_body("Forbidden API")),
+            Some(etag),
+            Some(&plain_key),
+        ),
+        keyed_connection_request(
+            Method::DELETE,
+            route,
+            reader,
+            None,
+            Some(etag),
+            Some(&plain_key),
+        ),
+        // Binding a credential needs secret authority too, and so does
+        // replacing or deleting a Connection that holds one.
+        keyed_connection_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            editor.clone(),
+            Some(aliased_connection_body("Forbidden API", "alias", "header")),
+            Some(&collection_etag),
+            Some(&aliased_key),
+        ),
+        keyed_connection_request(
+            Method::PUT,
+            route,
+            editor.clone(),
+            Some(aliased_connection_body("Forbidden API", "alias", "header")),
+            Some(etag),
+            Some(&aliased_key),
+        ),
+        keyed_connection_request(
+            Method::DELETE,
+            route,
+            editor,
+            None,
+            Some(etag),
+            Some(&aliased_key),
+        ),
+    ];
+    for request in forbidden {
+        let what = format!("{} {}", request.method(), request.uri());
+        let (status, _, body) = exchange(&router, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {body}");
+    }
+    assert_eq!(standalone_reservations(&connection_db.path), reserved);
+    let (evidence, _) =
+        standalone_change_evidence(&connection_db.path, "connection_change_evidence");
+    assert_eq!(
+        evidence
+            .iter()
+            .map(|change| change.action.as_str())
+            .collect::<Vec<_>>(),
+        ["connection.create", "connection.create"],
+        "nothing changed"
+    );
+}
+
+/// Required mode authorizes before it asks the evidence gate: an unkeyed
+/// Connection create by a caller without the route's permission, or without
+/// secret authority for a credentialed body, is `403`, not `409
+/// authority_evidence_unsupported`, and is not audited as an evidence
+/// refusal. The authorized caller's unkeyed create is then refused by the
+/// gate, and its refusal is the only one audited.
+#[tokio::test]
+async fn required_mode_authorizes_a_connection_change_before_it_asks_the_evidence_gate() {
+    let connection_db = TempDb::new("keyed-connection-required-authz");
+    let events = TempDb::new("keyed-connection-required-authz-events");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let (audit_log, capture) = captured_audit();
+    let router = keyed_connection_router(&connection_db, &policy, audit_log, |config| {
+        qualified_required(config, &events)
+    });
+    let collection_etag = connection_collection_etag(&router).await;
+    for (principal, body) in [
+        (
+            keyed_admin(&["connections-reader"]),
+            plain_connection_body("Unauthorized API"),
+        ),
+        (
+            keyed_admin(&["connections-editor"]),
+            aliased_connection_body("Unauthorized API", "alias", "header"),
+        ),
+    ] {
+        let (status, _, body) = exchange(
+            &router,
+            keyed_connection_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                principal,
+                Some(body),
+                Some(&collection_etag),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    }
+    let (status, _, refused) = exchange(
         &router,
         keyed_connection_request(
             Method::POST,
             CONNECTIONS_ADMIN_ROUTE,
-            editor,
-            Some(aliased_connection_body("Forbidden API", "alias", "header")),
+            keyed_admin(&["connections-superadmin"]),
+            Some(plain_connection_body("Refused API")),
             Some(&collection_etag),
-            Some(&caller_key(51)),
+            None,
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert!(standalone_reservations(&connection_db.path).is_empty());
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["reason"], json!("authority_evidence_unsupported"));
+    // The audit writer delivers in order: the authorized caller's refusal
+    // is the first and only one.
+    assert_eq!(refused_operations(&capture, 1), ["connection.create"]);
     let (evidence, _) =
         standalone_change_evidence(&connection_db.path, "connection_change_evidence");
     assert!(evidence.is_empty());
+    assert!(standalone_reservations(&connection_db.path).is_empty());
+}
+
+/// Drive `request` through `router` until `committed` says its change is in
+/// the store, then drop it: what a client that disconnects at that moment
+/// leaves behind. The store's own transaction keeps running when a handler's
+/// future is dropped (SQLite runs it on the blocking pool).
+async fn abandon_once_committed(
+    router: &Router,
+    request: Request<Body>,
+    committed: impl Fn() -> bool,
+) {
+    let mut in_flight = std::pin::pin!(router.clone().oneshot(request));
+    for _ in 0..10_000 {
+        if committed() {
+            return;
+        }
+        let polled = std::future::poll_fn(|context| {
+            std::task::Poll::Ready(std::future::Future::poll(in_flight.as_mut(), context))
+        })
+        .await;
+        if polled.is_ready() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("the change never committed");
+}
+
+/// The status, ETag and body of `GET` on `route` once `settled` accepts
+/// them, or the last answer after five seconds.
+async fn settled_get(
+    router: &Router,
+    route: &str,
+    principal: &auth::Principal,
+    settled: impl Fn(StatusCode, &Value) -> bool,
+) -> (StatusCode, Option<String>, Value) {
+    let started = Instant::now();
+    loop {
+        let (status, etag, body) = exchange(
+            router,
+            keyed_connection_request(Method::GET, route, principal.clone(), None, None, None),
+        )
+        .await;
+        if settled(status, &body) || started.elapsed() > Duration::from_secs(5) {
+            return (status, etag, body);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A Connection change runs to completion once admitted, even when its
+/// client goes away while the store is committing it: the runtime snapshot
+/// this replica serves, and the audit stream, then show the change, and the
+/// keyed retry's receipt describes what this replica serves. Before the
+/// change ran on its own task, the dropped handler left the replica serving
+/// the replaced or deleted Connection after the retry was told the change
+/// had committed.
+#[tokio::test]
+async fn an_admitted_connection_change_finishes_after_its_client_goes_away() {
+    let connection_db = TempDb::new("keyed-connection-abandoned");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let (audit_log, capture) = captured_audit();
+    let router = keyed_connection_router(&connection_db, &policy, audit_log, |_| {});
+    let admin = keyed_admin(&["connections-superadmin"]);
+    let collection_etag = connection_collection_etag(&router).await;
+    let (status, etag, created) = exchange(
+        &router,
+        keyed_connection_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            admin.clone(),
+            Some(aliased_connection_body(
+                "Abandoned API",
+                "abandoned-alias",
+                "abandoned-header",
+            )),
+            Some(&collection_etag),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("an ID").to_owned();
+    let route = format!("{CONNECTIONS_ADMIN_ROUTE}/{id}");
+    let etag = etag.expect("an ETag");
+    let recorded = |action: &'static str| {
+        let path = connection_db.path.clone();
+        move || {
+            standalone_change_evidence(&path, "connection_change_evidence")
+                .0
+                .iter()
+                .any(|change| change.action == action)
+        }
+    };
+
+    let replace_key = caller_key(60);
+    let replacement = aliased_connection_body(
+        "Abandoned API renamed",
+        "abandoned-alias-next",
+        "abandoned-header",
+    );
+    let replace = || {
+        keyed_connection_request(
+            Method::PUT,
+            &route,
+            admin.clone(),
+            Some(replacement.clone()),
+            Some(&etag),
+            Some(&replace_key),
+        )
+    };
+    abandon_once_committed(&router, replace(), recorded("connection.replace")).await;
+    let (status, _, receipt) = exchange(&router, replace()).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["operation"], json!("connection.replace"));
+    let (status, replaced_etag, served) = settled_get(&router, &route, &admin, |status, body| {
+        status == StatusCode::OK && body["display_name"] == json!("Abandoned API renamed")
+    })
+    .await;
+    assert_eq!(status, StatusCode::OK, "{served}");
+    assert_eq!(
+        served["display_name"],
+        json!("Abandoned API renamed"),
+        "the replica serves the replacement its retry was told committed"
+    );
+    let replaced_etag = replaced_etag.expect("the detail names its ETag");
+
+    let delete_key = caller_key(61);
+    let delete = || {
+        keyed_connection_request(
+            Method::DELETE,
+            &route,
+            admin.clone(),
+            None,
+            Some(&replaced_etag),
+            Some(&delete_key),
+        )
+    };
+    abandon_once_committed(&router, delete(), recorded("connection.delete")).await;
+    let (status, _, receipt) = exchange(&router, delete()).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["operation"], json!("connection.delete"));
+    let (status, _, served) = settled_get(&router, &route, &admin, |status, _| {
+        status == StatusCode::NOT_FOUND
+    })
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the replica no longer serves the Connection its retry was told is deleted: {served}"
+    );
+    let stored = connections::store::SqliteConnectionStore::open(&connection_db.path)
+        .expect("the store opens");
+    assert!(connections::store::ConnectionStore::list(&stored)
+        .expect("the store lists")
+        .is_empty());
+    // Each change emitted its audit event once, though nobody waited for
+    // its response.
+    let changes = || {
+        capture
+            .events()
+            .into_iter()
+            .filter(|event| event.event_type == audit::event::CONNECTION_CHANGED)
+            .count()
+    };
+    assert_eventually(Duration::from_secs(5), || changes() >= 3);
+    assert_eq!(changes(), 3);
+}
+
+/// Keyed Connection changes in cluster mode, through the admin handlers of a
+/// PostgreSQL-backed replica with a real roster (issue #425). The verified-TLS
+/// CI shard selects this module by its prefix.
+#[cfg(feature = "postgres")]
+mod cluster_connection_keys {
+    use super::*;
+    use storage::postgres::test_support::{locator, test_pool, test_settings};
+    use storage::{
+        MemberRegistration, PolicyControlPlane, PostgresMembershipStore, ToolControlPlane,
+    };
+
+    const CLUSTER_ISSUER: &str = "https://cluster-connection-keys.example.test";
+    const DEPLOYMENT: &str = "deploy-cluster-connection-keys";
+
+    /// A cluster replica over `pool` whose operation gate asks `membership`.
+    async fn replica(
+        config: config::Config,
+        pool: &deadpool_postgres::Pool,
+        membership: Arc<cluster_membership::ClusterMembership>,
+    ) -> Router {
+        let policy = Arc::new(storage::PostgresPolicyStore::new(pool.clone()));
+        let tools = Arc::new(storage::PostgresToolStore::new(pool.clone()));
+        let connections = Arc::new(
+            connections::pg_store::PostgresConnectionStore::new(
+                pool.clone(),
+                connections::model::MAX_CONNECTIONS,
+            )
+            .unwrap(),
+        );
+        let revision = connections.state_revision().await.unwrap();
+        let records = connections.list().await.unwrap();
+        let (openapi_catalogs, openapi_overlays) =
+            connections.openapi_catalogs_with_overlays().await.unwrap();
+        let boot = Arc::new(connections::managed_store::ClusterConnectionsBoot {
+            mcp_catalogs: connections.mcp_catalogs().await.unwrap(),
+            openapi_catalogs,
+            openapi_inventory_catalogs: connections.openapi_inventory_catalogs().await.unwrap(),
+            openapi_overlays,
+            enum_source_values: std::sync::Mutex::new(Some(
+                connections.enum_source_values().await.unwrap(),
+            )),
+        });
+        let app = gateway_app_with_process_started_at_and_overrides(
+            config,
+            PrometheusBuilder::new().build_recorder().handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+            Instant::now(),
+            GatewayAppBuildOverrides {
+                pg_policy: Some(ClusterPolicySeed {
+                    active: policy.active().await.unwrap().unwrap(),
+                    store: policy,
+                }),
+                pg_tools: Some(ClusterToolsSeed {
+                    active: tools.active_tools().await.unwrap().unwrap(),
+                    store: tools,
+                }),
+                pg_connections: Some(ClusterConnectionsSeed {
+                    store: connections,
+                    records,
+                    boot,
+                    revision,
+                }),
+                pg_membership: Some(membership),
+                disable_proxy_health_checks: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        match app.http {
+            GatewayApp::Unified(router) => router,
+            GatewayApp::Split { .. } => panic!("expected a unified test router"),
+        }
+    }
+
+    /// One admin request with a bearer token, an optional `If-Match` and an
+    /// optional caller key: its status, ETag and JSON body.
+    async fn call(
+        router: &Router,
+        method: Method,
+        uri: &str,
+        token: &str,
+        body: Option<String>,
+        if_match: Option<&str>,
+        key: Option<&str>,
+    ) -> (StatusCode, HeaderMap, Value) {
+        let mut request = connection_admin_request(method, uri, None, body, if_match, false);
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        if let Some(key) = key {
+            request
+                .headers_mut()
+                .insert("idempotency-key", key.parse().unwrap());
+        }
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        (status, headers, json_body(response).await)
+    }
+
+    fn disabled_connection(display_name: &str) -> String {
+        json!({
+            "display_name": display_name,
+            "enabled": false,
+            "kind": "http_api",
+            "endpoint": {"base_url": "https://cluster-keys.example.test", "base_path": "/v1"},
+            "authentication": {"type": "none"}
+        })
+        .to_string()
+    }
+
+    async fn collection_etag(router: &Router, token: &str) -> String {
+        let (status, headers, body) = call(
+            router,
+            Method::GET,
+            CONNECTIONS_ADMIN_ROUTE,
+            token,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        headers[CONNECTION_COLLECTION_ETAG_HEADER]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    async fn connection_reservations(pool: &deadpool_postgres::Pool) -> Vec<(String, String)> {
+        pool.get()
+            .await
+            .unwrap()
+            .query(
+                "SELECT operation_id::text, action FROM greengateway.authority_caller_operation_ids \
+                 WHERE action LIKE 'connection.%' ORDER BY operation_id",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
+    /// The keyed Connection routes in cluster mode, end to end:
+    ///
+    /// - while a live member lacks `caller_operation_keys`, a keyed create,
+    ///   replace and delete are `409 capability_not_advertised`, change
+    ///   nothing and reserve nothing, and the unkeyed forms still commit;
+    /// - once that member is stale, so that the operation gate would admit a
+    ///   key and raise the contract fence, a keyed request from a caller
+    ///   without the route's permission (or without secret authority for a
+    ///   credentialed body) is still `403`, and the fence is unchanged byte
+    ///   for byte: authorization comes before admission;
+    /// - the first authorized keyed create raises the fence once; exact
+    ///   retries of the create, replace and delete are answered from their
+    ///   receipts, a replacement's and a deletion's after the record is gone,
+    ///   and nothing raises the fence again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_keyed_connection_changes_wait_for_the_fleet_and_authorize_before_the_fence() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database =
+            storage::contract_tests::postgres_audit_tests::create_test_database(&admin_dsn).await;
+        let foundation = test_pool(&database.dsn).await;
+        let pool = foundation.pool();
+        storage::migrations::apply_missing_for_startup(pool, &test_settings())
+            .await
+            .unwrap();
+        storage::postgres_authority_events::PostgresAuthorityEventStore::new(pool.clone())
+            .configure_capacity(100)
+            .await
+            .unwrap();
+        let policy = rbac::Policy::validate_json_value(
+            serde_json::from_str(&connection_policy_document_string()).unwrap(),
+        )
+        .unwrap();
+        storage::PostgresPolicyStore::new(pool.clone())
+            .commit(storage::PolicyCommitRequest {
+                precondition: storage::PolicyCommitPrecondition::Initialize,
+                candidate: &policy,
+                change: storage::DocumentChange::test_policy("installer"),
+                diff_summary: &json!({}),
+            })
+            .await
+            .unwrap();
+        storage::PostgresToolStore::new(pool.clone())
+            .seed_empty_document()
+            .await
+            .unwrap();
+
+        let membership = cluster_membership::ClusterMembership::new(
+            PostgresMembershipStore::new(
+                pool.clone(),
+                DEPLOYMENT,
+                crate::ha::InstanceIdentity::generate(),
+            ),
+            MemberRegistration {
+                binary_version: env!("CARGO_PKG_VERSION").to_owned(),
+                schema_version: storage::migrations::schema_version_range(),
+                document_version: cluster_membership::DOCUMENT_VERSION_RANGE,
+                fingerprint: "b".repeat(64),
+                capabilities: storage::compatibility::BINARY_CAPABILITIES.to_vec(),
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        );
+        membership.register_boot().await.expect("boot row");
+        // A live member built before caller keys.
+        let earlier = uuid::Uuid::new_v4();
+        pool.get()
+            .await
+            .unwrap()
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint,
+                      capabilities)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, '1.0.1', 18, 18, 0, 0,
+                         repeat('b', 64), 'operation_requirements,policy_role_descriptions')",
+                &[
+                    &DEPLOYMENT,
+                    &earlier.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                ],
+            )
+            .await
+            .expect("an earlier member row inserts");
+
+        let mut config = test_config(Vec::new());
+        config.state_backend = config::StateBackend::Postgres;
+        config.deployment_id = Some(DEPLOYMENT.into());
+        configure_test_jwt_provider(&mut config, spawn_test_jwks_server().await);
+        config.auth_providers[0].issuer = Some(CLUSTER_ISSUER.into());
+        config.rate_limit_write_burst = 1000;
+        config.rate_limit_write_rps = 1000.0;
+        let router = replica(config, pool, membership).await;
+        let admin =
+            signed_token_with_issuer("operator", &["connections-superadmin"], CLUSTER_ISSUER);
+        let reader = signed_token_with_issuer("reader", &["connections-reader"], CLUSTER_ISSUER);
+        let editor = signed_token_with_issuer("editor", &["connections-editor"], CLUSTER_ISSUER);
+        let read_fence = || async move {
+            storage::read_contract_fence(pool)
+                .await
+                .expect("the fence reads")
+        };
+        let fence = read_fence().await;
+        let key = |seed: u8| caller_key(seed);
+
+        // A live member lacks the capability: every keyed form waits, the
+        // unkeyed forms commit.
+        let etag = collection_etag(&router, &admin).await;
+        let (status, _, body) = call(
+            &router,
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            &admin,
+            Some(disabled_connection("Held API")),
+            Some(&etag),
+            Some(&key(70)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], json!("capability_not_advertised"));
+        let (status, headers, created) = call(
+            &router,
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            &admin,
+            Some(disabled_connection("Unkeyed API")),
+            Some(&etag),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let unkeyed = format!(
+            "{CONNECTIONS_ADMIN_ROUTE}/{}",
+            created["id"].as_str().unwrap()
+        );
+        let mut unkeyed_etag = headers[header::ETAG].to_str().unwrap().to_owned();
+        for (method, body) in [
+            (
+                Method::PUT,
+                Some(disabled_connection("Unkeyed API renamed")),
+            ),
+            (Method::DELETE, None),
+        ] {
+            let (status, _, refused) = call(
+                &router,
+                method.clone(),
+                &unkeyed,
+                &admin,
+                body,
+                Some(&unkeyed_etag),
+                Some(&key(71)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{method}: {refused}");
+            assert_eq!(refused["reason"], json!("capability_not_advertised"));
+        }
+        let (status, headers, replaced) = call(
+            &router,
+            Method::PUT,
+            &unkeyed,
+            &admin,
+            Some(disabled_connection("Unkeyed API renamed")),
+            Some(&unkeyed_etag),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replaced}");
+        unkeyed_etag = headers[header::ETAG].to_str().unwrap().to_owned();
+        assert!(connection_reservations(pool).await.is_empty());
+        assert_eq!(read_fence().await, fence, "a refused key raises nothing");
+
+        // The lacking member goes stale: the gate would now admit a key and
+        // raise the fence. A caller without the route's permission is still
+        // refused first, and the fence does not move.
+        let updated = pool
+            .get()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE greengateway.cluster_members
+                 SET last_heartbeat_at = now() - make_interval(secs => 60)
+                 WHERE instance_id = $1::text::uuid",
+                &[&earlier.to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated, 1);
+        let etag = collection_etag(&router, &admin).await;
+        let forbidden = [
+            (
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE.to_owned(),
+                &reader,
+                Some(disabled_connection("Forbidden API")),
+                etag.clone(),
+            ),
+            (
+                Method::PUT,
+                unkeyed.clone(),
+                &reader,
+                Some(disabled_connection("Forbidden API")),
+                unkeyed_etag.clone(),
+            ),
+            (
+                Method::DELETE,
+                unkeyed.clone(),
+                &reader,
+                None,
+                unkeyed_etag.clone(),
+            ),
+            (
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE.to_owned(),
+                &editor,
+                Some(aliased_connection_body("Forbidden API", "alias", "header")),
+                etag.clone(),
+            ),
+            (
+                Method::PUT,
+                unkeyed.clone(),
+                &editor,
+                Some(aliased_connection_body("Forbidden API", "alias", "header")),
+                unkeyed_etag.clone(),
+            ),
+        ];
+        for (seed, (method, uri, token, body, if_match)) in (72..).zip(forbidden) {
+            let (status, _, refused) = call(
+                &router,
+                method.clone(),
+                &uri,
+                token,
+                body,
+                Some(&if_match),
+                Some(&key(seed)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {refused}");
+        }
+        assert_eq!(
+            read_fence().await,
+            fence,
+            "a forbidden keyed request leaves the contract fence unchanged"
+        );
+        assert!(connection_reservations(pool).await.is_empty());
+
+        // The first authorized keyed change raises the fence once; exact
+        // retries are answered from their receipts.
+        let create_key = key(80);
+        let create = || {
+            call(
+                &router,
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                &admin,
+                Some(disabled_connection("Keyed API")),
+                Some(&etag),
+                Some(&create_key),
+            )
+        };
+        let (status, headers, created) = create().await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let raised = read_fence().await;
+        assert_eq!(raised.generation, fence.generation + 1);
+        assert!(
+            raised.capabilities.contains("caller_operation_keys"),
+            "{raised:?}"
+        );
+        let id = created["id"].as_str().unwrap().to_owned();
+        let route = format!("{CONNECTIONS_ADMIN_ROUTE}/{id}");
+        let created_etag = headers[header::ETAG].to_str().unwrap().to_owned();
+        let (status, _, receipt) = create().await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(receipt["operation"], json!("connection.create"));
+        assert_eq!(receipt["operation_id"], json!(create_key));
+        assert_eq!(receipt["resource_id"], json!(id));
+
+        let replace_key = key(81);
+        let replace = || {
+            call(
+                &router,
+                Method::PUT,
+                &route,
+                &admin,
+                Some(disabled_connection("Keyed API renamed")),
+                Some(&created_etag),
+                Some(&replace_key),
+            )
+        };
+        let (status, headers, replaced) = replace().await;
+        assert_eq!(status, StatusCode::OK, "{replaced}");
+        let replaced_etag = headers[header::ETAG].to_str().unwrap().to_owned();
+        let (status, _, receipt) = replace().await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(receipt["operation"], json!("connection.replace"));
+
+        let delete_key = key(82);
+        let delete = || {
+            call(
+                &router,
+                Method::DELETE,
+                &route,
+                &admin,
+                None,
+                Some(&replaced_etag),
+                Some(&delete_key),
+            )
+        };
+        let (status, _, deleted) = delete().await;
+        assert_eq!(status, StatusCode::OK, "{deleted}");
+        let (status, _, receipt) = delete().await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(receipt["operation"], json!("connection.delete"));
+        assert_eq!(receipt["resource_id"], json!(id));
+        let (status, _, receipt) = replace().await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a committed replacement is answered after the record is gone: {receipt}"
+        );
+        assert_eq!(receipt["operation"], json!("connection.replace"));
+
+        let mut expected = vec![
+            (create_key.clone(), "connection.create".to_owned()),
+            (replace_key.clone(), "connection.replace".to_owned()),
+            (delete_key.clone(), "connection.delete".to_owned()),
+        ];
+        expected.sort();
+        assert_eq!(connection_reservations(pool).await, expected);
+        assert_eq!(read_fence().await, raised, "the fence was raised once");
+        // The unkeyed delete still commits.
+        let (status, _, body) = call(
+            &router,
+            Method::DELETE,
+            &unkeyed,
+            &admin,
+            None,
+            Some(&unkeyed_etag),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
 }

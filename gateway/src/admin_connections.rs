@@ -695,6 +695,45 @@ pub(super) async fn connection_create_endpoint(
     State(state): State<ConnectionAdminState>,
     request: AxumRequest,
 ) -> Response {
+    let pins = request.extensions().clone();
+    connection_change_to_completion(pins, Box::pin(connection_create(state, request))).await
+}
+
+/// Runs a Connection create, replace or delete on a task of its own, so it
+/// finishes whether or not anyone is still waiting for the response (issue
+/// #425). axum drops a handler's future when the client disconnects, while
+/// a store call already under way still commits: the SQLite transaction runs
+/// on the blocking pool, and a PostgreSQL `COMMIT` already sent completes.
+/// Dropped there, a change would be committed but never published to this
+/// replica's runtime snapshot, its catalogs never reconciled or removed and
+/// its audit event never emitted, and in standalone mode nothing would heal
+/// that before a restart -- while a keyed retry is answered from the receipt
+/// of the committed change. The request's pinned snapshots are re-entered on
+/// the task and its span carried over. A panic is resumed here, as if the
+/// handler had panicked itself. The change arrives boxed: a handler's state
+/// machine is large, and moving it by value through the spawn would grow
+/// every stack it passes through.
+async fn connection_change_to_completion(
+    pins: http::Extensions,
+    change: std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>,
+) -> Response {
+    use tracing::Instrument as _;
+
+    let task = tokio::spawn(
+        async move { crate::middleware::rbac::with_request_pins(Some(&pins), change).await }
+            .instrument(tracing::Span::current()),
+    );
+    match task.await {
+        Ok(response) => response,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => {
+            tracing::error!(error = %error, "a Connection change task was cancelled");
+            service_unavailable("managed connection state is unavailable")
+        }
+    }
+}
+
+async fn connection_create(state: ConnectionAdminState, request: AxumRequest) -> Response {
     record_request(CONNECTIONS_ADMIN_ROUTE);
 
     let (parts, body) = request.into_parts();
@@ -734,7 +773,12 @@ pub(super) async fn connection_create_endpoint(
 
     // Authorized and validated: bind the caller key, ask the gates, and
     // answer an exact retry before the collection precondition, which a
-    // committed create has since moved (issue #425).
+    // committed create has since moved (issue #425). The snapshot is read
+    // first: one older than a racing first attempt's commit passes `If-Match`
+    // and the control plane answers the retry from the key under its lock,
+    // while a snapshot that already shows the commit means the pre-check
+    // below sees the key too.
+    let snapshot = state.control_plane.runtime_snapshot();
     let actor = auth::change_actor::ChangeActor::from_principal(&principal);
     let caller = match admit_keyed_connection_change(
         &state,
@@ -751,7 +795,6 @@ pub(super) async fn connection_create_endpoint(
         Err(response) => return *response,
     };
 
-    let snapshot = state.control_plane.runtime_snapshot();
     match if_match_matches(&parts.headers, snapshot.collection_etag()) {
         Ok(true) => {}
         Ok(false) => {
@@ -845,6 +888,15 @@ pub(super) async fn connection_put_endpoint(
     Path(raw_id): Path<String>,
     request: AxumRequest,
 ) -> Response {
+    let pins = request.extensions().clone();
+    connection_change_to_completion(pins, Box::pin(connection_put(state, raw_id, request))).await
+}
+
+async fn connection_put(
+    state: ConnectionAdminState,
+    raw_id: String,
+    request: AxumRequest,
+) -> Response {
     record_request(CONNECTION_ADMIN_ROUTE);
 
     let (parts, body) = request.into_parts();
@@ -863,6 +915,7 @@ pub(super) async fn connection_put_endpoint(
         Ok(id) => id,
         Err(_) => return not_found("connection was not found"),
     };
+    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
     let snapshot = state.control_plane.runtime_snapshot();
     let Some(current) = snapshot.managed().get(&id).cloned() else {
         if snapshot
@@ -871,6 +924,49 @@ pub(super) async fn connection_put_endpoint(
             .any(|projection| projection.id() == &id)
         {
             return conflict("legacy connection projections are read-only");
+        }
+        // A keyed replacement that committed is answered from its evidence
+        // even once the Connection has since been deleted, as a keyed delete
+        // is (issue #425). The caller is authorized for what the body says
+        // before the key is bound; with the record gone, the body is bound
+        // as received and not judged against it. An unkeyed request for a
+        // missing record is `404`, as before.
+        if parts.headers.contains_key("idempotency-key") {
+            let body = match read_request_body(body, connection_admin_body_limit(&state)).await {
+                Ok(body) => body,
+                Err(response) => return *response,
+            };
+            match explicit_connection_binding_intent_from_body(&body) {
+                Ok(true)
+                    if !rbac_state.principal_has_permission(
+                        &principal,
+                        ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION,
+                    ) =>
+                {
+                    return connection_secret_authority_forbidden(
+                        &state,
+                        &parts,
+                        &principal,
+                        CONNECTION_ADMIN_ROUTE,
+                        "replace",
+                    );
+                }
+                Ok(_) => {}
+                Err(response) => return *response,
+            }
+            if let Err(response) = admit_keyed_connection_change(
+                &state,
+                &parts,
+                &principal,
+                &actor,
+                KeyedConnectionChange::Replace,
+                &body,
+                id.as_str(),
+            )
+            .await
+            {
+                return *response;
+            }
         }
         return not_found("connection was not found");
     };
@@ -913,7 +1009,6 @@ pub(super) async fn connection_put_endpoint(
     // answer an exact retry before the ETag precondition, which a committed
     // replacement has since moved (issue #425).
     let current_etag = current.etag();
-    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
     let caller = match admit_keyed_connection_change(
         &state,
         &parts,
@@ -1023,6 +1118,15 @@ pub(super) async fn connection_put_endpoint(
 pub(super) async fn connection_delete_endpoint(
     State(state): State<ConnectionAdminState>,
     Path(raw_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    let pins = request.extensions().clone();
+    connection_change_to_completion(pins, Box::pin(connection_delete(state, raw_id, request))).await
+}
+
+async fn connection_delete(
+    state: ConnectionAdminState,
+    raw_id: String,
     request: AxumRequest,
 ) -> Response {
     record_request(CONNECTION_ADMIN_ROUTE);

@@ -1027,10 +1027,18 @@ async fn reserve_caller_key(
     let Some(caller) = caller else {
         return Ok(None);
     };
+    // A reservation that cannot be written -- the table unreachable, or the
+    // fence found below `caller_operation_keys` after the operation gate
+    // admitted the key -- rolls the change back like a failed evidence
+    // insert, and is counted with them (I2). A conflict is an answer, not a
+    // failure.
     let reservation =
         crate::storage::postgres_authority_events::reserve_bound_operation(client, caller)
             .await
-            .map_err(|error| reservation_failure(operation, &error))?;
+            .map_err(|error| {
+                crate::storage::postgres_authority_events::record_evidence_failure();
+                reservation_failure(operation, &error)
+            })?;
     match reservation {
         CallerKeyReservation::Reserved => Ok(None),
         CallerKeyReservation::OtherBinding => Err(ConnectionStoreError::CallerOperationConflict),
