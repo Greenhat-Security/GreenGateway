@@ -903,6 +903,38 @@ impl ManagedConnectionStore {
         expected_catalog_revision: u64,
         actor: &ChangeActor,
     ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
+        super::store::committed(
+            self.replace_mcp_catalog_with_operation(
+                id,
+                expected,
+                entries,
+                resources,
+                resource_templates,
+                expected_catalog_revision,
+                actor,
+                None,
+            )
+            .await,
+        )
+    }
+
+    /// [`Self::replace_mcp_catalog`] under a caller key (issue #425). Both
+    /// stores look the key up first in the publishing transaction, answer an
+    /// exact retry of a committed publication with its receipt, and
+    /// otherwise reserve the key with the publication and record it as the
+    /// evidence's operation ID.
+    #[allow(clippy::too_many_arguments)] // The store's own signature, one per axis.
+    pub async fn replace_mcp_catalog_with_operation(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        entries: &[StoredMcpCatalogEntry],
+        resources: &[StoredMcpResource],
+        resource_templates: &[StoredMcpResourceTemplate],
+        expected_catalog_revision: u64,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<StoredMcpCatalog>, ConnectionStoreError> {
         // `expected_catalog_revision` is the catalog's own compare-and-swap
         // (`0` = no catalog yet). The connection ETag does not move on a
         // catalog replacement and the per-process refresh guard does not
@@ -918,8 +950,9 @@ impl ManagedConnectionStore {
                 let resources = resources.to_vec();
                 let resource_templates = resource_templates.to_vec();
                 let actor = actor.clone();
+                let caller = caller.cloned();
                 blocking("mcp catalog replace", move || {
-                    store.replace_mcp_catalog_expecting(
+                    store.replace_mcp_catalog_expecting_with_operation(
                         &id,
                         &expected,
                         &entries,
@@ -927,6 +960,7 @@ impl ManagedConnectionStore {
                         &resource_templates,
                         Some(expected_catalog_revision),
                         &actor,
+                        caller.as_ref(),
                     )
                 })
                 .await
@@ -934,7 +968,7 @@ impl ManagedConnectionStore {
             #[cfg(feature = "postgres")]
             Self::Postgres { store, .. } => {
                 store
-                    .replace_mcp_catalog(
+                    .replace_mcp_catalog_with_operation(
                         id,
                         expected,
                         entries,
@@ -942,6 +976,7 @@ impl ManagedConnectionStore {
                         resource_templates,
                         expected_catalog_revision,
                         actor,
+                        caller,
                     )
                     .await
             }
@@ -1226,6 +1261,47 @@ impl ManagedConnectionStore {
         policy_protected_names: &[String],
         enum_values: &[StoredEnumSourceValueWrite],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
+        super::store::committed(
+            self.replace_openapi_catalog_with_overlay_and_enum_values_with_operation(
+                id,
+                expected_connection_etag,
+                expected_spec_revision,
+                expected_catalog_revision,
+                spec,
+                spec_digest,
+                entries,
+                overlay,
+                compiled_overlay_revision,
+                actor,
+                policy_protected_names,
+                enum_values,
+                None,
+            )
+            .await,
+        )
+    }
+
+    /// [`Self::replace_openapi_catalog_with_overlay_and_enum_values`] under a
+    /// caller key, as [`Self::replace_mcp_catalog_with_operation`] describes.
+    /// The key must be bound to the action the write records: what it does to
+    /// the overlay.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn replace_openapi_catalog_with_overlay_and_enum_values_with_operation(
+        &self,
+        id: &ConnectionId,
+        expected_connection_etag: &ConnectionEtag,
+        expected_spec_revision: u64,
+        expected_catalog_revision: u64,
+        spec: &str,
+        spec_digest: &str,
+        entries: &[StoredOpenApiCatalogEntry],
+        overlay: Option<&StoredOverlayWrite>,
+        compiled_overlay_revision: u64,
+        actor: &ChangeActor,
+        policy_protected_names: &[String],
+        enum_values: &[StoredEnumSourceValueWrite],
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<StoredOpenApiCatalog>, ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {
                 let store = store.clone();
@@ -1238,8 +1314,9 @@ impl ManagedConnectionStore {
                 let actor = actor.clone();
                 let policy_protected_names = policy_protected_names.to_vec();
                 let enum_values = enum_values.to_vec();
+                let caller = caller.cloned();
                 blocking("openapi catalog replace", move || {
-                    store.replace_openapi_catalog_with_overlay_and_enum_values(
+                    store.replace_openapi_catalog_with_overlay_and_enum_values_with_operation(
                         &id,
                         &expected_connection_etag,
                         expected_spec_revision,
@@ -1252,6 +1329,7 @@ impl ManagedConnectionStore {
                         &actor,
                         &policy_protected_names,
                         &enum_values,
+                        caller.as_ref(),
                     )
                 })
                 .await
@@ -1259,7 +1337,7 @@ impl ManagedConnectionStore {
             #[cfg(feature = "postgres")]
             Self::Postgres { store, .. } => {
                 store
-                    .replace_openapi_catalog_with_overlay_and_enum_values(
+                    .replace_openapi_catalog_with_overlay_and_enum_values_with_operation(
                         id,
                         expected_connection_etag,
                         expected_spec_revision,
@@ -1272,6 +1350,7 @@ impl ManagedConnectionStore {
                         actor,
                         policy_protected_names,
                         enum_values,
+                        caller,
                     )
                     .await
             }

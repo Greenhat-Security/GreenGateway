@@ -7031,6 +7031,7 @@ mod keyed_connection_changes {
     use crate::connections::caller_operation_contract::{
         self as contract, ContractDatabase, EvidenceRow as ContractEvidenceRow, Reservation,
     };
+    use crate::connections::catalog_operation_contract as catalog;
     use crate::connections::managed_store::{ClusterConnectionsBoot, ManagedConnectionStore};
 
     /// A migrated database whose contract fence carries
@@ -7218,6 +7219,68 @@ mod keyed_connection_changes {
                 .expect("the reservation inserts")
             );
         }
+
+        async fn catalog_evidence(&self) -> Vec<ContractEvidenceRow> {
+            self.pool
+                .get()
+                .await
+                .expect("catalog evidence checkout")
+                .query(
+                    "SELECT operation_id::text, action, connection_id::text \
+                     FROM greengateway.catalog_change_evidence \
+                     ORDER BY committed_at, event_id",
+                    &[],
+                )
+                .await
+                .expect("catalog evidence reads")
+                .iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect()
+        }
+
+        async fn catalog_evidence_text(&self) -> String {
+            self.pool
+                .get()
+                .await
+                .expect("catalog evidence dump checkout")
+                .query_one(
+                    "SELECT coalesce(string_agg(row_to_json(t)::text, '|'), '') \
+                     FROM greengateway.catalog_change_evidence t",
+                    &[],
+                )
+                .await
+                .expect("the catalog evidence dumps")
+                .get(0)
+        }
+
+        async fn fail_catalog_evidence_inserts(&self, fail: bool) {
+            let sql = if fail {
+                r#"
+                CREATE FUNCTION greengateway.fail_keyed_catalog_evidence()
+                RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    RAISE EXCEPTION 'injected evidence failure';
+                END;
+                $$;
+                CREATE TRIGGER fail_keyed_catalog_evidence
+                BEFORE INSERT ON greengateway.catalog_change_evidence
+                FOR EACH ROW EXECUTE FUNCTION greengateway.fail_keyed_catalog_evidence();
+                "#
+            } else {
+                r#"
+                DROP TRIGGER fail_keyed_catalog_evidence
+                    ON greengateway.catalog_change_evidence;
+                DROP FUNCTION greengateway.fail_keyed_catalog_evidence();
+                "#
+            };
+            self.pool
+                .get()
+                .await
+                .expect("fault checkout")
+                .batch_execute(sql)
+                .await
+                .expect("fault statement");
+        }
     }
 
     macro_rules! database_or_skip {
@@ -7286,6 +7349,140 @@ mod keyed_connection_changes {
     async fn postgres_the_binding_digest_is_stored_only_in_the_reservation_row() {
         contract::the_binding_digest_is_stored_only_in_the_reservation_row(&database_or_skip!())
             .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_catalog_caller_operation_contract() {
+        catalog::catalog_caller_operation_contract(&database_or_skip!()).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_a_reused_catalog_key_with_a_different_binding_conflicts_and_changes_nothing()
+    {
+        catalog::a_reused_catalog_key_with_a_different_binding_conflicts_and_changes_nothing(
+            &database_or_skip!(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_a_key_reserved_by_another_action_cannot_take_effect_on_a_catalog() {
+        catalog::a_key_reserved_by_another_action_cannot_take_effect_on_a_catalog(
+            &database_or_skip!(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_a_failed_evidence_insert_rolls_back_the_keyed_publication_and_its_reservation(
+    ) {
+        catalog::a_failed_evidence_insert_rolls_back_the_keyed_publication_and_its_reservation(
+            &database_or_skip!(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_a_stale_catalog_precondition_under_a_key_writes_no_change_evidence_or_reservation(
+    ) {
+        catalog::a_stale_catalog_precondition_under_a_key_writes_no_change_evidence_or_reservation(
+            &database_or_skip!(),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_two_writers_racing_one_catalog_key_commit_one_change() {
+        catalog::two_writers_racing_one_catalog_key_commit_one_change(&database_or_skip!()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_two_catalog_keys_racing_one_revision_leave_only_the_winners_rows() {
+        catalog::two_catalog_keys_racing_one_revision_leave_only_the_winners_rows(
+            &database_or_skip!(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record(
+    ) {
+        catalog::a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record(
+            &database_or_skip!(),
+        )
+        .await;
+    }
+
+    /// I2, I4 and A4 for catalogs: a full journal refuses the keyed MCP
+    /// publication, registration and overlay put with `503`, and none of
+    /// them reserves its key; once there is room the same keys commit.
+    #[tokio::test]
+    async fn a_full_journal_refuses_the_keyed_catalog_publication_and_reserves_nothing() {
+        use crate::storage::postgres_authority_events::{
+            PostgresAuthorityEventStore, OPERATION_JOURNAL_APPEND,
+        };
+
+        let db = database_or_skip!();
+        let actor = contract::operator();
+        let mcp = catalog::create(&db, catalog::mcp_candidate("Journaled MCP")).await;
+        let fresh =
+            catalog::create(&db, catalog::openapi_candidate("Journaled registration")).await;
+        let api = catalog::registered(&db, "Journaled OpenAPI").await;
+        let evidence = db.catalog_evidence().await;
+        let journal = PostgresAuthorityEventStore::new(db.pool.clone());
+        journal
+            .configure_capacity(1)
+            .await
+            .expect("capacity applies");
+        let document = catalog::overlay_document("journaled overlay");
+        let put = catalog::overlay_put(&document, 0);
+        let mcp_op = catalog::mcp_key(94, &actor, &mcp);
+        let register_op = catalog::openapi_key(95, &actor, &fresh);
+        let put_op = catalog::overlay_put_key(96, &actor, &api, 0, &document);
+        let refusals = [
+            catalog::publish_mcp(&db, &mcp, 0, Some(&mcp_op))
+                .await
+                .map(|_| ()),
+            catalog::publish_openapi(&db, &fresh, (0, 0), None, 0, Some(&register_op))
+                .await
+                .map(|_| ()),
+            catalog::publish_openapi(&db, &api, (1, 1), Some(&put), 1, Some(&put_op))
+                .await
+                .map(|_| ()),
+        ];
+        for refused in refusals {
+            let refused = refused.expect_err("a full journal refuses the keyed publication");
+            assert!(
+                matches!(
+                    refused,
+                    ConnectionStoreError::Unavailable { operation } if operation == OPERATION_JOURNAL_APPEND
+                ),
+                "{refused}"
+            );
+        }
+        assert!(db.reservations().await.is_empty(), "nothing was reserved");
+        assert_eq!(
+            db.catalog_evidence().await,
+            evidence,
+            "nothing was recorded"
+        );
+        assert!(db.store.mcp_catalog(&mcp.id).await.unwrap().is_none());
+        catalog::assert_catalog_reservations_match_evidence(&db).await;
+
+        journal
+            .configure_capacity(16)
+            .await
+            .expect("capacity applies");
+        catalog::committed(
+            catalog::publish_mcp(&db, &mcp, 0, Some(&mcp_op)).await,
+            "the keyed MCP publication once there is room",
+        );
+        catalog::committed(
+            catalog::publish_openapi(&db, &api, (1, 1), Some(&put), 1, Some(&put_op)).await,
+            "the keyed overlay put once there is room",
+        );
+        assert_eq!(db.reservations().await.len(), 2);
+        catalog::assert_catalog_reservations_match_evidence(&db).await;
     }
 
     /// I2, I4 and A4: a full journal refuses the keyed create, replace and

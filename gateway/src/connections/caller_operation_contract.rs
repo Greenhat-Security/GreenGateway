@@ -45,6 +45,13 @@ pub(crate) trait ContractDatabase {
     async fn fail_evidence_inserts(&self, fail: bool);
     /// Reserve `key` the way a keyed service-token revoke does: no digest.
     async fn reserve_for_a_keyed_revoke(&self, key: Uuid);
+    /// Every catalog evidence row (`catalog_change_evidence`), in commit
+    /// order: its operation ID, action and Connection ID.
+    async fn catalog_evidence(&self) -> Vec<EvidenceRow>;
+    /// The text of every column of every catalog evidence row.
+    async fn catalog_evidence_text(&self) -> String;
+    /// Make every catalog evidence insert fail, or stop doing so.
+    async fn fail_catalog_evidence_inserts(&self, fail: bool);
 }
 
 pub(crate) const ISSUER: &str = "https://keyed-connections.example.test";
@@ -877,7 +884,7 @@ pub(crate) async fn the_binding_digest_is_stored_only_in_the_reservation_row(
 }
 
 /// The standalone store runs the contract on its own Connections database.
-mod sqlite {
+pub(super) mod sqlite {
     use std::path::PathBuf;
 
     use rusqlite::Connection;
@@ -885,13 +892,13 @@ mod sqlite {
     use super::*;
     use crate::connections::store::SqliteConnectionStore;
 
-    struct SqliteDatabase {
+    pub(crate) struct SqliteDatabase {
         path: PathBuf,
         store: ManagedConnectionStore,
     }
 
     impl SqliteDatabase {
-        fn new(name: &str) -> Self {
+        pub(crate) fn new(name: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
                 "greengateway-keyed-connections-{name}-{}.sqlite",
                 Uuid::new_v4()
@@ -1015,6 +1022,45 @@ mod sqlite {
                 )
                 .unwrap()
             );
+        }
+
+        async fn catalog_evidence(&self) -> Vec<EvidenceRow> {
+            let connection = self.open();
+            let mut statement = connection
+                .prepare(
+                    "SELECT operation_id, action, connection_id                      FROM catalog_change_evidence ORDER BY sequence",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        }
+
+        async fn catalog_evidence_text(&self) -> String {
+            let connection = self.open();
+            let mut statement = connection
+                .prepare("SELECT * FROM catalog_change_evidence")
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows = statement.query([]).unwrap();
+            let mut text = String::new();
+            while let Some(row) = rows.next().unwrap() {
+                for index in 0..columns {
+                    text.push_str(&format!("{:?}|", row.get_ref(index).unwrap()));
+                }
+            }
+            text
+        }
+
+        async fn fail_catalog_evidence_inserts(&self, fail: bool) {
+            let statement = if fail {
+                "CREATE TRIGGER fail_catalog_change_evidence                  BEFORE INSERT ON catalog_change_evidence                  BEGIN SELECT RAISE(ABORT, 'injected evidence failure'); END;"
+            } else {
+                "DROP TRIGGER fail_catalog_change_evidence;"
+            };
+            self.open().execute_batch(statement).unwrap();
         }
     }
 
