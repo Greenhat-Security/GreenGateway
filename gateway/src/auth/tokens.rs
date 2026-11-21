@@ -13,7 +13,13 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::{auth::change_actor::ChangeActor, metrics::LOCK_POISON_RECOVERIES_TOTAL};
+use crate::{
+    auth::change_actor::ChangeActor,
+    authority_events::caller_operation::{
+        CallerKeyReservation, CallerKeyState, CallerOperation, CallerOutcome, OperationReceipt,
+    },
+    metrics::LOCK_POISON_RECOVERIES_TOTAL,
+};
 
 const CREATE_SERVICE_TOKEN_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS service_tokens (
@@ -132,6 +138,53 @@ const CHANGE_EVIDENCE_ACTOR_COLUMNS: [(&str, &str); 3] = [
     ),
 ];
 
+/// The token row's store-owned revision (issue #425, plan P5): 1 when the
+/// token is issued, advanced by one by every rotation and revocation this
+/// build commits, so a change's evidence can name the revision before and
+/// after it as authority_event.v1 needs. Added on open like the actor
+/// columns: an older binary inserts tokens by an explicit column list, so
+/// its rows take the default, and it never reads or advances the column.
+const SERVICE_TOKEN_REVISION_COLUMNS: [(&str, &str); 1] = [(
+    "revision",
+    "INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1)",
+)];
+
+/// The revisions a change's evidence records (issue #425, plan P5), and the
+/// per-row marker `revised` that says whether the row's writer records them.
+/// Added on open after the actor columns, so an older table and a fresh one
+/// end with one schema. Nothing is backfilled: an existing row keeps NULL
+/// revisions and `revised = 0`, and so does every row an older binary still
+/// writes (its insert names its columns, and the token database has no
+/// version fence that would keep an older binary away), so delivery reads
+/// such a row as the unrevised legacy record it is. Every row this build
+/// writes has `revised = 1` and a revision transition: an issue NULL to 1,
+/// a rotation or revocation one step up. The last CHECK holds that pairing
+/// for each action exactly as standalone delivery projects it (an issue is a
+/// create, anything else an advance), so the table refuses a revised row
+/// delivery would stall on; PostgreSQL migration 27 ties the NULL prior to
+/// the issue the same way. SQLite cannot change a column's CHECK in place,
+/// so it is complete from the start.
+const CHANGE_EVIDENCE_REVISION_COLUMNS: [(&str, &str); 3] = [
+    (
+        "prior_version",
+        "INTEGER CHECK (prior_version IS NULL OR prior_version >= 1)",
+    ),
+    (
+        "new_version",
+        "INTEGER CHECK (new_version IS NULL OR new_version >= 1)",
+    ),
+    (
+        "revised",
+        r#"INTEGER NOT NULL DEFAULT 0 CHECK (revised IN (0, 1)) CHECK (
+    (revised = 0 AND prior_version IS NULL AND new_version IS NULL)
+    OR (revised = 1 AND action = 'service_token.issue'
+        AND prior_version IS NULL AND new_version = 1)
+    OR (revised = 1 AND action <> 'service_token.issue'
+        AND prior_version IS NOT NULL AND new_version > prior_version)
+)"#,
+    ),
+];
+
 /// The longest actor an issue, rotate or revoke records as its change
 /// evidence, in both the SQLite table above and PostgreSQL migration 18. It is exactly
 /// the principal subject bound authentication enforces, so evidence never
@@ -180,6 +233,11 @@ pub struct SqliteTokenStore {
 
 pub(crate) const REVOKE_OPERATION_BINDING: &str = "service_token_revoke_binding";
 
+/// The operation label of a keyed issue or rotation refused because its
+/// caller key is bound to another request (issue #425): a `Conflict` with
+/// this label means exactly that, and nothing changed.
+pub(crate) const CALLER_OPERATION_BINDING: &str = "service_token_caller_operation_binding";
+
 /// Unkeyed service-token operations, including historical ones, use v4.
 /// Reserving v7 for the caller prevents a legacy operation from ever being
 /// presented as a matching keyed request.
@@ -199,7 +257,24 @@ pub trait TokenStore: Send + Sync {
         &self,
         request: CreateTokenRequest,
         actor: &ChangeActor,
-    ) -> Result<CreatedToken, TokenStoreError>;
+    ) -> Result<CreatedToken, TokenStoreError> {
+        match self.create_with_operation(request, actor, None)? {
+            CallerOutcome::Committed(created) => Ok(created),
+            // Only a caller key is answered from a receipt.
+            CallerOutcome::Replayed(_) => Err(TokenStoreError::CallerOperationAction),
+        }
+    }
+
+    /// [`Self::create`] under a caller key bound to this request (issue
+    /// #425): the key is reserved with the issue and its evidence in one
+    /// transaction, and an exact retry is answered with the receipt of what
+    /// committed, never a second token or its plaintext.
+    fn create_with_operation(
+        &self,
+        request: CreateTokenRequest,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<CreatedToken>, TokenStoreError>;
 
     fn list(&self, filters: &TokenListFilters) -> Result<TokenPage, TokenStoreError>;
 
@@ -231,7 +306,23 @@ pub trait TokenStore: Send + Sync {
         &self,
         id: &str,
         actor: &ChangeActor,
-    ) -> Result<Option<CreatedToken>, TokenStoreError>;
+    ) -> Result<Option<CreatedToken>, TokenStoreError> {
+        match self.rotate_with_operation(id, actor, None)? {
+            None => Ok(None),
+            Some(CallerOutcome::Committed(created)) => Ok(Some(created)),
+            Some(CallerOutcome::Replayed(_)) => Err(TokenStoreError::CallerOperationAction),
+        }
+    }
+
+    /// [`Self::rotate`] under a caller key bound to this request (issue
+    /// #425). An exact retry is answered with the receipt of the committed
+    /// rotation whatever the token's state since, never a plaintext.
+    fn rotate_with_operation(
+        &self,
+        id: &str,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<Option<CallerOutcome<CreatedToken>>, TokenStoreError>;
 
     fn verify(&self, plaintext_token: &str) -> Result<TokenVerification, TokenStoreError>;
 
@@ -274,6 +365,18 @@ pub struct TokenRecord {
 pub struct CreatedToken {
     pub record: TokenRecord,
     pub plaintext_token: String,
+}
+
+/// Written by hand so the plaintext can never reach a log line or a test
+/// failure message through `{:?}`.
+impl fmt::Debug for CreatedToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreatedToken")
+            .field("record", &self.record)
+            .field("plaintext_token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// One `service_tokens` row exactly as stored, for the standalone-to-cluster
@@ -386,6 +489,17 @@ pub enum TokenStoreError {
         path: PathBuf,
         source: rusqlite::Error,
     },
+    /// A keyed issue or rotation whose caller key is reserved for another
+    /// action or another request in this file (issue #425): nothing changed.
+    CallerOperationConflict,
+    /// A caller key bound to another action than the change it was handed
+    /// to, or a receipt where none can be: the gateway's defect, refused
+    /// before anything changed.
+    CallerOperationAction,
+    /// The caller key's reservation could not be read or written, or its
+    /// receipt could not be read; nothing committed. Already classified and
+    /// logged by the reservation table's own functions.
+    CallerOperation(crate::storage::RepositoryError),
 }
 
 impl SqliteTokenStore {
@@ -506,12 +620,165 @@ impl crate::storage::standalone_authority_events::StandaloneEvidenceAuthority fo
     }
 }
 
+impl SqliteTokenStore {
+    /// What this file's reservation table says about `caller`'s key: the
+    /// read-only pre-check a handler asks before it does any work (issue
+    /// #425). Advisory: the change's own transaction decides again.
+    pub(crate) fn caller_operation_state(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<CallerKeyState, TokenStoreError> {
+        let connection = self.connection_guard();
+        crate::storage::standalone_authority_events::read_caller_operation(&connection, caller)
+            .map_err(TokenStoreError::CallerOperation)
+    }
+
+    /// The receipt of the issue or rotation `caller`'s key committed, read
+    /// from its evidence row, or `None` when there is none.
+    pub(crate) fn caller_operation_receipt(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<Option<OperationReceipt>, TokenStoreError> {
+        let connection = self.connection_guard();
+        token_operation_receipt(&connection, caller).map_err(|source| self.sqlite_error(source))
+    }
+
+    /// Step 1 of a keyed issue or rotation, inside its IMMEDIATE transaction
+    /// (issue #425): `None` for no key or an unused one; the receipt for an
+    /// exact retry of a committed change; a conflict for a key reserved for
+    /// anything else, or used by a keyed revoke an older build committed
+    /// without reserving it (the next open reserves those, but an older
+    /// build can serve this file meanwhile). A reservation without its
+    /// evidence row is refused.
+    fn keyed_receipt(
+        &self,
+        transaction: &Connection,
+        caller: Option<&CallerOperation>,
+        action: &'static str,
+    ) -> Result<Option<OperationReceipt>, TokenStoreError> {
+        let Some(caller) = caller else {
+            return Ok(None);
+        };
+        if caller.action() != action {
+            return Err(TokenStoreError::CallerOperationAction);
+        }
+        let state =
+            crate::storage::standalone_authority_events::read_caller_operation(transaction, caller)
+                .map_err(TokenStoreError::CallerOperation)?;
+        match state {
+            CallerKeyState::Unused => {
+                let used: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS (SELECT 1 FROM service_token_change_evidence \
+                         WHERE operation_id = ?1)",
+                        params![caller.id().to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|source| self.sqlite_error(source))?;
+                if used {
+                    return Err(TokenStoreError::CallerOperationConflict);
+                }
+                Ok(None)
+            }
+            CallerKeyState::OtherBinding => Err(TokenStoreError::CallerOperationConflict),
+            CallerKeyState::SameBinding => self.committed_receipt(transaction, caller).map(Some),
+        }
+    }
+
+    /// Step 3 of a keyed issue or rotation: reserve the key with its binding
+    /// digest in the change's transaction. The write lock is held and step 1
+    /// found the key free, so a taken key means the file disagrees with
+    /// itself and nothing commits. A reservation that cannot be written is
+    /// part of the change's evidence failing (I2): counted on the standalone
+    /// evidence-failure counter, and nothing commits.
+    fn reserve_caller_key(
+        &self,
+        transaction: &Connection,
+        caller: Option<&CallerOperation>,
+    ) -> Result<(), TokenStoreError> {
+        let Some(caller) = caller else {
+            return Ok(());
+        };
+        let reservation = crate::storage::standalone_authority_events::reserve_bound_operation(
+            transaction,
+            caller,
+        )
+        .map_err(|error| {
+            crate::storage::record_standalone_evidence_failure(
+                crate::storage::StandaloneEvidenceStore::ServiceTokens,
+            );
+            TokenStoreError::CallerOperation(error)
+        })?;
+        match reservation {
+            CallerKeyReservation::Reserved => Ok(()),
+            CallerKeyReservation::SameBinding | CallerKeyReservation::OtherBinding => {
+                Err(TokenStoreError::CallerOperationConflict)
+            }
+        }
+    }
+
+    /// The committed receipt of an exact retry, or a refusal when the
+    /// reservation has no evidence row.
+    fn committed_receipt(
+        &self,
+        transaction: &Connection,
+        caller: &CallerOperation,
+    ) -> Result<OperationReceipt, TokenStoreError> {
+        token_operation_receipt(transaction, caller)
+            .map_err(|source| self.sqlite_error(source))?
+            .ok_or_else(|| {
+                tracing::error!(
+                    "a caller operation is reserved without its service-token evidence row; the change is refused"
+                );
+                TokenStoreError::InconsistentRevokeEvidence
+            })
+    }
+}
+
+/// The receipt of the token change `caller`'s key committed: its evidence
+/// row for the key's action, never anything from the request and never
+/// token material.
+fn token_operation_receipt(
+    connection: &Connection,
+    caller: &CallerOperation,
+) -> rusqlite::Result<Option<OperationReceipt>> {
+    connection
+        .query_row(
+            "SELECT token_id, new_version, committed_at FROM service_token_change_evidence \
+             WHERE operation_id = ?1 AND action = ?2",
+            params![caller.id().to_string(), caller.action()],
+            |row| {
+                Ok(OperationReceipt {
+                    operation_id: caller.id().to_string(),
+                    operation: caller.action().to_owned(),
+                    resource_id: row.get(0)?,
+                    revision: row.get(1)?,
+                    committed_at: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+}
+
+/// The token row's store-owned revision, read inside the change's
+/// transaction.
+fn token_revision(connection: &Connection, path: &Path, id: &str) -> Result<i64, TokenStoreError> {
+    connection
+        .query_row(
+            "SELECT revision FROM service_tokens WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(|source| store_failure(path, source))
+}
+
 impl TokenStore for SqliteTokenStore {
-    fn create(
+    fn create_with_operation(
         &self,
         request: CreateTokenRequest,
         actor: &ChangeActor,
-    ) -> Result<CreatedToken, TokenStoreError> {
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<CreatedToken>, TokenStoreError> {
         validate_optional_timestamp(request.expires_at.as_deref(), "expires_at")?;
         if !is_valid_change_actor(actor) {
             return Err(TokenStoreError::InvalidChangeActor);
@@ -529,13 +796,21 @@ impl TokenStore for SqliteTokenStore {
             })?;
 
         let mut connection = self.connection_guard();
-        // One unit, as in `revoke` and `rotate`: the token row and the
-        // evidence of its issue commit together or not at all. An early
-        // return drops the transaction, which rolls it back with nothing
-        // written.
+        // One unit, as in `revoke` and `rotate`: the token row, the evidence
+        // of its issue and a caller key's reservation commit together or not
+        // at all. An early return drops the transaction, which rolls it back
+        // with nothing written.
         let transaction = connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|source| self.sqlite_error(source))?;
+        // An exact retry is answered from what committed: no second token,
+        // and never a plaintext (the first one was returned once).
+        if let Some(receipt) =
+            self.keyed_receipt(&transaction, caller, TOKEN_CHANGE_ACTION_ISSUE)?
+        {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
+        self.reserve_caller_key(&transaction, caller)?;
         transaction
             .execute(
                 r#"
@@ -548,8 +823,9 @@ impl TokenStore for SqliteTokenStore {
                     created_at,
                     expires_at,
                     last_used_at,
-                    revoked_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)
+                    revoked_at,
+                    revision
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, 1)
                 "#,
                 params![
                     id.as_str(),
@@ -564,23 +840,26 @@ impl TokenStore for SqliteTokenStore {
             .map_err(|source| self.sqlite_error(source))?;
         // The issue's commit time is the token's own `created_at`, as a
         // revoke's is its `revoked_at`. Neither the plaintext nor the hash
-        // is passed: the evidence names the token by its ID alone.
+        // is passed: the evidence names the token by its ID alone. An issue
+        // creates the token's first revision.
         record_change_evidence(
             &transaction,
             &self.path,
             &ChangeEvidence {
-                operation_id: None,
+                operation_id: caller.map(CallerOperation::id),
                 action: TOKEN_CHANGE_ACTION_ISSUE,
                 token_id: &id,
                 actor,
                 committed_at: &created_at,
+                prior_version: None,
+                new_version: 1,
             },
         )?;
         transaction
             .commit()
             .map_err(|source| self.sqlite_error(source))?;
 
-        Ok(CreatedToken {
+        Ok(CallerOutcome::Committed(CreatedToken {
             record: TokenRecord {
                 id,
                 token_prefix,
@@ -592,7 +871,7 @@ impl TokenStore for SqliteTokenStore {
                 revoked_at: None,
             },
             plaintext_token,
-        })
+        }))
     }
 
     fn list(&self, filters: &TokenListFilters) -> Result<TokenPage, TokenStoreError> {
@@ -752,10 +1031,14 @@ impl TokenStore for SqliteTokenStore {
             }
         }
 
+        // A revocation advances the token's revision by one, so its evidence
+        // names the revision it withdrew and the one it left (issue #425).
+        let prior_revision = token_revision(&transaction, &self.path, id)?;
         let changed = transaction
             .execute(
-                "UPDATE service_tokens SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
-                params![revoked_at.as_str(), id],
+                "UPDATE service_tokens SET revoked_at = ?1, revision = ?3 \
+                 WHERE id = ?2 AND revoked_at IS NULL AND revision = ?4",
+                params![revoked_at.as_str(), id, prior_revision + 1, prior_revision],
             )
             .map_err(|source| self.sqlite_error(source))?;
         // The evidence describes exactly one changed row or nothing commits.
@@ -771,6 +1054,8 @@ impl TokenStore for SqliteTokenStore {
                 token_id: id,
                 actor,
                 committed_at: &revoked_at,
+                prior_version: Some(prior_revision),
+                new_version: prior_revision + 1,
             },
         )?;
         let record = load_record_by_id(&transaction, &self.path, id)?;
@@ -780,11 +1065,12 @@ impl TokenStore for SqliteTokenStore {
         Ok(record)
     }
 
-    fn rotate(
+    fn rotate_with_operation(
         &self,
         id: &str,
         actor: &ChangeActor,
-    ) -> Result<Option<CreatedToken>, TokenStoreError> {
+        caller: Option<&CallerOperation>,
+    ) -> Result<Option<CallerOutcome<CreatedToken>>, TokenStoreError> {
         if !is_valid_change_actor(actor) {
             return Err(TokenStoreError::InvalidChangeActor);
         }
@@ -800,22 +1086,40 @@ impl TokenStore for SqliteTokenStore {
         let transaction = connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|source| self.sqlite_error(source))?;
+        // The key first: an exact retry is answered from the committed
+        // rotation whatever happened to the token since, and never with a
+        // plaintext.
+        if let Some(receipt) =
+            self.keyed_receipt(&transaction, caller, TOKEN_CHANGE_ACTION_ROTATE)?
+        {
+            return Ok(Some(CallerOutcome::Replayed(receipt)));
+        }
         let Some(record) = load_record_by_id(&transaction, &self.path, id)? else {
             return Ok(None);
         };
         if record.revoked_at.is_some() {
             return Err(TokenStoreError::RevokedToken { id: id.to_owned() });
         }
+        self.reserve_caller_key(&transaction, caller)?;
 
+        // A rotation advances the token's revision by one (issue #425).
+        let prior_revision = token_revision(&transaction, &self.path, id)?;
         let changed = transaction
             .execute(
                 r#"
                 UPDATE service_tokens
                 SET token_hash = ?1,
-                    token_prefix = ?2
-                WHERE id = ?3 AND revoked_at IS NULL
+                    token_prefix = ?2,
+                    revision = ?4
+                WHERE id = ?3 AND revoked_at IS NULL AND revision = ?5
                 "#,
-                params![token_hash.as_str(), token_prefix.as_str(), id],
+                params![
+                    token_hash.as_str(),
+                    token_prefix.as_str(),
+                    id,
+                    prior_revision + 1,
+                    prior_revision
+                ],
             )
             .map_err(|source| self.sqlite_error(source))?;
         if changed != 1 {
@@ -825,11 +1129,13 @@ impl TokenStore for SqliteTokenStore {
             &transaction,
             &self.path,
             &ChangeEvidence {
-                operation_id: None,
+                operation_id: caller.map(CallerOperation::id),
                 action: TOKEN_CHANGE_ACTION_ROTATE,
                 token_id: id,
                 actor,
                 committed_at: &rotated_at,
+                prior_version: Some(prior_revision),
+                new_version: prior_revision + 1,
             },
         )?;
         // The row was read inside this transaction, which holds the write
@@ -839,10 +1145,10 @@ impl TokenStore for SqliteTokenStore {
         transaction
             .commit()
             .map_err(|source| self.sqlite_error(source))?;
-        Ok(Some(CreatedToken {
+        Ok(Some(CallerOutcome::Committed(CreatedToken {
             record,
             plaintext_token,
-        }))
+        })))
     }
 
     fn verify(&self, plaintext_token: &str) -> Result<TokenVerification, TokenStoreError> {
@@ -989,6 +1295,17 @@ impl fmt::Display for TokenStoreError {
                     path.display()
                 )
             }
+            Self::CallerOperationConflict => formatter
+                .write_str("the caller operation is bound to another request; nothing was changed"),
+            Self::CallerOperationAction => {
+                formatter.write_str("a caller operation was handed to a change it is not bound to")
+            }
+            Self::CallerOperation(error) => {
+                write!(
+                    formatter,
+                    "the caller operation could not be read or reserved: {error}"
+                )
+            }
         }
     }
 }
@@ -1008,7 +1325,10 @@ impl Error for TokenStoreError {
             | Self::InvalidChangeActor
             | Self::InvalidRevokeOperationId
             | Self::RevokeOperationConflict
-            | Self::InconsistentRevokeEvidence => None,
+            | Self::InconsistentRevokeEvidence
+            | Self::CallerOperationConflict
+            | Self::CallerOperationAction => None,
+            Self::CallerOperation(error) => Some(error),
             Self::Random(source) => Some(source),
         }
     }
@@ -1076,10 +1396,15 @@ struct ChangeEvidence<'a> {
     token_id: &'a str,
     actor: &'a ChangeActor,
     committed_at: &'a str,
+    /// The token's revision before the change: `None` exactly for an issue.
+    prior_version: Option<i64>,
+    /// The token's revision after it.
+    new_version: i64,
 }
 
-/// Append one evidence row inside the caller's transaction. Its event and
-/// operation IDs are minted here unless a keyed revocation supplies its operation ID. Any failure is
+/// Append one evidence row inside the caller's transaction, with its
+/// revisions and `revised = 1` (issue #425, plan P5). Its event and
+/// operation IDs are minted here unless a caller key supplies its operation ID. Any failure is
 /// returned for the caller to roll back, so the change it describes never
 /// commits without it, and it is reported as an evidence failure rather
 /// than as whatever constraint class SQLite gave it: a rotate whose
@@ -1101,8 +1426,9 @@ fn record_change_evidence(
             r#"
             INSERT INTO service_token_change_evidence (
                 event_id, operation_id, actor_user_id, actor_issuer, actor_kind,
-                actor_auth_mode, action, token_id, committed_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                actor_auth_mode, action, token_id, committed_at,
+                prior_version, new_version, revised
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)
             "#,
             params![
                 event_id.as_str(),
@@ -1114,6 +1440,8 @@ fn record_change_evidence(
                 evidence.action,
                 evidence.token_id,
                 evidence.committed_at,
+                evidence.prior_version,
+                evidence.new_version,
             ],
         )
         .map_err(|source| {
@@ -1159,6 +1487,19 @@ pub fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch(CHANGE_EVIDENCE_INDEX_SQL)?;
     add_change_evidence_actor_columns(connection)?;
     rebuild_change_evidence_for_issue(connection)?;
+    // The store-owned token revision and the evidence revisions (issue
+    // #425, plan P5), after the rebuild, which copies only the columns
+    // before them.
+    add_missing_columns(
+        connection,
+        "service_tokens",
+        &SERVICE_TOKEN_REVISION_COLUMNS,
+    )?;
+    add_missing_columns(
+        connection,
+        "service_token_change_evidence",
+        &CHANGE_EVIDENCE_REVISION_COLUMNS,
+    )?;
     // The delivery state of the evidence above (issue #425): this file's
     // authority ID and its cursor, created empty on open like the evidence
     // table, so an older binary simply never reads them.
@@ -1336,12 +1677,49 @@ fn add_change_evidence_actor_columns(connection: &Connection) -> rusqlite::Resul
 fn missing_change_evidence_actor_columns(
     connection: &Connection,
 ) -> rusqlite::Result<Vec<(&'static str, &'static str)>> {
-    let mut statement = connection.prepare("PRAGMA table_info(service_token_change_evidence)")?;
+    missing_columns(
+        connection,
+        "service_token_change_evidence",
+        &CHANGE_EVIDENCE_ACTOR_COLUMNS,
+    )
+}
+
+/// Add whichever of `columns` `table` lacks, in order, exactly as
+/// [`add_change_evidence_actor_columns`] does: the common case reads the
+/// schema and writes nothing; otherwise one IMMEDIATE transaction looks again
+/// under the write lock, so two processes opening the same older file cannot
+/// both add a column, and a failure leaves the table as it was.
+fn add_missing_columns(
+    connection: &Connection,
+    table: &'static str,
+    columns: &[(&'static str, &'static str)],
+) -> rusqlite::Result<()> {
+    if missing_columns(connection, table, columns)?.is_empty() {
+        return Ok(());
+    }
+    let transaction =
+        rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)?;
+    for (name, definition) in missing_columns(&transaction, table, columns)? {
+        transaction.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {name} {definition}"),
+            [],
+        )?;
+    }
+    transaction.commit()
+}
+
+fn missing_columns(
+    connection: &Connection,
+    table: &'static str,
+    columns: &[(&'static str, &'static str)],
+) -> rusqlite::Result<Vec<(&'static str, &'static str)>> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     let existing = statement
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(CHANGE_EVIDENCE_ACTOR_COLUMNS
-        .into_iter()
+    Ok(columns
+        .iter()
+        .copied()
         .filter(|(name, _)| !existing.iter().any(|column| column == name))
         .collect())
 }
@@ -2579,6 +2957,199 @@ mod tests {
                 )
                 .expect("the held key reads");
             assert_eq!(kept.as_deref(), Some(digest.as_str()));
+        }
+    }
+
+    /// The store-owned token revision and the evidence revisions (issue
+    /// #425, plan P5). A file an older binary wrote -- here one from before
+    /// issue evidence, so the open also rebuilds its evidence table -- gains
+    /// the columns on its first open: its tokens start at revision 1, its
+    /// evidence rows keep NULL revisions and `revised = 0`, and nothing is
+    /// fabricated. Every change this build writes is revised: an issue NULL
+    /// to 1, a rotation and a revocation one step up each. Reopening changes
+    /// nothing, and the table refuses a revised row without its revision.
+    #[test]
+    fn standalone_token_revisions_start_at_one_and_legacy_evidence_stays_unrevised() {
+        let db = TempDb::new("token-revisions");
+        let connection = Connection::open(&db.path).expect("database should open");
+        create_pre_issue_schema(&connection);
+        connection
+            .execute(
+                "INSERT INTO service_tokens \
+                     (id, token_hash, token_prefix, scopes_json, created_by, created_at) \
+                 VALUES ('token_older', ?1, 'ggw_aaaaaaaaaa', '[\"reader\"]', \
+                         'older-creator', '2026-10-01T00:00:00Z')",
+                [hash_token("older-plaintext")],
+            )
+            .expect("an older binary's token");
+        connection
+            .execute(
+                "INSERT INTO service_token_change_evidence \
+                     (event_id, operation_id, actor_user_id, action, token_id, committed_at) \
+                 VALUES (?1, ?2, 'older-admin', 'service_token.rotate', 'token_older', \
+                         '2026-10-01T00:00:01Z')",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    uuid::Uuid::new_v4().to_string()
+                ],
+            )
+            .expect("an older binary's evidence row");
+        drop(connection);
+
+        type Revision = (String, String, Option<i64>, Option<i64>, i64);
+        let revisions = |path: &PathBuf| -> Vec<Revision> {
+            let connection = Connection::open(path).expect("database should open");
+            let mut statement = connection
+                .prepare(
+                    "SELECT token_id, action, prior_version, new_version, revised \
+                     FROM service_token_change_evidence ORDER BY sequence",
+                )
+                .expect("the evidence query prepares");
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .expect("the evidence reads")
+                .collect::<Result<_, _>>()
+                .expect("every row reads")
+        };
+        let token_revision = |path: &PathBuf, id: &str| -> i64 {
+            Connection::open(path)
+                .expect("database should open")
+                .query_row(
+                    "SELECT revision FROM service_tokens WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .expect("the token's revision reads")
+        };
+
+        let store = SqliteTokenStore::open(&db.path).expect("the store opens the older file");
+        assert_eq!(token_revision(&db.path, "token_older"), 1);
+        assert_eq!(
+            revisions(&db.path),
+            [(
+                "token_older".to_owned(),
+                "service_token.rotate".to_owned(),
+                None,
+                None,
+                0
+            )],
+            "an older row is not revised and nothing is fabricated for it"
+        );
+
+        // The older token's next change starts its chain from revision 1.
+        store
+            .rotate("token_older", &ChangeActor::for_test("rotating-admin"))
+            .expect("the older token rotates")
+            .expect("the older token exists");
+        let created = store
+            .create(
+                create_request(&["reader"], "creating-admin", None),
+                &ChangeActor::for_test("creating-admin"),
+            )
+            .expect("a token issues");
+        let id = created.record.id.clone();
+        store
+            .rotate(&id, &ChangeActor::for_test("rotating-admin"))
+            .expect("the token rotates")
+            .expect("the token exists");
+        store
+            .revoke(&id, &ChangeActor::for_test("revoking-admin"))
+            .expect("the token revokes")
+            .expect("the token exists");
+        // A repeat revoke changes nothing and records nothing.
+        store
+            .revoke(&id, &ChangeActor::for_test("revoking-admin"))
+            .expect("a repeat revoke answers")
+            .expect("the token exists");
+        assert_eq!(token_revision(&db.path, &id), 3);
+        assert_eq!(token_revision(&db.path, "token_older"), 2);
+        let expected = vec![
+            (
+                "token_older".to_owned(),
+                "service_token.rotate".to_owned(),
+                None,
+                None,
+                0,
+            ),
+            (
+                "token_older".to_owned(),
+                "service_token.rotate".to_owned(),
+                Some(1),
+                Some(2),
+                1,
+            ),
+            (
+                id.clone(),
+                "service_token.issue".to_owned(),
+                None,
+                Some(1),
+                1,
+            ),
+            (
+                id.clone(),
+                "service_token.rotate".to_owned(),
+                Some(1),
+                Some(2),
+                1,
+            ),
+            (
+                id.clone(),
+                "service_token.revoke".to_owned(),
+                Some(2),
+                Some(3),
+                1,
+            ),
+        ];
+        assert_eq!(revisions(&db.path), expected);
+        drop(store);
+
+        // Reopening adds nothing and changes nothing.
+        drop(SqliteTokenStore::open(&db.path).expect("the store reopens"));
+        assert_eq!(revisions(&db.path), expected);
+
+        // The table holds the pairing, per action as delivery projects it: a
+        // revised row must carry its action's transition (an issue NULL to
+        // 1, anything else one step up from a prior revision), and a legacy
+        // row none.
+        let connection = Connection::open(&db.path).expect("database should open");
+        for (action, prior, new, revised) in [
+            ("service_token.rotate", None, None, 1),
+            ("service_token.rotate", Some(2), Some(2), 1),
+            ("service_token.rotate", None, Some(1), 0),
+            ("service_token.rotate", None, Some(2), 1),
+            ("service_token.revoke", None, Some(3), 1),
+            ("service_token.issue", None, Some(2), 1),
+            ("service_token.issue", Some(1), Some(2), 1),
+        ] {
+            assert!(
+                connection
+                    .execute(
+                        "INSERT INTO service_token_change_evidence \
+                             (event_id, operation_id, actor_user_id, action, token_id, \
+                              committed_at, prior_version, new_version, revised) \
+                         VALUES (?1, ?2, 'fixture', ?3, ?4, \
+                                 '2026-10-01T00:00:09Z', ?5, ?6, ?7)",
+                        params![
+                            uuid::Uuid::new_v4().to_string(),
+                            uuid::Uuid::new_v4().to_string(),
+                            action,
+                            id,
+                            prior,
+                            new,
+                            revised
+                        ],
+                    )
+                    .is_err(),
+                "{action} {prior:?} {new:?} {revised}"
+            );
         }
     }
 

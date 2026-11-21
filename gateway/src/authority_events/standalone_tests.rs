@@ -715,15 +715,182 @@ async fn the_file_sink_holds_the_records_and_no_identifier() {
             .expect("delivery succeeds");
     }
     let written = std::fs::read_to_string(&events).expect("the event file reads");
-    let lines: Vec<DeliveryRecord> = written
+    let lines: Vec<serde_json::Value> = written
         .lines()
         .map(|line| serde_json::from_str(line).expect("every line is one record"))
         .collect();
     assert_eq!(lines.len(), 3);
-    assert_eq!(lines[2].schema_version, "authority_event_delivery.v1");
-    assert_eq!(lines[2].operation_id, revoke_id.to_string());
+    // The unkeyed issue and rotation keep the delivery record; the keyed
+    // principal revoke records its revisions (issue #425, plan P5), so the
+    // negotiated file holds it as an `authority_event.v1`.
+    assert_eq!(lines[0]["schema_version"], "authority_event_delivery.v1");
+    assert_eq!(lines[1]["schema_version"], "authority_event_delivery.v1");
+    assert_eq!(lines[2]["schema_version"], "authority_event.v1");
+    assert_eq!(lines[2]["operation_id"], revoke_id.to_string());
+    assert_eq!(lines[2]["revision"]["before"], "2");
+    assert_eq!(lines[2]["revision"]["after"], "3");
     for marker in [ACTOR_MARKER, ACTOR_ISSUER_MARKER, token_id.as_str()] {
         assert!(!written.contains(marker), "{marker} reached the file");
+    }
+}
+
+/// A keyed issue, rotation and revocation in the token database (issue #425,
+/// plan P5), committed by the real store under caller keys, reach a
+/// negotiated file sink as schema-valid `authority_event.v1` events carrying
+/// the token's revisions, and a crash after the sink accepted them and before
+/// the cursor advance redelivers them byte for byte. No token, actor, issuer,
+/// key digest or plaintext reaches the file.
+#[tokio::test]
+async fn a_keyed_token_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit() {
+    use crate::authority_events::caller_operation::{
+        test_caller_key, CallerOperation, CallerOperationBinding, CallerOutcome,
+    };
+
+    let scratch = Scratch::new("keyed-token");
+    let path = scratch.path("tokens.sqlite");
+    let tokens = SqliteTokenStore::open(&path).expect("the token store opens");
+    let owner = actor();
+    let bind = |seed: u8, action: &'static str, target: &str, request: &[u8]| {
+        CallerOperation::bind(
+            test_caller_key(seed),
+            &CallerOperationBinding {
+                action,
+                actor: &owner,
+                target,
+                precondition: "",
+                request,
+            },
+        )
+        .expect("the key binds")
+    };
+    let issue = bind(1, "service_token.issue", "", b"{\"scopes\":[\"reader\"]}");
+    let created = match tokens
+        .create_with_operation(
+            CreateTokenRequest {
+                scopes: vec!["admin:connections:read".to_owned()],
+                created_by: ACTOR_MARKER.to_owned(),
+                expires_at: None,
+            },
+            &owner,
+            Some(&issue),
+        )
+        .expect("the keyed issue commits")
+    {
+        CallerOutcome::Committed(created) => created,
+        CallerOutcome::Replayed(receipt) => panic!("a first attempt commits: {receipt:?}"),
+    };
+    let token_id = created.record.id.clone();
+    let rotation = bind(2, "service_token.rotate", &token_id, b"");
+    let rotated = match tokens
+        .rotate_with_operation(&token_id, &owner, Some(&rotation))
+        .expect("the keyed rotation commits")
+        .expect("the token exists")
+    {
+        CallerOutcome::Committed(rotated) => rotated,
+        CallerOutcome::Replayed(receipt) => panic!("a first attempt commits: {receipt:?}"),
+    };
+    let revoke_key = test_caller_key(3);
+    tokens
+        .revoke_with_operation(&token_id, &owner, Some(revoke_key))
+        .expect("the keyed revoke commits")
+        .expect("the token exists");
+    let material = generated_key_hex();
+    let events = scratch.path("authority-events.jsonl");
+    let sink = FileSink::new(
+        events.clone(),
+        crate::config::AuthorityEventFormat::QualifiedV1,
+    );
+
+    let crashing: Arc<dyn StandaloneEvidenceAuthority> = Arc::new(CrashingAdvance {
+        inner: tokens,
+        crash: AtomicBool::new(true),
+    });
+    let stop = CancellationToken::new();
+    let mut lane = lanes_for(&crashing, &material)
+        .await
+        .pop()
+        .expect("the token table has a lane");
+    match lane.step(&sink, 100, &stop).await {
+        Err(StepError::Cursor(_)) => {}
+        other => panic!("the advance must fail after the sink accepted: {other:?}"),
+    }
+    assert_eq!(
+        cursor(&path, StandaloneEvidenceSource::ServiceTokenChange),
+        0
+    );
+    // The process dies here.
+    drop(lane);
+    drop(crashing);
+
+    let restarted: Arc<dyn StandaloneEvidenceAuthority> =
+        Arc::new(SqliteTokenStore::open(&path).expect("the token store reopens"));
+    let mut lane = lanes_for(&restarted, &material)
+        .await
+        .pop()
+        .expect("the token table has a lane");
+    assert_eq!(
+        lane.deliver_until_caught_up(&sink, test_config(100), &stop)
+            .await
+            .expect("delivery succeeds"),
+        Some(3)
+    );
+    let written = std::fs::read_to_string(&events).expect("the event file reads");
+    let lines: Vec<&str> = written.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), 6);
+    assert_eq!(
+        &lines[..3],
+        &lines[3..],
+        "recovery redelivers byte-identical events"
+    );
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/schemas/authority_event.v1.schema.json"
+    ))
+    .expect("the v1 schema is JSON");
+    let validator = jsonschema::validator_for(&schema).expect("the v1 schema compiles");
+    let expected = [
+        (
+            "service_token.issue",
+            issue.id().to_string(),
+            serde_json::Value::Null,
+            json!("1"),
+        ),
+        (
+            "service_token.rotate",
+            rotation.id().to_string(),
+            json!("1"),
+            json!("2"),
+        ),
+        (
+            "service_token.revoke",
+            revoke_key.to_string(),
+            json!("2"),
+            json!("3"),
+        ),
+    ];
+    for (line, (operation, operation_id, before, after)) in lines.iter().zip(expected) {
+        let event: serde_json::Value = serde_json::from_str(line).expect("one event per line");
+        if let Err(error) = validator.validate(&event) {
+            panic!("the v1 schema must accept {event}: {error}");
+        }
+        assert_eq!(event["schema_version"], "authority_event.v1");
+        assert_eq!(event["operation"], operation);
+        assert_eq!(event["operation_id"], operation_id.as_str());
+        assert_eq!(event["resource"]["kind"], "service_token");
+        assert_eq!(event["revision"]["axis"], "token");
+        assert_eq!(event["revision"]["before"], before, "{operation}");
+        assert_eq!(event["revision"]["after"], after, "{operation}");
+        assert_eq!(event["revision"]["security"], serde_json::Value::Null);
+    }
+    for marker in [
+        ACTOR_MARKER,
+        ACTOR_ISSUER_MARKER,
+        token_id.as_str(),
+        created.plaintext_token.as_str(),
+        rotated.plaintext_token.as_str(),
+        issue.binding_digest(),
+        rotation.binding_digest(),
+    ] {
+        assert!(!written.contains(marker), "a raw value reached the file");
     }
 }
 

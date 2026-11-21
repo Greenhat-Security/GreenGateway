@@ -4719,8 +4719,8 @@ fn admin_route_patterns(routes: &AdminRoutes) -> std::collections::BTreeMap<Stri
 /// their handler, and every other pair -- including the unkeyed `DELETE` of
 /// a token and the unkeyed `POST` of a preparation, which before this change
 /// ignored the header -- is `400 idempotency_key_unsupported` from the
-/// router. A refused token issue creates no token. Reads ignore the header,
-/// and a mutation without one is untouched.
+/// router. A refused token revoke leaves the token live. Reads ignore the
+/// header, and a mutation without one is untouched.
 #[tokio::test]
 async fn an_idempotency_key_on_a_route_that_does_not_honour_it_is_refused_and_changes_nothing() {
     let token_db = TempDb::new("idempotency-key-guard");
@@ -4829,26 +4829,39 @@ async fn an_idempotency_key_on_a_route_that_does_not_honour_it_is_refused_and_ch
         "exactly KEYED_ROUTES reach their handlers with a key"
     );
 
-    // A refused token issue changed nothing; the same request without the
-    // key issues the token, and a read with a key is answered as a read.
+    // A refused token revoke changed nothing: the token stays live, a read
+    // with a key is answered as a read, and the same request without the key
+    // revokes it.
     let issue = || Some(json!({ "scopes": ["probe-reader"] }).to_string());
-    let refused = router
-        .clone()
-        .oneshot(request(Method::POST, TOKENS_ADMIN_ROUTE, true, issue()))
-        .await
-        .unwrap();
-    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
-    let listed = router
-        .clone()
-        .oneshot(request(Method::GET, TOKENS_ADMIN_ROUTE, true, None))
-        .await
-        .unwrap();
-    assert_eq!(listed.status(), StatusCode::OK);
-    assert_eq!(json_body(listed).await["tokens"], json!([]));
     let issued = router
         .clone()
         .oneshot(request(Method::POST, TOKENS_ADMIN_ROUTE, false, issue()))
         .await
         .unwrap();
     assert_eq!(issued.status(), StatusCode::CREATED);
+    let token_id = json_body(issued).await["token"]["id"]
+        .as_str()
+        .expect("the issued token has an ID")
+        .to_owned();
+    let token_path = format!("{TOKENS_ADMIN_ROUTE}/{token_id}");
+    let refused = router
+        .clone()
+        .oneshot(request(Method::DELETE, &token_path, true, None))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let read = router
+        .clone()
+        .oneshot(request(Method::GET, &token_path, true, None))
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+    assert_eq!(json_body(read).await.get("revoked_at"), None);
+    let revoked = router
+        .clone()
+        .oneshot(request(Method::DELETE, &token_path, false, None))
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK);
+    assert!(json_body(revoked).await["revoked_at"].is_string());
 }

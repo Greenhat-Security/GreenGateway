@@ -12,12 +12,14 @@ const TOKEN_MARKER: &str = "svc-standalone-token-marker";
 const CONNECTION_MARKER: &str = "c0ffee00-5b8a-4c39-9a51-2f6c1d0e4b77";
 const SECRET_MARKER: &str = "5ec7e700-0000-4000-8000-00000000beef";
 
-/// A well-formed row of `shape`, with the revisions its table records.
+/// A well-formed row of `shape`, with the revisions its table records. A
+/// token row is one this build writes: revised, an issue creating revision
+/// 1 and a rotation or revocation advancing it by one.
 fn evidence(shape: &StandaloneShape) -> StandaloneEvidence {
     let (resource_id, prior_version, new_version) = match shape.action {
-        "service_token.issue" | "service_token.rotate" | "service_token.revoke" => {
-            (Some(TOKEN_MARKER), None, None)
-        }
+        "service_token.issue" => (Some(TOKEN_MARKER), None, Some(1)),
+        "service_token.rotate" => (Some(TOKEN_MARKER), Some(1), Some(2)),
+        "service_token.revoke" => (Some(TOKEN_MARKER), Some(2), Some(3)),
         "connection.create" => (Some(CONNECTION_MARKER), None, Some(1)),
         "connection.replace" => (Some(CONNECTION_MARKER), Some(3), Some(4)),
         // A first binding on a Connection created without one.
@@ -45,6 +47,18 @@ fn evidence(shape: &StandaloneShape) -> StandaloneEvidence {
         prior_version,
         new_version,
         committed_at: "2026-11-05T12:34:56.123456789Z".to_owned(),
+        revised: true,
+    }
+}
+
+/// A token row of `shape` as a writer that recorded no revisions left it:
+/// written before the token table recorded them, or by an older build since.
+fn legacy_token_evidence(shape: &StandaloneShape) -> StandaloneEvidence {
+    StandaloneEvidence {
+        prior_version: None,
+        new_version: None,
+        revised: false,
+        ..evidence(shape)
     }
 }
 
@@ -169,16 +183,36 @@ fn revisions_follow_each_tables_transition() {
             after.map(str::to_owned),
         )
     };
-    // The token database keeps no token revision, so nothing is invented.
-    for action in [
-        "service_token.issue",
-        "service_token.rotate",
-        "service_token.revoke",
-    ] {
+    // A revised token row carries the token's own revision: an issue
+    // creates revision 1, a rotation or revocation advances it.
+    assert_eq!(
+        revision("service_token.issue"),
+        owned("service_token", "token", None, Some("1"))
+    );
+    assert_eq!(
+        revision("service_token.rotate"),
+        owned("service_token", "token", Some("1"), Some("2"))
+    );
+    assert_eq!(
+        revision("service_token.revoke"),
+        owned("service_token", "token", Some("2"), Some("3"))
+    );
+    // A legacy token row records none, so nothing is invented.
+    for shape in STANDALONE_SHAPES
+        .iter()
+        .filter(|shape| shape.source == StandaloneEvidenceSource::ServiceTokenChange)
+    {
+        let record = project_standalone(
+            &legacy_token_evidence(shape),
+            &keyring,
+            AuthorityEventFormat::DeliveryV1,
+        )
+        .expect("a legacy token row projects");
         assert_eq!(
-            revision(action),
-            owned("service_token", "token", None, None),
-            "{action}"
+            (record.revision.before, record.revision.after),
+            (None, None),
+            "{}",
+            shape.action
         );
     }
     assert_eq!(
@@ -323,7 +357,7 @@ fn the_same_row_projects_to_identical_bytes() {
 #[test]
 fn a_token_row_without_actor_metadata_guesses_none() {
     let keyring = generated_keyring(Uuid::new_v4());
-    let mut row = evidence(&STANDALONE_SHAPES[1]);
+    let mut row = legacy_token_evidence(&STANDALONE_SHAPES[1]);
     row.actor_issuer = None;
     row.actor_kind = None;
     row.actor_auth_mode = None;
@@ -377,6 +411,13 @@ fn rows_that_cannot_be_projected_faithfully_are_refused() {
     let mut revised_token = by_action("service_token.revoke");
     revised_token.new_version = Some(2);
     assert_eq!(refused(revised_token), ProjectionError::InvalidEvidence);
+    let mut unrevised_connection = by_action("connection.create");
+    unrevised_connection.revised = false;
+    assert_eq!(
+        refused(unrevised_connection),
+        ProjectionError::InvalidEvidence,
+        "only the token table has rows that are not revised"
+    );
     let mut named_batch = by_action("secret.reencrypt");
     named_batch.resource_id = Some(SECRET_MARKER.to_owned());
     assert_eq!(refused(named_batch), ProjectionError::InvalidEvidence);
@@ -402,13 +443,16 @@ fn rows_that_cannot_be_projected_faithfully_are_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// The qualification rule in standalone mode (issue #425). A token row records
-// no revision, so it stays a delivery record whatever its operation ID: the
-// keyed revocations SQLite has written since #765 carry a caller UUIDv7, an
+// The qualification rule in standalone mode (issue #425). A token row whose
+// writer recorded no revision (`revised = 0`) stays a delivery record
+// whatever its operation ID: the keyed revocations SQLite has written since
+// #765, before the token table recorded revisions, carry a caller UUIDv7, an
 // issuer-bound principal and no revisions, and must keep their delivered
-// bytes. The Connection, local-secret and catalog tables record revisions,
-// so a keyed principal row there is an `authority_event.v1` under the
-// negotiated format, and only there.
+// bytes, as must every row an older build still writes into an upgraded
+// file. Every other row records revisions -- a revised token row (plan P5)
+// and the Connection, local-secret and catalog tables' rows -- so a keyed
+// principal row there is an `authority_event.v1` under the negotiated
+// format, and only there.
 // ---------------------------------------------------------------------------
 
 fn v1_schema() -> jsonschema::Validator {
@@ -421,6 +465,36 @@ fn v1_schema() -> jsonschema::Validator {
 
 fn caller_key(seed: u8) -> String {
     crate::auth::tokens::test_revoke_operation_id(seed).to_string()
+}
+
+/// The evidence insert every build before plan P5 runs, column for column:
+/// it names no revision column, so in an upgraded file its rows take NULL
+/// revisions and `revised = 0`.
+const OLDER_BUILD_EVIDENCE_INSERT: &str = "INSERT INTO service_token_change_evidence (
+        event_id, operation_id, actor_user_id, actor_issuer, actor_kind,
+        actor_auth_mode, action, token_id, committed_at
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+
+/// A keyed principal revoke as #765 records it, written into an upgraded
+/// token file the way an older build writes it.
+fn insert_older_build_keyed_revoke(path: &std::path::Path, token_id: &str, key: Uuid) {
+    rusqlite::Connection::open(path)
+        .expect("the token file opens")
+        .execute(
+            OLDER_BUILD_EVIDENCE_INSERT,
+            rusqlite::params![
+                Uuid::new_v4().to_string(),
+                key.to_string(),
+                ACTOR_MARKER,
+                ACTOR_ISSUER_MARKER,
+                "principal",
+                "bearer_token",
+                "service_token.revoke",
+                token_id,
+                "2026-11-05T12:34:56.123456789Z",
+            ],
+        )
+        .expect("an older build's evidence row inserts");
 }
 
 #[test]
@@ -437,9 +511,12 @@ fn a_keyed_principal_revoke_with_null_revisions_stays_a_legacy_record_under_qual
     let directory =
         std::env::temp_dir().join(format!("greengateway-keyed-revoke-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&directory).expect("scratch directory");
-    let tokens = SqliteTokenStore::open(directory.join("tokens.sqlite")).expect("the store opens");
-    // What the keyed POST route records since #765: a provider-authenticated
-    // principal with a canonical issuer, and the caller's UUIDv7.
+    let path = directory.join("tokens.sqlite");
+    let tokens = SqliteTokenStore::open(&path).expect("the store opens");
+    // What the keyed POST route recorded since #765, before the token table
+    // recorded revisions: a provider-authenticated principal with a canonical
+    // issuer, the caller's UUIDv7 and no revision. The row is written by the
+    // insert that build ran, so it is the real shape, not a synthetic one.
     let actor = ChangeActor::for_test_with_issuer(ACTOR_MARKER, ACTOR_ISSUER_MARKER);
     let created = tokens
         .create(
@@ -452,21 +529,19 @@ fn a_keyed_principal_revoke_with_null_revisions_stays_a_legacy_record_under_qual
         )
         .expect("the token issues");
     let key = crate::auth::tokens::test_revoke_operation_id(11);
-    tokens
-        .revoke_with_operation(&created.record.id, &actor, Some(key))
-        .expect("the token revokes")
-        .expect("the token exists");
-    let rows = tokens
+    insert_older_build_keyed_revoke(&path, &created.record.id, key);
+    let rows: Vec<_> = tokens
         .read_after(StandaloneEvidenceSource::ServiceTokenChange, 0, 10)
-        .expect("the evidence reads");
-    let revoke = rows
-        .iter()
-        .find(|row| row.action == "service_token.revoke")
-        .expect("the revoke recorded its evidence");
+        .expect("the evidence reads")
+        .into_iter()
+        .filter(|row| row.action == "service_token.revoke")
+        .collect();
+    let revoke = rows.first().expect("the revoke recorded its evidence");
     assert_eq!(revoke.operation_id, key.to_string());
     assert_eq!(revoke.actor_kind.as_deref(), Some("principal"));
     assert_eq!(revoke.actor_issuer.as_deref(), Some(ACTOR_ISSUER_MARKER));
     assert_eq!((revoke.prior_version, revoke.new_version), (None, None));
+    assert!(!revoke.revised, "an older build's row is not revised");
 
     let keyring = generated_keyring(Uuid::new_v4());
     for row in &rows {
@@ -496,7 +571,7 @@ fn a_token_row_with_a_revision_it_should_not_have_stalls() {
         .filter(|shape| shape.source == StandaloneEvidenceSource::ServiceTokenChange)
     {
         for (prior, new) in [(None, Some(1)), (Some(1), Some(2)), (Some(1), None)] {
-            let mut row = evidence(shape);
+            let mut row = legacy_token_evidence(shape);
             row.operation_id = caller_key(12);
             row.prior_version = prior;
             row.new_version = new;
@@ -526,10 +601,10 @@ fn a_keyed_principal_row_of_a_revised_source_is_qualified_under_the_negotiated_f
         )
         .unwrap();
     let mut sources = Vec::new();
-    for shape in STANDALONE_SHAPES.iter().filter(|shape| {
-        shape.source != StandaloneEvidenceSource::ServiceTokenChange
-            && shape.action != "secret.reencrypt"
-    }) {
+    for shape in STANDALONE_SHAPES
+        .iter()
+        .filter(|shape| shape.action != "secret.reencrypt")
+    {
         let action = shape.action;
         let unkeyed = evidence(shape);
         let mut row = unkeyed.clone();
@@ -567,6 +642,7 @@ fn a_keyed_principal_row_of_a_revised_source_is_qualified_under_the_negotiated_f
         for marker in [
             ACTOR_MARKER,
             ACTOR_ISSUER_MARKER,
+            TOKEN_MARKER,
             CONNECTION_MARKER,
             SECRET_MARKER,
         ] {
@@ -622,6 +698,7 @@ fn a_keyed_principal_row_of_a_revised_source_is_qualified_under_the_negotiated_f
     assert_eq!(
         sources,
         [
+            StandaloneEvidenceSource::ServiceTokenChange,
             StandaloneEvidenceSource::ConnectionChange,
             StandaloneEvidenceSource::LocalSecretChange,
             StandaloneEvidenceSource::CatalogChange,
@@ -658,4 +735,138 @@ fn a_keyed_principal_row_of_a_revised_source_is_qualified_under_the_negotiated_f
             "{kind}"
         );
     }
+}
+
+/// A token row this build writes is revised and carries its transition
+/// (plan P5). One whose revision is missing or out of its transition is not
+/// a row this build writes, nor a legacy one: it stalls the batch under both
+/// formats rather than passing as a legacy record.
+#[test]
+fn a_revised_token_row_with_a_null_revision_stalls() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    for shape in STANDALONE_SHAPES
+        .iter()
+        .filter(|shape| shape.source == StandaloneEvidenceSource::ServiceTokenChange)
+    {
+        let mut missing_after = evidence(shape);
+        missing_after.operation_id = caller_key(15);
+        missing_after.new_version = None;
+        let mut nothing_recorded = missing_after.clone();
+        nothing_recorded.prior_version = None;
+        let mut out_of_transition = evidence(shape);
+        out_of_transition.operation_id = caller_key(15);
+        out_of_transition.prior_version = Some(4);
+        out_of_transition.new_version = Some(4);
+        for row in [missing_after, nothing_recorded, out_of_transition] {
+            for format in [
+                AuthorityEventFormat::DeliveryV1,
+                AuthorityEventFormat::QualifiedV1,
+            ] {
+                let stalled =
+                    project_standalone(&row, &keyring, format).expect_err("the row stalls");
+                assert!(
+                    matches!(
+                        stalled,
+                        ProjectionError::InvalidEvidence | ProjectionError::MissingEvidence
+                    ),
+                    "{} {:?} {:?} {format:?}: {stalled:?}",
+                    shape.action,
+                    row.prior_version,
+                    row.new_version
+                );
+            }
+        }
+    }
+}
+
+/// An older build can still serve an upgraded token file (the token database
+/// has no version fence) and keeps writing evidence by its own column list.
+/// Its rows take `revised = 0` and NULL revisions, project as the unrevised
+/// legacy records they are under either format, and never stall delivery,
+/// even beside rows this build revised before and after them.
+#[test]
+fn a_row_an_older_build_writes_after_the_upgrade_stays_a_legacy_record() {
+    use crate::{
+        auth::{
+            change_actor::ChangeActor,
+            tokens::{CreateTokenRequest, TokenStore},
+            SqliteTokenStore,
+        },
+        storage::standalone_authority_events::StandaloneEvidenceAuthority,
+    };
+
+    let directory =
+        std::env::temp_dir().join(format!("greengateway-older-writer-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).expect("scratch directory");
+    let path = directory.join("tokens.sqlite");
+    let tokens = SqliteTokenStore::open(&path).expect("the store opens");
+    let actor = ChangeActor::for_test_with_issuer(ACTOR_MARKER, ACTOR_ISSUER_MARKER);
+    let issue = || {
+        tokens
+            .create(
+                CreateTokenRequest {
+                    scopes: vec!["admin:tokens:read".to_owned()],
+                    created_by: ACTOR_MARKER.to_owned(),
+                    expires_at: None,
+                },
+                &actor,
+            )
+            .expect("the token issues")
+            .record
+            .id
+    };
+    let first = issue();
+    // The older build revokes the first token: its keyed revoke records no
+    // revision and does not advance the token's.
+    insert_older_build_keyed_revoke(
+        &path,
+        &first,
+        crate::auth::tokens::test_revoke_operation_id(16),
+    );
+    let second = issue();
+    tokens
+        .rotate(&second, &actor)
+        .expect("the rotation commits")
+        .expect("the token exists");
+
+    let rows = tokens
+        .read_after(StandaloneEvidenceSource::ServiceTokenChange, 0, 10)
+        .expect("the evidence reads");
+    let shape: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.action.as_str(),
+                row.revised,
+                row.prior_version,
+                row.new_version,
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            ("service_token.issue", true, None, Some(1)),
+            ("service_token.revoke", false, None, None),
+            ("service_token.issue", true, None, Some(1)),
+            ("service_token.rotate", true, Some(1), Some(2)),
+        ]
+    );
+    let keyring = generated_keyring(Uuid::new_v4());
+    let legacy = &rows[1];
+    for format in [
+        AuthorityEventFormat::DeliveryV1,
+        AuthorityEventFormat::QualifiedV1,
+    ] {
+        let record = project_standalone(legacy, &keyring, format)
+            .expect("an older build's row never stalls delivery");
+        assert!(record.qualified.is_none(), "{format:?}");
+        assert_eq!(
+            (record.revision.before, record.revision.after),
+            (None, None),
+            "{format:?}"
+        );
+    }
+    drop(tokens);
+    let _ = std::fs::remove_dir_all(directory);
 }

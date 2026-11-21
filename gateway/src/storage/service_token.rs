@@ -7,6 +7,9 @@ use crate::auth::{
         TokenRecord, TokenStore, TokenStoreError, TokenVerification,
     },
 };
+use crate::authority_events::caller_operation::{
+    CallerKeyState, CallerOperation, CallerOutcome, OperationReceipt,
+};
 use async_trait::async_trait;
 
 use super::{
@@ -36,13 +39,71 @@ use super::{
 /// changes. The evidence never holds the plaintext, the hash, the display
 /// prefix or the scopes. A token's `created_by` still names its creator; for
 /// a token issued before issue evidence existed it is the only record.
+///
+/// Issue and rotation also take an optional caller key bound to one request
+/// (issue #425, [`CallerOperation`]). Inside the change's own transaction the
+/// key is looked up first: an exact retry of a committed change is answered
+/// with its [`OperationReceipt`] (`CallerOutcome::Replayed`), read from the
+/// evidence row, and changes nothing -- never a second token, and never a
+/// plaintext; a key reserved for anything else is a `Conflict` labelled
+/// [`crate::auth::tokens::CALLER_OPERATION_BINDING`], and nothing changes.
+/// Otherwise the key is reserved with the change and its evidence row, whose
+/// `operation_id` it becomes, and the three commit together or not at all.
+/// Every committed issue, rotation and revocation records the token's
+/// revision before and after it.
 #[async_trait]
 pub trait ServiceTokenStore: Send + Sync {
+    // The admin handlers call the `_with_operation` forms; the unkeyed
+    // wrappers serve the tests and any caller that binds no key.
+    #[allow(dead_code)]
     async fn create(
         &self,
         request: CreateTokenRequest,
         actor: &ChangeActor,
-    ) -> Result<CreatedToken, RepositoryError>;
+    ) -> Result<CreatedToken, RepositoryError> {
+        match self.create_with_operation(request, actor, None).await? {
+            CallerOutcome::Committed(created) => Ok(created),
+            // Only a caller key is answered from a receipt.
+            CallerOutcome::Replayed(_) => Err(RepositoryError::new(
+                RepositoryErrorKind::Internal,
+                "service_token_create",
+            )),
+        }
+    }
+
+    /// [`Self::create`] under an optional caller key bound to the request.
+    async fn create_with_operation(
+        &self,
+        request: CreateTokenRequest,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<CreatedToken>, RepositoryError>;
+
+    /// What the store's reservation table says about `caller`'s key: the
+    /// read-only pre-check a keyed handler asks before it does any work.
+    /// Advisory: the change's own transaction decides again. A store that
+    /// binds no caller keys refuses, so no key is ever ignored.
+    async fn caller_operation_state(
+        &self,
+        _caller: &CallerOperation,
+    ) -> Result<CallerKeyState, RepositoryError> {
+        Err(RepositoryError::new(
+            RepositoryErrorKind::Unavailable,
+            "service_token_caller_operation",
+        ))
+    }
+
+    /// The receipt of the issue or rotation `caller`'s key committed, read
+    /// from its evidence row, or `None` when there is none.
+    async fn caller_operation_receipt(
+        &self,
+        _caller: &CallerOperation,
+    ) -> Result<Option<OperationReceipt>, RepositoryError> {
+        Err(RepositoryError::new(
+            RepositoryErrorKind::Unavailable,
+            "service_token_caller_operation",
+        ))
+    }
 
     async fn list(&self, filters: &TokenListFilters) -> Result<TokenPage, RepositoryError>;
 
@@ -65,11 +126,31 @@ pub trait ServiceTokenStore: Send + Sync {
         operation_id: Option<uuid::Uuid>,
     ) -> Result<Option<TokenRecord>, RepositoryError>;
 
+    #[allow(dead_code)]
     async fn rotate(
         &self,
         id: &str,
         actor: &ChangeActor,
-    ) -> Result<Option<CreatedToken>, RepositoryError>;
+    ) -> Result<Option<CreatedToken>, RepositoryError> {
+        match self.rotate_with_operation(id, actor, None).await? {
+            None => Ok(None),
+            Some(CallerOutcome::Committed(created)) => Ok(Some(created)),
+            Some(CallerOutcome::Replayed(_)) => Err(RepositoryError::new(
+                RepositoryErrorKind::Internal,
+                "service_token_rotate",
+            )),
+        }
+    }
+
+    /// [`Self::rotate`] under an optional caller key bound to the request.
+    /// An exact retry is answered from its receipt whatever happened to the
+    /// token since.
+    async fn rotate_with_operation(
+        &self,
+        id: &str,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<Option<CallerOutcome<CreatedToken>>, RepositoryError>;
 
     async fn verify(&self, plaintext_token: &str) -> Result<TokenVerification, RepositoryError>;
 
@@ -87,16 +168,46 @@ pub trait ServiceTokenStore: Send + Sync {
 /// trait shares its method names with this contract.
 #[async_trait]
 impl ServiceTokenStore for SqliteTokenStore {
-    async fn create(
+    async fn create_with_operation(
         &self,
         request: CreateTokenRequest,
         actor: &ChangeActor,
-    ) -> Result<CreatedToken, RepositoryError> {
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<CreatedToken>, RepositoryError> {
         let store = self.clone();
         let actor = actor.clone();
+        let caller = caller.cloned();
         run_blocking(move || {
-            TokenStore::create(&store, request, &actor)
+            TokenStore::create_with_operation(&store, request, &actor, caller.as_ref())
                 .map_err(|error| map_token_store_error("service_token_create", error))
+        })
+        .await
+    }
+
+    async fn caller_operation_state(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<CallerKeyState, RepositoryError> {
+        let store = self.clone();
+        let caller = caller.clone();
+        run_blocking(move || {
+            store
+                .caller_operation_state(&caller)
+                .map_err(|error| map_token_store_error("service_token_caller_operation", error))
+        })
+        .await
+    }
+
+    async fn caller_operation_receipt(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<Option<OperationReceipt>, RepositoryError> {
+        let store = self.clone();
+        let caller = caller.clone();
+        run_blocking(move || {
+            store
+                .caller_operation_receipt(&caller)
+                .map_err(|error| map_token_store_error("service_token_caller_operation", error))
         })
         .await
     }
@@ -137,16 +248,18 @@ impl ServiceTokenStore for SqliteTokenStore {
         .await
     }
 
-    async fn rotate(
+    async fn rotate_with_operation(
         &self,
         id: &str,
         actor: &ChangeActor,
-    ) -> Result<Option<CreatedToken>, RepositoryError> {
+        caller: Option<&CallerOperation>,
+    ) -> Result<Option<CallerOutcome<CreatedToken>>, RepositoryError> {
         let store = self.clone();
         let id = id.to_owned();
         let actor = actor.clone();
+        let caller = caller.cloned();
         run_blocking(move || {
-            TokenStore::rotate(&store, &id, &actor)
+            TokenStore::rotate_with_operation(&store, &id, &actor, caller.as_ref())
                 .map_err(|error| map_token_store_error("service_token_rotate", error))
         })
         .await
@@ -219,6 +332,24 @@ pub(super) fn map_token_store_error(
         }
         TokenStoreError::InvalidRevokeOperationId => {
             RepositoryError::invalid_parameter(operation, "operation_id")
+        }
+        // A keyed issue or rotation whose key is bound to another request:
+        // the one conflict the admin API answers `409 caller_operation_conflict`.
+        TokenStoreError::CallerOperationConflict => RepositoryError::new(
+            RepositoryErrorKind::Conflict,
+            crate::auth::tokens::CALLER_OPERATION_BINDING,
+        ),
+        TokenStoreError::CallerOperationAction => {
+            RepositoryError::new(RepositoryErrorKind::Internal, operation)
+        }
+        // Already classified by the reservation table. Never a conflict here:
+        // on rotate that kind means exactly "the token is revoked".
+        TokenStoreError::CallerOperation(error) => {
+            if error.kind() == RepositoryErrorKind::Conflict {
+                RepositoryError::new(RepositoryErrorKind::Internal, operation)
+            } else {
+                RepositoryError::new(error.kind(), operation)
+            }
         }
         // Only an authenticated principal reaches a store, so an actor
         // evidence cannot record is the gateway's defect, not the caller's

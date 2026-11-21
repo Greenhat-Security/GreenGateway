@@ -318,33 +318,36 @@ impl StandaloneEvidenceSource {
     }
 
     /// One bounded batch after `$1`, oldest first, in the one column order
-    /// every source shares. A table without revision columns reads none.
+    /// every source shares. Only the token table has rows whose writer
+    /// recorded no revisions (`revised = 0`); every other table's rows are
+    /// revised.
     const fn read_after_sql(self) -> &'static str {
         match self {
             Self::ServiceTokenChange => {
                 "SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer, \
-                 actor_kind, actor_auth_mode, action, token_id, NULL, NULL, committed_at \
+                 actor_kind, actor_auth_mode, action, token_id, prior_version, new_version, \
+                 committed_at, revised \
                  FROM service_token_change_evidence \
                  WHERE sequence > ?1 ORDER BY sequence LIMIT ?2"
             }
             Self::ConnectionChange => {
                 "SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer, \
                  actor_kind, actor_auth_mode, action, connection_id, prior_version, \
-                 new_version, committed_at \
+                 new_version, committed_at, 1 \
                  FROM connection_change_evidence \
                  WHERE sequence > ?1 ORDER BY sequence LIMIT ?2"
             }
             Self::LocalSecretChange => {
                 "SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer, \
                  actor_kind, actor_auth_mode, action, secret_id, prior_version, \
-                 new_version, committed_at \
+                 new_version, committed_at, 1 \
                  FROM connection_local_secret_change_evidence \
                  WHERE sequence > ?1 ORDER BY sequence LIMIT ?2"
             }
             Self::CatalogChange => {
                 "SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer, \
                  actor_kind, actor_auth_mode, action, connection_id, prior_version, \
-                 new_version, committed_at \
+                 new_version, committed_at, 1 \
                  FROM catalog_change_evidence \
                  WHERE sequence > ?1 ORDER BY sequence LIMIT ?2"
             }
@@ -411,11 +414,17 @@ pub(crate) struct StandaloneEvidence {
     /// The token ID, the Connection ID or the local secret's ID; `None` for
     /// a re-encryption batch, which names no secret.
     pub(crate) resource_id: Option<String>,
-    /// The revisions on the action's axis. The token table records none.
+    /// The revisions on the action's axis. A token row written before the
+    /// token table recorded revisions, or by an older build since, has none.
     pub(crate) prior_version: Option<i64>,
     pub(crate) new_version: Option<i64>,
     /// The change's own process-clock RFC 3339 timestamp.
     pub(crate) committed_at: String,
+    /// Whether the row's writer records revisions (issue #425, plan P5): the
+    /// token table's per-row `revised` marker, and always true for the
+    /// Connections database's tables. A token row that is not revised is a
+    /// legacy row, whose revisions must be NULL.
+    pub(crate) revised: bool,
 }
 
 /// How far one source's delivery is behind its table.
@@ -569,6 +578,7 @@ pub(crate) fn read_after(
                 prior_version: row.get(9)?,
                 new_version: row.get(10)?,
                 committed_at: row.get(11)?,
+                revised: row.get::<_, i64>(12)? != 0,
             })
         })?;
         rows.collect()

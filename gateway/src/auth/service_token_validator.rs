@@ -736,11 +736,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ServiceTokenStore for SpyStore {
-        async fn create(
+        async fn create_with_operation(
             &self,
             _request: CreateTokenRequest,
             _actor: &ChangeActor,
-        ) -> Result<CreatedToken, RepositoryError> {
+            _caller: Option<&crate::authority_events::caller_operation::CallerOperation>,
+        ) -> Result<
+            crate::authority_events::caller_operation::CallerOutcome<CreatedToken>,
+            RepositoryError,
+        > {
             unimplemented!("not needed by this validator test")
         }
 
@@ -761,11 +765,15 @@ mod tests {
             unimplemented!("not needed by this validator test")
         }
 
-        async fn rotate(
+        async fn rotate_with_operation(
             &self,
             _id: &str,
             _actor: &crate::auth::change_actor::ChangeActor,
-        ) -> Result<Option<CreatedToken>, RepositoryError> {
+            _caller: Option<&crate::authority_events::caller_operation::CallerOperation>,
+        ) -> Result<
+            Option<crate::authority_events::caller_operation::CallerOutcome<CreatedToken>>,
+            RepositoryError,
+        > {
             unimplemented!("not needed by this validator test")
         }
 
@@ -791,11 +799,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ServiceTokenStore for RevocableStore {
-        async fn create(
+        async fn create_with_operation(
             &self,
             _request: CreateTokenRequest,
             _actor: &ChangeActor,
-        ) -> Result<CreatedToken, RepositoryError> {
+            _caller: Option<&crate::authority_events::caller_operation::CallerOperation>,
+        ) -> Result<
+            crate::authority_events::caller_operation::CallerOutcome<CreatedToken>,
+            RepositoryError,
+        > {
             unimplemented!("not needed by this validator test")
         }
 
@@ -816,11 +828,15 @@ mod tests {
             unimplemented!("not needed by this validator test")
         }
 
-        async fn rotate(
+        async fn rotate_with_operation(
             &self,
             _id: &str,
             _actor: &crate::auth::change_actor::ChangeActor,
-        ) -> Result<Option<CreatedToken>, RepositoryError> {
+            _caller: Option<&crate::authority_events::caller_operation::CallerOperation>,
+        ) -> Result<
+            Option<crate::authority_events::caller_operation::CallerOutcome<CreatedToken>>,
+            RepositoryError,
+        > {
             unimplemented!("not needed by this validator test")
         }
 
@@ -866,11 +882,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ServiceTokenStore for ExpiringStore {
-        async fn create(
+        async fn create_with_operation(
             &self,
             _request: CreateTokenRequest,
             _actor: &ChangeActor,
-        ) -> Result<CreatedToken, RepositoryError> {
+            _caller: Option<&crate::authority_events::caller_operation::CallerOperation>,
+        ) -> Result<
+            crate::authority_events::caller_operation::CallerOutcome<CreatedToken>,
+            RepositoryError,
+        > {
             unimplemented!("not needed by this validator test")
         }
 
@@ -891,11 +911,15 @@ mod tests {
             unimplemented!("not needed by this validator test")
         }
 
-        async fn rotate(
+        async fn rotate_with_operation(
             &self,
             _id: &str,
             _actor: &crate::auth::change_actor::ChangeActor,
-        ) -> Result<Option<CreatedToken>, RepositoryError> {
+            _caller: Option<&crate::authority_events::caller_operation::CallerOperation>,
+        ) -> Result<
+            Option<crate::authority_events::caller_operation::CallerOutcome<CreatedToken>>,
+            RepositoryError,
+        > {
             unimplemented!("not needed by this validator test")
         }
 
@@ -928,11 +952,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ServiceTokenStore for SlowExpiringStore {
-        async fn create(
+        async fn create_with_operation(
             &self,
             _request: CreateTokenRequest,
             _actor: &ChangeActor,
-        ) -> Result<CreatedToken, RepositoryError> {
+            _caller: Option<&crate::authority_events::caller_operation::CallerOperation>,
+        ) -> Result<
+            crate::authority_events::caller_operation::CallerOutcome<CreatedToken>,
+            RepositoryError,
+        > {
             unimplemented!("not needed by this validator test")
         }
 
@@ -953,11 +981,15 @@ mod tests {
             unimplemented!("not needed by this validator test")
         }
 
-        async fn rotate(
+        async fn rotate_with_operation(
             &self,
             _id: &str,
             _actor: &crate::auth::change_actor::ChangeActor,
-        ) -> Result<Option<CreatedToken>, RepositoryError> {
+            _caller: Option<&crate::authority_events::caller_operation::CallerOperation>,
+        ) -> Result<
+            Option<crate::authority_events::caller_operation::CallerOutcome<CreatedToken>>,
+            RepositoryError,
+        > {
             unimplemented!("not needed by this validator test")
         }
 
@@ -993,11 +1025,15 @@ mod tests {
 
         #[async_trait::async_trait]
         impl ServiceTokenStore for PastByLocalClockStore {
-            async fn create(
+            async fn create_with_operation(
                 &self,
                 _request: CreateTokenRequest,
                 _actor: &ChangeActor,
-            ) -> Result<CreatedToken, RepositoryError> {
+                _caller: Option<&crate::authority_events::caller_operation::CallerOperation>,
+            ) -> Result<
+                crate::authority_events::caller_operation::CallerOutcome<CreatedToken>,
+                RepositoryError,
+            > {
                 unimplemented!("not needed by this validator test")
             }
 
@@ -1021,11 +1057,15 @@ mod tests {
                 unimplemented!("not needed by this validator test")
             }
 
-            async fn rotate(
+            async fn rotate_with_operation(
                 &self,
                 _id: &str,
                 _actor: &crate::auth::change_actor::ChangeActor,
-            ) -> Result<Option<CreatedToken>, RepositoryError> {
+                _caller: Option<&crate::authority_events::caller_operation::CallerOperation>,
+            ) -> Result<
+                Option<crate::authority_events::caller_operation::CallerOutcome<CreatedToken>>,
+                RepositoryError,
+            > {
                 unimplemented!("not needed by this validator test")
             }
 

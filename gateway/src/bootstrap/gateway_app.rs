@@ -1240,6 +1240,9 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
         store: service_token_store,
         validator: service_token_validator,
         rbac_state: rbac_state.clone(),
+        authority_evidence,
+        #[cfg(feature = "postgres")]
+        membership: build_overrides.pg_membership.clone(),
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,

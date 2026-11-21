@@ -606,6 +606,14 @@ pub(super) struct TokenAdminState {
     pub(super) store: Option<Arc<dyn storage::ServiceTokenStore>>,
     pub(super) validator: Option<Arc<auth::ServiceTokenValidator>>,
     pub(super) rbac_state: Option<middleware::rbac::RbacState>,
+    /// Asked before a token issue or rotation (issue #425): required mode
+    /// admits only their keyed form.
+    pub(super) authority_evidence: authority_events::required::AuthorityEvidenceGate,
+    /// Cluster mode's roster, whose operation gate admits
+    /// `caller_operation_keys` before a keyed issue or rotation (issue #425).
+    /// In cluster mode a keyed request with no membership is refused.
+    #[cfg(feature = "postgres")]
+    pub(super) membership: Option<Arc<cluster_membership::ClusterMembership>>,
     pub(super) audit: audit::AuditLog,
     pub(super) client_ip_policy: client_ip::ClientIpPolicy,
     pub(super) max_body_size: usize,
