@@ -1311,7 +1311,9 @@ impl std::fmt::Display for ClusterToolsStartupError {
             ),
             Self::SeedRefused(refusal) => write!(
                 formatter,
-                "the cluster-mode tools control plane has no document and will not seed one:                  {refusal}. Provision it first: start once with                  AUTHORITY_EVIDENCE_DURABILITY=best_effort, or import it with import-standalone"
+                "the cluster-mode tools control plane has no document and will not seed one: \
+                 {refusal}. Provision it first: start once with \
+                 AUTHORITY_EVIDENCE_DURABILITY=best_effort, or import it with import-standalone"
             ),
             Self::NotSeeded => write!(
                 formatter,

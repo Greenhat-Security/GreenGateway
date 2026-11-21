@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import test from "node:test";
-import { NOT_AUTHORITY_CHANGES, OPERATIONS, QUALIFIED_PATHS, ROOT, readJson, schema, summary, validateEvent, validateInventory, validateSchema } from "./check-authority-evidence.mjs";
+import { NOT_AUTHORITY_CHANGES, OPERATIONS, QUALIFIED_PATHS, ROOT, SHARED_KEYED_ROUTES, readJson, schema, summary, validateEvent, validateInventory, validateSchema } from "./check-authority-evidence.mjs";
 
 const inventory = () => readJson("docs/authority-evidence-inventory.json");
 const source = (path) => readFileSync(resolve(ROOT, path), "utf8");
@@ -50,14 +50,18 @@ function honouringAll(entries) {
 test("a row is supported only when every pair has its reviewed path", () => {
   // Today these rows qualify: PostgreSQL keyed preparation, and in both
   // modes keyed Connection create and replace, keyed catalog publication
-  // and overlay changes, and keyed token issue and rotation.
+  // and overlay changes, and keyed token issue and rotation; in PostgreSQL
+  // keyed policy, tools and policy test changes.
   const current = validateInventory(inventory());
   assert.deepEqual(current.qualifiedPairs, [
     "catalog.mcp.publish/postgres", "catalog.mcp.publish/standalone", "catalog.openapi.publish/postgres", "catalog.openapi.publish/standalone",
     "catalog.overlay.delete/postgres", "catalog.overlay.delete/standalone", "catalog.overlay.replace/postgres", "catalog.overlay.replace/standalone",
     "connection.create/postgres", "connection.create/standalone", "connection.replace/postgres", "connection.replace/standalone", "credential.binding_change/postgres", "credential.binding_change/standalone",
     "mutation_approval.prepare/postgres",
+    "policy.publish/postgres", "policy.rollback/postgres", "policy.rule.create/postgres", "policy.rule.delete/postgres", "policy.rule.reorder/postgres", "policy.rule.update/postgres", "policy.suggestion.accept/postgres",
+    "policy_tests.publish/postgres",
     "service_token.issue/postgres", "service_token.issue/standalone", "service_token.rotate/postgres", "service_token.rotate/standalone",
+    "tools.publish/postgres",
   ]);
   assert.deepEqual(current.keyedWithdrawalPairs, [
     "connection.delete/postgres", "connection.delete/standalone", "service_token.revoke/postgres", "service_token.revoke/standalone",
@@ -104,11 +108,19 @@ test("a row is supported only when every pair has its reviewed path", () => {
       .filter((path) => path.criteria.operation !== "catalog.overlay.delete");
     assert.throws(() => validateInventory(partial), new RegExp(`${id}: unproven durability claim`), id);
   }
+  // So does the qualified policy row, with any one of its seven paths: a
+  // suggestion acceptance is its own pair, whichever route commits it.
+  for (const operation of groupOf(inventory(), "policy_postgres").operations) {
+    const partial = inventory();
+    groupOf(partial, "policy_postgres").qualified_delivery_paths = groupOf(partial, "policy_postgres").qualified_delivery_paths
+      .filter((path) => path.criteria.operation !== operation);
+    assert.throws(() => validateInventory(partial), /policy_postgres: unproven durability claim/, operation);
+  }
   const keyedOnly = inventory();
   groupOf(keyedOnly, "mutation_approval_prepare_standalone").required_mode = "caller_key_required";
   assert.throws(() => validateInventory(keyedOnly), /unreviewed caller-key admission/);
   const sufficient = inventory();
-  groupOf(sufficient, "tools_postgres").disposition = ["already_sufficient"];
+  groupOf(sufficient, "policy_tests_standalone").disposition = ["already_sufficient"];
   assert.throws(() => validateInventory(sufficient), /unreviewed sufficient disposition/);
   // A qualified token row loses its claim with its path, or with its mode's
   // dispatcher, in either mode.
@@ -180,8 +192,8 @@ test("a path outside the reviewed table is refused", () => {
     : source(path);
   assert.notEqual(unrouted(routing), source(routing), "the test removes the preparation route");
   assert.throws(() => validateInventory(inventory(), unrouted), /qualified path mutation_approval\.prepare\/postgres \(PUT \/v1\{ADMIN_PREFIX\}\/tools\/\{id\}\/mutation-approvals\) is not honoured by KEYED_ROUTES/);
-  assert.throws(() => validateInventory(inventory(), honouring("POST", "/v1{ADMIN_PREFIX}/policy/rules")),
-    /KEYED_ROUTES in gateway\/src\/routing\.rs honours POST \/v1\{ADMIN_PREFIX\}\/policy\/rules, which no reviewed qualified path names/);
+  assert.throws(() => validateInventory(inventory(), honouring("POST", "/v1{ADMIN_PREFIX}/policy/drafts")),
+    /KEYED_ROUTES in gateway\/src\/routing\.rs honours POST \/v1\{ADMIN_PREFIX\}\/policy\/drafts, which no reviewed qualified path names/);
   assert.throws(() => validateInventory(inventory(), (path) => path === routing ? source(path).replace(KEYED_ROUTES_OPEN, "const ROUTES: &[KeyedRoute] = &[") : source(path)),
     /declares no KEYED_ROUTES/);
   // Every entry the router could honour is read: the fields in either
@@ -191,9 +203,9 @@ test("a path outside the reviewed table is refused", () => {
   const withEntry = (entry) => (path) => path === routing
     ? source(path).replace(KEYED_ROUTES_OPEN, `${KEYED_ROUTES_OPEN}\n    ${entry}`)
     : source(path);
-  assert.throws(() => validateInventory(inventory(), withEntry('KeyedRoute { route: "/v1{ADMIN_PREFIX}/policy/rules", method: "POST" },')),
-    /KEYED_ROUTES in gateway\/src\/routing\.rs honours POST \/v1\{ADMIN_PREFIX\}\/policy\/rules, which no reviewed qualified path names/);
-  validateInventory(inventory(), withEntry('/* KeyedRoute { method: "POST", route: "/v1{ADMIN_PREFIX}/policy/rules" }, */'));
+  assert.throws(() => validateInventory(inventory(), withEntry('KeyedRoute { route: "/v1{ADMIN_PREFIX}/policy/drafts", method: "POST" },')),
+    /KEYED_ROUTES in gateway\/src\/routing\.rs honours POST \/v1\{ADMIN_PREFIX\}\/policy\/drafts, which no reviewed qualified path names/);
+  validateInventory(inventory(), withEntry('/* KeyedRoute { method: "POST", route: "/v1{ADMIN_PREFIX}/policy/drafts" }, */'));
   assert.throws(() => validateInventory(inventory(), withEntry('KeyedRoute { method: "POST", route: TOKENS_ROUTE },')),
     /must name method and route once each as string literals/);
   assert.throws(() => validateInventory(inventory(), withEntry('KeyedRoute { method: "POST", route: "/v1{ADMIN_PREFIX}/tokens", method: "PUT" },')),
@@ -209,6 +221,9 @@ test("a path outside the reviewed table is refused", () => {
 test("evidence anchors only in the gateway or the compiler it links", () => {
   const anchored = (path) => {
     const value = inventory();
+    // A row with no qualified path, first, so its source is the first
+    // reference read.
+    value.groups.unshift(...value.groups.splice(value.groups.indexOf(groupOf(value, "policy_standalone")), 1));
     value.groups[0].sources[0] = { path, anchor: "fn reject_local_authority_in_postgres_mode(" };
     return value;
   };
@@ -220,7 +235,7 @@ test("evidence anchors only in the gateway or the compiler it links", () => {
 
 test("deleting a mode or duplicating its coverage cannot silently pass", () => {
   const missing = inventory();
-  missing.groups[0].modes = ["standalone"];
+  groupOf(missing, "policy_reload_postgres").modes = ["standalone"];
   assert.throws(() => validateInventory(missing), /duplicate coverage/);
   const missingGroup = inventory();
   missingGroup.groups.shift();
@@ -279,10 +294,32 @@ test("a mutation endpoint in the policy draft, policy test and observability han
   assert.throws(() => validateInventory(both), /gateway\/src\/admin_policy_drafts\.rs::policy_draft_create_endpoint is both excluded and an inventory entry point/);
 });
 
+// A route the router honours that is not a reviewed path's own route commits
+// only pairs that have one, under the same action, gate and key binding
+// (issue #425): draft publication commits policy.publish, or
+// policy.suggestion.accept when the draft names a suggestion.
+test("a keyed route shared by reviewed paths names only pairs that have one", () => {
+  const DRAFT_PUBLISH = "POST /v1{ADMIN_PREFIX}/policy/drafts/{id}/publish";
+  assert.deepEqual(SHARED_KEYED_ROUTES, { [DRAFT_PUBLISH]: ["policy.publish/postgres", "policy.suggestion.accept/postgres"] });
+  const sharing = (routes) => () => validateInventory(inventory(), undefined, QUALIFIED_PATHS, routes);
+  // Without its entry the honoured draft route has no reviewed path.
+  assert.throws(sharing({}), /honours POST \/v1\{ADMIN_PREFIX\}\/policy\/drafts\/\{id\}\/publish, which no reviewed qualified path names/);
+  // An entry the router does not honour is stale.
+  assert.throws(sharing({ ...SHARED_KEYED_ROUTES, "POST /v1{ADMIN_PREFIX}/policy/drafts": ["policy.publish/postgres"] }),
+    /shared keyed route POST \/v1\{ADMIN_PREFIX\}\/policy\/drafts is not honoured by KEYED_ROUTES/);
+  // It names at least one pair, and only pairs with a reviewed path.
+  assert.throws(sharing({ [DRAFT_PUBLISH]: [] }), /shared keyed route POST \/v1\{ADMIN_PREFIX\}\/policy\/drafts\/\{id\}\/publish names no pair/);
+  assert.throws(sharing({ [DRAFT_PUBLISH]: ["policy.publish/standalone"] }),
+    /shared keyed route POST \/v1\{ADMIN_PREFIX\}\/policy\/drafts\/\{id\}\/publish names policy\.publish\/standalone, which has no reviewed qualified path/);
+  // A reviewed path's own route is not shared.
+  assert.throws(sharing({ ...SHARED_KEYED_ROUTES, "PUT /v1{ADMIN_PREFIX}/policy": ["policy.publish/postgres"] }),
+    /shared keyed route PUT \/v1\{ADMIN_PREFIX\}\/policy is a reviewed path's own route/);
+});
+
 test("the summary line is computed from the inventory", () => {
   const line = summary(validateInventory(inventory()));
   assert.match(line, new RegExp(`^Authority evidence inventory valid: ${inventory().groups.length} groups, ${OPERATIONS.length * 2} operation/mode pairs, \\d+ source references\\.`));
-  assert.match(line, / Qualified in required mode: catalog\.mcp\.publish\/postgres, .*, connection\.create\/postgres, .*, mutation_approval\.prepare\/postgres, service_token\.issue\/postgres, .*, service_token\.rotate\/standalone\./);
+  assert.match(line, / Qualified in required mode: catalog\.mcp\.publish\/postgres, .*, connection\.create\/postgres, .*, mutation_approval\.prepare\/postgres, policy\.publish\/postgres, .*, policy_tests\.publish\/postgres, service_token\.issue\/postgres, .*, service_token\.rotate\/standalone, tools\.publish\/postgres\./);
   assert.match(line, / Admitted withdrawals with a reviewed keyed path: connection\.delete\/postgres, connection\.delete\/standalone, service_token\.revoke\/postgres, service_token\.revoke\/standalone\./);
   assert.equal(summary({ groups: 1, operationModePairs: 2, sourceReferences: 3, qualifiedPairs: [], keyedWithdrawalPairs: [] }),
     "Authority evidence inventory valid: 1 groups, 2 operation/mode pairs, 3 source references. Qualified in required mode: none. Admitted withdrawals with a reviewed keyed path: none.");
@@ -338,13 +375,13 @@ test("stale code and regression anchors fail with an actionable location", () =>
 
 test("a document cannot enable required durability or relabel a gap sufficient", () => {
   const qualified = inventory();
-  qualified.groups[0].required_durability_supported = true;
+  groupOf(qualified, "policy_standalone").required_durability_supported = true;
   assert.throws(() => validateInventory(qualified), /unproven durability claim/);
   const enabled = inventory();
   enabled.required_durability_mode = "implemented";
   assert.throws(() => validateInventory(enabled), /cannot enable runtime durability/);
   const contradictory = inventory();
-  contradictory.groups[0].disposition.push("already_sufficient");
+  groupOf(contradictory, "policy_standalone").disposition.push("already_sufficient");
   assert.throws(() => validateInventory(contradictory), /sufficient contradicts/);
 });
 
@@ -437,7 +474,7 @@ test("no_caller_key is limited to its reviewed pairs", () => {
     assert.equal(group.qualified_delivery_paths, undefined, group.id);
   }
   // A caller-started change that is not a withdrawal cannot be relabelled.
-  for (const id of ["mutation_approvals", "tools_postgres", "local_secrets", "policy_postgres", "local_secret_delete"]) {
+  for (const id of ["mutation_approvals", "tools_standalone", "local_secrets", "policy_standalone", "local_secret_delete"]) {
     const relabelled = inventory();
     row(relabelled, id).disposition = ["no_caller_key"];
     assert.throws(() => validateInventory(relabelled), new RegExp(`${id}: no_caller_key is limited to its reviewed pairs`), id);
@@ -472,7 +509,7 @@ test("withdrawal_admitted is limited to its reviewed pairs and needs a reviewed 
   assert.equal(revoke(current).qualified_delivery_paths.length, 1);
   for (const pair of rowsWith(current, "withdrawal_admitted").flatMap(pairsOf)) assert.ok(WITHDRAWALS.includes(pair), pair);
   // A change that grants or replaces authority is never a withdrawal.
-  for (const id of ["tools_postgres", "policy_postgres", "local_secrets", "mutation_approvals", "jwt_postgres"]) {
+  for (const id of ["tools_standalone", "policy_standalone", "local_secrets", "mutation_approvals", "jwt_postgres"]) {
     const relabelled = inventory();
     row(relabelled, id).disposition = ["withdrawal_admitted"];
     assert.throws(() => validateInventory(relabelled), new RegExp(`${id}: withdrawal_admitted is limited to its reviewed pairs`), id);
@@ -574,7 +611,7 @@ test("required mode never admits an unsupported row or waves through a reachable
   assert.equal(byId.configuration_activation, "refused_at_startup");
 
   const unknown = inventory();
-  unknown.groups[0].required_mode = "ignored";
+  groupOf(unknown, "policy_standalone").required_mode = "ignored";
   assert.throws(() => validateInventory(unknown), /unknown required mode/);
   const admitted = inventory();
   admitted.groups.find((group) => group.id === "policy_standalone").required_mode = "admitted";

@@ -7093,6 +7093,26 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/admin_policy.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::admin_policy::PolicyMutationFailure#1",
+      "sha256": "478acbd74b0206b35d93293f72195446380558f9322c2e50b4440b93cc2139d7",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/admin_policy.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy::document_change_to_completion#1",
+      "sha256": "14f5426a5ea590467dbc41345214c7d4250f23a62332ed52e870af2417bf8075",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Runs an admitted policy, tools or policy test change on its own Tokio task so a client disconnect cannot separate the store commit from its policy install, tools reconcile and audit event (issue #425); re-enters the request pins and span. No outbound transport authority."
+    },
+    {
       "file": "gateway/src/main.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -7171,6 +7191,16 @@
       "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/admin_tools.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_tools::reconcile_committed_tools#1",
+      "sha256": "3c9d1d6f6b2681c656b10e516776c2481cdca35cc420f59d3c34360ccb627c06",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Brings this replica's tools lane up to the authority's activation when an exact keyed retry of a committed tools registration is answered from its receipt (issue #425), through the existing cluster tools resource. No outbound transport authority and no specification fetch."
     },
     {
       "file": "gateway/src/main.rs",
@@ -10875,7 +10905,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::import::sections::impl  PolicySection::apply_in#1",
-      "sha256": "0ded964e3ada434647868959154be4d72f6ab18e0c093aa85911836e7659f3fa",
+      "sha256": "4d30ee0b4ddebd7b2f9a00394a47e0942909e5f5e98caedcc09f8a2588709ab9",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -12798,6 +12828,16 @@
       "purpose": "Lock-poison recovery counter for the standalone stored policy test suite SQLite connection; metrics instrumentation only, no network, process or HTTP authority."
     },
     {
+      "file": "gateway/src/storage/policy_tests.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::storage::policy_tests::PolicyTestSuiteCommitError#1",
+      "sha256": "16316c907341e41531efa724b3484e2ee5730d75eb6a44f5ef8a5b5ffd7d5b2c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
       "file": "gateway/src/storage/postgres.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -13693,10 +13733,10 @@
     {
       "file": "gateway/src/storage/postgres_discovery_lifecycle.rs",
       "reasons": [
-        "network-or-process-reference"
+        "unexpanded-attribute"
       ],
       "scope": "gateway::storage::postgres_discovery_lifecycle::impl  PostgresDiscoveryLifecycleStore::accept_suggestion#1",
-      "sha256": "bc87318db6d18b90825634d097e0f8e69b1adce17e528544868bcd86c791d5ac",
+      "sha256": "016a781803218311a1f0848a05d1ef2ba23343c8f4f1f46111ecd1cd6797c816",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -13726,7 +13766,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery_lifecycle::accept_suggestion_in#1",
-      "sha256": "a44e0abfab5b85bdbe149e97117fa5079a0e17cbeed7f117b1ff4422265ce1e3",
+      "sha256": "d32c76be7c192478cdc3abb771f7f431b797d89551e817379ad9a55a15ee9ebb",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -13789,6 +13829,16 @@
       "sha256": "a0fce604b40389e22a75874fd80642d3ea0af88bc834609620360996ab45146c",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_discovery_lifecycle.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_discovery_lifecycle::impl  PostgresDiscoveryLifecycleStore::accept_suggestion_with_operation#1",
+      "sha256": "f0c20682ea35b18f4a49f9fa52d202766057ff9ffc7f7dc393bc0b74380ad737",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Accepts a suggestion under a caller key: the key lookup, reservation, policy commit and its evidence share the acceptance's PostgreSQL transaction (issue #425); no caller-selected HTTP authority."
     },
     {
       "file": "gateway/src/storage/postgres_discovery_read.rs",
@@ -14036,7 +14086,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_documents::record_document_change#1",
-      "sha256": "0abb564c585e3bbf25920f065ee9d1fb8d95bb717fec68a1d6bcdfaa8326366a",
+      "sha256": "1e1a52e145637ede516e496107937ae8eca21451da8cfe334b4c7ca0ebfbf90b",
       "owner": "GreenGateway maintainers",
       "purpose": "Appends one document change-evidence row through the caller's open PostgreSQL transaction (issue #425) and counts a refused insert on the in-process evidence-failure counter (issue #440); no new connection, endpoint or transport."
     },
@@ -14076,7 +14126,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_documents::commit#1",
-      "sha256": "af43e62a84ae79f87ba5ebc03feea3a9ce73e87230b395896e5246e3a036ffad",
+      "sha256": "20a9194d42bf1931490d1374d96106d6b1defeb65f65e55f9d751d4522dda057",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -14086,9 +14136,79 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_documents::commit_in#1",
-      "sha256": "2d357fbe63063655530c7898c9658e779ab6c0ed66c97f49902fb3a5ff38cf18",
+      "sha256": "061c8dcdafd52e2b4feb16b07a2798876e01d4a7380ae5b2fd3509242148dde3",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_documents.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_documents::end_keyed_transaction#1",
+      "sha256": "b075fa38cfb2234af330a132060f7b3921c220d607792a1216994f158defb6a1",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Ends a keyed document change's PostgreSQL transaction that reserved nothing with an explicit rollback (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_documents.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_documents::caller_operation_state#1",
+      "sha256": "4c1d30579247c85416fc2bf2fe7fd59c5d95fd7e2a24dd30c3325f31b03c18d8",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Reads whether a caller key is free, bound to this binding or bound to another, through the shared pool, for the keyed document change pre-check (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_documents.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_documents::caller_operation_receipt#1",
+      "sha256": "507abf44d89349800e85f66bdaef136861885f2af971af9b3d84bb52fee6694c",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Reads the receipt of a committed keyed document change from authority_caller_operation_ids and document_change_evidence through the shared pool (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_documents.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_documents::document_operation_receipt#1",
+      "sha256": "2dd68d9d2a568e8021a449325e06bd0b0e46fda6afccce3d8caaf292eb90549f",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Reads a committed document change's receipt by operation ID from document_change_evidence (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_documents.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_documents::committed_receipt#1",
+      "sha256": "f8096a34acbc6e7c73aed458b88150e3ff8ce9c148d61d0afc9190c6d5bcbcfb",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Reads a keyed document change's receipt from its evidence row inside the caller's open PostgreSQL transaction (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_documents.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_documents::keyed_receipt#1",
+      "sha256": "bd0fd6efb4faa8a8d06ac80ff4a7787a91537ed8c205bc0d44bf5ad559bb789e",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Looks a caller key up in authority_caller_operation_ids inside a document change's transaction and answers an exact retry from its evidence (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_documents.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_documents::reserve_caller_key#1",
+      "sha256": "b5e04c80776d65f213a95f949811022db6694d9809c9df5011c700a67188dfa7",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Reserves a keyed document change's caller key, after the contract fence check, inside the change's PostgreSQL transaction (issue #425); no caller-selected HTTP authority."
     },
     {
       "file": "gateway/src/storage/postgres_execution_leases.rs",
@@ -14416,7 +14536,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_policy::commit_policy_in#1",
-      "sha256": "2a58c6f0cf3563ad16e997ed6e12378dee68f1ea9ae5ffc0e8fe37a60ebd03c7",
+      "sha256": "495e01d4eb107250b36977ae75ec554baad01d7ed90f8b7ac8739e53ce160c08",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -16888,6 +17008,16 @@
       "sha256": "fc1b302367c7376a3ce2327e04e7abc623a558e0ac4258679f52777cdffcb3d4",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed for #242 PR 15 (standalone backup restore): imports MetadataExt on Unix to compare the device numbers of the target state directory and the directory holding it, refusing a mount point that no rename within its parent can move. Read-only metadata; it adds no network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/policy_history.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::storage::policy_history::PolicyControlPlane#1",
+      "sha256": "f82a107f96bf251d5b7475e18bfe30024535fbac9100dfc2617333087e5cf9f0",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     }
   ]
 }
