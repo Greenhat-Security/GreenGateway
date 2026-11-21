@@ -13626,7 +13626,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::import_suggestions#1",
-      "sha256": "c668651b931b21777af64ad8f177fdd7879760a966899cb65670359458332a06",
+      "sha256": "8dce9b79f02b05f9e563cb9e986a9029db1f6437f620891b6e51209272beef59",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

@@ -82,21 +82,19 @@ describe('Policy Studio suggestions', () => {
     expect(fact('Evidence cutoff')).toMatch(/^2026-11-01T10:00:00Z: evidence was read from the run/);
     expect(fact('Resource snapshot')).toBe(`sha256:${'5'.repeat(64)}, complete`);
 
-    // A suggestion generated before bindings were recorded says so, and
-    // still offers Review in draft.
+    // A suggestion without a binding says so without naming a cause the
+    // gateway did not report, and still offers Review in draft.
     gateway.suggestion(BILLING).generation = null;
     gateway.suggestion(BILLING).freshness = { status: 'unbound', reasons: ['binding_not_recorded'] };
     fireEvent.click(screen.getByRole('button', { name: 'Read suggestions again' }));
     const unbound = await screen.findByText(
-      'Unbound: generated before this gateway recorded bindings',
+      'Unbound: no generation binding recorded',
       undefined,
       WAIT,
     );
     const unboundRow = suggestionRow(BILLING);
     expect(unboundRow.contains(unbound)).toBe(true);
-    expect(
-      within(unboundRow).getAllByText('Not recorded: generated before this gateway recorded bindings.'),
-    ).toHaveLength(4);
+    expect(within(unboundRow).getAllByText('Not recorded.')).toHaveLength(4);
     expect(
       (within(unboundRow).getByRole('button', { name: 'Review in draft' }) as HTMLButtonElement).disabled,
     ).toBe(false);

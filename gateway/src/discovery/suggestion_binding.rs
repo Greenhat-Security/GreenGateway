@@ -29,10 +29,17 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::canonical_json;
 
-/// The version of the suggestion generator this build runs. Moves whenever
-/// the planner would propose something different from the same inputs.
+/// The version of the suggestion generator this build runs. Any change to
+/// the planner that would propose something different from the same inputs
+/// must bump it in the same change: it is the only guard that marks
+/// suggestions bound by the old planner stale. The bound `gateway_build`
+/// component is the crate version (`CARGO_PKG_VERSION`), which does not move
+/// with every build, so an upgrade alone does not. The golden test
+/// `planner_output_for_a_fixed_fixture_matches_the_generator_version` in
+/// `discovery/suggestions.rs` fails when the planner's output changes.
 pub const RULE_SUGGESTION_GENERATOR_VERSION: &str = "rule-suggestions.v1";
-/// The version of the per-suggestion `evidence` object's schema.
+/// The version of the per-suggestion `evidence` object's schema. Bump it
+/// with any change to that shape; the same golden test checks it.
 pub const RULE_SUGGESTION_EVIDENCE_SCHEMA_VERSION: &str = "rule-suggestion-evidence.v1";
 /// The media type the evidence digest frames.
 const RULE_SUGGESTION_EVIDENCE_MEDIA_TYPE: &str =
@@ -159,6 +166,19 @@ impl SuggestionGenerationContext {
             resource_components: self.resource_components.clone(),
         };
         binding.is_well_formed().then_some(binding)
+    }
+
+    /// Whether `live` still has the freshness inputs this context recorded:
+    /// the policy ETag, the resource components and their completeness. A
+    /// generation run checks it again once it holds the suggestion
+    /// lifecycle lock, so a run planned against an older policy never
+    /// rebinds rows back to it. The snapshot digest is not compared: it
+    /// covers the cluster security revision, which alone never makes a
+    /// suggestion stale.
+    pub fn still_holds(&self, live: &LiveGenerationState) -> bool {
+        self.policy_etag == live.policy_etag
+            && self.resource_snapshot_complete == live.resource_snapshot_complete
+            && live.resource_components.as_deref() == Some(self.resource_components.as_str())
     }
 
     /// A fixed context for tests that exercise generation without caring

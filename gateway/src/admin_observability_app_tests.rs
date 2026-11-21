@@ -4786,6 +4786,180 @@ async fn a_policy_change_marks_listed_suggestions_stale_and_regeneration_makes_t
 }
 
 #[tokio::test]
+async fn a_generation_run_planned_against_an_older_policy_writes_nothing() {
+    let discovery_db = TempDb::new("suggestions-generation-race-discovery");
+    let audit_db = TempDb::new("suggestions-generation-race-audit");
+    seed_two_generated_callers(&discovery_db.path, &audit_db.path);
+    let (router, _policy) =
+        suggestions_admin_router(Some(&discovery_db.path), Some(&audit_db.path));
+    let (reader, writer) = generate_two_bound_suggestions(&router).await;
+
+    // Run A plans against the current policy, then stops before it takes
+    // the suggestion lifecycle lock.
+    let mut slow_principal = test_principal(&["suggestions-writer"]);
+    slow_principal.session_id = "generation-race-slow-run".to_owned();
+    let (reached, resume) = generation_pause::arm(&slow_principal.session_id);
+    let slow_run = tokio::spawn(router.clone().oneshot(suggestions_admin_request(
+        Method::POST,
+        "/v1/admin/suggestions/generate",
+        Some(slow_principal),
+        None,
+        None,
+    )));
+    reached.await.expect("the slow run stops after planning");
+
+    // Meanwhile the policy changes (an acceptance) and run B rebinds the
+    // open row to the new policy.
+    let etag = suggestions_policy_etag(&router).await;
+    let accepted = router
+        .clone()
+        .oneshot(suggestions_admin_request(
+            Method::POST,
+            &format!("/v1/admin/suggestions/{reader}/accept"),
+            Some(test_principal(&["suggestions-policy-writer"])),
+            None,
+            Some(&etag),
+        ))
+        .await
+        .expect("accept request should complete");
+    assert_eq!(accepted.status(), StatusCode::CREATED);
+    let rebound = regenerate(&router).await;
+    assert_eq!(rebound["rebound_count"], json!(1), "{rebound}");
+    let reader_principal = || Some(test_principal(&["suggestions-reader"]));
+    let before = suggestions_json(&router, "/v1/admin/suggestions", reader_principal()).await;
+    assert_eq!(
+        listed_freshness(&before, &writer),
+        json!({ "status": "current", "reasons": [] })
+    );
+
+    // Run A resumes: its inputs are no longer live, so it writes nothing
+    // and never binds the row back to the older policy.
+    resume.send(()).expect("the slow run is waiting");
+    let refused = slow_run
+        .await
+        .expect("the slow run completes")
+        .expect("generation request should complete");
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(refused).await["reason"],
+        json!("suggestion_generation_inputs_changed")
+    );
+    let after = suggestions_json(&router, "/v1/admin/suggestions", reader_principal()).await;
+    assert_eq!(after, before);
+    assert_eq!(
+        listed_freshness(&after, &writer),
+        json!({ "status": "current", "reasons": [] })
+    );
+}
+
+/// A bound draft publication loses to a rebind that a real generation run
+/// wrote (not a hand-moved revision): the policy changes, a suggestion is
+/// opened in a draft at its revision, generation rebinds it, and the
+/// publication that names the earlier revision is refused and writes
+/// nothing.
+#[tokio::test]
+async fn a_bound_publication_of_a_revision_a_generation_run_moved_is_refused_as_stale() {
+    let discovery_db = TempDb::new("suggestions-publish-rebind-discovery");
+    let audit_db = TempDb::new("suggestions-publish-rebind-audit");
+    seed_two_generated_callers(&discovery_db.path, &audit_db.path);
+    let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+    let mut config =
+        suggestions_admin_config(Some(&discovery_db.path), Some(&audit_db.path), &policy);
+    config.rate_limit_write_burst = 1_000;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let router = app(
+        config,
+        recorder.handle(),
+        test_audit_log(),
+        test_audit_event_sender(),
+    )
+    .expect("app should build");
+    let (reader, writer) = generate_two_bound_suggestions(&router).await;
+    let reviewer = || Some(test_principal(&["suggestions-policy-writer"]));
+
+    // The policy changes: the writer suggestion is stale at revision 1.
+    let etag = suggestions_policy_etag(&router).await;
+    let accepted = router
+        .clone()
+        .oneshot(suggestions_admin_request(
+            Method::POST,
+            &format!("/v1/admin/suggestions/{reader}/accept"),
+            reviewer(),
+            None,
+            Some(&etag),
+        ))
+        .await
+        .expect("accept request should complete");
+    assert_eq!(accepted.status(), StatusCode::CREATED);
+
+    // Review in draft at revision 1, against the live policy.
+    let etag = suggestions_policy_etag(&router).await;
+    let opened = router
+        .clone()
+        .oneshot(suggestions_admin_request(
+            Method::POST,
+            &format!("/v1/admin/suggestions/{writer}/draft"),
+            reviewer(),
+            None,
+            Some(&etag),
+        ))
+        .await
+        .expect("draft request should complete");
+    assert_eq!(opened.status(), StatusCode::CREATED);
+    let draft_etag = policy_etag_header(&opened);
+    let opened = json_body(opened).await;
+    assert_eq!(opened["suggestion"]["revision"], json!(1), "{opened}");
+    let draft_id = opened["draft"]["draft_id"]
+        .as_str()
+        .expect("the draft names its id")
+        .to_owned();
+
+    // Generation rebinds the open row to the changed policy: revision 2.
+    let rebound = regenerate(&router).await;
+    assert_eq!(rebound["rebound_count"], json!(1), "{rebound}");
+    let disk_before = fs::read(&policy.path).expect("policy file should read");
+
+    let mut publish = suggestions_admin_request(
+        Method::POST,
+        &format!("{POLICY_DRAFTS_ADMIN_ROUTE}/{draft_id}/publish"),
+        reviewer(),
+        Some(json!({ "suggestion": { "id": writer, "revision": 1 } }).to_string()),
+        Some(&etag),
+    );
+    publish.headers_mut().insert(
+        POLICY_DRAFT_ETAG_HEADER,
+        http::HeaderValue::from_str(&draft_etag).expect("the draft ETag is a header value"),
+    );
+    let refused = router
+        .clone()
+        .oneshot(publish)
+        .await
+        .expect("publish request should complete");
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(refused).await["reason"],
+        json!("suggestion_stale")
+    );
+    assert_eq!(
+        fs::read(&policy.path).expect("policy file should read"),
+        disk_before
+    );
+    let page = suggestions_json(
+        &router,
+        "/v1/admin/suggestions",
+        Some(test_principal(&["suggestions-reader"])),
+    )
+    .await;
+    let row = page["suggestions"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == writer.as_str()))
+        .cloned()
+        .expect("the writer row");
+    assert_eq!(row["state"], json!("open"));
+    assert_eq!(row["revision"], json!(2));
+}
+
+#[tokio::test]
 async fn a_generated_suggestion_whose_rule_went_live_is_listed_as_superseded() {
     let discovery_db = TempDb::new("suggestions-superseded-discovery");
     let audit_db = TempDb::new("suggestions-superseded-audit");

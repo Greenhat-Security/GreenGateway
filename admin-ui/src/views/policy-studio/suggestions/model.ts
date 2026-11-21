@@ -274,9 +274,9 @@ export function freshnessLabels(suggestion: RuleSuggestion): StateLabel[] {
     case 'unbound':
       return [
         {
-          text: 'Unbound: generated before this gateway recorded bindings',
+          text: 'Unbound: no generation binding recorded',
           badge: 'warning',
-          detail: `The gateway recorded no binding for it. ${REBIND_ADVICE}`,
+          detail: `The gateway holds no usable generation binding for it: it may have been written before bindings were recorded, imported from a standalone gateway, or stored with a binding the gateway cannot read. ${REBIND_ADVICE}`,
         },
       ];
     case 'unknown':
@@ -319,7 +319,7 @@ export type GenerationFacts = Readonly<{
 export function generationFacts(suggestion: RuleSuggestion): GenerationFacts {
   const generation = suggestion.generation;
   if (generation === null) {
-    const none = 'Not recorded: generated before this gateway recorded bindings.';
+    const none = 'Not recorded.';
     return { generator: none, evidenceSchema: none, evidenceCutoff: none, resourceSnapshot: none };
   }
   return {

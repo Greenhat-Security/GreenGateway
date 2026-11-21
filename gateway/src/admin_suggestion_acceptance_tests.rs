@@ -1112,6 +1112,61 @@ async fn accept_refuses_a_stale_binding_with_409_and_writes_nothing() {
     assert!(events_of(&capture, audit::event::SUGGESTION_LIFECYCLE_CHANGED).is_empty());
 }
 
+/// A resource component change, not a policy change: the gateway restarts
+/// over the same files with a different static configuration, so its
+/// configuration fingerprint moves while the policy ETag does not. A
+/// suggestion bound before the restart is refused on accept with that
+/// component's code, and nothing is written.
+#[tokio::test]
+async fn accept_refuses_a_suggestion_bound_before_a_configuration_change() {
+    let discovery_db = TempDb::new("accept-stale-configuration");
+    create_rule_suggestion_schema(&discovery_db.path);
+    seed_suggestion(
+        &discovery_db.path,
+        "sug-stale-config",
+        "/stale-config/{id}",
+        "allow",
+        None,
+    );
+    let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+    let (before_restart, _) = gateway(&discovery_db.path, &policy);
+    bind_seeded_suggestions(&before_restart, &discovery_db.path).await;
+    let etag = live_etag(&before_restart).await;
+
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let mut config = suggestions_admin_config(Some(&discovery_db.path), None, &policy);
+    config.rate_limit_write_burst = 2_000;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let router = app(
+        config,
+        recorder.handle(),
+        audit_log,
+        test_audit_event_sender(),
+    )
+    .expect("app should build");
+    assert_eq!(live_etag(&router).await, etag, "the policy did not change");
+    let disk_before = fs::read(&policy.path).expect("policy file should read");
+
+    let (status, body) = refusal(accept(&router, "sug-stale-config", &etag).await).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["reason"], "suggestion_binding_stale");
+    assert_eq!(
+        body["freshness"],
+        json!({ "status": "stale", "reasons": ["configuration_changed"] })
+    );
+    assert_eq!(
+        fs::read(&policy.path).expect("policy file should read"),
+        disk_before
+    );
+    assert_eq!(
+        stored_suggestion(&discovery_db.path, "sug-stale-config"),
+        ("open".to_owned(), 1, None)
+    );
+    assert!(stored_intents(&discovery_db.path).is_empty());
+    assert!(events_of(&capture, audit::event::SUGGESTION_LIFECYCLE_CHANGED).is_empty());
+}
+
 #[tokio::test]
 async fn accept_refuses_an_unbound_suggestion_while_review_in_draft_still_opens_it() {
     let discovery_db = TempDb::new("accept-unbound");

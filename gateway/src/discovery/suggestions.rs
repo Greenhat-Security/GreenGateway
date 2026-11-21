@@ -129,12 +129,14 @@ const RULE_SUGGESTION_BINDING_COLUMNS: [(&str, &str); 9] = [
 /// open and either has no complete binding or was bound to different
 /// freshness inputs (the policy ETag, the generator or evidence schema
 /// version, the resource components or their completeness) or proposes a
-/// different rule; the evidence, rationale and cutoff are refreshed with it
-/// and never trigger it on their own, so regenerating over moving traffic
-/// against an unchanged policy and resources writes nothing. A planned row
-/// without a binding never overwrites one. Accepted and dismissed rows are
-/// never touched. `RETURNING id` names the planned id for an insert, the
-/// existing id for a rebind, and nothing when the statement changed nothing.
+/// different rule; the evidence, rationale, cutoff and source signal are
+/// refreshed with it (so `source_signal_id` always names the signal the
+/// evidence names) and never trigger it on their own, so regenerating over
+/// moving traffic against an unchanged policy and resources writes nothing.
+/// A planned row without a binding never overwrites one. Accepted and
+/// dismissed rows are never touched. `RETURNING id` names the planned id for
+/// an insert, the existing id for a rebind, and nothing when the statement
+/// changed nothing.
 const UPSERT_RULE_SUGGESTION_SQL: &str = r#"
 INSERT INTO discovery_rule_suggestions (
     id,
@@ -166,6 +168,7 @@ ON CONFLICT (suggestion_type, method, path_pattern, principal_key) DO UPDATE SET
     proposed_rule_json = excluded.proposed_rule_json,
     rationale = excluded.rationale,
     evidence_json = excluded.evidence_json,
+    source_signal_id = excluded.source_signal_id,
     updated_at = excluded.created_at,
     generator_version = excluded.generator_version,
     evidence_schema_version = excluded.evidence_schema_version,
@@ -3978,6 +3981,228 @@ mod tests {
         assert_eq!(
             Some(binding.evidence_digest),
             crate::discovery::suggestion_binding::evidence_digest(&suggestions[0].evidence)
+        );
+    }
+
+    /// A golden record of what the planner proposes for one fixed fixture: a
+    /// baseline observation and an open discovery signal. Nothing but
+    /// [`RULE_SUGGESTION_GENERATOR_VERSION`] marks an open suggestion stale
+    /// after a planner change (the bound gateway version is the crate
+    /// version, which does not move with every build), and nothing but
+    /// [`RULE_SUGGESTION_EVIDENCE_SCHEMA_VERSION`] marks a change to the
+    /// evidence shape. When this test fails because the planner now proposes
+    /// something different, bump the matching constant in
+    /// `discovery/suggestion_binding.rs` in the same change, then update the
+    /// expected values here.
+    ///
+    /// [`RULE_SUGGESTION_GENERATOR_VERSION`]: crate::discovery::suggestion_binding::RULE_SUGGESTION_GENERATOR_VERSION
+    /// [`RULE_SUGGESTION_EVIDENCE_SCHEMA_VERSION`]: crate::discovery::suggestion_binding::RULE_SUGGESTION_EVIDENCE_SCHEMA_VERSION
+    #[test]
+    fn planner_output_for_a_fixed_fixture_matches_the_generator_version() {
+        use crate::discovery::suggestion_binding::{
+            RULE_SUGGESTION_EVIDENCE_SCHEMA_VERSION, RULE_SUGGESTION_GENERATOR_VERSION,
+        };
+
+        let (discovery_db, audit_db) = seed_bound_generation_fixture("golden", &["/invoices"]);
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/orders/{id}");
+        seed_signal(
+            &discovery_db.path,
+            SeedSignal {
+                id: "golden-signal",
+                signal_type: "schema_mismatch",
+                target_kind: "endpoint",
+                target_identity: json!({
+                    "method": "GET",
+                    "endpoint_template": "/orders/{id}"
+                }),
+                evidence: json!({ "schema_mismatch_count": 4 }),
+                state: "open",
+            },
+        );
+        let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
+        engine
+            .generate(&empty_policy())
+            .expect("generation should succeed");
+        let mut suggestions = engine.list_suggestions().expect("suggestions should query");
+        suggestions.sort_by(|left, right| {
+            (&left.suggestion_type, &left.method, &left.path_pattern).cmp(&(
+                &right.suggestion_type,
+                &right.method,
+                &right.path_pattern,
+            ))
+        });
+
+        let proposals: Vec<Value> = suggestions
+            .iter()
+            .map(|suggestion| {
+                json!({
+                    "suggestion_type": suggestion.suggestion_type,
+                    "method": suggestion.method,
+                    "path_pattern": suggestion.path_pattern,
+                    "principal_key": suggestion.principal_key,
+                    "proposed_rule": suggestion.proposed_rule,
+                })
+            })
+            .collect();
+        let expected_proposals = json!([
+            {
+                "suggestion_type": "baseline_allow",
+                "method": "GET",
+                "path_pattern": "/invoices/{id}",
+                "principal_key": "{\"roles\":[\"billing-reader\"],\"issuers\":[\"provider:test\"],\"auth_methods\":[\"bearer_token\"],\"principal_ids\":[]}",
+                "proposed_rule": {
+                    "action": "allow",
+                    "dispatch": { "kind": "contextless" },
+                    "methods": ["GET"],
+                    "path": "/invoices/{id}",
+                    "principal": {
+                        "auth_methods": ["bearer_token"],
+                        "issuers": ["provider:test"],
+                        "principal_ids": [],
+                        "roles": ["billing-reader"]
+                    }
+                }
+            },
+            {
+                "suggestion_type": "signal_shadow_schema_mismatch",
+                "method": "GET",
+                "path_pattern": "/orders/{id}",
+                "principal_key": "principal:any",
+                "proposed_rule": {
+                    "action": "shadow",
+                    "dispatch": { "kind": "contextless" },
+                    "methods": ["GET"],
+                    "path": "/orders/{id}",
+                    "principal": {
+                        "auth_methods": [],
+                        "issuers": [],
+                        "principal_ids": [],
+                        "roles": []
+                    }
+                }
+            }
+        ]);
+        assert_eq!(
+            Value::Array(proposals),
+            expected_proposals,
+            "the planner's proposals for the golden fixture changed: bump \
+             RULE_SUGGESTION_GENERATOR_VERSION (now {RULE_SUGGESTION_GENERATOR_VERSION}) in \
+             discovery/suggestion_binding.rs, so suggestions bound by the old planner read \
+             stale, then update this expectation"
+        );
+
+        let evidence_shapes: Vec<Value> = suggestions
+            .iter()
+            .map(|suggestion| {
+                let mut keys: Vec<&str> = suggestion
+                    .evidence
+                    .as_object()
+                    .map(|object| object.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                keys.sort_unstable();
+                json!(keys)
+            })
+            .collect();
+        let expected_evidence_shapes = json!([
+            [
+                "audit_scan_truncated",
+                "audit_scanned_event_count",
+                "auth_method",
+                "endpoint_template",
+                "error_count",
+                "first_seen",
+                "from",
+                "issuer",
+                "last_seen",
+                "lookback_window_hours",
+                "match_limitations",
+                "match_strategy",
+                "method",
+                "observation_count",
+                "role",
+                "skipped_denied_observations",
+                "skipped_unauthenticated_observations",
+                "skipped_unknown_routing_context_observations",
+                "skipped_unsupported_auth_method_observations",
+                "skipped_without_issuer_observations",
+                "skipped_without_roles_observations",
+                "source",
+                "to",
+                "upstream_origin",
+                "upstream_route_host",
+                "upstream_route_path_prefix"
+            ],
+            [
+                "mapped_action",
+                "mapping_reason",
+                "source",
+                "source_signal_evidence",
+                "source_signal_explanation",
+                "source_signal_id",
+                "source_signal_target",
+                "source_signal_type"
+            ]
+        ]);
+        assert_eq!(
+            Value::Array(evidence_shapes),
+            expected_evidence_shapes,
+            "the evidence shape for the golden fixture changed: bump \
+             RULE_SUGGESTION_EVIDENCE_SCHEMA_VERSION (now \
+             {RULE_SUGGESTION_EVIDENCE_SCHEMA_VERSION}) in discovery/suggestion_binding.rs, \
+             then update this expectation"
+        );
+    }
+
+    #[test]
+    fn a_rebind_from_a_different_signal_moves_the_source_signal_with_the_evidence() {
+        let discovery_db = TempDb::new("rebind-signal-discovery");
+        seed_discovery_endpoint(&discovery_db.path, "GET", "/orders/{id}");
+        let signal = |id: &'static str| SeedSignal {
+            id,
+            signal_type: "schema_mismatch",
+            target_kind: "endpoint",
+            target_identity: json!({
+                "method": "GET",
+                "endpoint_template": "/orders/{id}"
+            }),
+            evidence: json!({ "schema_mismatch_count": 4 }),
+            state: "open",
+        };
+        seed_signal(&discovery_db.path, signal("first-signal"));
+        let engine = suggestion_engine(&discovery_db.path, None);
+        engine
+            .generate_bound(&empty_policy(), &binding_context('a'))
+            .expect("generation should succeed");
+        let first = engine.list_suggestions().expect("suggestions should query");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].source_signal_id.as_deref(), Some("first-signal"));
+
+        // The same suggestion identity, now produced from another signal,
+        // against a changed policy: the rebind takes the new signal's
+        // evidence, and the row's source signal moves with it.
+        Connection::open(&discovery_db.path)
+            .expect("test discovery database should open")
+            .execute(
+                "DELETE FROM discovery_signals WHERE id = 'first-signal'",
+                [],
+            )
+            .expect("the first signal should delete");
+        seed_signal(&discovery_db.path, signal("second-signal"));
+        let run = engine
+            .generate_bound(&empty_policy(), &binding_context('b'))
+            .expect("regeneration should succeed");
+        assert_eq!(run.rebound_count, 1);
+        let rebound = engine.list_suggestions().expect("suggestions should query");
+        assert_eq!(rebound.len(), 1);
+        assert_eq!(rebound[0].id, first[0].id);
+        assert_eq!(rebound[0].revision, 2);
+        assert_eq!(
+            rebound[0].evidence["source_signal_id"],
+            json!("second-signal")
+        );
+        assert_eq!(
+            rebound[0].source_signal_id.as_deref(),
+            Some("second-signal")
         );
     }
 

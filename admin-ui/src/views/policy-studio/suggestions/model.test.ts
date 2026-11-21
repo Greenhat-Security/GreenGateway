@@ -119,11 +119,12 @@ describe('suggestion presentation', () => {
       freshness: { status: 'unbound', reasons: ['binding_not_recorded'] },
     });
     expect(freshnessLabels(unbound).map((label) => label.text)).toEqual([
-      'Unbound: generated before this gateway recorded bindings',
+      'Unbound: no generation binding recorded',
     ]);
-    expect(generationFacts(unbound).generator).toBe(
-      'Not recorded: generated before this gateway recorded bindings.',
-    );
+    // The label names no cause the gateway did not report; the detail line
+    // lists the possible ones.
+    expect(freshnessLabels(unbound)[0]?.detail).toMatch(/imported from a standalone gateway/);
+    expect(generationFacts(unbound).generator).toBe('Not recorded.');
   });
 
   it('a superseded suggestion comes from the server, not only from a 409', () => {

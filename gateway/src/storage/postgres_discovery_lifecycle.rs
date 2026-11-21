@@ -97,7 +97,9 @@ const OPERATION_ACCEPT_SUGGESTION: &str = "discovery_accept_suggestion";
 /// binding or was bound to different freshness inputs (the policy ETag,
 /// the generator or evidence schema version, the resource components or
 /// their completeness) or proposes a different rule. The evidence,
-/// rationale and cutoff are refreshed with a rebind and never trigger one.
+/// rationale, cutoff and source signal are refreshed with a rebind and
+/// never trigger one, so the row's `source_signal_id` always names the
+/// signal its evidence names.
 /// Accepted and dismissed rows are never touched, and a planned row
 /// without a binding never overwrites one. `RETURNING id` names the
 /// planned id for an insert and the existing id for a rebind.
@@ -129,6 +131,7 @@ ON CONFLICT (suggestion_type, method, path_pattern, principal_key) DO UPDATE SET
     proposed_rule_json = EXCLUDED.proposed_rule_json,
     rationale = EXCLUDED.rationale,
     evidence_json = EXCLUDED.evidence_json,
+    source_signal_id = EXCLUDED.source_signal_id,
     updated_at = EXCLUDED.created_at,
     generator_version = EXCLUDED.generator_version,
     evidence_schema_version = EXCLUDED.evidence_schema_version,

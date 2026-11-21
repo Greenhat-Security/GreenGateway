@@ -672,19 +672,24 @@ pub(super) async fn rule_suggestions_list_endpoint(
 
     // A listing waits for an in-flight acceptance and settles any an
     // earlier request or process left pending (issue #243), so it never
-    // shows a suggestion open whose rule is already live.
-    let _lifecycle = match reconciled_suggestion_lifecycle(&state).await {
-        Ok(lifecycle) => lifecycle,
-        Err(response) => return *response,
-    };
-    let suggestions_page = match suggestion_engine.list_suggestion_page(filters).await {
-        Ok(page) => page,
-        Err(discovery::suggestions::RuleSuggestionError::InvalidCursor { parameter }) => {
-            return bad_request(&format!("invalid query parameter: {parameter}"))
-        }
-        Err(err) => {
-            tracing::error!(error = %err, "failed to query rule suggestions");
-            return internal_server_error("suggestions query failed");
+    // shows a suggestion open whose rule is already live. The lock is held
+    // only while the page is read: the freshness below is advisory (the
+    // accept route judges it again under the lock), so the policy read and
+    // the resource snapshot never hold up other lifecycle writes.
+    let suggestions_page = {
+        let _lifecycle = match reconciled_suggestion_lifecycle(&state).await {
+            Ok(lifecycle) => lifecycle,
+            Err(response) => return *response,
+        };
+        match suggestion_engine.list_suggestion_page(filters).await {
+            Ok(page) => page,
+            Err(discovery::suggestions::RuleSuggestionError::InvalidCursor { parameter }) => {
+                return bad_request(&format!("invalid query parameter: {parameter}"))
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "failed to query rule suggestions");
+                return internal_server_error("suggestions query failed");
+            }
         }
     };
 
@@ -759,6 +764,7 @@ pub(super) async fn rule_suggestions_generate_endpoint(
     // standalone handle runs that on the blocking pool, the cluster handle
     // awaits PostgreSQL; neither sits on the executor. The scans run before
     // the suggestion lifecycle lock is taken.
+    let planned_against = context.clone();
     let planned = match suggestion_engine.plan_generation(policy, context).await {
         Ok(planned) => planned,
         Err(err) => {
@@ -766,6 +772,8 @@ pub(super) async fn rule_suggestions_generate_endpoint(
             return internal_server_error("suggestion generation failed");
         }
     };
+    #[cfg(test)]
+    generation_pause::pause_if_armed(&principal.session_id).await;
     // Generation now rebinds open rows, so its writes wait for an in-flight
     // acceptance and settle any an earlier request or process left pending
     // (issue #243): a rebind can never land between a standalone
@@ -775,6 +783,25 @@ pub(super) async fn rule_suggestions_generate_endpoint(
         Ok(lifecycle) => lifecycle,
         Err(response) => return *response,
     };
+    // The policy or resources may have moved while the run planned without
+    // the lock (a policy write, or an overlapping run elsewhere). A run
+    // planned against inputs that are no longer live writes nothing, so it
+    // can never rebind open rows back to an older policy; the caller runs
+    // generation again.
+    let live_etag = match authoritative_policy_and_etag(&state.policy, rbac_state).await {
+        Ok((_, etag)) => etag,
+        Err(response) => return *response,
+    };
+    if !planned_against.still_holds(&live_generation_state(&live_etag, rbac_state)) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "the policy or resources changed while suggestions were generated; nothing was written, run generation again",
+                "reason": "suggestion_generation_inputs_changed",
+            })),
+        )
+            .into_response();
+    }
     let generation = match suggestion_engine.persist_generation(planned).await {
         Ok(run) => run,
         Err(err) => {
@@ -1395,6 +1422,57 @@ pub(super) enum AcceptanceBoundary {
     IntentRecorded,
     PolicyCommitted,
     SuggestionAccepted,
+}
+
+/// A test-only stop between a generation run's planning and its writes, so
+/// a test can change the policy in between. Keyed by the generating
+/// principal's session id, since tests run in parallel; nothing else ever
+/// stops here.
+#[cfg(test)]
+pub(super) mod generation_pause {
+    use std::sync::Mutex;
+    use tokio::sync::oneshot;
+
+    struct Armed {
+        session_id: String,
+        reached: oneshot::Sender<()>,
+        resume: oneshot::Receiver<()>,
+    }
+
+    static ARMED: Mutex<Vec<Armed>> = Mutex::new(Vec::new());
+
+    /// Stop the next generation run by a principal with `session_id` after
+    /// it planned. The first receiver fires when the run stops; sending on
+    /// the returned sender (or dropping it) lets the run continue.
+    pub(crate) fn arm(session_id: &str) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached, reached_rx) = oneshot::channel();
+        let (resume_tx, resume) = oneshot::channel();
+        ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Armed {
+                session_id: session_id.to_owned(),
+                reached,
+                resume,
+            });
+        (reached_rx, resume_tx)
+    }
+
+    pub(crate) async fn pause_if_armed(session_id: &str) {
+        let armed = {
+            let mut armed = ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            armed
+                .iter()
+                .position(|armed| armed.session_id == session_id)
+                .map(|index| armed.swap_remove(index))
+        };
+        if let Some(armed) = armed {
+            let _ = armed.reached.send(());
+            let _ = armed.resume.await;
+        }
+    }
 }
 
 #[cfg(test)]

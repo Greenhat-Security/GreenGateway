@@ -288,3 +288,30 @@ fn a_serialized_binding_never_carries_the_policy_etag_or_components() {
     assert_eq!(serialized["evidence_cutoff"], json!(CUTOFF));
     assert_eq!(serialized["resource_snapshot_complete"], json!(true));
 }
+
+#[test]
+fn a_planned_context_still_holds_only_while_its_freshness_inputs_are_live() {
+    let planned = context(LIVE_ETAG, &components(), true);
+    assert!(planned.still_holds(&live(LIVE_ETAG, &components(), true)));
+
+    // A policy write, a resource change or a snapshot that became
+    // incomplete between planning and persisting each fail the check.
+    assert!(!planned.still_holds(&live(OTHER_ETAG, &components(), true)));
+    let mut tools_changed = components();
+    tools_changed["tools"] = json!(format!("sha256:{}", "8".repeat(64)));
+    assert!(!planned.still_holds(&live(LIVE_ETAG, &tools_changed, true)));
+    assert!(!planned.still_holds(&live(LIVE_ETAG, &components(), false)));
+    assert!(!planned.still_holds(&live(LIVE_ETAG, &json!("not an object"), true)));
+
+    // The snapshot digest, which covers the security revision, is not
+    // compared.
+    let other_digest = SuggestionGenerationContext::new(
+        LIVE_ETAG.to_owned(),
+        None,
+        Some(format!("sha256:{}", "f".repeat(64))),
+        true,
+        &components(),
+    )
+    .expect("the context is canonical");
+    assert!(other_digest.still_holds(&live(LIVE_ETAG, &components(), true)));
+}
