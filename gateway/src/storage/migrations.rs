@@ -420,6 +420,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("9a2965fceb62b36abea9c58841df092b1c97db24259d20a0301ffc0d3a523a31"),
+        Migration::new(
+            37,
+            "rule_suggestion_bindings",
+            include_str!("migrations/0037_rule_suggestion_bindings.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("be12cdb646c63275cdc768c0d3d44aed97c7859e58dde406b1ab3ed51d8d5c90"),
     ]
 });
 
@@ -452,7 +459,14 @@ impl SchemaCompatibility {
     }
 }
 
-// This build serves exactly schema 36. The move from 35 to 36 (caller
+// This build serves exactly schema 37. The move from 36 to 37 (discovery
+// suggestions bound to the policy and resources they were generated from,
+// #243 item 19) is coordinated: no release approved migration 37's checksum
+// before a build applied it, so no schema-36 build has an overlap window
+// across it. A schema-36 binary left serving after migration 37 would write
+// unbound suggestions and accept them without the freshness check this
+// build applies.
+// The move from 35 to 36 (caller
 // operation IDs bound to a request digest, #425) is coordinated for one
 // reason: no release approved migration 36's checksum before a build applied
 // it, so no schema-35 build has an overlap window across it
@@ -508,7 +522,7 @@ impl SchemaCompatibility {
 // the same explicit column list (`connections::pg_store::
 // record_catalog_change_evidence`). This build is not that successor: it
 // carries migration 25 byte for byte, so its migrator records the approved
-// checksum, but it serves only schema 36, so from a prepared fleet it is a
+// checksum, but it serves only schema 37, so from a prepared fleet it is a
 // coordinated drain/migrate/restart like every other step.
 // That shared column list left out the three columns; this build's catalog
 // writer records all three.
@@ -527,8 +541,8 @@ impl SchemaCompatibility {
 // journaled authority evidence, #425), from 25 to 26 (admin session evidence
 // in the authority-event journal, with capacity held for every session's
 // withdrawal, #425), from 26 to 27 (service-token issue evidence, #425),
-// from 27 to 28, from 28 to 29, from 29 to 30, from 30 to 31 and from 31 to
-// 32. A schema-26 binary left serving after migration 27 would issue tokens
+// from 27 to 28, from 28 to 29, from 29 to 30, from 30 to 31, from 31 to
+// 32 and from 36 to 37. A schema-26 binary left serving after migration 27 would issue tokens
 // without their evidence, and a schema-25 binary left serving after
 // migration 26 would grant and withdraw admin sessions without journaling
 // their evidence. A schema-23 binary must not keep writing evidence after
@@ -539,8 +553,8 @@ impl SchemaCompatibility {
 // covering every binary that can serve this database: none that predates it
 // accepts this ledger either.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (36, 36),
-    write: (36, 36),
+    read: (37, 37),
+    write: (37, 37),
     approved_extensions: &[],
 };
 
@@ -575,7 +589,7 @@ const APPROVED_EXTENSION_SOURCES: &[ExtensionSource] = &[];
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 36.
+/// contract the schema. The shipped contract accepts only schema 37.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1495,18 +1509,18 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            36,
+            37,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (36, 36));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (36, 36));
-        assert_eq!(schema_version_range(), (36, 36));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (37, 37));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (37, 37));
+        assert_eq!(schema_version_range(), (37, 37));
         assert!(
             BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty(),
             "this build approves no migration above its manifest"
         );
         // Readiness samples the manifest and one row more.
-        assert_eq!(runtime_ledger_row_limit(), 37);
+        assert_eq!(runtime_ledger_row_limit(), 38);
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
             Ok(SchemaStatus::Current)
@@ -1514,7 +1528,7 @@ mod tests {
         // The next migration is refused whatever it is: nothing prepared this
         // build for one.
         let mut beyond = ledger_for(&MANIFEST, MANIFEST.len(), "");
-        beyond.push((37, hex_checksum("-- migration 37")));
+        beyond.push((38, hex_checksum("-- migration 38")));
         assert_eq!(
             validate_runtime_ledger(&beyond),
             Err(LedgerProblem::UnknownVersion)
@@ -2698,6 +2712,13 @@ mod tests {
                  DROP TABLE greengateway.mutation_approval_prepare_evidence; \
                  DROP TABLE greengateway.authority_caller_operation_ids; \
                  DROP TABLE greengateway.connection_mutation_approvals; \
+                 ALTER TABLE greengateway.discovery_rule_suggestions \
+                     DROP COLUMN generator_version, DROP COLUMN evidence_schema_version, \
+                     DROP COLUMN evidence_cutoff, DROP COLUMN evidence_digest, \
+                     DROP COLUMN binding_policy_etag, DROP COLUMN binding_policy_semantic_digest, \
+                     DROP COLUMN binding_resource_snapshot_digest, \
+                     DROP COLUMN binding_resource_snapshot_complete, \
+                     DROP COLUMN binding_resource_components; \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await
@@ -4903,6 +4924,196 @@ mod tests {
         clean_database(foundation.pool()).await;
     }
 
+    /// Migration 37 upgrades a populated schema-36 suggestion table: every
+    /// existing row is kept exactly as it was and gains no binding, so it
+    /// reads as unbound. The binding constraints are present as `NOT VALID`
+    /// CHECKs and enforced on every new write: a partial binding and a
+    /// malformed digest or ETag are refused, a complete binding is accepted.
+    #[tokio::test]
+    async fn migration_thirty_seven_adds_unbound_suggestion_bindings_and_backfills_nothing() {
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let config = migration_config(&dsn_file);
+        let foundation = establish(&config).await;
+        clean_database(foundation.pool()).await;
+        let client = foundation.pool().get().await.expect("checkout");
+        bootstrap_ledger(&client).await.expect("ledger");
+        for migration in MANIFEST.iter().take_while(|m| m.version <= 36) {
+            apply_one(&client, migration, &test_settings())
+                .await
+                .expect("apply schema 36");
+        }
+        const INSERT_SCHEMA_36: &str = "INSERT INTO greengateway.discovery_rule_suggestions \
+             (id, suggestion_type, method, path_pattern, principal_key, proposed_rule_json, \
+              rationale, evidence_json, state, created_at, updated_at) \
+             VALUES ($1, 'baseline_allow', 'GET', $2, 'role:reader', '{}', 'seeded', '{}', $3, \
+                     '2026-11-20T00:00:00Z', '2026-11-20T00:00:00Z')";
+        for (id, path, state) in [
+            ("sug-open", "/open", "open"),
+            ("sug-accepted", "/accepted", "accepted"),
+        ] {
+            client
+                .execute(INSERT_SCHEMA_36, &[&id, &path, &state])
+                .await
+                .expect("populate schema 36");
+        }
+        const ROWS: &str = "SELECT id, state, revision, updated_at \
+             FROM greengateway.discovery_rule_suggestions ORDER BY id";
+        let read = |rows: Vec<tokio_postgres::Row>| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.get::<_, String>(0),
+                        row.get::<_, String>(1),
+                        row.get::<_, i64>(2),
+                        row.get::<_, String>(3),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = read(client.query(ROWS, &[]).await.expect("schema-36 rows"));
+        apply_one(&client, &MANIFEST[36], &test_settings())
+            .await
+            .expect("apply schema 37");
+        let after = read(client.query(ROWS, &[]).await.expect("schema-37 rows"));
+        assert_eq!(after, before, "existing rows are kept as they were");
+        let bound: i64 = client
+            .query_one(
+                "SELECT count(*)::bigint FROM greengateway.discovery_rule_suggestions \
+                 WHERE generator_version IS NOT NULL OR evidence_schema_version IS NOT NULL \
+                    OR evidence_cutoff IS NOT NULL OR evidence_digest IS NOT NULL \
+                    OR binding_policy_etag IS NOT NULL \
+                    OR binding_policy_semantic_digest IS NOT NULL \
+                    OR binding_resource_snapshot_digest IS NOT NULL \
+                    OR binding_resource_snapshot_complete IS NOT NULL \
+                    OR binding_resource_components IS NOT NULL",
+                &[],
+            )
+            .await
+            .expect("binding count")
+            .get(0);
+        assert_eq!(bound, 0, "nothing is backfilled");
+
+        let constraints: Vec<(String, bool)> = client
+            .query(
+                "SELECT conname::text, convalidated FROM pg_constraint \
+                 WHERE conrelid = 'greengateway.discovery_rule_suggestions'::regclass \
+                   AND contype = 'c' AND NOT convalidated \
+                 ORDER BY conname",
+                &[],
+            )
+            .await
+            .expect("constraints")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(
+            constraints
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "discovery_rule_suggestions_binding_check",
+                "discovery_rule_suggestions_components_check",
+                "discovery_rule_suggestions_cutoff_check",
+                "discovery_rule_suggestions_evidence_digest_check",
+                "discovery_rule_suggestions_evidence_schema_check",
+                "discovery_rule_suggestions_generator_check",
+                "discovery_rule_suggestions_policy_etag_check",
+                "discovery_rule_suggestions_semantic_digest_check",
+                "discovery_rule_suggestions_snapshot_digest_check",
+            ],
+            "nine NOT VALID constraints"
+        );
+
+        const BIND: &str = "UPDATE greengateway.discovery_rule_suggestions SET \
+             generator_version = $2, evidence_schema_version = $3, evidence_cutoff = $4, \
+             evidence_digest = $5, binding_policy_etag = $6, binding_policy_semantic_digest = $7, \
+             binding_resource_snapshot_digest = $8, binding_resource_snapshot_complete = $9, \
+             binding_resource_components = $10 WHERE id = $1";
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let etag = format!("\"sha256:{}\"", "b".repeat(64));
+        let complete = (
+            Some("rule-suggestions.v1".to_owned()),
+            Some("rule-suggestion-evidence.v1".to_owned()),
+            Some("2026-11-20T00:00:00Z".to_owned()),
+            Some(digest.clone()),
+            Some(etag.clone()),
+            None::<String>,
+            Some(digest.clone()),
+            Some(true),
+            Some("{}".to_owned()),
+        );
+        type Binding = (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<bool>,
+            Option<String>,
+        );
+        let bind = |binding: Binding| {
+            let client = &client;
+            async move {
+                client
+                    .execute(
+                        BIND,
+                        &[
+                            &"sug-open",
+                            &binding.0,
+                            &binding.1,
+                            &binding.2,
+                            &binding.3,
+                            &binding.4,
+                            &binding.5,
+                            &binding.6,
+                            &binding.7,
+                            &binding.8,
+                        ],
+                    )
+                    .await
+            }
+        };
+        let mut partial = complete.clone();
+        partial.3 = None;
+        let mut malformed_digest = complete.clone();
+        malformed_digest.3 = Some("sha256:XYZ".to_owned());
+        let mut unquoted_etag = complete.clone();
+        unquoted_etag.4 = Some(digest.clone());
+        let mut long_version = complete.clone();
+        long_version.0 = Some("v".repeat(65));
+        for (case, binding) in [
+            ("a partial binding", partial),
+            ("a malformed evidence digest", malformed_digest),
+            ("an unquoted policy ETag", unquoted_etag),
+            ("an oversize generator version", long_version),
+        ] {
+            let refused = bind(binding)
+                .await
+                .expect_err("a malformed binding is refused");
+            assert_eq!(
+                refused.code(),
+                Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION),
+                "{case}"
+            );
+        }
+        assert_eq!(
+            bind(complete)
+                .await
+                .expect("a complete binding is accepted"),
+            1
+        );
+        drop(client);
+        clean_database(foundation.pool()).await;
+    }
+
     /// Migration 36 upgrades a populated schema-35 reservation table: the
     /// keyed revoke and keyed prepare reservations stay exactly as they were,
     /// with no binding digest. The widened action CHECK, the digest's shape
@@ -5505,7 +5716,7 @@ mod tests {
     /// refuses naming the missing migrations and readiness reports the schema
     /// incompatible, so a replica of it started before the migration stalls
     /// the rollout rather than serving. Its `migrate check` reports exactly
-    /// migrations 25 through 36 unapplied, and its `migrate up` applies them
+    /// migrations 25 through 37 unapplied, and its `migrate up` applies them
     /// and nothing else, recording for migration 25 exactly the checksum the
     /// prepared release approved. From then on it serves, with and without
     /// development auto-migration, and its migrator has nothing left to do.
@@ -5562,7 +5773,7 @@ mod tests {
 
         // The prepared release's schema: not served here.
         let missing = MANIFEST.len() - through_v24;
-        assert_eq!(missing, 12, "migrations 25 through 36");
+        assert_eq!(missing, 13, "migrations 25 through 37");
         let authority = PostgresReadinessAuthority::new(pool.clone());
         assert_eq!(
             read_and_validate_runtime(pool).await,
@@ -5595,7 +5806,7 @@ mod tests {
             })
         );
 
-        // The migration role's `migrate up`: migrations 25 through 36 and
+        // The migration role's `migrate up`: migrations 25 through 37 and
         // nothing else, migration 25 under the approved checksum.
         assert_eq!(
             execute(&strict, false).await,
@@ -5625,7 +5836,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 36 }
+            AuthorityObservation::Writable { schema_version: 37 }
         );
         assert_eq!(
             execute(&strict, true).await,
@@ -5665,7 +5876,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 36 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 37 }
         );
         drop(client);
         clean_database(pool).await;

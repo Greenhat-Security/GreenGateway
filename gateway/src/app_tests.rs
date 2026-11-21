@@ -1435,6 +1435,144 @@ async fn suggestions_policy_etag(router: &Router) -> String {
     policy_etag_header(&response)
 }
 
+/// The generation context a run on `router` would bind its suggestions to
+/// now (issue #243, item 19): the live policy ETag, and the resource
+/// snapshot `POST .../policy/validate` reports for the live document, with
+/// the cluster security revision left out as a run leaves it out.
+async fn current_generation_context(
+    router: &Router,
+) -> discovery::suggestion_binding::SuggestionGenerationContext {
+    let response = router
+        .clone()
+        .oneshot(suggestions_admin_request(
+            Method::GET,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["policy-reader"])),
+            None,
+            None,
+        ))
+        .await
+        .expect("policy GET should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = policy_etag_header(&response);
+    let document = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("policy body should read");
+    let validated = router
+        .clone()
+        .oneshot(suggestions_admin_request(
+            Method::POST,
+            POLICY_VALIDATE_ADMIN_ROUTE,
+            Some(test_principal(&["policy-reader"])),
+            Some(String::from_utf8(document.to_vec()).expect("policy body is UTF-8")),
+            None,
+        ))
+        .await
+        .expect("policy validate should complete");
+    assert_eq!(validated.status(), StatusCode::OK);
+    let validated = json_body(validated).await;
+    let snapshot = &validated["resource_snapshot"];
+    let mut components = snapshot["components"].clone();
+    if let Some(components) = components.as_object_mut() {
+        components.remove("security_revision");
+    }
+    discovery::suggestion_binding::SuggestionGenerationContext::new(
+        etag,
+        validated["semantic_digest"].as_str().map(str::to_owned),
+        snapshot["digest"].as_str().map(str::to_owned),
+        snapshot["complete"] == json!(true),
+        &components,
+    )
+    .expect("the resource components are canonical")
+}
+
+/// Policy resources for a handler-level test app that is not built by
+/// [`app`]: no tool registered, the default Connections, a fixed egress lane
+/// and configuration fingerprint, and the policy route. Every component
+/// reads, so the resource snapshot is complete, as it is in production.
+#[cfg(feature = "postgres")]
+fn test_policy_resource_sources() -> rbac::policy_resources::PolicyResourceSources {
+    let config = test_config(Vec::new());
+    rbac::policy_resources::PolicyResourceSources {
+        tools: tools::definitions::ToolRegistry::disabled(),
+        connections: connections::control_plane::ConnectionControlPlane::from_config(&config)
+            .expect("the default Connections should load"),
+        egress: Arc::new(policy_eval::egress::CompiledEgressPolicy::new(
+            policy_eval::egress::EgressControls {
+                allowed_hosts: std::collections::HashSet::new(),
+                allowed_host_globs: Vec::new(),
+                allowed_ports: std::collections::HashSet::new(),
+                deny_private_ips: true,
+                nat64_prefixes: Vec::new(),
+                private_ip_allow_cidrs: Vec::new(),
+            },
+        )),
+        configuration_fingerprint: format!("sha256:{}", "c".repeat(64)),
+        policy_route: POLICY_ADMIN_ROUTE.to_owned(),
+        verified_claims: rbac::policy_resources::ClaimAllowlists::default(),
+    }
+}
+
+/// Bind every open suggestion seeded by SQL without a binding to the state
+/// `router` serves now, as a generation run would have bound it. A fixture
+/// for tests about acceptance, whose rows are written directly rather than
+/// generated from traffic: it records what generation records, and the
+/// accept route's freshness check is unchanged.
+async fn bind_seeded_suggestions(router: &Router, discovery_path: &PathBuf) {
+    let context = current_generation_context(router).await;
+    let connection = Connection::open(discovery_path).expect("test discovery database should open");
+    let rows = {
+        let mut statement = connection
+            .prepare(
+                "SELECT id, evidence_json, created_at FROM discovery_rule_suggestions
+                 WHERE state = 'open' AND generator_version IS NULL",
+            )
+            .expect("unbound suggestions query should prepare");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .expect("unbound suggestions should read")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("unbound suggestions should decode")
+    };
+    for (id, evidence_json, created_at) in rows {
+        let evidence: Value =
+            serde_json::from_str(&evidence_json).expect("seeded evidence should parse");
+        let binding = discovery::suggestion_binding::StoredGenerationBinding::of(
+            context.binding_for(&created_at, &evidence).as_ref(),
+        );
+        connection
+            .execute(
+                "UPDATE discovery_rule_suggestions SET
+                     generator_version = ?2, evidence_schema_version = ?3,
+                     evidence_cutoff = ?4, evidence_digest = ?5, binding_policy_etag = ?6,
+                     binding_policy_semantic_digest = ?7,
+                     binding_resource_snapshot_digest = ?8,
+                     binding_resource_snapshot_complete = ?9,
+                     binding_resource_components = ?10
+                 WHERE id = ?1",
+                params![
+                    id,
+                    binding.generator_version,
+                    binding.evidence_schema_version,
+                    binding.evidence_cutoff,
+                    binding.evidence_digest,
+                    binding.policy_etag,
+                    binding.policy_semantic_digest,
+                    binding.resource_snapshot_digest,
+                    binding.resource_snapshot_complete,
+                    binding.resource_components,
+                ],
+            )
+            .expect("seeded suggestion should bind");
+    }
+}
+
 fn suggestions_policy_document_string() -> String {
     serde_json::to_string_pretty(&json!({
         "schema_version": "0.1.0",

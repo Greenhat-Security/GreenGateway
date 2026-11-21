@@ -664,12 +664,12 @@
       "boundary": "PostgresConnectionStore::create/replace refuse an actor the evidence cannot record exactly (ChangeActor::is_recordable) before opening a transaction, then lock shared Connection state, check collection/object CAS, write records, credential bindings, immutable version, shared revision and outbox, append one connection_change_evidence row carrying the outbox row's shared revision (connection.create, or connection.replace plus credential.binding_change under the same operation_id when the replacement advances the credential revision), journal each row, and commit once. An evidence insert or journal append failure rolls the whole change back and is reported as a store failure (503), never as a conflict or validation problem; a full journal refuses the change with 503. Credential/TLS revisions derive from replacement; an identical replace commits nothing and records nothing.",
       "record": "connection_versions actor/diff and outbox from/to are atomic; that history cascades when the Connection is deleted. Since migration 28, connection_change_evidence (no foreign key) keeps one row per committed create and replace, and one credential.binding_change row per replacement that advances the credential revision: the actor, action, event/operation UUIDs, revision_axis (connection, or credential for the binding change), the revision before and after on that axis (none before a create; 0 before a binding change means no credential authority was configured), the outbox row's shared revision and database-clock committed_at. No specification, endpoint, header name, binding, bound secret ID or locator. Stale ETag, collection conflict, capacity, a lost race, an unrecordable actor and an identical replace write no row. Connections created or replaced before migration 28 have no such rows; nothing is backfilled.",
       "actor": "The authenticated principal the admin create and put endpoints pass through the control plane and ManagedConnectionStore as a ChangeActor (ChangeActor::from_principal), committed with the change: actor_user_id (the subject, 1 to 4096 bytes), actor_kind (principal or service_token), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). connection_documents still records the subject while the Connection exists. A keyed safe actor reference exists only in what is delivered.",
-      "identity": "Generated event_id and operation_id UUIDs per store call (not bound to a client idempotency key); a credential-changing replacement's two rows share its operation_id and shared revision. Connection ID, the revision transition on the row's axis, shared revision equal to the outbox row's, database-clock committed_at. A lost replace response is reconciled by the row naming the new version, and a retry with the old ETag is a conflict that writes nothing; a lost create response is reconciled by the Connection's create row, and a blind retry creates a second Connection with its own row.",
+      "identity": "With an Idempotency-Key (issue #425) the caller's UUIDv7 is the operation_id of every row the change writes, reserved in authority_caller_operation_ids with its binding digest in the same transaction, after the contract fence is confirmed to carry caller_operation_keys; an exact retry is answered from the committed connection.create or connection.replace row, and a key bound to anything else is 409. Without one, event_id and operation_id are generated UUIDv4s per store call. A credential-changing replacement's two rows share its operation_id and shared revision. Connection ID, the revision transition on the row's axis, shared revision equal to the outbox row's, database-clock committed_at. A keyed no-op (an identical replacement) writes and reserves nothing, so it is not reconcilable by its key: a retry after a later change gets 412.",
       "delivery": "journaled_dispatch",
       "disposition": [
-        "missing_metadata"
+        "already_sufficient"
       ],
-      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the store and derive an issuer-scoped subject reference, so the delivered record can become authority_event.v1. Delivery journals each row in the change's transaction and dispatches it as authority_event_delivery.v1: connection.create and connection.replace on the connection axis, credential.binding_change on the credential axis with the Connection as its resource (v1 names a credential_binding resource, which the evidence cannot reference without a binding identifier it deliberately omits). AUTHORITY_EVIDENCE_DURABILITY=required makes a configured sink mandatory and admits this row; nothing qualifies it yet.",
+      "follow_up": "Qualified in required mode by issue #425: only the keyed form of an issuer-bound provider principal under AUTHORITY_EVENT_FORMAT=qualified_v1 with the synced file sink on a Unix build is admitted, and in cluster mode only once every live member advertises caller_operation_keys. The unkeyed form and service-token callers are refused with 409 authority_evidence_unsupported before anything is read or written; under best_effort they are recorded as before and delivered as authority_event_delivery.v1. credential.binding_change is delivered in v1 as a credential_binding resource derived from the Connection ID, sharing the replacement's operation_id.",
       "sources": [
         {
           "path": "gateway/src/storage/migrations/0028_connection_create_replace_evidence.sql",
@@ -701,11 +701,31 @@
         },
         {
           "path": "gateway/src/connections/managed_store.rs",
-          "anchor": "Self::Postgres { store, .. } => store.create(candidate, actor, collection).await,"
+          "anchor": ".create_with_operation(candidate, actor, collection, caller)"
         },
         {
           "path": "gateway/src/authority_events/delivery.rs",
           "anchor": "const ACTION_CREDENTIAL_BINDING_CHANGE: &str = \"credential.binding_change\";"
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "pub async fn create_with_operation("
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "pub async fn replace_with_operation("
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "pub async fn delete_with_operation("
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "async fn keyed_receipt("
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "async fn reserve_caller_key("
         }
       ],
       "tests": [
@@ -752,11 +772,265 @@
         {
           "path": "gateway/src/authority_events/delivery_tests.rs",
           "anchor": "fn connection_changes_project_only_on_their_recorded_axis("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn postgres_connection_caller_operation_contract("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn postgres_a_reused_key_with_a_different_binding_conflicts_and_changes_nothing("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn postgres_a_failed_evidence_insert_rolls_back_the_keyed_change_and_its_reservation("
         }
       ],
-      "required_durability_supported": false,
-      "required_mode": "admitted",
-      "test_claim": "PostgreSQL-gated regression anchors for the transactional create, replace and credential binding change evidence and its journaled delivery: the actor recorded, refusals and lost races writing nothing, rollback on a failed evidence insert or journal append, a full journal refused with 503, survival after delete and restart, and binding and secret material absent. They do not certify the proposed authority_event.v1 contract."
+      "required_durability_supported": true,
+      "required_mode": "caller_key_required",
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional create, replace and credential binding change evidence and its journaled delivery, and, through the qualified delivery paths, the keyed contract: exact retries answered from the receipt with no second change, conflicting bindings and cross-action keys refused, rollback of the reservation with the evidence, a full journal refusing the keyed change, racing writers, the digest kept in the reservation only, and v1 delivery and redelivery through the file sink.",
+      "qualified_delivery_paths": [
+        {
+          "criteria": {
+            "operation": "connection.create",
+            "storage_mode": "postgres",
+            "method": "POST",
+            "route": "/v1{ADMIN_PREFIX}/connections",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed POST binds the caller's UUIDv7 to the action, the recorded actor, the collection If-Match and the canonical body (credential aliases included). In one transaction the key is looked up, the create is checked, the key is reserved with its binding digest, and the record, its evidence row under the caller's key and the delivery record commit together. An exact retry is answered 200 with the receipt read from the evidence and changes nothing; any other use of the key is 409. The negotiated file sink syncs the qualified event and its parent directory on Unix before cursor advance. Consumers deduplicate on (authority_id, event_id). Durable cluster file delivery assumes shared storage or shipping to the same durable consumer. The opt-in log sink emits the same representation with process-log acceptance only.",
+          "sources": [
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn create_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn replace_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn delete_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "pub(super) async fn admit_keyed_connection_change("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery.rs",
+              "anchor": "pub(super) fn qualify_caller_bound("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_connection_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_reused_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_failed_evidence_insert_rolls_back_the_keyed_change_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn a_full_journal_refuses_the_keyed_connection_change_and_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_two_writers_racing_one_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_the_binding_digest_is_stored_only_in_the_reservation_row("
+            },
+            {
+              "path": "gateway/src/authority_events/dispatcher_tests.rs",
+              "anchor": "async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            }
+          ]
+        },
+        {
+          "criteria": {
+            "operation": "connection.replace",
+            "storage_mode": "postgres",
+            "method": "PUT",
+            "route": "/v1{ADMIN_PREFIX}/connections/{id}",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed PUT binds the caller's UUIDv7 to the action, the recorded actor, the Connection ID, the If-Match ETag and the canonical body (credential aliases included). In one transaction the key is looked up, the ETag is checked (412 writes nothing) and an identical replacement is answered before the key is reserved (nothing recorded or reserved); otherwise the key is reserved and the replacement and its evidence row under the caller's key commit together. An exact retry is answered 200 with the receipt of the connection.replace row; any other use of the key is 409. The negotiated file sink syncs the qualified event and its parent directory on Unix before cursor advance. Consumers deduplicate on (authority_id, event_id). Durable cluster file delivery assumes shared storage or shipping to the same durable consumer. The opt-in log sink emits the same representation with process-log acceptance only.",
+          "sources": [
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn create_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn replace_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn delete_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "pub(super) async fn admit_keyed_connection_change("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery.rs",
+              "anchor": "pub(super) fn qualify_caller_bound("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_connection_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_reused_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_failed_evidence_insert_rolls_back_the_keyed_change_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn a_full_journal_refuses_the_keyed_connection_change_and_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_two_writers_racing_one_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_the_binding_digest_is_stored_only_in_the_reservation_row("
+            },
+            {
+              "path": "gateway/src/authority_events/dispatcher_tests.rs",
+              "anchor": "async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            }
+          ]
+        },
+        {
+          "criteria": {
+            "operation": "credential.binding_change",
+            "storage_mode": "postgres",
+            "method": "PUT",
+            "route": "/v1{ADMIN_PREFIX}/connections/{id}",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "Made only by a keyed replacement that advances the credential revision: its row commits in the replacement's transaction under the replacement's caller key, so the two v1 events share one operation_id. In v1 its resource is a credential_binding reference derived from the Connection ID; the binding itself, its secret IDs and locators never enter the record. The negotiated file sink syncs the qualified event and its parent directory on Unix before cursor advance. Consumers deduplicate on (authority_id, event_id). Durable cluster file delivery assumes shared storage or shipping to the same durable consumer. The opt-in log sink emits the same representation with process-log acceptance only.",
+          "sources": [
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn create_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn replace_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn delete_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "pub(super) async fn admit_keyed_connection_change("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery.rs",
+              "anchor": "pub(super) fn qualify_caller_bound("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_connection_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_reused_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_failed_evidence_insert_rolls_back_the_keyed_change_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn a_full_journal_refuses_the_keyed_connection_change_and_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_two_writers_racing_one_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_the_binding_digest_is_stored_only_in_the_reservation_row("
+            },
+            {
+              "path": "gateway/src/authority_events/dispatcher_tests.rs",
+              "anchor": "async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "connection_standalone",
@@ -781,12 +1055,12 @@
       "boundary": "SqliteConnectionStore::create/replace refuse an actor the evidence cannot record exactly (ChangeActor::is_recordable) before any other work, then run one IMMEDIATE transaction on the CONNECTIONS_SQLITE_PATH database: write the record and bindings, append connection_change_evidence rows (connection.create; connection.replace, plus credential.binding_change under the same operation_id when the credential revision advances) and commit once. The control plane publishes its runtime snapshot only after that commit. An evidence insert failure rolls the whole change back and is reported as a store failure (503), never as a validation problem or conflict; an identical replace commits and records nothing.",
       "record": "Current records and revisions are atomic. The same database's connection_change_evidence table (Connections schema migration 12, no foreign key) keeps one append-only row per committed create, replace and credential-axis change: actor (subject, kind, auth mode and, for a principal that has one, canonical issuer, with the same pairing CHECK as PostgreSQL migration 24 and every column required), action, event/operation UUIDs, Connection ID, the revision before and after on the action's axis (connection_revision; credential_revision for credential.binding_change), a commit-ordered sequence and the change's own committed_at. No specification, endpoint, binding or bound secret ID. Rows are never pruned, and import-standalone does not carry them.",
       "actor": "The authenticated principal the admin endpoints pass through the control plane and the managed-store adapter as a ChangeActor, committed with the change: the subject (1 to 4096 bytes), actor_kind (principal or service_token), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). A keyed safe actor reference is absent.",
-      "identity": "Generated event_id/operation_id UUIDs per store call (not bound to a client idempotency key), Connection ID, prior/new revision per axis, store sequence and the process-clock committed_at (the record's updated_at). Standalone mode has no shared security revision and no database clock.",
+      "identity": "With an Idempotency-Key (issue #425) the caller's UUIDv7 is the operation_id of every row the change writes, reserved in this file's authority_caller_operation_ids (Connections migration 16) with its binding digest in the same IMMEDIATE transaction; an exact retry is answered from the committed connection.create or connection.replace row, and a key bound to anything else is 409. Without one, event_id and operation_id are generated UUIDv4s per store call. Connection ID, prior/new revision per axis, store sequence and the process-clock committed_at (the record's updated_at). Standalone mode has no shared security revision and no database clock. A keyed no-op writes and reserves nothing.",
       "delivery": "standalone_cursor_dispatch",
       "disposition": [
-        "missing_metadata"
+        "already_sufficient"
       ],
-      "follow_up": "PR4 follow-up: a caller-bound operation identity at the store. Delivered from this same database since Connections schema migration 14 (standalone_cursor_dispatch), with no audit-database dual write; a credential.binding_change is delivered as the Connection's, on the credential axis. Catalog/overlay publication in this database is its own row (catalog_standalone). Issuer, actor kind and auth mode are recorded.",
+      "follow_up": "Qualified in required mode by issue #425: only the keyed form of an issuer-bound provider principal under AUTHORITY_EVENT_FORMAT=qualified_v1 with the synced file sink on a Unix build is admitted; the unkeyed form and service-token callers are refused before anything is read or written. Delivered from this same database since Connections schema migration 14 (standalone_cursor_dispatch), with no audit-database dual write; a credential.binding_change is delivered in v1 as a credential_binding resource sharing the replacement's operation_id. Catalog/overlay publication in this database is its own row (catalog_standalone).",
       "sources": [
         {
           "path": "gateway/src/connections/store.rs",
@@ -810,11 +1084,31 @@
         },
         {
           "path": "gateway/src/connections/managed_store.rs",
-          "anchor": "ConnectionStore::create(&store, candidate, &actor)"
+          "anchor": "ConnectionStore::create_with_operation("
         },
         {
           "path": "gateway/src/connections/control_plane.rs",
           "anchor": "pub async fn create_managed("
+        },
+        {
+          "path": "gateway/src/connections/store.rs",
+          "anchor": "fn create_with_operation("
+        },
+        {
+          "path": "gateway/src/connections/store.rs",
+          "anchor": "fn replace_with_operation("
+        },
+        {
+          "path": "gateway/src/connections/store.rs",
+          "anchor": "fn delete_with_operation("
+        },
+        {
+          "path": "gateway/src/connections/store.rs",
+          "anchor": "fn keyed_receipt("
+        },
+        {
+          "path": "gateway/src/connections/store.rs",
+          "anchor": "fn reserve_caller_key("
         }
       ],
       "tests": [
@@ -853,11 +1147,277 @@
         {
           "path": "gateway/src/authority_events/standalone_tests.rs",
           "anchor": "async fn every_owning_stores_evidence_is_delivered_in_commit_order_under_its_own_authority("
+        },
+        {
+          "path": "gateway/src/connections/caller_operation_contract.rs",
+          "anchor": "async fn sqlite_connection_caller_operation_contract("
+        },
+        {
+          "path": "gateway/src/connections/caller_operation_contract.rs",
+          "anchor": "async fn sqlite_a_reused_key_with_a_different_binding_conflicts_and_changes_nothing("
+        },
+        {
+          "path": "gateway/src/connections/caller_operation_contract.rs",
+          "anchor": "async fn sqlite_a_failed_evidence_insert_rolls_back_the_keyed_change_and_its_reservation("
         }
       ],
-      "required_durability_supported": false,
-      "required_mode": "admitted",
-      "test_claim": "Standalone regression anchors for the create/replace/credential-change evidence in the Connections database's own transactions: forced insert failure and rollback, restart, refused changes and unrecordable actors, migration onto an existing database, the actor CHECKs pinned to PostgreSQL migration 24, and the admin endpoints recording the authenticated principal with its issuer. They do not certify the proposed authority-event contract or delivery."
+      "required_durability_supported": true,
+      "required_mode": "caller_key_required",
+      "test_claim": "Standalone regression anchors for the create/replace/credential-change evidence in the Connections database's own transactions, and, through the qualified delivery paths, the keyed contract run on the same database (exact retries, conflicting and cross-action keys, rollback, races, the digest kept in the reservation only), v1 delivery and redelivery through the file sink, and required mode end to end through the admin handlers.",
+      "qualified_delivery_paths": [
+        {
+          "criteria": {
+            "operation": "connection.create",
+            "storage_mode": "standalone",
+            "method": "POST",
+            "route": "/v1{ADMIN_PREFIX}/connections",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed POST binds the caller's UUIDv7 to the action, the recorded actor, the collection If-Match and the canonical body (credential aliases included). In one transaction the key is looked up, the create is checked, the key is reserved with its binding digest, and the record, its evidence row under the caller's key and the delivery record commit together. An exact retry is answered 200 with the receipt read from the evidence and changes nothing; any other use of the key is 409. The standalone dispatcher delivers it from the same Connections database under that file's own authority; the negotiated file sink syncs the qualified event and its parent directory on Unix before the cursor advances. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn create_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn replace_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn delete_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "pub(super) async fn admit_keyed_connection_change("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery.rs",
+              "anchor": "pub(crate) fn project_standalone("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_connection_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_a_reused_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_a_failed_evidence_insert_rolls_back_the_keyed_change_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_two_writers_racing_one_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_the_binding_digest_is_stored_only_in_the_reservation_row("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_tests.rs",
+              "anchor": "async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_the_unkeyed_connection_create_and_replace_and_admits_the_keyed_principal("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_replayed_connection_change_repeats_no_side_effect("
+            }
+          ]
+        },
+        {
+          "criteria": {
+            "operation": "connection.replace",
+            "storage_mode": "standalone",
+            "method": "PUT",
+            "route": "/v1{ADMIN_PREFIX}/connections/{id}",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed PUT binds the caller's UUIDv7 to the action, the recorded actor, the Connection ID, the If-Match ETag and the canonical body (credential aliases included). In one transaction the key is looked up, the ETag is checked (412 writes nothing) and an identical replacement is answered before the key is reserved (nothing recorded or reserved); otherwise the key is reserved and the replacement and its evidence row under the caller's key commit together. An exact retry is answered 200 with the receipt of the connection.replace row; any other use of the key is 409. The standalone dispatcher delivers it from the same Connections database under that file's own authority; the negotiated file sink syncs the qualified event and its parent directory on Unix before the cursor advances. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn create_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn replace_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn delete_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "pub(super) async fn admit_keyed_connection_change("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery.rs",
+              "anchor": "pub(crate) fn project_standalone("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_connection_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_a_reused_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_a_failed_evidence_insert_rolls_back_the_keyed_change_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_two_writers_racing_one_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_the_binding_digest_is_stored_only_in_the_reservation_row("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_tests.rs",
+              "anchor": "async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_the_unkeyed_connection_create_and_replace_and_admits_the_keyed_principal("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_replayed_connection_change_repeats_no_side_effect("
+            }
+          ]
+        },
+        {
+          "criteria": {
+            "operation": "credential.binding_change",
+            "storage_mode": "standalone",
+            "method": "PUT",
+            "route": "/v1{ADMIN_PREFIX}/connections/{id}",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "Made only by a keyed replacement that advances the credential revision: its row commits in the replacement's transaction under the replacement's caller key, so the two v1 events share one operation_id. In v1 its resource is a credential_binding reference derived from the Connection ID; the binding itself, its secret IDs and locators never enter the record. The standalone dispatcher delivers it from the same Connections database under that file's own authority; the negotiated file sink syncs the qualified event and its parent directory on Unix before the cursor advances. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn create_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn replace_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn delete_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "pub(super) async fn admit_keyed_connection_change("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery.rs",
+              "anchor": "pub(crate) fn project_standalone("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_connection_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_a_reused_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_a_failed_evidence_insert_rolls_back_the_keyed_change_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_two_writers_racing_one_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_the_binding_digest_is_stored_only_in_the_reservation_row("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_tests.rs",
+              "anchor": "async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_the_unkeyed_connection_create_and_replace_and_admits_the_keyed_principal("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_replayed_connection_change_repeats_no_side_effect("
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "connection_delete_postgres",
@@ -876,12 +1436,12 @@
       "boundary": "PostgresConnectionStore::delete refuses an actor the evidence cannot record exactly (ChangeActor::is_recordable: an empty or oversized subject or issuer, or an issuer on an actor that has none) before opening a transaction, then locks shared Connection state and the record, checks ETag and dependencies, appends the outbox tombstone to_version=0 and one connection_change_evidence row carrying the same shared revision, releases names, deletes the parent and commits once. An evidence insert failure rolls the whole delete back.",
       "record": "Outbox tombstone unchanged; connection_documents and bindings cascade. connection_change_evidence (migration 16) has no foreign key, so it survives the cascade; it holds identifiers, revisions and the actor only. Stale ETag, dependency, missing record and lost race write no row.",
       "actor": "The deleting principal as the admin endpoint builds it from the authenticated Principal (ChangeActor::from_principal), committed with the delete and retained after it: actor_user_id (the subject, 1 to 4096 bytes, the principal bound) and, since migration 24, actor_kind (principal or service_token), actor_auth_mode (the audit auth mode) and actor_issuer (the canonical issuer of a principal that has one, 1 to 4096 bytes). Rows committed before migration 24 record none of the three. No credential, session, role or email; a keyed safe actor reference exists only in what is delivered.",
-      "identity": "Generated event_id and operation_id UUIDs, Connection ID, prior version, shared security revision equal to the tombstone's revision, database-clock committed_at. operation_id is minted per store call, not bound to a client idempotency key; a lost response is reconciled by the Connection's evidence row, and a blind retry is NotFound.",
+      "identity": "With an Idempotency-Key (issue #425) the caller's UUIDv7 is the deletion's operation_id, reserved with its binding digest in the deleting transaction; an exact retry is answered from the evidence row, which outlives the record, and a key bound to anything else is 409. Without one, event_id and operation_id are generated UUIDv4s. Connection ID, prior version, shared security revision equal to the tombstone's revision, database-clock committed_at. A lost unkeyed response is reconciled by the Connection's evidence row, and a blind unkeyed retry is NotFound.",
       "delivery": "journaled_dispatch",
       "disposition": [
-        "missing_metadata"
+        "withdrawal_admitted"
       ],
-      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the store and derive an issuer-scoped subject reference, so the delivered record can become authority_event.v1. Issuer, actor kind and auth mode are recorded since migration 24. Delivery (PR3) journals each row in the delete's transaction and dispatches it as authority_event_delivery.v1 behind a persisted cursor; AUTHORITY_EVIDENCE_DURABILITY=required makes a configured sink mandatory and admits this row; nothing qualifies it yet.",
+      "follow_up": "A withdrawal admitted in every form in required mode (owner ruling 4 on #425, 2026-11-20): refusing the unkeyed DELETE the admin UI sends, or a service-token caller's delete, would leave a Connection's authority in place, so both stay admitted; they commit their evidence atomically and are delivered at least once as authority_event_delivery.v1, and are not caller-keyed. Only the keyed principal form has the reviewed qualified path below.",
       "sources": [
         {
           "path": "gateway/src/storage/migrations/0016_connection_change_evidence.sql",
@@ -968,7 +1528,89 @@
       ],
       "required_durability_supported": false,
       "required_mode": "admitted",
-      "test_claim": "PostgreSQL-gated regression anchors for the transactional deletion evidence and its journaled delivery: commit order, crash redelivery under the same event IDs, retention floors and capacity refusal. They do not certify the proposed authority_event.v1 contract."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional deletion evidence and its journaled delivery: commit order, crash redelivery under the same event IDs, retention floors and capacity refusal. They do not certify the proposed authority_event.v1 contract. The qualified delivery path below lists the tests that certify the keyed principal form; the unkeyed and service-token forms are not certified.",
+      "qualified_delivery_paths": [
+        {
+          "criteria": {
+            "operation": "connection.delete",
+            "storage_mode": "postgres",
+            "method": "DELETE",
+            "route": "/v1{ADMIN_PREFIX}/connections/{id}",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed DELETE binds the caller's UUIDv7 to the action, the recorded actor, the Connection ID and the If-Match ETag. In one transaction the key is looked up, the ETag and dependencies are checked, the key is reserved, and the deletion and its evidence row under the caller's key commit together; the evidence outlives the record, so an exact retry after the record is gone is answered 200 with the receipt (the revision removed) and changes nothing. Unkeyed requests and service-token callers stay admitted (withdrawal_admitted) and do not qualify for this path. The negotiated file sink syncs the qualified event and its parent directory on Unix before cursor advance. Consumers deduplicate on (authority_id, event_id). Durable cluster file delivery assumes shared storage or shipping to the same durable consumer. The opt-in log sink emits the same representation with process-log acceptance only.",
+          "sources": [
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn create_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn replace_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "pub async fn delete_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/pg_store.rs",
+              "anchor": "async fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "pub(super) async fn admit_keyed_connection_change("
+            },
+            {
+              "path": "gateway/src/authority_events/delivery.rs",
+              "anchor": "pub(super) fn qualify_caller_bound("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_connection_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_reused_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_a_failed_evidence_insert_rolls_back_the_keyed_change_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn a_full_journal_refuses_the_keyed_connection_change_and_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_two_writers_racing_one_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/pg_store_tests.rs",
+              "anchor": "async fn postgres_the_binding_digest_is_stored_only_in_the_reservation_row("
+            },
+            {
+              "path": "gateway/src/authority_events/dispatcher_tests.rs",
+              "anchor": "async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "connection_delete_standalone",
@@ -987,12 +1629,12 @@
       "boundary": "SqliteConnectionStore::delete refuses an actor the evidence cannot record exactly (ChangeActor::is_recordable), then in one IMMEDIATE transaction checks bindings, ETag and dependencies, appends one connection_change_evidence row (connection.delete), deletes the record, whose children cascade, and commits once. An evidence insert failure rolls the delete back and is reported as a store failure (503).",
       "record": "connection_change_evidence (no foreign key) keeps the deletion's actor (subject, kind, auth mode and, for a principal that has one, canonical issuer, with the same pairing CHECK as PostgreSQL migration 24 and every column required), action, event/operation UUIDs, Connection ID and prior connection revision with no successor after the record, bindings, catalogs and status have cascaded, beside the record's earlier create/replace rows. Stale ETag, dependency, missing record and an unrecordable actor write no row.",
       "actor": "The authenticated principal passed through the managed-store adapter as a ChangeActor, the same one the PostgreSQL store records: subject (1 to 4096 bytes), actor_kind, actor_auth_mode and canonical actor_issuer, committed with the delete and retained after it.",
-      "identity": "Generated event_id/operation_id UUIDs, Connection ID, prior revision, store sequence and process-clock committed_at. A lost delete response is reconciled from the Connection's evidence rows; a blind retry is NotFound and records nothing.",
+      "identity": "With an Idempotency-Key (issue #425) the caller's UUIDv7 is the deletion's operation_id, reserved with its binding digest in the deleting IMMEDIATE transaction; an exact retry is answered from the evidence row, which outlives the record, and a key bound to anything else is 409. Without one, event_id/operation_id are generated UUIDs. Connection ID, prior revision, store sequence and process-clock committed_at. A lost unkeyed delete response is reconciled from the Connection's evidence rows; a blind unkeyed retry is NotFound and records nothing.",
       "delivery": "standalone_cursor_dispatch",
       "disposition": [
-        "missing_metadata"
+        "withdrawal_admitted"
       ],
-      "follow_up": "PR4 follow-up: a caller-bound operation identity. Delivered from this same database since Connections schema migration 14 (standalone_cursor_dispatch); standalone mode has no journal. Issuer, actor kind and auth mode are recorded.",
+      "follow_up": "A withdrawal admitted in every form in required mode (owner ruling 4 on #425, 2026-11-20): refusing the unkeyed DELETE the admin UI sends, or a service-token caller's delete, would leave a Connection's authority in place, so both stay admitted; they commit their evidence atomically and are delivered at least once as authority_event_delivery.v1, and are not caller-keyed. Only the keyed principal form has the reviewed qualified path below.",
       "sources": [
         {
           "path": "gateway/src/connections/store.rs",
@@ -1035,7 +1677,93 @@
       ],
       "required_durability_supported": false,
       "required_mode": "admitted",
-      "test_claim": "Standalone regression anchors for the transactional deletion evidence: survival of the cascade and a restart, refused deletes, forced insert failure and rollback. They do not certify the proposed authority-event contract or delivery."
+      "test_claim": "Standalone regression anchors for the transactional deletion evidence: survival of the cascade and a restart, refused deletes, forced insert failure and rollback. They do not certify the proposed authority-event contract or delivery. The qualified delivery path below lists the tests that certify the keyed principal form; the unkeyed and service-token forms are not certified.",
+      "qualified_delivery_paths": [
+        {
+          "criteria": {
+            "operation": "connection.delete",
+            "storage_mode": "standalone",
+            "method": "DELETE",
+            "route": "/v1{ADMIN_PREFIX}/connections/{id}",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed DELETE binds the caller's UUIDv7 to the action, the recorded actor, the Connection ID and the If-Match ETag. In one transaction the key is looked up, the ETag and dependencies are checked, the key is reserved, and the deletion and its evidence row under the caller's key commit together; the evidence outlives the record, so an exact retry after the record is gone is answered 200 with the receipt (the revision removed) and changes nothing. Unkeyed requests and service-token callers stay admitted (withdrawal_admitted) and do not qualify for this path. The standalone dispatcher delivers it from the same Connections database under that file's own authority; the negotiated file sink syncs the qualified event and its parent directory on Unix before the cursor advances. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn create_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn replace_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn delete_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/store.rs",
+              "anchor": "fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "pub(super) async fn admit_keyed_connection_change("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery.rs",
+              "anchor": "pub(crate) fn project_standalone("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_connection_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_a_reused_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_a_failed_evidence_insert_rolls_back_the_keyed_change_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_two_writers_racing_one_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/caller_operation_contract.rs",
+              "anchor": "async fn sqlite_the_binding_digest_is_stored_only_in_the_reservation_row("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_tests.rs",
+              "anchor": "async fn a_keyed_connection_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_the_unkeyed_connection_create_and_replace_and_admits_the_keyed_principal("
+            },
+            {
+              "path": "gateway/src/authority_evidence_app_tests.rs",
+              "anchor": "async fn a_replayed_connection_change_repeats_no_side_effect("
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "catalog_postgres",

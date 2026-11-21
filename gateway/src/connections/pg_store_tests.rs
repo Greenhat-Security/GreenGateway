@@ -7023,3 +7023,430 @@ async fn a_failed_catalog_evidence_insert_rolls_back_the_publication() {
         "a recorded publication counts nothing"
     );
 }
+
+// ---- keyed Connection create, replace and delete (issue #425) -------------
+
+mod keyed_connection_changes {
+    use super::*;
+    use crate::connections::caller_operation_contract::{
+        self as contract, ContractDatabase, EvidenceRow as ContractEvidenceRow, Reservation,
+    };
+    use crate::connections::managed_store::{ClusterConnectionsBoot, ManagedConnectionStore};
+
+    /// A migrated database whose contract fence carries
+    /// `caller_operation_keys`, as the operation gate's first admission of a
+    /// keyed change leaves it, with the store under test behind the managed
+    /// dispatch a handler uses.
+    struct PostgresDatabase {
+        pool: deadpool_postgres::Pool,
+        store: ManagedConnectionStore,
+        _database: TestDatabase,
+    }
+
+    impl PostgresDatabase {
+        async fn new(admin_dsn: &str) -> Self {
+            let database = create_test_database(admin_dsn).await;
+            let (store, pool) = migrated_store(&database.dsn, 64).await;
+            raise_caller_operation_keys_fence(&pool).await;
+            Self {
+                store: ManagedConnectionStore::Postgres {
+                    store: std::sync::Arc::new(store),
+                    boot: std::sync::Arc::new(ClusterConnectionsBoot {
+                        mcp_catalogs: Vec::new(),
+                        openapi_catalogs: Vec::new(),
+                        openapi_inventory_catalogs: Vec::new(),
+                        openapi_overlays: Vec::new(),
+                        enum_source_values: std::sync::Mutex::new(None),
+                    }),
+                },
+                pool,
+                _database: database,
+            }
+        }
+    }
+
+    /// Raise the contract fence the way the operation gate's first admission
+    /// of a keyed change does (`CALLER_OPERATION_KEYS`).
+    async fn raise_caller_operation_keys_fence(pool: &deadpool_postgres::Pool) {
+        let requirement = &crate::storage::compatibility::CALLER_OPERATION_KEYS;
+        let raised = pool
+            .get()
+            .await
+            .expect("fence checkout")
+            .execute(
+                "UPDATE greengateway.contract_fence
+                 SET generation = generation + 1,
+                     minimum_schema = GREATEST(minimum_schema, $1),
+                     capabilities = $2,
+                     raised_at = now(),
+                     raised_by = 'fixture.caller_operation_keys'
+                 WHERE singleton",
+                &[
+                    &requirement.minimum_schema,
+                    &requirement.capability.as_str(),
+                ],
+            )
+            .await
+            .expect("the fence raises");
+        assert_eq!(raised, 1);
+    }
+
+    impl ContractDatabase for PostgresDatabase {
+        fn store(&self) -> &ManagedConnectionStore {
+            &self.store
+        }
+
+        async fn evidence(&self) -> Vec<ContractEvidenceRow> {
+            self.pool
+                .get()
+                .await
+                .expect("evidence checkout")
+                .query(
+                    "SELECT operation_id::text, action, connection_id::text \
+                     FROM greengateway.connection_change_evidence \
+                     ORDER BY committed_at, event_id",
+                    &[],
+                )
+                .await
+                .expect("evidence reads")
+                .iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect()
+        }
+
+        async fn reservations(&self) -> Vec<Reservation> {
+            self.pool
+                .get()
+                .await
+                .expect("reservation checkout")
+                .query(
+                    "SELECT operation_id::text, action, binding_digest \
+                     FROM greengateway.authority_caller_operation_ids ORDER BY operation_id",
+                    &[],
+                )
+                .await
+                .expect("reservations read")
+                .iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect()
+        }
+
+        async fn text_outside_reservations(&self) -> String {
+            let client = self.pool.get().await.expect("dump checkout");
+            let tables: Vec<String> = client
+                .query(
+                    "SELECT table_name::text FROM information_schema.tables \
+                     WHERE table_schema = 'greengateway' AND table_type = 'BASE TABLE' \
+                     AND table_name <> 'authority_caller_operation_ids'",
+                    &[],
+                )
+                .await
+                .expect("tables list")
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            let mut text = String::new();
+            for table in tables {
+                let row = client
+                    .query_one(
+                        &format!(
+                            "SELECT coalesce(string_agg(row_to_json(t)::text, '|'), '') \
+                             FROM greengateway.\"{table}\" t"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .expect("table dumps");
+                text.push_str(row.get::<_, &str>(0));
+            }
+            text
+        }
+
+        async fn evidence_text(&self) -> String {
+            self.pool
+                .get()
+                .await
+                .expect("evidence dump checkout")
+                .query_one(
+                    "SELECT coalesce(string_agg(row_to_json(t)::text, '|'), '') \
+                     FROM greengateway.connection_change_evidence t",
+                    &[],
+                )
+                .await
+                .expect("the evidence dumps")
+                .get(0)
+        }
+
+        async fn fail_evidence_inserts(&self, fail: bool) {
+            let sql = if fail {
+                r#"
+                CREATE FUNCTION greengateway.fail_keyed_connection_evidence()
+                RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    RAISE EXCEPTION 'injected evidence failure';
+                END;
+                $$;
+                CREATE TRIGGER fail_keyed_connection_evidence
+                BEFORE INSERT ON greengateway.connection_change_evidence
+                FOR EACH ROW EXECUTE FUNCTION greengateway.fail_keyed_connection_evidence();
+                "#
+            } else {
+                r#"
+                DROP TRIGGER fail_keyed_connection_evidence
+                    ON greengateway.connection_change_evidence;
+                DROP FUNCTION greengateway.fail_keyed_connection_evidence();
+                "#
+            };
+            self.pool
+                .get()
+                .await
+                .expect("fault checkout")
+                .batch_execute(sql)
+                .await
+                .expect("fault statement");
+        }
+
+        async fn reserve_for_a_keyed_revoke(&self, key: uuid::Uuid) {
+            let client = self.pool.get().await.expect("revoke checkout");
+            assert!(
+                crate::storage::postgres_authority_events::reserve_caller_operation(
+                    &client,
+                    key,
+                    "service_token.revoke",
+                )
+                .await
+                .expect("the reservation inserts")
+            );
+        }
+    }
+
+    macro_rules! database_or_skip {
+        () => {{
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            PostgresDatabase::new(&admin_dsn).await
+        }};
+    }
+
+    #[tokio::test]
+    async fn postgres_connection_caller_operation_contract() {
+        contract::connection_caller_operation_contract(&database_or_skip!()).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_a_reused_key_with_a_different_binding_conflicts_and_changes_nothing() {
+        contract::a_reused_key_with_a_different_binding_conflicts_and_changes_nothing(
+            &database_or_skip!(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_a_key_reserved_by_another_action_cannot_take_effect_here() {
+        contract::a_key_reserved_by_another_action_cannot_take_effect_here(&database_or_skip!())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_a_failed_evidence_insert_rolls_back_the_keyed_change_and_its_reservation() {
+        contract::a_failed_evidence_insert_rolls_back_the_keyed_change_and_its_reservation(
+            &database_or_skip!(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_a_stale_etag_under_a_key_writes_no_change_evidence_or_reservation() {
+        contract::a_stale_etag_under_a_key_writes_no_change_evidence_or_reservation(
+            &database_or_skip!(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_an_identical_keyed_replace_records_and_reserves_nothing() {
+        contract::an_identical_keyed_replace_records_and_reserves_nothing(&database_or_skip!())
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_two_writers_racing_one_key_commit_one_change() {
+        contract::two_writers_racing_one_key_commit_one_change(&database_or_skip!()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_two_keys_racing_one_revision_leave_only_the_winners_rows() {
+        contract::two_keys_racing_one_revision_leave_only_the_winners_rows(&database_or_skip!())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_the_binding_digest_is_stored_only_in_the_reservation_row() {
+        contract::the_binding_digest_is_stored_only_in_the_reservation_row(&database_or_skip!())
+            .await;
+    }
+
+    /// I2, I4 and A4: a full journal refuses the keyed create, replace and
+    /// delete with `503`, and none of them reserves its key; once there is
+    /// room the same keys commit.
+    #[tokio::test]
+    async fn a_full_journal_refuses_the_keyed_connection_change_and_reserves_nothing() {
+        use crate::storage::postgres_authority_events::{
+            PostgresAuthorityEventStore, OPERATION_JOURNAL_APPEND,
+        };
+
+        let db = database_or_skip!();
+        let actor = contract::operator();
+        let fixture = contract::candidate("Journaled keyed API", "journaled-token");
+        let created = db
+            .store
+            .create(fixture, &actor, None)
+            .await
+            .expect("the fixture creates");
+        let journal = PostgresAuthorityEventStore::new(db.pool.clone());
+        journal
+            .configure_capacity(1)
+            .await
+            .expect("capacity applies");
+        let fresh = contract::candidate("Refused keyed API", "refused-token");
+        let changed = contract::candidate("Journaled keyed API", "journaled-token-next");
+        let create_op = contract::keyed(
+            90,
+            "connection.create",
+            &actor,
+            "",
+            "",
+            &serde_json::to_vec(&fresh).unwrap(),
+        );
+        let replace_op = contract::keyed(
+            91,
+            "connection.replace",
+            &actor,
+            created.id.as_str(),
+            created.etag().as_str(),
+            &serde_json::to_vec(&changed).unwrap(),
+        );
+        let delete_op = contract::keyed(
+            92,
+            "connection.delete",
+            &actor,
+            created.id.as_str(),
+            created.etag().as_str(),
+            b"",
+        );
+        let refusals = [
+            db.store
+                .create_with_operation(fresh.clone(), &actor, None, Some(&create_op))
+                .await
+                .map(|_| ()),
+            db.store
+                .replace_with_operation(
+                    &created.id,
+                    &created.etag(),
+                    changed.clone(),
+                    &actor,
+                    Some(&replace_op),
+                )
+                .await
+                .map(|_| ()),
+            db.store
+                .delete_with_operation(&created.id, &created.etag(), &actor, Some(&delete_op))
+                .await
+                .map(|_| ()),
+        ];
+        for refused in refusals {
+            let refused = refused.expect_err("a full journal refuses the keyed change");
+            assert!(
+                matches!(
+                    refused,
+                    ConnectionStoreError::Unavailable { operation } if operation == OPERATION_JOURNAL_APPEND
+                ),
+                "{refused}"
+            );
+        }
+        assert!(db.reservations().await.is_empty(), "nothing was reserved");
+        assert_eq!(
+            db.store.get(&created.id).await.unwrap().unwrap(),
+            created,
+            "nothing changed"
+        );
+        contract::assert_reservations_match_evidence(&db).await;
+
+        journal
+            .configure_capacity(16)
+            .await
+            .expect("capacity applies");
+        db.store
+            .create_with_operation(fresh, &actor, None, Some(&create_op))
+            .await
+            .expect("the keyed create commits once there is room");
+        db.store
+            .replace_with_operation(
+                &created.id,
+                &created.etag(),
+                changed,
+                &actor,
+                Some(&replace_op),
+            )
+            .await
+            .expect("the keyed replace commits once there is room");
+        assert_eq!(db.reservations().await.len(), 2);
+        contract::assert_reservations_match_evidence(&db).await;
+    }
+
+    /// The store confirms the fence in the change's own transaction: below
+    /// `caller_operation_keys` a keyed change is refused as unavailable and
+    /// nothing is reserved or changed, while the unkeyed form still commits.
+    #[tokio::test]
+    async fn a_keyed_connection_change_below_the_fence_is_refused_and_changes_nothing() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_store(&database.dsn, 64).await;
+        // The recorder is this thread's, and the test's current-thread
+        // runtime runs the store on this thread.
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        let _recording = ::metrics::set_default_local_recorder(&recorder);
+        let evidence_failures =
+            || recorder.count(crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL, &[]);
+        let actor = contract::operator();
+        let fresh = contract::candidate("Unfenced API", "unfenced-token");
+        let create_op = contract::keyed(
+            93,
+            "connection.create",
+            &actor,
+            "",
+            "",
+            &serde_json::to_vec(&fresh).unwrap(),
+        );
+        let refused = store
+            .create_with_operation(fresh.clone(), &actor, None, Some(&create_op))
+            .await
+            .expect_err("an open fence refuses a keyed change");
+        assert!(
+            matches!(refused, ConnectionStoreError::Unavailable { .. }),
+            "{refused}"
+        );
+        assert_eq!(store.count().await.unwrap(), 0);
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM greengateway.authority_caller_operation_ids"
+            )
+            .await,
+            0
+        );
+        // A reservation that could not be written is counted with the
+        // evidence write failures (I2).
+        assert_eq!(evidence_failures(), 1);
+        store
+            .create(fresh, &actor, None)
+            .await
+            .expect("the unkeyed form commits below the fence");
+        assert_eq!(evidence_failures(), 1, "an unkeyed change reserves nothing");
+    }
+}

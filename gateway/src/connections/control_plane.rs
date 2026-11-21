@@ -14,7 +14,13 @@ use tokio::sync::{
     Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, OwnedSemaphorePermit, Semaphore,
 };
 
-use crate::{auth::change_actor::ChangeActor, config::Config};
+use crate::{
+    auth::change_actor::ChangeActor,
+    authority_events::caller_operation::{
+        CallerKeyState, CallerOperation, CallerOutcome, OperationReceipt,
+    },
+    config::Config,
+};
 
 use super::google_delegation::GoogleWorkloadIdentity;
 
@@ -1595,7 +1601,99 @@ impl ConnectionControlPlane {
         candidate: ConnectionWrite,
         actor: &ChangeActor,
     ) -> Result<StoredConnection, ConnectionMutationError> {
+        committed_mutation(
+            self.create_managed_with_operation(expected_collection_etag, candidate, actor, None)
+                .await,
+        )
+    }
+
+    /// The caller-key read a keyed handler asks before any external work
+    /// (issue #425): what the store's reservation table says about the key.
+    pub(crate) async fn caller_operation_state(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<CallerKeyState, crate::storage::RepositoryError> {
+        match self.managed_store() {
+            Ok(store) => store.caller_operation_state(caller).await,
+            Err(_) => Err(crate::storage::RepositoryError::new(
+                crate::storage::RepositoryErrorKind::Unavailable,
+                "connection_caller_operation",
+            )),
+        }
+    }
+
+    /// The receipt of the Connection change a caller key committed.
+    pub(crate) async fn caller_operation_receipt(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<Option<OperationReceipt>, crate::storage::RepositoryError> {
+        match self.managed_store() {
+            Ok(store) => store.caller_operation_receipt(caller).await,
+            Err(_) => Err(crate::storage::RepositoryError::new(
+                crate::storage::RepositoryErrorKind::Unavailable,
+                "connection_caller_operation",
+            )),
+        }
+    }
+
+    /// Under the mutation lock and before this control plane's own checks
+    /// against its runtime snapshot, which an exact retry of a committed
+    /// change no longer passes (the collection moved, the record is gone):
+    /// the receipt of the change `caller`'s key committed, a conflict for a
+    /// key bound to anything else, or `None` to go on. The store's own
+    /// transaction decides again.
+    async fn committed_by_key(
+        store: &ManagedConnectionStore,
+        caller: Option<&CallerOperation>,
+    ) -> Result<Option<OperationReceipt>, ConnectionMutationError> {
+        let Some(caller) = caller else {
+            return Ok(None);
+        };
+        let unavailable = |error: crate::storage::RepositoryError| {
+            tracing::error!(error = %error, "a Connection change's caller key could not be read");
+            ConnectionMutationError::Store(ConnectionStoreError::Unavailable {
+                operation: "connection caller operation read",
+            })
+        };
+        match store
+            .caller_operation_state(caller)
+            .await
+            .map_err(unavailable)?
+        {
+            CallerKeyState::Unused => Ok(None),
+            CallerKeyState::OtherBinding => Err(ConnectionMutationError::Store(
+                ConnectionStoreError::CallerOperationConflict,
+            )),
+            CallerKeyState::SameBinding => match store
+                .caller_operation_receipt(caller)
+                .await
+                .map_err(unavailable)?
+            {
+                Some(receipt) => Ok(Some(receipt)),
+                None => Err(ConnectionMutationError::Store(
+                    ConnectionStoreError::Unavailable {
+                        operation: "connection caller operation read",
+                    },
+                )),
+            },
+        }
+    }
+
+    /// [`Self::create_managed`] under a caller key (issue #425): an exact
+    /// retry of a committed create is answered with its receipt and changes
+    /// nothing here either, and the runtime snapshot is published only for
+    /// a change this call committed.
+    pub async fn create_managed_with_operation(
+        &self,
+        expected_collection_etag: &str,
+        candidate: ConnectionWrite,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<StoredConnection>, ConnectionMutationError> {
         let _guard = self.mutation_guard().await;
+        if let Some(receipt) = Self::committed_by_key(self.managed_store()?, caller).await? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         let current = self.runtime.load_full();
         if current.collection_etag() != expected_collection_etag {
             return Err(ConnectionMutationError::CollectionConflict {
@@ -1615,15 +1713,16 @@ impl ConnectionControlPlane {
         let compute = move |managed: &BTreeMap<ConnectionId, StoredConnection>| {
             collection_etag(managed, &legacy, omitted)
         };
-        let created = self
+        let created = match self
             .managed_store()?
-            .create(
+            .create_with_operation(
                 candidate,
                 actor,
                 Some(CollectionCheck {
                     expected_etag: expected_collection_etag,
                     compute: &compute,
                 }),
+                caller,
             )
             .await
             .map_err(|error| match error {
@@ -1631,12 +1730,15 @@ impl ConnectionControlPlane {
                     ConnectionMutationError::CollectionConflict { current }
                 }
                 other => ConnectionMutationError::Store(other),
-            })?;
+            })? {
+            CallerOutcome::Committed(created) => created,
+            CallerOutcome::Replayed(receipt) => return Ok(CallerOutcome::Replayed(receipt)),
+        };
         let mut managed = current.managed().clone();
         managed.insert(created.id.clone(), created.clone());
         self.publish_runtime(managed);
         self.caller_assertion_keys.forget(&created.id);
-        Ok(created)
+        Ok(CallerOutcome::Committed(created))
     }
 
     pub async fn replace_managed(
@@ -1646,20 +1748,43 @@ impl ConnectionControlPlane {
         candidate: ConnectionWrite,
         actor: &ChangeActor,
     ) -> Result<StoredConnection, ConnectionMutationError> {
+        committed_mutation(
+            self.replace_managed_with_operation(id, expected, candidate, actor, None)
+                .await,
+        )
+    }
+
+    /// [`Self::replace_managed`] under a caller key, as
+    /// [`Self::create_managed_with_operation`] describes.
+    pub async fn replace_managed_with_operation(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        candidate: ConnectionWrite,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<StoredConnection>, ConnectionMutationError> {
         let _guard = self.mutation_guard().await;
+        if let Some(receipt) = Self::committed_by_key(self.managed_store()?, caller).await? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         self.ensure_no_reserved_alias(&candidate)?;
         self.ensure_activatable(&candidate)?;
         self.ensure_assertion_kids_unambiguous(Some(id), &candidate, &self.runtime.load_full())?;
-        let replaced = self
+        let replaced = match self
             .managed_store()?
-            .replace(id, expected, candidate, actor)
-            .await?;
+            .replace_with_operation(id, expected, candidate, actor, caller)
+            .await?
+        {
+            CallerOutcome::Committed(replaced) => replaced,
+            CallerOutcome::Replayed(receipt) => return Ok(CallerOutcome::Replayed(receipt)),
+        };
         let current = self.runtime.load_full();
         let mut managed = current.managed().clone();
         managed.insert(id.clone(), replaced.clone());
         self.publish_runtime(managed);
         self.caller_assertion_keys.forget(id);
-        Ok(replaced)
+        Ok(CallerOutcome::Committed(replaced))
     }
 
     pub async fn delete_managed(
@@ -1668,7 +1793,25 @@ impl ConnectionControlPlane {
         expected: &ConnectionEtag,
         actor: &ChangeActor,
     ) -> Result<(), ConnectionMutationError> {
+        committed_mutation(
+            self.delete_managed_with_operation(id, expected, actor, None)
+                .await,
+        )
+    }
+
+    /// [`Self::delete_managed`] under a caller key, as
+    /// [`Self::create_managed_with_operation`] describes.
+    pub async fn delete_managed_with_operation(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<()>, ConnectionMutationError> {
         let _guard = self.mutation_guard().await;
+        if let Some(receipt) = Self::committed_by_key(self.managed_store()?, caller).await? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         // Cluster mode queues dependency guard rows for a background flush;
         // a delete must not outrun them, or ON DELETE RESTRICT has no child
         // row to protect and a live route or tool is orphaned. Flush first,
@@ -1677,13 +1820,19 @@ impl ConnectionControlPlane {
         // judged; a flush that fails refuses the delete rather than risk
         // that.
         self.flush_pending_dependencies_locked().await?;
-        self.managed_store()?.delete(id, expected, actor).await?;
+        if let CallerOutcome::Replayed(receipt) = self
+            .managed_store()?
+            .delete_with_operation(id, expected, actor, caller)
+            .await?
+        {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         let current = self.runtime.load_full();
         let mut managed = current.managed().clone();
         managed.remove(id);
         self.publish_runtime(managed);
         self.caller_assertion_keys.forget(id);
-        Ok(())
+        Ok(CallerOutcome::Committed(()))
     }
 
     /// Replace the whole managed map with what the authority currently
@@ -2491,6 +2640,19 @@ pub enum ConnectionMutationError {
     Busy,
     DeadlineExceeded,
     Store(ConnectionStoreError),
+}
+
+/// The change an unkeyed control-plane call committed: only a keyed call is
+/// answered from a receipt, so a receipt here is refused as a defect.
+fn committed_mutation<T>(
+    outcome: Result<CallerOutcome<T>, ConnectionMutationError>,
+) -> Result<T, ConnectionMutationError> {
+    match outcome? {
+        CallerOutcome::Committed(value) => Ok(value),
+        CallerOutcome::Replayed(_) => Err(ConnectionMutationError::Store(
+            ConnectionStoreError::CallerOperationConflict,
+        )),
+    }
 }
 
 impl fmt::Display for ConnectionMutationError {

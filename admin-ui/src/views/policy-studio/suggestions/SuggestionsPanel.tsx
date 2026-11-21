@@ -13,7 +13,9 @@ import {
   draftedActionText,
   evidenceAvailabilityText,
   evidenceFacts,
+  freshnessLabels,
   freshnessText,
+  generationFacts,
   principalText,
   routingFacts,
   sourceText,
@@ -66,8 +68,6 @@ const FILTERS: ReadonlyArray<{ value: SuggestionFilter; label: string }> = [
   { value: 'dismissed', label: 'Dismissed' },
   { value: 'all', label: 'All states' },
 ];
-
-const GENERATOR_VERSION_TEXT = 'Not recorded by this gateway';
 
 export function SuggestionsPanel({
   handle,
@@ -453,11 +453,11 @@ export function SuggestionsPanel({
                 : ''}
           </p>
           <p className="rule-hint">
-            Listing does not recompute a suggestion, and the gateway records no policy revision,
-            resource snapshot, evidence schema or generator version with one. So a listed
-            suggestion is not known to fit the live policy until it is opened in a draft, which
-            checks it against the live policy and current routing and refuses it, writing nothing,
-            when it no longer fits.
+            Each suggestion records the generator and evidence schema versions, the evidence
+            cutoff and the policy and resource snapshot it was generated against, and the gateway
+            labels it current, stale, unbound or superseded on every listing. A stale or unbound
+            suggestion can still be opened in a draft, which checks it against the live policy and
+            current routing; regenerating suggestions refreshes its binding.
           </p>
           {list.alert !== null ? <StudioAlertPanel alert={list.alert} /> : null}
           {list.loadedAt !== null && list.rows.length === 0 && !list.loading ? (
@@ -582,12 +582,24 @@ function SuggestionRow({
   }, [confirmingDismiss]);
 
   const rule = suggestion.proposed_rule;
-  const labels = stateLabels(suggestion, mark);
+  const markLabels = stateLabels(suggestion, mark);
+  // The gateway's own freshness verdict, after what this view learned since
+  // the listing; one label per text.
+  const labels = [
+    ...markLabels,
+    ...(mark?.kind === 'gone'
+      ? []
+      : freshnessLabels(suggestion).filter(
+          (label) => !markLabels.some((known) => known.text === label.text),
+        )),
+  ];
   const evidence = evidenceFacts(suggestion);
   const routing = routingFacts(rule);
+  const generation = generationFacts(suggestion);
   const open = suggestion.state === 'open' && mark?.kind !== 'gone';
+  const ruleLive = mark?.kind === 'rule_live' || suggestion.freshness?.status === 'superseded';
   const rowBlockers = [
-    ...(mark?.kind === 'rule_live'
+    ...(ruleLive
       ? ['The live policy already holds this rule; dismiss the suggestion instead.']
       : []),
     ...reviewBlockers,
@@ -674,7 +686,19 @@ function SuggestionRow({
         </div>
         <div>
           <dt>Generator version</dt>
-          <dd>{GENERATOR_VERSION_TEXT}</dd>
+          <dd>{generation.generator}</dd>
+        </div>
+        <div>
+          <dt>Evidence schema</dt>
+          <dd>{generation.evidenceSchema}</dd>
+        </div>
+        <div>
+          <dt>Evidence cutoff</dt>
+          <dd>{generation.evidenceCutoff}</dd>
+        </div>
+        <div>
+          <dt>Resource snapshot</dt>
+          <dd>{generation.resourceSnapshot}</dd>
         </div>
         <div>
           <dt>Revision</dt>

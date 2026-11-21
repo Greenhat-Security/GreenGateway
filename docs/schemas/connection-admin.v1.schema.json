@@ -1744,6 +1744,66 @@
         }
       }
     },
+    "OperationReceipt": {
+      "description": "What an exact retry of a keyed Connection create, replace or delete is answered with (issue #425): read from the committed evidence row, never a secret, a credential alias or a binding digest. revision is the Connection's revision after the change, or the revision a deletion removed.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "operation",
+        "resource_id",
+        "revision",
+        "committed_at"
+      ],
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "connection.create",
+            "connection.replace",
+            "connection.delete"
+          ]
+        },
+        "resource_id": {
+          "$ref": "#/$defs/StableId"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "committed_at": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "AuthorityEvidenceRefusal": {
+      "description": "A change AUTHORITY_EVIDENCE_DURABILITY=required refused before anything was read or written (issue #425). operation names the refused operation code; error names the first unmet criterion and nothing from the request.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "error",
+        "reason",
+        "operation"
+      ],
+      "properties": {
+        "error": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "const": "authority_evidence_unsupported"
+        },
+        "operation": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
     "SecretPurpose": {
       "description": "What a secret alias may be resolved as. A purpose sets size and encoding rules; an encrypted local secret is stored under one purpose and resolves under no other, while operator and external-provider aliases are not tied to a purpose. assertion_signing_key is the PKCS#8 private key a caller assertion signs with and whose public half the gateway publishes; it is never sent as a header value. token_exchange_client_secret is the client secret a delegated_issuer_token Connection authenticates to its token-exchange issuer with. The issuer hands out any user's upstream token to whoever holds it, so a Connection save that binds such an alias under any other field of any Connection, or binds another field to an alias a Connection exchanges with, is refused with secret_purpose_conflict. The encrypted local store can hold neither, so both come from an operator alias or an external secret provider.",
       "enum": [

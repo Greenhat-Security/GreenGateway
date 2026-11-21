@@ -3,9 +3,9 @@
   "issue": 426,
   "describes": "Which GreenGateway builds may share one PostgreSQL deployment, how a deployment moves between them, and what proves each row. The procedure is docs/deployment/postgres.md#upgrading-a-cluster. storage::migrations' and storage::contraction's tests check this_build (its contracting migrations included) and schema_steps against the binary, and scripts/upgrade_pair_evidence.py checks the pinned pair (gateway/tests/ha/rolling-upgrade-pair.json) against the evidence the ha-release-gate (ha_rolling_upgrade) leg records.",
   "this_build": {
-    "manifest_versions": 36,
-    "read": [36, 36],
-    "write": [36, 36],
+    "manifest_versions": 37,
+    "read": [37, 37],
+    "write": [37, 37],
     "approved_extensions": [],
     "document_format": [0, 1],
     "capabilities": ["caller_operation_keys", "delegated_token_purges", "managed_http_mutation_v1", "openapi_discovery_catalogs", "openapi_repeated_query", "openapi_swagger2_catalogs", "operation_requirements", "policy_document_v1", "policy_role_descriptions", "policy_rule_conditions", "policy_tool_argument_conditions"],
@@ -124,7 +124,8 @@
     { "from": 32, "to": 33, "migration": "admin_session_evidence_actor", "procedure": "coordinated" },
     { "from": 33, "to": 34, "migration": "connection_mutation_approvals", "procedure": "coordinated" },
     { "from": 34, "to": 35, "migration": "mutation_approval_prepare_evidence", "procedure": "coordinated" },
-    { "from": 35, "to": 36, "migration": "caller_operation_bindings", "procedure": "coordinated" }
+    { "from": 35, "to": 36, "migration": "caller_operation_bindings", "procedure": "coordinated" },
+    { "from": 36, "to": 37, "migration": "rule_suggestion_bindings", "procedure": "coordinated" }
   ],
   "released_cluster_binaries": [],
   "qualified_pairs": [

@@ -8,7 +8,7 @@ use serde_json::Value;
 use super::*;
 use crate::audit::sink::tests::CaptureSink;
 
-const EVERY_OPERATION: [AuthorityOperation; 17] = [
+const EVERY_OPERATION: [AuthorityOperation; 19] = [
     AuthorityOperation::PolicyPublish,
     AuthorityOperation::PolicyRollback,
     AuthorityOperation::PolicyRuleCreate,
@@ -26,6 +26,14 @@ const EVERY_OPERATION: [AuthorityOperation; 17] = [
     AuthorityOperation::MutationApprovalConsume,
     AuthorityOperation::MutationApprovalReview,
     AuthorityOperation::MutationApprovalRevoke,
+    AuthorityOperation::ConnectionCreate,
+    AuthorityOperation::ConnectionReplace,
+];
+
+/// The operations both modes admit only in their keyed form (issue #425).
+const KEYED_CONNECTION_OPERATIONS: [AuthorityOperation; 2] = [
+    AuthorityOperation::ConnectionCreate,
+    AuthorityOperation::ConnectionReplace,
 ];
 
 /// The service-token changes both modes admit only in their keyed form
@@ -36,8 +44,12 @@ const KEYED_TOKEN_OPERATIONS: [AuthorityOperation; 2] = [
 ];
 
 /// The operation whose gate covers an inventory operation code, or `None`
-/// for one no gate asks about.
+/// for one no gate asks about. A credential binding change is never asked on
+/// its own: the Connection replacement that makes it is.
 fn gated_operation(code: &str) -> Option<AuthorityOperation> {
+    if code == "credential.binding_change" {
+        return Some(AuthorityOperation::ConnectionReplace);
+    }
     EVERY_OPERATION
         .into_iter()
         .find(|operation| operation.code() == code)
@@ -105,7 +117,9 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
         assert_eq!(refusal.operation(), operation);
         let why = if operation == AuthorityOperation::ConfigurationImport {
             "does not perform it"
-        } else if KEYED_TOKEN_OPERATIONS.contains(&operation) {
+        } else if KEYED_CONNECTION_OPERATIONS.contains(&operation)
+            || KEYED_TOKEN_OPERATIONS.contains(&operation)
+        {
             "admits it only with an Idempotency-Key, on a route that honours one"
         } else {
             "records no durable evidence of it"
@@ -138,21 +152,26 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
             AuthorityOperation::MutationApprovalPrepare,
             AuthorityOperation::MutationApprovalConsume,
             AuthorityOperation::MutationApprovalReview,
-            AuthorityOperation::MutationApprovalRevoke
+            AuthorityOperation::MutationApprovalRevoke,
+            AuthorityOperation::ConnectionCreate,
+            AuthorityOperation::ConnectionReplace,
         ],
-        "cluster mode refuses operations without durable authority evidence"
+        "cluster mode refuses operations without durable authority evidence, and the unkeyed form of keyed ones"
     );
     for operation in refused_in_cluster {
         let why = match operation {
             AuthorityOperation::PolicyFileReload => "does not perform it",
             AuthorityOperation::ConfigurationImport => "records evidence for only part of it",
-            AuthorityOperation::ServiceTokenIssue | AuthorityOperation::ServiceTokenRotate => {
-                "admits it only with an Idempotency-Key, on a route that honours one"
-            }
             // The ordinary preparation POST refuses a key: the message names
             // the keyed route instead.
             AuthorityOperation::MutationApprovalPrepare => {
                 "admits it only as a keyed preparation, PUT .../tools/{id}/mutation-approvals with an Idempotency-Key"
+            }
+            AuthorityOperation::ConnectionCreate
+            | AuthorityOperation::ConnectionReplace
+            | AuthorityOperation::ServiceTokenIssue
+            | AuthorityOperation::ServiceTokenRotate => {
+                "admits it only with an Idempotency-Key, on a route that honours one"
             }
             _ => "records no durable evidence of it",
         };
@@ -611,12 +630,9 @@ fn the_gate_enforces_exactly_what_the_evidence_inventory_says() {
     );
     // The standalone Connections database records these in the change's own
     // transaction, so required mode admits them and no gate asks: Connection
-    // and local-secret changes since its migration 12, and managed catalog
-    // and overlay publication since its migration 13.
+    // deletion and local-secret changes since its migration 12, and managed
+    // catalog and overlay publication since its migration 13.
     for code in [
-        "connection.create",
-        "connection.replace",
-        "credential.binding_change",
         "connection.delete",
         "secret.create",
         "secret.rotate",
@@ -633,6 +649,22 @@ fn the_gate_enforces_exactly_what_the_evidence_inventory_says() {
             "{code}"
         );
         assert!(gated_operation(code).is_none(), "{code} is not gated");
+    }
+    // Connection create and replace, with the credential binding change a
+    // replacement makes, bind caller keys in both modes (issue #425): only
+    // their keyed form is admitted.
+    for code in [
+        "connection.create",
+        "connection.replace",
+        "credential.binding_change",
+    ] {
+        for mode in ["postgres", "standalone"] {
+            assert_eq!(
+                by_mode.get(&(code, mode)),
+                Some(&"caller_key_required"),
+                "{code} in {mode}"
+            );
+        }
     }
     // Service-token issue and rotation bind caller keys in both modes (issue
     // #425, plan P5): only their keyed form is admitted. Revocation is a
@@ -724,6 +756,74 @@ fn service_token_issue_and_rotation_admit_only_their_keyed_issuer_bound_form_in_
         Some(Withdrawal::ServiceTokenRevoke)
     );
     assert_eq!(gated_operation("service_token.revoke"), None);
+}
+
+/// Connection create and replace (issue #425): in both modes required mode
+/// admits only the keyed request of an issuer-bound principal under
+/// `qualified_v1` with the file sink on a Unix build, and the refusal of
+/// every other form names the first criterion it misses. Connection deletion
+/// is a withdrawal and never asks.
+#[test]
+fn connection_create_and_replace_admit_only_their_keyed_issuer_bound_form_in_both_modes() {
+    use crate::auth::change_actor::ChangeActor;
+    use crate::config::AuthorityEventFormat;
+
+    let principal = issuer_bound_principal();
+    let keyed = RequestForm::of(true, &principal);
+    let service_token = ChangeActor::service_token_for_test("service-token:1");
+    for backend in [StateBackend::Sqlite, StateBackend::Postgres] {
+        let gate = AuthorityEvidenceGate::new(AuthorityEvidenceDurability::Required, backend)
+            .with_delivery(AuthorityEventFormat::QualifiedV1, true, true);
+        for operation in KEYED_CONNECTION_OPERATIONS {
+            assert_eq!(
+                operation.required_mode(backend),
+                RequiredMode::CallerKeyRequired,
+                "{operation:?} {backend:?}"
+            );
+            assert_eq!(gate.refusal_for(operation, keyed), None, "{operation:?}");
+            for (gate, form, expected) in [
+                (gate, RequestForm::UNKEYED, KeyedAdmission::CallerKey),
+                (
+                    gate,
+                    RequestForm::of(true, &service_token),
+                    KeyedAdmission::IssuerBoundPrincipal,
+                ),
+                (
+                    gate.with_delivery(AuthorityEventFormat::DeliveryV1, true, true),
+                    keyed,
+                    KeyedAdmission::QualifiedFormat,
+                ),
+                (
+                    gate.with_delivery(AuthorityEventFormat::QualifiedV1, false, true),
+                    keyed,
+                    KeyedAdmission::FileSink,
+                ),
+                (
+                    gate.with_delivery(AuthorityEventFormat::QualifiedV1, true, false),
+                    keyed,
+                    KeyedAdmission::SyncedFilesystem,
+                ),
+            ] {
+                assert_eq!(
+                    gate.refusal_for(operation, form)
+                        .and_then(|refusal| refusal.unmet()),
+                    Some(expected),
+                    "{operation:?} {backend:?} {form:?}"
+                );
+            }
+            assert_eq!(
+                AuthorityEvidenceGate::new(AuthorityEvidenceDurability::BestEffort, backend)
+                    .refusal(operation),
+                None,
+                "best_effort admits the unkeyed form"
+            );
+        }
+    }
+    assert_eq!(
+        Withdrawal::from_code("connection.delete"),
+        Some(Withdrawal::ConnectionDelete)
+    );
+    assert_eq!(gated_operation("connection.delete"), None);
 }
 
 /// No proof of a configuration activation exists, so required mode refuses

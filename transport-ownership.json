@@ -7063,6 +7063,16 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/admin_connections.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_connections::connection_change_to_completion#1",
+      "sha256": "d777c424899e6f0e2091dd43cdf24e0b0c9d6d685202afd09ae85666a249aa72",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Runs an admitted Connection create, replace or delete on its own Tokio task so a client disconnect cannot separate the store commit from its runtime publication, catalog reconcile and audit event (issue #425); re-enters the request pins and span. No outbound transport authority."
+    },
+    {
       "file": "gateway/src/main.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -7311,76 +7321,6 @@
       "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
-    },
-    {
-      "file": "gateway/src/admin_responses.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::admin_responses::caller_operation#1",
-      "sha256": "fe0737f22342f7153435d35aecc4b1853738e9d41092f144947ee69e8a70ab08",
-      "owner": "GreenGateway authority evidence maintainers",
-      "purpose": "Binds an admin request's Idempotency-Key header to a CallerOperation digest over the action, actor, target, precondition and secret-free request; reads only request headers, no transport authority. Allowed dead outside tests until an operation family binds a key."
-    },
-    {
-      "file": "gateway/src/admin_responses.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::admin_responses::KeyedChangeGates#1",
-      "sha256": "f54271a4985935b33ea79f122c6b94f3e9e3e16f280880a617475f53066bb2a3",
-      "owner": "GreenGateway authority evidence maintainers",
-      "purpose": "Borrows the evidence gate, cluster membership, audit log and client-address policy a keyed admin change asks before its store is called; no transport authority. Allowed dead outside tests until an operation family binds a key."
-    },
-    {
-      "file": "gateway/src/admin_responses.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::admin_responses::KeyedChange#1",
-      "sha256": "ef5a81df70eed7444fe6299867da4bced44eca8a1dfe0a65e37d71c41924b9b5",
-      "owner": "GreenGateway authority evidence maintainers",
-      "purpose": "Names a keyed admin change as gated by the evidence gate or as one of the three closed withdrawals; data only, no transport authority. Allowed dead outside tests until an operation family binds a key."
-    },
-    {
-      "file": "gateway/src/admin_responses.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::admin_responses::admit_keyed_authority_change#1",
-      "sha256": "262392172e189d5e59ffb8047a888ebd9549ffeb948bae3052178523c8d5d19d",
-      "owner": "GreenGateway authority evidence maintainers",
-      "purpose": "Refuses a keyed change whose named withdrawal and caller key disagree, asks the configuration-only evidence gate for a gated change, then for a keyed cluster request the existing operation gate for caller_operation_keys through ClusterMembership; no caller-selected HTTP authority. Allowed dead outside tests until an operation family binds a key."
-    },
-    {
-      "file": "gateway/src/admin_responses.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::admin_responses::replayed_receipt#1",
-      "sha256": "a37f1e2c77c7c25d2d59410bddf4c87274e6e7333c5a27c32e2528e71e269dd3",
-      "owner": "GreenGateway authority evidence maintainers",
-      "purpose": "Awaits a store's read-only caller-key lookup and evidence receipt futures supplied by the handler and maps them to an admin response; no transport authority of its own. Allowed dead outside tests until an operation family binds a key."
-    },
-    {
-      "file": "gateway/src/admin_responses.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::admin_responses::operation_receipt#1",
-      "sha256": "be3fbead4e235331e52c1ace6ca8cb811a2322df2a02509eb11fd5ef0fa2098c",
-      "owner": "GreenGateway authority evidence maintainers",
-      "purpose": "Renders a committed caller operation receipt as a no-store 200 response; no transport authority. Allowed dead outside tests until an operation family binds a key."
-    },
-    {
-      "file": "gateway/src/admin_responses.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::admin_responses::caller_operation_conflict#1",
-      "sha256": "fcd3dfa7557b1c757f06f263fd4dc1331d2a76da7eb7ad5d59881cc85aa77588",
-      "owner": "GreenGateway authority evidence maintainers",
-      "purpose": "Renders the 409 caller_operation_conflict response; no transport authority. Allowed dead outside tests until an operation family binds a key."
     },
     {
       "file": "gateway/src/main.rs",
@@ -8211,16 +8151,6 @@
       "sha256": "84732172f99944f988093c4fd0bdfb420106fdb79414ce0e9027b6620947b9e9",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
-    },
-    {
-      "file": "gateway/src/authority_events/caller_operation.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::authority_events::caller_operation::file_attributes#1",
-      "sha256": "d08a9f90cf24307d4e309725d64a1f70a944e74efba3aacca6c7bb8d373baed2",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Allows dead code outside tests for the caller operation types (issue #425) until an operation family binds a key; no I/O and no transport authority."
     },
     {
       "file": "gateway/src/authority_events/delivery.rs",
@@ -9062,6 +8992,56 @@
       "sha256": "e9d3db97af149d463a29f203c5848d9f1b674f37ef88a24a9ce59993a0f8a585",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::finish_keyed#1",
+      "sha256": "939630d9b20a40564063d69a16698b2318a60256784ff8af0bda1582777b7444",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Commits or rolls back a keyed Connection change's transaction on the store's pooled PostgreSQL client: an exact retry answered from its receipt rolls back (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::connection_operation_receipt#1",
+      "sha256": "8151cdcdb478666e9810869483f186d7b8fbb9d9464fe809688e625f1e0d8ece",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Reads one committed Connection evidence row by the caller's operation ID and action to build a receipt, through the shared infrastructure pool (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::keyed_receipt#1",
+      "sha256": "6f26a316bd1dc40def3e05677e879e50d7b7e68722462a23d4794bb9399249f2",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Looks a caller key up in authority_caller_operation_ids inside a Connection change's transaction and answers an exact retry from its evidence (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::committed_receipt#1",
+      "sha256": "def02c02708c1ef83680fa561c665543558ced3b872b6f7fc14b5a6798a42dbb",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Reads the committed receipt of an exact retry inside a Connection change's transaction, refusing a reservation without its evidence row (issue #425); no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::reserve_caller_key#1",
+      "sha256": "6932d19147037dfbd1d8679da28017a495095b632e5ce4b5e2388f6ed1469b2f",
+      "owner": "GreenGateway authority evidence maintainers",
+      "purpose": "Reserves a caller key with its binding digest inside a Connection change's transaction after the contract fence is confirmed (issue #425); no caller-selected HTTP authority."
     },
     {
       "file": "gateway/src/connections/pg_store.rs",
@@ -10160,8 +10140,18 @@
       "reasons": [
         "network-or-process-reference"
       ],
+      "scope": "gateway::discovery::suggestions::stored_binding_at#1",
+      "sha256": "5b62749f7bf7e175fc4a876ef0c1ae0a94102f91f3d29fd5def07d81e4801314",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reads stored suggestion binding columns from a local SQLite row; no transport authority."
+    },
+    {
+      "file": "gateway/src/discovery/suggestions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
       "scope": "gateway::discovery::suggestions::impl  RawRuleSuggestion::from_row#1",
-      "sha256": "0f0b0e897fbf2ba5e80b63c5ed8fbe7f0343a327a11dbd020511dba1372845cc",
+      "sha256": "cff5432674dac3ee0a3242a99f5e3639b8c03eb291e6ecd23893dde742f0ec82",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -13626,7 +13616,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::import_suggestions#1",
-      "sha256": "c668651b931b21777af64ad8f177fdd7879760a966899cb65670359458332a06",
+      "sha256": "8dce9b79f02b05f9e563cb9e986a9029db1f6437f620891b6e51209272beef59",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -13735,8 +13725,18 @@
       "reasons": [
         "network-or-process-reference"
       ],
+      "scope": "gateway::storage::postgres_discovery_lifecycle::stored_binding_at#1",
+      "sha256": "f758d08f554fa182c6619eb17576f7562841311177010121d33c15dbefadefe0",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_discovery_lifecycle.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
       "scope": "gateway::storage::postgres_discovery_lifecycle::raw_suggestion#1",
-      "sha256": "ab5d51bf74521bc17451477bd03edd4c43893a07ca1901be004d66904ca1c2fc",
+      "sha256": "add8ed2b029ba58aa05337eeac178044ee385398a3e0224b3e7ca8bbdfa0e4aa",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

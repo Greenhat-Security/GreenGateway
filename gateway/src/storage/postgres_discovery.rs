@@ -1516,11 +1516,15 @@ async fn import_signals(
     Ok(inserted)
 }
 
-/// Rule suggestions verbatim, including the signal each was derived from.
-/// The proposed rule is re-serialized from the decoded `Rule` rather than
-/// copied as text: the source's bytes were validated on the way out, and
-/// the cluster stores the form THIS build writes, so an accepted
-/// suggestion commits the rule this binary parsed.
+/// Rule suggestions verbatim, including the signal each was derived from,
+/// except for their generation binding (issue #243, item 19): bindings are
+/// not carried, so every imported row is unbound and is never accepted
+/// through `POST .../accept` until a generation run on the cluster rebinds
+/// it against the cluster's own policy and resources. The proposed rule is
+/// re-serialized from the decoded `Rule` rather than copied as text: the
+/// source's bytes were validated on the way out, and the cluster stores the
+/// form THIS build writes, so an accepted suggestion commits the rule this
+/// binary parsed.
 async fn import_suggestions(
     client: &deadpool_postgres::Object,
     suggestions: &[crate::discovery::suggestions::RuleSuggestion],

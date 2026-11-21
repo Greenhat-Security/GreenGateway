@@ -47,11 +47,11 @@ describe('Policy Studio suggestions', () => {
     expect(
       within(row).getByText(/Window: 2026-10-25T10:00:00Z to 2026-11-01T10:00:00Z \(168 hours\)/),
     ).toBeTruthy();
-    expect(within(row).getByText(/Generated 2026-11-01T10:00:00Z and not recomputed since/)).toBeTruthy();
+    expect(within(row).getByText(/Generated 2026-11-01T10:00:00Z\. Still bound to the live policy/)).toBeTruthy();
+    expect(within(row).getByText('Current')).toBeTruthy();
     expect(within(row).getByText('Contextless.')).toBeTruthy();
     expect(within(row).getByText(/Position 1 \(rule #2\), after the last rule of the live policy/)).toBeTruthy();
-    expect(within(row).getByText('Not recorded by this gateway')).toBeTruthy();
-    expect(screen.getByText(/the gateway records no policy revision,\s+resource snapshot, evidence schema or generator version/)).toBeTruthy();
+    expect(screen.getByText(/labels it current, stale, unbound or superseded on every listing/)).toBeTruthy();
     expect(within(row).getByText(/^1, updated/)).toBeTruthy();
 
     const signal = suggestionRow(EXPORTS);
@@ -69,6 +69,80 @@ describe('Policy Studio suggestions', () => {
     expect(within(dismissed).queryByRole('button', { name: 'Review in draft' })).toBeNull();
     expect(gateway.requests('GET', '/v1/admin/suggestions').at(-1)?.search).toBe('?limit=50');
     expect(accessibilityProblems()).toEqual([]);
+  });
+
+  it('shows the generator version, evidence cutoff and resource snapshot', async () => {
+    const gateway = fakeGateway();
+    renderStudio(gateway);
+    const row = await openSuggestions(BILLING);
+
+    const fact = (term: string) => within(row).getByText(term).nextElementSibling?.textContent;
+    expect(fact('Generator version')).toBe('rule-suggestions.v1');
+    expect(fact('Evidence schema')).toBe('rule-suggestion-evidence.v1');
+    expect(fact('Evidence cutoff')).toMatch(/^2026-11-01T10:00:00Z: evidence was read from the run/);
+    expect(fact('Resource snapshot')).toBe(`sha256:${'5'.repeat(64)}, complete`);
+
+    // A suggestion without a binding says so without naming a cause the
+    // gateway did not report, and still offers Review in draft.
+    gateway.suggestion(BILLING).generation = null;
+    gateway.suggestion(BILLING).freshness = { status: 'unbound', reasons: ['binding_not_recorded'] };
+    fireEvent.click(screen.getByRole('button', { name: 'Read suggestions again' }));
+    const unbound = await screen.findByText(
+      'Unbound: no generation binding recorded',
+      undefined,
+      WAIT,
+    );
+    const unboundRow = suggestionRow(BILLING);
+    expect(unboundRow.contains(unbound)).toBe(true);
+    expect(within(unboundRow).getAllByText('Not recorded.')).toHaveLength(4);
+    expect(
+      (within(unboundRow).getByRole('button', { name: 'Review in draft' }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+    expect(accessibilityProblems()).toEqual([]);
+  });
+
+  it('a stale suggestion still opens in a draft and the panel says what changed', async () => {
+    const gateway = fakeGateway();
+    gateway.suggestion(BILLING).freshness = {
+      status: 'stale',
+      reasons: ['policy_changed', 'tools_changed', 'shiny_new_reason'],
+    };
+    renderStudio(gateway);
+    const row = await openSuggestions(BILLING);
+
+    expect(
+      within(row).getByText(
+        'Stale: the live policy changed; the registered tools changed; unrecognised reason (shiny_new_reason)',
+      ),
+    ).toBeTruthy();
+    expect(within(row).getByText(/regenerating suggestions refreshes its binding/)).toBeTruthy();
+    fireEvent.click(within(row).getByRole('button', { name: 'Review in draft' }));
+    expect(await screen.findByText('Suggestion opened in a draft', undefined, WAIT)).toBeTruthy();
+    expect(gateway.requests('POST', `/v1/admin/suggestions/${BILLING}/draft`)).toHaveLength(1);
+    expect(gateway.requests('POST', `/v1/admin/suggestions/${BILLING}/accept`)).toHaveLength(0);
+  });
+
+  it('a superseded suggestion offers only dismiss', async () => {
+    const gateway = fakeGateway();
+    gateway.suggestion(BILLING).freshness = { status: 'superseded', reasons: ['rule_already_live'] };
+    renderStudio(gateway);
+    const row = await openSuggestions(BILLING, false);
+    await waitFor(
+      () =>
+        expect(
+          (within(suggestionRow(BILLING)).getByRole('button', { name: 'Dismiss' }) as HTMLButtonElement)
+            .disabled,
+        ).toBe(false),
+      WAIT,
+    );
+
+    expect(within(row).getByText('Superseded: rule already live')).toBeTruthy();
+    expect(
+      (within(row).getByRole('button', { name: 'Review in draft' }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect(
+      within(row).getByText('The live policy already holds this rule; dismiss the suggestion instead.'),
+    ).toBeTruthy();
   });
 
   it('reviews a suggestion in a new draft, opens it in the editors and checks it at its real position', async () => {
@@ -487,6 +561,18 @@ function billingSuggestion() {
     transitioned_by: null as string | null,
     revision: 1,
     source_signal_id: null as string | null,
+    generation: {
+      generator_version: 'rule-suggestions.v1',
+      evidence_schema_version: 'rule-suggestion-evidence.v1',
+      evidence_cutoff: '2026-11-01T10:00:00Z',
+      evidence_digest: `sha256:${'4'.repeat(64)}`,
+      resource_snapshot_digest: `sha256:${'5'.repeat(64)}`,
+      resource_snapshot_complete: true,
+    } as Record<string, unknown> | null,
+    freshness: { status: 'current', reasons: [] } as {
+      status: string | null;
+      reasons: string[];
+    },
   };
 }
 
@@ -527,6 +613,7 @@ function dismissedSuggestion(): SuggestionRecord {
     transitioned_at: '2026-11-02T09:00:00Z',
     transitioned_by: 'alice',
     evidence: {},
+    freshness: { status: null, reasons: [] },
   };
 }
 

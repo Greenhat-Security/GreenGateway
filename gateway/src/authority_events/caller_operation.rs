@@ -24,13 +24,10 @@
 //! This module holds the types every keyed operation shares. The stores'
 //! reservation functions are `storage::postgres_authority_events::
 //! {read_caller_operation, reserve_bound_operation}` and their SQLite
-//! counterparts in `storage::standalone_authority_events`. No admin route
-//! binds a key through them yet: each operation family does so in its own
-//! change, so until then they are exercised by the storage contract tests.
-
-// Only the tests call this module until the first operation family binds a
-// key (issue #425).
-#![cfg_attr(not(test), allow(dead_code))]
+//! counterparts in `storage::standalone_authority_events`. Admin routes bind
+//! keys through the helpers in `admin_responses` (Connection create, replace
+//! and delete, in `admin_connections::admit_keyed_connection_change`); each
+//! other operation family does so in its own change.
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -202,7 +199,6 @@ pub(crate) enum CallerKeyReservation {
 
 /// What an exact retry gets back, read from the committed evidence row. It
 /// never carries a secret, a binding digest or a raw request field.
-#[allow(dead_code)] // Built by the operation families that bind keys (issue #425).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct OperationReceipt {
     pub(crate) operation_id: String,
@@ -217,7 +213,6 @@ pub(crate) struct OperationReceipt {
 
 /// A keyed store call: the change it committed, or the receipt of the change
 /// an earlier attempt with the same key and binding committed.
-#[allow(dead_code)] // Returned by the operation families that bind keys (issue #425).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CallerOutcome<T> {
     Committed(T),

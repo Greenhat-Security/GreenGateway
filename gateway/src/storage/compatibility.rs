@@ -574,8 +574,9 @@ mod gate {
     /// service-token revoke and the keyed approval preparation predate the
     /// capability and do not ask.
     ///
-    /// From schema 36 every build serves the same schema, so builds of
-    /// different changes of issue #425 can share one database. A build that
+    /// From schema 36, builds of different changes of issue #425 that serve
+    /// the same schema (37 since migration 37, issue #243) can share one
+    /// database. A build that
     /// predates the capability would ignore the key -- applying a keyed retry
     /// a second time -- and, holding the dispatcher's lease, would deliver a
     /// caller-bound row as `authority_event_delivery.v1`. Neither fails

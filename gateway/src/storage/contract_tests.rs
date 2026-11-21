@@ -19135,6 +19135,335 @@ pub(crate) mod postgres_audit_tests {
         }
         assert_eq!(paged, postgres_suggestions);
     }
+
+    /// A generation context against the policy ETag `"sha256:<c x 64>"`.
+    fn binding_context(
+        etag_digit: char,
+    ) -> crate::discovery::suggestion_binding::SuggestionGenerationContext {
+        crate::discovery::suggestion_binding::SuggestionGenerationContext::new(
+            format!("\"sha256:{}\"", etag_digit.to_string().repeat(64)),
+            None,
+            Some(format!("sha256:{}", "d".repeat(64))),
+            true,
+            &json!({
+                "gateway_build": "1.0.0",
+                "evaluator": {},
+                "configuration": "sha256:configuration",
+                "egress": "sha256:egress",
+                "tools": "sha256:tools",
+                "connections": "\"connections:0\"",
+            }),
+        )
+        .expect("the context is canonical")
+    }
+
+    /// Generation rebinds an open row by one conditional upsert (issue
+    /// #243, item 19): a run against the same inputs writes nothing, a run
+    /// against a changed policy rebinds every open row once, two replicas
+    /// running that at once rebind each row exactly once between them
+    /// (the batch is identity-sorted, so they cannot deadlock), a
+    /// transition that read the revision before the rebind loses to it, and
+    /// a present but malformed binding is repaired by an unchanged run.
+    #[tokio::test]
+    async fn postgres_regeneration_rebinds_open_suggestions_by_compare_and_set() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let events = generation_events();
+        let policy = contract_policy("rebind");
+        let config = RuleSuggestionConfig {
+            baseline_window_hours: 876_000,
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let audit_store = Arc::new(PostgresAuditEventStore::new(
+            pool.clone(),
+            Some(ingest_identity()),
+        ));
+        audit_store
+            .insert_events(&events)
+            .await
+            .expect("the PostgreSQL audit store ingests");
+        seed_postgres_discovery_fixture(&pool).await;
+        let engine = |audit_store: Arc<PostgresAuditEventStore>| {
+            ClusterRuleSuggestionEngine::new(
+                Arc::new(PostgresDiscoveryReadStore::new(pool.clone())),
+                audit_store,
+                PostgresDiscoveryLifecycleStore::new(pool.clone()),
+                config,
+            )
+        };
+        let replica_a = engine(Arc::clone(&audit_store));
+        let replica_b = engine(audit_store);
+
+        let first = replica_a
+            .generate_bound(&policy, &binding_context('a'))
+            .await
+            .expect("the first run generates");
+        assert_eq!(first.inserted_count, 5, "{first:?}");
+        let generated = replica_a
+            .list_suggestions()
+            .await
+            .expect("suggestions list");
+        assert!(generated.iter().all(|suggestion| suggestion
+            .generation
+            .as_ref()
+            .is_some_and(|binding| binding.policy_etag == binding_context('a').policy_etag)));
+
+        let unchanged = replica_b
+            .generate_bound(&policy, &binding_context('a'))
+            .await
+            .expect("an unchanged run generates");
+        assert_eq!((unchanged.inserted_count, unchanged.rebound_count), (0, 0));
+        assert_eq!(
+            replica_a
+                .list_suggestions()
+                .await
+                .expect("suggestions list"),
+            generated
+        );
+
+        // One row leaves `open`; it is never rebound.
+        let dismissed_id = generated[0].id.clone();
+        let from_open = crate::discovery::lifecycle::TransitionPrecondition::from_state(
+            crate::discovery::suggestions::RuleSuggestionLifecycleState::Open,
+        );
+        replica_a
+            .transition_suggestion(
+                &dismissed_id,
+                crate::discovery::suggestions::RuleSuggestionLifecycleState::Dismissed,
+                Some("admin"),
+                from_open,
+            )
+            .await
+            .expect("the dismissal applies");
+        let dismissed_before = replica_a
+            .get_suggestion(&dismissed_id)
+            .await
+            .expect("the row reads")
+            .expect("the row exists");
+
+        let context_b = binding_context('b');
+        let (left, right) = tokio::join!(
+            replica_a.generate_bound(&policy, &context_b),
+            replica_b.generate_bound(&policy, &context_b),
+        );
+        let left = left.expect("replica a regenerates");
+        let right = right.expect("replica b regenerates");
+        assert_eq!(left.inserted_count + right.inserted_count, 0);
+        assert_eq!(
+            left.rebound_count + right.rebound_count,
+            4,
+            "each open row is rebound exactly once: {left:?} {right:?}"
+        );
+        let after = replica_a
+            .list_suggestions()
+            .await
+            .expect("suggestions list");
+        for suggestion in &after {
+            if suggestion.id == dismissed_id {
+                assert_eq!(suggestion, &dismissed_before);
+                continue;
+            }
+            assert_eq!(suggestion.revision, 2, "{suggestion:?}");
+            assert_eq!(
+                suggestion
+                    .generation
+                    .as_ref()
+                    .map(|binding| binding.policy_etag.as_str()),
+                Some(context_b.policy_etag.as_str())
+            );
+        }
+
+        // A transition that read revision 1 loses to the rebind.
+        let rebound_id = after
+            .iter()
+            .find(|suggestion| suggestion.id != dismissed_id)
+            .map(|suggestion| suggestion.id.clone())
+            .expect("an open row");
+        match replica_b
+            .transition_suggestion(
+                &rebound_id,
+                crate::discovery::suggestions::RuleSuggestionLifecycleState::Dismissed,
+                Some("admin"),
+                from_open.with_revision(Some(1)),
+            )
+            .await
+            .expect("the transition answers")
+        {
+            crate::discovery::lifecycle::TransitionOutcome::Refused(refused) => {
+                assert_eq!(refused.current.revision, 2);
+            }
+            other => panic!("the stale revision must be refused: {other:?}"),
+        }
+
+        // A binding that is present but malformed in a column no comparison
+        // sees (a cutoff the CHECK accepts but that is not RFC 3339) reads
+        // as unbound, and the next run against the same inputs repairs it.
+        let client = pool.get().await.expect("client checkout");
+        client
+            .execute(
+                "UPDATE greengateway.discovery_rule_suggestions
+                 SET evidence_cutoff = 'yesterday' WHERE id = $1",
+                &[&rebound_id],
+            )
+            .await
+            .expect("the binding is damaged");
+        let damaged = replica_a
+            .get_suggestion(&rebound_id)
+            .await
+            .expect("the row reads")
+            .expect("the row exists");
+        assert!(damaged.generation.is_none(), "{damaged:?}");
+        let repaired_run = replica_b
+            .generate_bound(&policy, &context_b)
+            .await
+            .expect("the repairing run generates");
+        assert_eq!(
+            (repaired_run.inserted_count, repaired_run.rebound_count),
+            (0, 1),
+            "only the damaged row is rebound: {repaired_run:?}"
+        );
+        let repaired = replica_a
+            .get_suggestion(&rebound_id)
+            .await
+            .expect("the row reads")
+            .expect("the row exists");
+        assert_eq!(repaired.revision, 3);
+        assert!(repaired.generation.is_some(), "{repaired:?}");
+    }
+
+    /// A regeneration rebind and an acceptance through the real cluster
+    /// acceptance transaction (issue #243, item 19): an acceptance that read
+    /// the revision before a rebind is refused with the row at its new
+    /// revision and nothing written on the policy side, and a rebind racing
+    /// an acceptance at the current revision leaves exactly one outcome --
+    /// either the rule committed and the row is accepted (and no rebind
+    /// touched it), or the row was rebound and nothing was committed.
+    #[tokio::test]
+    async fn postgres_a_rebind_and_an_acceptance_race_have_one_winner() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let events = generation_events();
+        let policy = contract_policy("rebind-accept");
+        let config = RuleSuggestionConfig {
+            baseline_window_hours: 876_000,
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let policy_store = PostgresPolicyStore::new(pool.clone());
+        let current_etag = initialize_policy(&policy_store).await;
+        let audit_store = Arc::new(PostgresAuditEventStore::new(
+            pool.clone(),
+            Some(ingest_identity()),
+        ));
+        audit_store
+            .insert_events(&events)
+            .await
+            .expect("the PostgreSQL audit store ingests");
+        seed_postgres_discovery_fixture(&pool).await;
+        let engine = ClusterRuleSuggestionEngine::new(
+            Arc::new(PostgresDiscoveryReadStore::new(pool.clone())),
+            audit_store,
+            PostgresDiscoveryLifecycleStore::new(pool.clone()),
+            config,
+        );
+        let lifecycle = PostgresDiscoveryLifecycleStore::new(pool.clone());
+
+        engine
+            .generate_bound(&policy, &binding_context('a'))
+            .await
+            .expect("the first run generates");
+        let read = engine
+            .list_suggestions()
+            .await
+            .expect("suggestions list")
+            .into_iter()
+            .find(|suggestion| {
+                suggestion.state == RuleSuggestionLifecycleState::Open
+                    && suggestion.is_identity_bound_for_acceptance()
+            })
+            .expect("an acceptable open suggestion was generated");
+        assert_eq!(read.revision, 1);
+
+        // The policy moved and a run rebinds the row the caller read.
+        let rebound = engine
+            .generate_bound(&policy, &binding_context('b'))
+            .await
+            .expect("the regeneration runs");
+        assert!(rebound.rebound_count >= 1, "{rebound:?}");
+        let before = policy_footprint(&policy_store, &pool).await;
+
+        let candidate = contract_policy_variant("rebind-accept-candidate", "reader");
+        let request = |expected_revision| AcceptSuggestionRequest {
+            suggestion_id: &read.id,
+            expected_revision: Some(expected_revision),
+            actor: "admin-a",
+            policy_commit: commit_request(
+                PolicyCommitPrecondition::Expected {
+                    etag: current_etag.clone(),
+                },
+                &candidate,
+                "admin-a",
+            ),
+        };
+        match lifecycle
+            .accept_suggestion(request(1))
+            .await
+            .expect_err("an acceptance of the pre-rebind revision is refused")
+        {
+            AcceptRefused::Suggestion(refused) => {
+                assert_eq!(refused.current.state, RuleSuggestionLifecycleState::Open);
+                assert_eq!(refused.current.revision, 2);
+            }
+            other => panic!("expected the rebound row, got {other:?}"),
+        }
+        // No policy version, history row, outbox row or evidence row.
+        assert_eq!(policy_footprint(&policy_store, &pool).await, before);
+
+        // A rebind and an acceptance of the current revision at once.
+        let context_c = binding_context('c');
+        let (rebind, accepted) = tokio::join!(
+            engine.generate_bound(&policy, &context_c),
+            lifecycle.accept_suggestion(request(2)),
+        );
+        rebind.expect("the racing regeneration runs");
+        let after = policy_footprint(&policy_store, &pool).await;
+        let row = lifecycle
+            .get_suggestion(&read.id)
+            .await
+            .expect("the row reads")
+            .expect("the row exists");
+        match accepted {
+            Ok(accepted) => {
+                assert_eq!(
+                    accepted.suggestion.state,
+                    RuleSuggestionLifecycleState::Accepted
+                );
+                assert_eq!(
+                    row, accepted.suggestion,
+                    "no rebind touched the accepted row"
+                );
+                assert_eq!(row.revision, 3);
+                assert_eq!(after.active_version, before.active_version + 1);
+                assert_eq!(after.document_rows, before.document_rows + 1);
+                assert_eq!(after.outbox_rows, before.outbox_rows + 1);
+            }
+            Err(AcceptRefused::Suggestion(refused)) => {
+                assert_eq!(refused.current.state, RuleSuggestionLifecycleState::Open);
+                assert_eq!(refused.current.revision, 3);
+                assert_eq!(row.state, RuleSuggestionLifecycleState::Open);
+                assert_eq!(row.revision, 3);
+                assert_eq!(after, before, "the refused acceptance wrote nothing");
+            }
+            Err(other) => panic!("the acceptance must commit or lose to the rebind: {other:?}"),
+        }
+    }
 }
 
 fn contract_policy(id: &str) -> Policy {
