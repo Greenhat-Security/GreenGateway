@@ -1192,7 +1192,7 @@ async fn a_keyed_catalog_change_without_the_routes_permission_is_forbidden_and_r
 /// create is admitted only in its keyed form (issue #425), so an unkeyed one
 /// is refused before anything is written.
 #[tokio::test]
-async fn required_evidence_admits_standalone_connection_and_secret_changes() {
+async fn required_evidence_admits_standalone_withdrawals_and_refuses_unkeyed_creates() {
     let connection_db = TempDb::new("authority-evidence-connections");
     let policy = TempPolicyFile::new(&connection_policy_document_string());
     let (audit_log, capture) = captured_audit();
@@ -1298,31 +1298,19 @@ async fn required_evidence_admits_standalone_connection_and_secret_changes() {
         ))
         .await
         .expect("secret create should complete");
-    assert_eq!(secret.status(), StatusCode::CREATED);
+    // An unkeyed local-secret create is refused too (issue #425, plan P8).
+    assert_eq!(secret.status(), StatusCode::CONFLICT);
+    let refused = json_body(secret).await;
+    assert_eq!(refused["operation"], json!("secret.create"));
     let (secret_evidence, _) = standalone_change_evidence(
         &connection_db.path,
         "connection_local_secret_change_evidence",
     );
+    assert!(secret_evidence.is_empty());
     assert_eq!(
-        secret_evidence
-            .iter()
-            .map(|change| change.action.as_str())
-            .collect::<Vec<_>>(),
-        ["secret.create"]
-    );
-
-    // The audit writer delivers in order: once the secret's own event has
-    // arrived, a refusal of an admitted change before it would have too.
-    assert_eventually(Duration::from_secs(5), || {
-        capture
-            .events()
-            .iter()
-            .any(|event| event.event_type == audit::event::CONNECTION_SECRET_CHANGED)
-    });
-    assert_eq!(
-        refused_operations(&capture, 1),
-        ["connection.create"],
-        "only the unkeyed create was refused"
+        refused_operations(&capture, 2),
+        ["connection.create", "secret.create"],
+        "only the unkeyed creates were refused"
     );
 }
 
@@ -2799,6 +2787,10 @@ async fn a_keyed_catalog_change_on_a_connection_without_openapi_discovery_is_ref
     }
     assert!(standalone_reservations(&connection_db.path).is_empty());
 }
+
+/// Keyed local-secret changes (issue #425, plan P8).
+#[path = "authority_evidence_secret_app_tests.rs"]
+mod local_secret_keys;
 
 #[cfg(feature = "postgres")]
 mod cluster_connection_keys {

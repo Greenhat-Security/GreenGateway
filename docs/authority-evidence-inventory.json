@@ -2962,7 +2962,7 @@
         }
       ],
       "required_durability_supported": false,
-      "required_mode": "admitted",
+      "required_mode": "caller_key_required",
       "test_claim": "Standalone regression anchors for the transactional local-secret evidence in the Connections database: forced insert failure and rollback of each change, restart, refused changes and unrecordable actors, synthetic-marker exclusion, the CLI's system actor and the admin endpoints recording the authenticated principal. They do not certify the proposed authority-event contract or delivery."
     },
     {

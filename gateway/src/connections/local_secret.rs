@@ -1461,10 +1461,13 @@ pub(crate) struct SecretChangeBinding<'a> {
 }
 
 impl SecretChangeBinding<'_> {
-    /// Bind `key` to this request. The canonical request is the label and
+    /// The canonical request this binding's key is bound to: the label and
     /// the purpose, each as a presence byte, its length (eight bytes, big
-    /// endian) and its bytes.
-    pub(crate) fn bind(&self, key: Uuid) -> Result<CallerOperation, BindingRefusal> {
+    /// endian) and its bytes. The admin handlers pass it to the shared
+    /// header binding (`admin_responses::caller_operation`) with the same
+    /// action, actor, target and `If-Match`, so a key they bind is the key
+    /// [`Self::bind`] binds.
+    pub(crate) fn canonical_request(&self) -> Vec<u8> {
         let mut request = Vec::new();
         for field in [self.label, self.purpose.map(purpose_as_str)] {
             let field = field.map(str::as_bytes);
@@ -1473,6 +1476,11 @@ impl SecretChangeBinding<'_> {
             request.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
             request.extend_from_slice(bytes);
         }
+        request
+    }
+
+    /// Bind `key` to this request ([`Self::canonical_request`]).
+    pub(crate) fn bind(&self, key: Uuid) -> Result<CallerOperation, BindingRefusal> {
         CallerOperation::bind(
             key,
             &CallerOperationBinding {
@@ -1480,7 +1488,7 @@ impl SecretChangeBinding<'_> {
                 actor: self.actor,
                 target: self.secret_id,
                 precondition: self.if_match,
-                request: &request,
+                request: &self.canonical_request(),
             },
         )
     }
