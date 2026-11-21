@@ -2091,10 +2091,31 @@ fn trace_subscriber(logs: CapturedLogs) -> impl tracing::Subscriber + Send + Syn
 /// A thread-local subscriber or recorder on the test thread alone misses a
 /// log line or a metric emitted there. Returns `test`'s output, every
 /// captured log line and the metrics rendered after the runtime has ended.
+///
+/// What it captures is `tracing` events on the runtime's threads. It does
+/// not capture `log`-crate records from dependencies (production bridges
+/// those into its subscriber through `tracing-log`; this capture installs no
+/// global logger), nor events on threads the code under test spawns itself,
+/// such as the audit log writer.
+///
+/// `tracing` caches whether a callsite is enabled process-wide. While only
+/// one dispatcher is registered, a callsite first reached on a thread with
+/// no subscriber (a sibling test's) is cached as never enabled, and this
+/// capture would then skip that line silently. A second TRACE dispatcher
+/// is kept registered for the whole capture, so every callsite registered
+/// meanwhile consults a TRACE subscriber and stays enabled. The capture
+/// checks itself: one line, through a callsite first reached on a thread
+/// with no subscriber, must be captured on the test thread before the test
+/// starts and on the blocking pool after it ends.
 pub(super) fn capture_logs_and_metrics_on_every_runtime_thread<T>(
     test: impl std::future::Future<Output = T>,
 ) -> (T, String, String) {
-    let (logs, _logging) = capture_all_logs();
+    let logs = CapturedLogs::default();
+    let _second_dispatcher = tracing::Dispatch::new(trace_subscriber(logs.clone()));
+    let _logging = crate::tracing_test_guard(trace_subscriber(logs.clone()));
+    std::thread::spawn(|| capture_sentinel("a thread with no subscriber"))
+        .join()
+        .expect("the sentinel thread ends");
     // Leaked so that each blocking-pool thread can keep it as its default
     // recorder for the rest of the thread's life.
     let recorder: &'static metrics_exporter_prometheus::PrometheusRecorder =
@@ -2112,9 +2133,52 @@ pub(super) fn capture_logs_and_metrics_on_every_runtime_thread<T>(
         })
         .build()
         .expect("the test runtime builds");
-    let output = ::metrics::with_local_recorder(recorder, || runtime.block_on(test));
+    let output = ::metrics::with_local_recorder(recorder, || {
+        runtime.block_on(async {
+            // Before any blocking-pool thread starts: each one registers a
+            // dispatcher, which re-evaluates every callsite and would mask
+            // a callsite cached as never enabled.
+            capture_sentinel("test thread");
+            let output = test.await;
+            tokio::task::spawn_blocking(|| capture_sentinel("blocking pool"))
+                .await
+                .expect("the sentinel task ends");
+            output
+        })
+    });
     runtime.shutdown_timeout(Duration::from_secs(5));
-    (output, logs.contents(), recorder.handle().render())
+    let logged = logs.contents();
+    for place in ["test thread", "blocking pool"] {
+        assert!(
+            logged.contains(&format!("capture sentinel on the {place}")),
+            "the capture missed a log line on the {place}"
+        );
+    }
+    (output, logged, recorder.handle().render())
+}
+
+/// The one callsite of the capture's self-check.
+fn capture_sentinel(place: &str) {
+    tracing::trace!("capture sentinel on the {place}");
+}
+
+/// The capture sees a log line and a metric emitted on the blocking pool,
+/// where the SQLite stores run, as well as on the test thread.
+#[test]
+fn the_capture_sees_logs_and_metrics_on_the_blocking_pool() {
+    let ((), logged, rendered) = capture_logs_and_metrics_on_every_runtime_thread(async {
+        ::metrics::counter!("capture_test_thread_total").increment(1);
+        tokio::task::spawn_blocking(|| {
+            tracing::trace!("capture-check-pool-line");
+            ::metrics::counter!("capture_test_pool_total").increment(1);
+        })
+        .await
+        .expect("the pool task ends");
+    });
+    assert!(logged.contains("capture-check-pool-line"), "{logged}");
+    for metric in ["capture_test_thread_total 1", "capture_test_pool_total 1"] {
+        assert!(rendered.lines().any(|line| line == metric), "{rendered}");
+    }
 }
 
 /// I4 end to end: under `required`, the unkeyed issue and rotation are

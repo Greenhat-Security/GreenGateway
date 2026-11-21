@@ -34,11 +34,16 @@ pub(super) const REFERENCE_MARKERS: [&str; 4] = [
 ];
 
 /// The references a delegated-issuer Connection names instead: its client
-/// secret and its caller-assertion signing key.
-pub(super) const DELEGATED_MARKERS: [&str; 2] = [
+/// secret, its caller-assertion signing key and a key it publishes beside
+/// that one.
+pub(super) const DELEGATED_MARKERS: [&str; 3] = [
     "marked-connection-client-secret-alias",
     "marked-connection-signing-key-alias",
+    "marked-connection-published-key-alias",
 ];
+
+/// The client secret an OAuth client-credentials Connection names.
+pub(super) const OAUTH_MARKERS: [&str; 1] = ["marked-connection-oauth-client-secret-alias"];
 
 /// The overlay document's free text: its own description and a tool's.
 pub(super) const OVERLAY_MARKERS: [&str; 2] = [
@@ -70,7 +75,8 @@ pub(super) fn marked_connection_body(suffix: &str) -> String {
 /// caller-assertion signing key are [`DELEGATED_MARKERS`] markers followed
 /// by `suffix`.
 pub(super) fn delegated_connection_body(suffix: &str) -> String {
-    let [client_secret, signing_key] = DELEGATED_MARKERS.map(|marker| format!("{marker}{suffix}"));
+    let [client_secret, signing_key, published_key] =
+        DELEGATED_MARKERS.map(|marker| format!("{marker}{suffix}"));
     json!({
         "display_name": "Marked API",
         "enabled": false,
@@ -91,7 +97,30 @@ pub(super) fn delegated_connection_body(suffix: &str) -> String {
             "audience": "https://keyed.example.test",
             "token_type": "caller-assertion+jwt",
             "header_name": "x-caller-assertion",
-            "lifetime_seconds": 60
+            "lifetime_seconds": 60,
+            "published_keys": [
+                {"signing_key_id": published_key, "kid": "keyed-2026-12", "algorithm": "es256"}
+            ]
+        }
+    })
+    .to_string()
+}
+
+/// A disabled OAuth client-credentials Connection whose client secret is
+/// the [`OAUTH_MARKERS`] marker followed by `suffix`.
+pub(super) fn oauth_connection_body(suffix: &str) -> String {
+    let [client_secret] = OAUTH_MARKERS.map(|marker| format!("{marker}{suffix}"));
+    json!({
+        "display_name": "Marked API",
+        "enabled": false,
+        "kind": "http_api",
+        "endpoint": {"base_url": "https://keyed.example.test", "base_path": "/v1"},
+        "authentication": {
+            "type": "oauth2_client_credentials",
+            "client_id": "greengateway",
+            "client_secret_id": client_secret,
+            "token_url": "https://keyed.example.test/oauth2/token",
+            "client_auth_method": "client_secret_basic"
         }
     })
     .to_string()
@@ -207,8 +236,15 @@ fn assert_nothing_marked_escaped(
 /// additional-header secret aliases, TLS client certificate and key
 /// aliases), its exact retry and a retry naming other markers; a keyed
 /// replacement to a delegated-issuer body naming a marker as its client
-/// secret and caller-assertion signing key aliases, with the same retries;
-/// and a keyed create whose reservation cannot be written. No marker and no
+/// secret, caller-assertion signing key and published key aliases, with the
+/// same retries; a keyed replacement to an OAuth client-credentials body
+/// naming a marker as its client secret alias and a keyed delete of the
+/// Connection that still names it, each with its exact retry; and a keyed
+/// create whose reservation cannot be written. Every marked body is a
+/// disabled Connection: an enabled one naming an alias that is not
+/// configured is refused before its key is bound, so its references could
+/// not be marked. The enabled side (a credentialed Connection the runtime
+/// serves) is the catalog test's. No marker and no
 /// binding digest reaches a log line at any level, the rendered metrics, a
 /// receipt, a conflict or failure answer, or the audit stream. The create's
 /// and the replacement's own answers are the Connection's view for the
@@ -286,8 +322,10 @@ fn a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_lo
                     )
                 };
                 let delegated = delegated_connection_body(SUFFIXES[0]);
-                let (status, _, replaced) = exchange(&router, replace(&delegated)).await;
+                let (status, delegated_etag, replaced) =
+                    exchange(&router, replace(&delegated)).await;
                 assert_eq!(status, StatusCode::OK, "{replaced}");
+                let delegated_etag = delegated_etag.expect("the replacement names its ETag");
                 let (status, _, receipt) = exchange(&router, replace(&delegated)).await;
                 assert_eq!(status, StatusCode::OK, "{receipt}");
                 answers.push(receipt);
@@ -306,13 +344,67 @@ fn a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_lo
                     ));
                 }
 
+                // A replacement to an OAuth client-credentials body, then a
+                // delete of the Connection that still names its client
+                // secret, each with its exact retry.
+                let oauth = oauth_connection_body(SUFFIXES[0]);
+                let oauth_key = caller_key(96);
+                let replace_oauth = || {
+                    keyed_connection_request(
+                        Method::PUT,
+                        &route,
+                        admin.clone(),
+                        Some(oauth.clone()),
+                        Some(&delegated_etag),
+                        Some(&oauth_key),
+                    )
+                };
+                let (status, oauth_etag, replaced) = exchange(&router, replace_oauth()).await;
+                assert_eq!(status, StatusCode::OK, "{replaced}");
+                let oauth_etag = oauth_etag.expect("the replacement names its ETag");
+                let (status, _, receipt) = exchange(&router, replace_oauth()).await;
+                assert_eq!(status, StatusCode::OK, "{receipt}");
+                answers.push(receipt);
+                digests.push(bound_digest(
+                    &actor,
+                    &oauth_key,
+                    "connection.replace",
+                    &id,
+                    &delegated_etag,
+                    &oauth,
+                ));
+                let delete_key = caller_key(97);
+                let delete = || {
+                    keyed_connection_request(
+                        Method::DELETE,
+                        &route,
+                        admin.clone(),
+                        None,
+                        Some(&oauth_etag),
+                        Some(&delete_key),
+                    )
+                };
+                for _ in 0..2 {
+                    let (status, _, answer) = exchange(&router, delete()).await;
+                    assert!(status.is_success(), "{status}: {answer}");
+                    answers.push(answer);
+                }
+                digests.push(bound_digest(
+                    &actor,
+                    &delete_key,
+                    "connection.delete",
+                    &id,
+                    &oauth_etag,
+                    "",
+                ));
+
                 fail_every_reservation(&connection_db.path);
                 let collection = connection_collection_etag(&router).await;
                 let failed_key = caller_key(92);
                 let failing = marked_connection_body(SUFFIXES[2]);
                 let (status, _, failed) =
                     exchange(&router, create(&failing, &failed_key, &collection)).await;
-                assert!(status.is_server_error(), "{status}: {failed}");
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{failed}");
                 answers.push(failed);
                 digests.push(bound_digest(
                     &actor,
@@ -330,7 +422,7 @@ fn a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_lo
                         .filter(|event| event.event_type == audit::event::CONNECTION_CHANGED)
                         .count()
                 };
-                assert_eventually(Duration::from_secs(5), || changes() >= 2);
+                assert_eventually(Duration::from_secs(5), || changes() >= 4);
                 (answers, digests)
             },
         );
@@ -342,7 +434,12 @@ fn a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_lo
         .map(|(_, _, digest)| digest.expect("every Connection key is bound by digest"))
         .collect();
     reserved.sort();
-    let mut committed = vec![digests[0].clone(), digests[2].clone()];
+    let mut committed = vec![
+        digests[0].clone(),
+        digests[2].clone(),
+        digests[4].clone(),
+        digests[5].clone(),
+    ];
     committed.sort();
     assert_eq!(reserved, committed);
 
@@ -352,6 +449,7 @@ fn a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_lo
             REFERENCE_MARKERS
                 .iter()
                 .chain(DELEGATED_MARKERS.iter())
+                .chain(OAUTH_MARKERS.iter())
                 .map(move |marker| format!("{marker}{suffix}"))
         })
         .collect();
@@ -365,33 +463,57 @@ fn a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_lo
     );
 }
 
-/// I5 for the catalog family through the real handlers: a keyed OpenAPI
-/// registration, its exact retry and its key reused on the refresh route; a
-/// keyed overlay replacement whose document carries a marker in its own
-/// description and in a tool's, its exact retry and a retry naming other
-/// markers; and a keyed overlay replacement whose reservation cannot be
-/// written. No marker and no binding digest reaches a log line at any level,
-/// the rendered metrics, a receipt, a conflict or failure answer, or the
-/// audit stream. No catalog request names a credential: the registration
-/// carries its specification inline (published catalog content, not a
-/// secret), a refresh has no body, and the upstream's credentials are the
-/// Connection's own, never part of a catalog request. The registration's
-/// and the overlay replacement's own answers are the catalog's view for the
-/// caller who changed it, so they are not searched.
+/// I5 for the catalog family through the real handlers. The catalog's
+/// Connection is enabled and credentialed: its bearer and additional-header
+/// secrets are operator aliases whose IDs, file locators and values are
+/// [`CATALOG_SOURCE_MARKERS`], and its discovery uses the Connection's
+/// authentication. Against it: a keyed OpenAPI registration, its exact
+/// retry and its key reused on the refresh route; a keyed refresh, which
+/// loads that Connection and republishes the stored specification, and its
+/// exact retry; a keyed overlay replacement whose document carries a marker
+/// in its own description and in a tool's, its exact retry and a retry
+/// naming other markers; a keyed overlay replacement with
+/// `allow_unresolved_enum_sources` whose enum source request names a marker
+/// in its path and in a query value, and its exact retry; a keyed overlay
+/// delete of an overlay holding those markers, and its exact retry. Then a
+/// keyed overlay replacement whose reservation cannot be written and, once
+/// the Connection is replaced to name a discovery path, a keyed refresh
+/// whose credentialed specification fetch fails (the test egress policy
+/// admits no host). No marker and no binding digest reaches a log line, the
+/// rendered metrics, a receipt, a conflict or failure answer, or the audit
+/// stream.
+///
+/// Not driven: the TLS client certificate and key aliases of a catalog's
+/// Connection, because an enabled Connection builds its TLS client from PEM
+/// material that a marker is not (the Connection test marks those aliases
+/// on a disabled Connection); and `catalog.mcp.publish`, which needs an MCP
+/// upstream to list tools from. The registration's and the first overlay
+/// replacement's own answers are the catalog's view for the caller who
+/// changed it, so they are not searched.
 #[test]
 fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics() {
     let connection_db = TempDb::new("keyed-catalog-markers");
     let policy = TempPolicyFile::new(&connection_policy_document_string());
     let (audit_log, capture) = captured_audit();
-    let ((answers, digests, registered_digest), logged, rendered) =
+    write_catalog_source_secrets(&connection_db);
+    let ((answers, digests, committed), logged, rendered) =
         super::super::admin_tokens_app_tests::capture_logs_and_metrics_on_every_runtime_thread(
             async {
-                let router = keyed_connection_router(&connection_db, &policy, audit_log, |_| {});
-                let admin = keyed_admin(CATALOG_ROLES);
+                let router = keyed_connection_router(
+                    &connection_db,
+                    &policy,
+                    audit_log,
+                    configure_catalog_source_aliases,
+                );
+                let roles: Vec<&str> = std::iter::once("connections-superadmin")
+                    .chain(CATALOG_ROLES.iter().copied())
+                    .collect();
+                let admin = keyed_admin(&roles);
                 let actor = auth::change_actor::ChangeActor::from_principal(&admin);
                 let mut answers = Vec::new();
                 let mut digests = Vec::new();
-                let (id, etag) = create_managed_openapi_connection(&router, "Marked catalog").await;
+                let mut committed = Vec::new();
+                let (id, etag) = create_credentialed_catalog_connection(&router, &admin).await;
 
                 let registration = openapi_registration_body(&router, &id, &["createWidget"]).await;
                 let register_key = caller_key(93);
@@ -409,27 +531,44 @@ fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_
                 let (status, _, receipt) = exchange(&router, register()).await;
                 assert_eq!(status, StatusCode::OK, "{receipt}");
                 answers.push(receipt);
-                let (status, _, conflict) = exchange(
-                    &router,
-                    CatalogCall::Refresh.request(
-                        &id,
-                        &etag,
-                        None,
-                        admin.clone(),
-                        Some(&register_key),
-                    ),
-                )
-                .await;
+                let refresh = |key: &str| {
+                    CatalogCall::Refresh.request(&id, &etag, None, admin.clone(), Some(key))
+                };
+                let (status, _, conflict) = exchange(&router, refresh(&register_key)).await;
                 assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
                 answers.push(conflict);
-                let registered_digest = bound_digest(
+                committed.push(bound_digest(
                     &actor,
                     &register_key,
                     "catalog.openapi.publish",
                     &id,
                     &etag,
                     &registration,
-                );
+                ));
+                // The refresh route binds no body.
+                digests.push(bound_digest(
+                    &actor,
+                    &register_key,
+                    "catalog.openapi.publish",
+                    &id,
+                    &etag,
+                    "",
+                ));
+
+                let refresh_key = caller_key(98);
+                for _ in 0..2 {
+                    let (status, _, answer) = exchange(&router, refresh(&refresh_key)).await;
+                    assert_eq!(status, StatusCode::OK, "{answer}");
+                    answers.push(answer);
+                }
+                committed.push(bound_digest(
+                    &actor,
+                    &refresh_key,
+                    "catalog.openapi.publish",
+                    &id,
+                    &etag,
+                    "",
+                ));
 
                 let overlay = overlay_etag(&router, &id).await;
                 let put_key = caller_key(94);
@@ -454,16 +593,82 @@ fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_
                     exchange(&router, put(&conflicting, &put_key, &overlay)).await;
                 assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
                 answers.push(conflict);
-                for document in [&marked, &conflicting] {
-                    digests.push(bound_digest(
-                        &actor,
-                        &put_key,
-                        "catalog.overlay.replace",
-                        &id,
-                        &overlay,
-                        document,
-                    ));
+                committed.push(bound_digest(
+                    &actor,
+                    &put_key,
+                    "catalog.overlay.replace",
+                    &id,
+                    &overlay,
+                    &marked,
+                ));
+                digests.push(bound_digest(
+                    &actor,
+                    &put_key,
+                    "catalog.overlay.replace",
+                    &id,
+                    &overlay,
+                    &conflicting,
+                ));
+
+                // An enum source the gateway would fetch with the
+                // Connection's credentials, admitted unresolved.
+                let overlay = overlay_etag(&router, &id).await;
+                let sourced_key = caller_key(99);
+                let sourced = enum_source_overlay_document();
+                let (_, overlay_route) = CatalogCall::OverlayPut.route(&id);
+                let put_sourced = || {
+                    keyed_connection_request(
+                        Method::PUT,
+                        &format!("{overlay_route}?allow_unresolved_enum_sources=true"),
+                        admin.clone(),
+                        Some(sourced.clone()),
+                        Some(&overlay),
+                        Some(&sourced_key),
+                    )
+                };
+                for _ in 0..2 {
+                    let (status, _, answer) = exchange(&router, put_sourced()).await;
+                    assert_eq!(status, StatusCode::OK, "{answer}");
+                    answers.push(answer);
                 }
+                committed.push(bound_digest(
+                    &actor,
+                    &sourced_key,
+                    "catalog.overlay.replace",
+                    &id,
+                    &overlay,
+                    &json!([
+                        serde_json::from_str::<Value>(&sourced).expect("the overlay is JSON"),
+                        {"allow_unresolved_enum_sources": true}
+                    ])
+                    .to_string(),
+                ));
+
+                let overlay = overlay_etag(&router, &id).await;
+                let delete_key = caller_key(100);
+                for _ in 0..2 {
+                    let (status, _, answer) = exchange(
+                        &router,
+                        CatalogCall::OverlayDelete.request(
+                            &id,
+                            &overlay,
+                            None,
+                            admin.clone(),
+                            Some(&delete_key),
+                        ),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::OK, "{answer}");
+                    answers.push(answer);
+                }
+                committed.push(bound_digest(
+                    &actor,
+                    &delete_key,
+                    "catalog.overlay.delete",
+                    &id,
+                    &overlay,
+                    "",
+                ));
 
                 fail_every_reservation(&connection_db.path);
                 let overlay = overlay_etag(&router, &id).await;
@@ -471,7 +676,7 @@ fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_
                 let failing = marked_overlay_document(SUFFIXES[2]);
                 let (status, _, failed) =
                     exchange(&router, put(&failing, &failed_key, &overlay)).await;
-                assert!(status.is_server_error(), "{status}: {failed}");
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{failed}");
                 answers.push(failed);
                 digests.push(bound_digest(
                     &actor,
@@ -482,8 +687,49 @@ fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_
                     &failing,
                 ));
 
-                assert!(catalog_changes_through(&capture, &id, 2) >= 2);
-                (answers, digests, registered_digest)
+                // A refresh whose credentialed specification fetch fails:
+                // the Connection, replaced without a key to name a discovery
+                // path, fetches its specification with its own secrets.
+                let route = format!("{CONNECTIONS_ADMIN_ROUTE}/{id}");
+                let (status, fetched_etag, replaced) = exchange(
+                    &router,
+                    keyed_connection_request(
+                        Method::PUT,
+                        &route,
+                        admin.clone(),
+                        Some(credentialed_catalog_connection_body(Some("/openapi.json"))),
+                        Some(&etag),
+                        None,
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{replaced}");
+                let fetched_etag = fetched_etag.expect("the replacement names its ETag");
+                let fetch_key = caller_key(101);
+                let (status, _, failed) = exchange(
+                    &router,
+                    CatalogCall::Refresh.request(
+                        &id,
+                        &fetched_etag,
+                        None,
+                        admin.clone(),
+                        Some(&fetch_key),
+                    ),
+                )
+                .await;
+                assert!(!status.is_success(), "{status}: {failed}");
+                answers.push(failed);
+                digests.push(bound_digest(
+                    &actor,
+                    &fetch_key,
+                    "catalog.openapi.publish",
+                    &id,
+                    &fetched_etag,
+                    "",
+                ));
+
+                assert!(catalog_changes_through(&capture, &id, 5) >= 5);
+                (answers, digests, committed)
             },
         );
 
@@ -493,9 +739,9 @@ fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_
         .map(|(_, _, digest)| digest.expect("every catalog key is bound by digest"))
         .collect();
     reserved.sort();
-    let mut committed = vec![registered_digest.clone(), digests[0].clone()];
-    committed.sort();
-    assert_eq!(reserved, committed);
+    let mut expected = committed.clone();
+    expected.sort();
+    assert_eq!(reserved, expected);
 
     let markers: Vec<String> = SUFFIXES
         .iter()
@@ -504,11 +750,14 @@ fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_
                 .iter()
                 .map(move |marker| format!("{marker}{suffix}"))
         })
+        .chain(
+            CATALOG_SOURCE_MARKERS
+                .iter()
+                .chain(ENUM_SOURCE_MARKERS.iter())
+                .map(|marker| (*marker).to_owned()),
+        )
         .collect();
-    let digests: Vec<String> = digests
-        .into_iter()
-        .chain(std::iter::once(registered_digest))
-        .collect();
+    let digests: Vec<String> = digests.into_iter().chain(committed).collect();
     assert_nothing_marked_escaped(
         &markers,
         &digests,
@@ -517,4 +766,127 @@ fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_
         &logged,
         &rendered,
     );
+}
+
+/// A catalog Connection's credentials: the IDs of its two operator secret
+/// aliases (bearer, then additional header), the file each reads, and the
+/// value in that file.
+pub(super) const CATALOG_SOURCE_MARKERS: [&str; 6] = [
+    "marked-catalog-authentication-alias",
+    "marked-catalog-header-alias",
+    "marked-catalog-authentication-locator",
+    "marked-catalog-header-locator",
+    "marked-catalog-authentication-secret-value",
+    "marked-catalog-header-secret-value",
+];
+
+/// An overlay enum source's request path and query value.
+pub(super) const ENUM_SOURCE_MARKERS: [&str; 2] = [
+    "marked-catalog-enum-source-path",
+    "marked-catalog-enum-source-query",
+];
+
+/// Writes each [`CATALOG_SOURCE_MARKERS`] value to its locator in the test
+/// secret root of `connection_db`.
+pub(super) fn write_catalog_source_secrets(connection_db: &TempDb) {
+    let secret_root = connection_db.path.with_extension("secrets");
+    fs::create_dir_all(&secret_root).expect("the test secret root creates");
+    for (locator, value) in [
+        (CATALOG_SOURCE_MARKERS[2], CATALOG_SOURCE_MARKERS[4]),
+        (CATALOG_SOURCE_MARKERS[3], CATALOG_SOURCE_MARKERS[5]),
+    ] {
+        let file = secret_root.join(locator);
+        fs::write(&file, value).expect("the test secret writes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o600))
+                .expect("the test secret permissions set");
+        }
+    }
+}
+
+/// Configures the two operator aliases of [`CATALOG_SOURCE_MARKERS`].
+pub(super) fn configure_catalog_source_aliases(config: &mut config::Config) {
+    for (id, locator) in [
+        (CATALOG_SOURCE_MARKERS[0], CATALOG_SOURCE_MARKERS[2]),
+        (CATALOG_SOURCE_MARKERS[1], CATALOG_SOURCE_MARKERS[3]),
+    ] {
+        config
+            .connection_secret_aliases
+            .push(connections::secret::OperatorSecretAliasConfig {
+                id: id.to_owned(),
+                label: "Marked catalog alias".to_owned(),
+                source: connections::secret::OperatorSecretAliasSource::File {
+                    key: locator.to_owned(),
+                },
+            });
+    }
+}
+
+/// The body of an enabled managed OpenAPI Connection whose discovery uses
+/// its own bearer and additional-header secrets, the aliases of
+/// [`CATALOG_SOURCE_MARKERS`], with `discovery_path` as its discovery path.
+pub(super) fn credentialed_catalog_connection_body(discovery_path: Option<&str>) -> String {
+    let mut discovery = json!({"type": "managed_openapi", "use_connection_authentication": true});
+    if let Some(path) = discovery_path {
+        discovery["path"] = json!(path);
+    }
+    json!({
+        "display_name": format!("Marked catalog {}", discovery_path.unwrap_or("upload")),
+        "enabled": true,
+        "kind": "http_api",
+        "endpoint": {"base_url": "https://openapi.example.test", "base_path": "/v1"},
+        "authentication": {"type": "static_bearer", "secret_id": CATALOG_SOURCE_MARKERS[0]},
+        "additional_headers": [
+            {"header_name": "x-proxy-token", "secret_id": CATALOG_SOURCE_MARKERS[1]}
+        ],
+        "discovery": discovery
+    })
+    .to_string()
+}
+
+/// Creates the Connection of [`credentialed_catalog_connection_body`],
+/// without a discovery path and without a key; returns its ID and ETag. Its
+/// answer names its references to its creator and is not kept.
+async fn create_credentialed_catalog_connection(
+    router: &Router,
+    admin: &auth::Principal,
+) -> (String, String) {
+    let collection = connection_collection_etag(router).await;
+    let (status, etag, created) = exchange(
+        router,
+        keyed_connection_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            admin.clone(),
+            Some(credentialed_catalog_connection_body(None)),
+            Some(&collection),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    (
+        created["id"].as_str().expect("an ID").to_owned(),
+        etag.expect("the create names its ETag"),
+    )
+}
+
+/// An overlay whose one enum source requests a path and a query value that
+/// are [`ENUM_SOURCE_MARKERS`].
+pub(super) fn enum_source_overlay_document() -> String {
+    json!({
+        "schema_version": "0.1.0",
+        "enum_sources": {
+            "statuses": {
+                "request": {
+                    "path": format!("/{}", ENUM_SOURCE_MARKERS[0]),
+                    "query": {"filter": ENUM_SOURCE_MARKERS[1]}
+                },
+                "select": {"items": "/items/*", "value": "/value"}
+            }
+        }
+    })
+    .to_string()
 }

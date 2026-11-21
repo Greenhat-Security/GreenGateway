@@ -3006,6 +3006,14 @@ mod cluster_connection_keys {
     /// live member built before caller keys: the router and that member's
     /// instance ID, which [`stale`] ages out.
     async fn keyed_replica(pool: &deadpool_postgres::Pool) -> (Router, uuid::Uuid) {
+        keyed_replica_with(pool, |_| {}).await
+    }
+
+    /// [`keyed_replica`] with `configure` applied to its configuration last.
+    async fn keyed_replica_with(
+        pool: &deadpool_postgres::Pool,
+        configure: impl FnOnce(&mut config::Config),
+    ) -> (Router, uuid::Uuid) {
         storage::postgres_authority_events::PostgresAuthorityEventStore::new(pool.clone())
             .configure_capacity(100)
             .await
@@ -3087,6 +3095,7 @@ mod cluster_connection_keys {
         config.egress_deny_private_ips = false;
         config.rate_limit_write_burst = 1000;
         config.rate_limit_write_rps = 1000.0;
+        configure(&mut config);
         (replica(config, pool, membership).await, earlier)
     }
 
@@ -3726,20 +3735,90 @@ mod cluster_connection_keys {
             .expect("the failure trigger drops");
     }
 
+    /// Creates, without a discovery path and without a key, the
+    /// credentialed catalog Connection of
+    /// `marker_keys::credentialed_catalog_connection_body`; returns its ID
+    /// and ETag. Its answer names its references to its creator.
+    async fn create_cluster_catalog_connection(router: &Router, admin: &str) -> (String, String) {
+        let collection = collection_etag(router, admin).await;
+        let (status, headers, created) = call(
+            router,
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            admin,
+            Some(super::marker_keys::credentialed_catalog_connection_body(
+                None,
+            )),
+            Some(&collection),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        (
+            created["id"].as_str().unwrap().to_owned(),
+            headers[header::ETAG].to_str().unwrap().to_owned(),
+        )
+    }
+
+    /// The registration body of the widget specification for Connection
+    /// `id`, selecting `tool`, from its preview.
+    async fn cluster_openapi_registration(
+        router: &Router,
+        admin: &str,
+        id: &str,
+        tool: &str,
+    ) -> String {
+        let (status, _, preview) = call(
+            router,
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{id}/openapi/preview"),
+            admin,
+            Some(json!({ "spec": widget_openapi_spec() }).to_string()),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        let confirmations: Vec<Value> = preview["security_confirmations"]
+            .as_array()
+            .expect("the preview lists security confirmations")
+            .iter()
+            .filter(|confirmation| confirmation["tool_name"] == json!(tool))
+            .cloned()
+            .collect();
+        json!({
+            "spec": widget_openapi_spec(),
+            "spec_digest": preview["spec_digest"],
+            "expected_spec_revision": preview["spec_revision"],
+            "expected_catalog_revision": preview["catalog_revision"],
+            "selected_tool_names": [tool],
+            "security_confirmations": confirmations,
+        })
+        .to_string()
+    }
+
     /// I5 for the Connection and catalog families on a PostgreSQL-backed
     /// cluster replica, the form of
     /// `marker_keys::a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
     /// and its catalog sibling that runs against the PostgreSQL store: the
     /// same marked requests (a keyed create naming a marker in each bearer
     /// credential reference, a keyed replacement to a delegated-issuer body
-    /// naming its client secret and signing key aliases, a keyed OpenAPI
-    /// registration and a keyed overlay replacement with marked free text),
-    /// each with its exact retry and a conflicting retry, then a keyed create
-    /// whose caller key cannot be reserved and a keyed overlay replacement
-    /// whose catalog evidence row cannot be inserted. No marker and no
+    /// naming its client secret, signing key and published key aliases, a
+    /// keyed OpenAPI registration on an enabled Connection whose discovery
+    /// uses its marked operator secret aliases, and a keyed overlay
+    /// replacement with marked free text), each with its exact retry and a
+    /// conflicting retry; a keyed refresh of that Connection, a keyed
+    /// overlay replacement with a marked enum source request and a keyed
+    /// overlay delete, each with its exact retry; then a keyed create whose
+    /// caller key cannot be reserved and a keyed overlay replacement whose
+    /// catalog evidence row cannot be inserted; and, once that Connection
+    /// is replaced to name a discovery path, a keyed refresh whose
+    /// specification fetch fails. The SQLite
+    /// form also drives the OAuth client-credentials replacement and the
+    /// Connection delete. No marker and no
     /// binding digest reaches a log line at any level, the rendered metrics,
-    /// a receipt, or a conflict or failure answer. The failed catalog
-    /// evidence insert is counted on
+    /// a receipt, or a conflict or failure answer. Each forced failure is
+    /// answered `503`, and both are counted on
     /// `greengateway_authority_event_evidence_failures_total` in the same
     /// rendering, so the capture saw the store's metrics. Connection IDs and
     /// caller keys are not secrets and are not searched for; each receipt
@@ -3748,10 +3827,13 @@ mod cluster_connection_keys {
     fn postgres_keyed_connection_and_catalog_changes_keep_synthetic_markers_out_of_the_logs_and_metrics(
     ) {
         use super::marker_keys::{
-            bound_digest, delegated_connection_body, marked_connection_body,
-            marked_overlay_document, DELEGATED_MARKERS, OVERLAY_MARKERS, REFERENCE_MARKERS,
-            SUFFIXES,
+            bound_digest, configure_catalog_source_aliases, credentialed_catalog_connection_body,
+            delegated_connection_body, enum_source_overlay_document, marked_connection_body,
+            marked_overlay_document, write_catalog_source_secrets, CATALOG_SOURCE_MARKERS,
+            DELEGATED_MARKERS, ENUM_SOURCE_MARKERS, OVERLAY_MARKERS, REFERENCE_MARKERS, SUFFIXES,
         };
+        let secrets = TempDb::new("cluster-catalog-markers");
+        write_catalog_source_secrets(&secrets);
         let (outcome, logged, rendered) =
             super::super::admin_tokens_app_tests::capture_logs_and_metrics_on_every_runtime_thread(
                 async {
@@ -3769,7 +3851,14 @@ mod cluster_connection_keys {
                     storage::migrations::apply_missing_for_startup(pool, &test_settings())
                         .await
                         .unwrap();
-                    let (router, earlier) = keyed_replica(pool).await;
+                    let (router, earlier) = keyed_replica_with(pool, |config| {
+                        config.connection_secrets_root =
+                            Some(connections::secret::SecretRootConfig::new(
+                                secrets.path.with_extension("secrets"),
+                            ));
+                        configure_catalog_source_aliases(config);
+                    })
+                    .await;
                     stale(pool, earlier).await;
                     let roles: Vec<&str> = std::iter::once("connections-superadmin")
                         .chain(CATALOG_ROLES.iter().copied())
@@ -3880,49 +3969,13 @@ mod cluster_connection_keys {
                         &conflicting,
                     ));
 
-                    // An OpenAPI registration, its retry, its key on the
-                    // refresh route.
-                    let collection = collection_etag(&router, &admin).await;
-                    let (status, headers, managed) = call(
-                        &router,
-                        Method::POST,
-                        CONNECTIONS_ADMIN_ROUTE,
-                        &admin,
-                        Some(managed_openapi_connection_body("Marked cluster catalog")),
-                        Some(&collection),
-                        None,
-                    )
-                    .await;
-                    assert_eq!(status, StatusCode::CREATED, "{managed}");
-                    let catalog_id = managed["id"].as_str().unwrap().to_owned();
-                    let catalog_etag = headers[header::ETAG].to_str().unwrap().to_owned();
-                    let (status, _, preview) = call(
-                        &router,
-                        Method::POST,
-                        &format!("{CONNECTIONS_ADMIN_ROUTE}/{catalog_id}/openapi/preview"),
-                        &admin,
-                        Some(json!({ "spec": widget_openapi_spec() }).to_string()),
-                        None,
-                        None,
-                    )
-                    .await;
-                    assert_eq!(status, StatusCode::OK, "{preview}");
-                    let confirmations: Vec<Value> = preview["security_confirmations"]
-                        .as_array()
-                        .expect("the preview lists security confirmations")
-                        .iter()
-                        .filter(|confirmation| confirmation["tool_name"] == json!("createWidget"))
-                        .cloned()
-                        .collect();
-                    let registration = json!({
-                        "spec": widget_openapi_spec(),
-                        "spec_digest": preview["spec_digest"],
-                        "expected_spec_revision": preview["spec_revision"],
-                        "expected_catalog_revision": preview["catalog_revision"],
-                        "selected_tool_names": ["createWidget"],
-                        "security_confirmations": confirmations,
-                    })
-                    .to_string();
+                    // An OpenAPI registration on a credentialed Connection,
+                    // its retry, its key on the refresh route.
+                    let (catalog_id, catalog_etag) =
+                        create_cluster_catalog_connection(&router, &admin).await;
+                    let registration =
+                        cluster_openapi_registration(&router, &admin, &catalog_id, "createWidget")
+                            .await;
                     let register_key = caller_key(112);
                     let mut statuses = Vec::new();
                     for (index, catalog_call) in [
@@ -3963,6 +4016,42 @@ mod cluster_connection_keys {
                         &catalog_id,
                         &catalog_etag,
                         &registration,
+                    ));
+                    // The refresh route binds no body.
+                    refused.push(bound_digest(
+                        &actor,
+                        &register_key,
+                        "catalog.openapi.publish",
+                        &catalog_id,
+                        &catalog_etag,
+                        "",
+                    ));
+
+                    // A refresh, which loads the credentialed Connection and
+                    // republishes the stored specification, and its retry.
+                    let refresh_key = caller_key(116);
+                    for _ in 0..2 {
+                        let (method, uri) = CatalogCall::Refresh.route(&catalog_id);
+                        let (status, _, answer) = call(
+                            &router,
+                            method,
+                            &uri,
+                            &admin,
+                            None,
+                            Some(&catalog_etag),
+                            Some(&refresh_key),
+                        )
+                        .await;
+                        assert_eq!(status, StatusCode::OK, "{answer}");
+                        answers.push(answer);
+                    }
+                    committed.push(bound_digest(
+                        &actor,
+                        &refresh_key,
+                        "catalog.openapi.publish",
+                        &catalog_id,
+                        &catalog_etag,
+                        "",
                     ));
 
                     // An overlay replacement, its retries.
@@ -4015,6 +4104,66 @@ mod cluster_connection_keys {
                         ));
                     }
 
+                    // An enum source the gateway would fetch with the
+                    // Connection's credentials, admitted unresolved, then a
+                    // delete of the overlay holding it; each with its retry.
+                    let overlay =
+                        overlay_etag(router.clone(), admin.clone(), overlay_route.clone()).await;
+                    let sourced_key = caller_key(117);
+                    let sourced = enum_source_overlay_document();
+                    for _ in 0..2 {
+                        let (status, _, answer) = call(
+                            &router,
+                            Method::PUT,
+                            &format!("{overlay_route}?allow_unresolved_enum_sources=true"),
+                            &admin,
+                            Some(sourced.clone()),
+                            Some(&overlay),
+                            Some(&sourced_key),
+                        )
+                        .await;
+                        assert_eq!(status, StatusCode::OK, "{answer}");
+                        answers.push(answer);
+                    }
+                    committed.push(bound_digest(
+                        &actor,
+                        &sourced_key,
+                        "catalog.overlay.replace",
+                        &catalog_id,
+                        &overlay,
+                        &json!([
+                            serde_json::from_str::<Value>(&sourced).expect("the overlay is JSON"),
+                            {"allow_unresolved_enum_sources": true}
+                        ])
+                        .to_string(),
+                    ));
+                    let overlay =
+                        overlay_etag(router.clone(), admin.clone(), overlay_route.clone()).await;
+                    let delete_key = caller_key(118);
+                    for _ in 0..2 {
+                        let (method, uri) = CatalogCall::OverlayDelete.route(&catalog_id);
+                        let (status, _, answer) = call(
+                            &router,
+                            method,
+                            &uri,
+                            &admin,
+                            None,
+                            Some(&overlay),
+                            Some(&delete_key),
+                        )
+                        .await;
+                        assert_eq!(status, StatusCode::OK, "{answer}");
+                        answers.push(answer);
+                    }
+                    committed.push(bound_digest(
+                        &actor,
+                        &delete_key,
+                        "catalog.overlay.delete",
+                        &catalog_id,
+                        &overlay,
+                        "",
+                    ));
+
                     // Test-only fault injection: a create whose key cannot
                     // be reserved, then an overlay replacement whose catalog
                     // evidence cannot be inserted.
@@ -4032,7 +4181,7 @@ mod cluster_connection_keys {
                         Some(&failed_key),
                     )
                     .await;
-                    assert!(status.is_server_error(), "{status}: {failed}");
+                    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{failed}");
                     answers.push(failed);
                     refused.push(bound_digest(
                         &actor,
@@ -4058,7 +4207,7 @@ mod cluster_connection_keys {
                         Some(&failed_key),
                     )
                     .await;
-                    assert!(status.is_server_error(), "{status}: {failed}");
+                    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{failed}");
                     answers.push(failed);
                     refused.push(bound_digest(
                         &actor,
@@ -4067,6 +4216,46 @@ mod cluster_connection_keys {
                         &catalog_id,
                         &overlay,
                         &failing,
+                    ));
+
+                    admit_inserts_into(pool, "catalog_change_evidence").await;
+                    // A refresh whose credentialed specification fetch fails:
+                    // the Connection, replaced without a key to name a
+                    // discovery path, fetches with its own secrets, and the
+                    // replica's egress policy does not admit the host.
+                    let (status, headers, replaced) = call(
+                        &router,
+                        Method::PUT,
+                        &format!("{CONNECTIONS_ADMIN_ROUTE}/{catalog_id}"),
+                        &admin,
+                        Some(credentialed_catalog_connection_body(Some("/openapi.json"))),
+                        Some(&catalog_etag),
+                        None,
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::OK, "{replaced}");
+                    let fetched_etag = headers[header::ETAG].to_str().unwrap().to_owned();
+                    let fetch_key = caller_key(119);
+                    let (method, uri) = CatalogCall::Refresh.route(&catalog_id);
+                    let (status, _, failed) = call(
+                        &router,
+                        method,
+                        &uri,
+                        &admin,
+                        None,
+                        Some(&fetched_etag),
+                        Some(&fetch_key),
+                    )
+                    .await;
+                    assert!(!status.is_success(), "{status}: {failed}");
+                    answers.push(failed);
+                    refused.push(bound_digest(
+                        &actor,
+                        &fetch_key,
+                        "catalog.openapi.publish",
+                        &catalog_id,
+                        &fetched_etag,
+                        "",
                     ));
 
                     let mut stored: Vec<String> = pool
@@ -4100,21 +4289,32 @@ mod cluster_connection_keys {
             "{} ",
             crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL
         );
-        assert!(
+        // Once for the refused reservation, once for the refused catalog
+        // evidence insert; the failed fetch is answered before any evidence.
+        assert_eq!(
             rendered
                 .lines()
                 .filter_map(|line| line.strip_prefix(failures.as_str()))
-                .any(|count| count != "0"),
-            "the failed catalog evidence insert was counted where the capture saw it"
+                .collect::<Vec<_>>(),
+            ["2"],
+            "both forced failures were counted where the capture saw them"
         );
         let answered = format!("{answers:?}");
-        let markers = SUFFIXES.iter().flat_map(|suffix| {
-            REFERENCE_MARKERS
-                .iter()
-                .chain(DELEGATED_MARKERS.iter())
-                .chain(OVERLAY_MARKERS.iter())
-                .map(move |marker| format!("{marker}{suffix}"))
-        });
+        let markers = SUFFIXES
+            .iter()
+            .flat_map(|suffix| {
+                REFERENCE_MARKERS
+                    .iter()
+                    .chain(DELEGATED_MARKERS.iter())
+                    .chain(OVERLAY_MARKERS.iter())
+                    .map(move |marker| format!("{marker}{suffix}"))
+            })
+            .chain(
+                CATALOG_SOURCE_MARKERS
+                    .iter()
+                    .chain(ENUM_SOURCE_MARKERS.iter())
+                    .map(|marker| (*marker).to_owned()),
+            );
         for marker in markers {
             assert!(!answered.contains(&marker), "{marker} reached an answer");
             assert!(!logged.contains(&marker), "{marker} reached the logs");

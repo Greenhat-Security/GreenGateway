@@ -1155,7 +1155,7 @@ mod cluster_document_keys {
                     let failing = cluster_policy("failed").to_string();
                     let etag = policy_etag(&router, &admin).await;
                     let (status, _, failed) = publish(&keys[3], &failing, &etag).await;
-                    assert!(status.is_server_error(), "{status}: {failed}");
+                    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{failed}");
                     answers.push(failed);
                     computed.push(document_digest(
                         &actor,
