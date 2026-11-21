@@ -208,6 +208,7 @@ export function validateEvent(event) {
 // No row is run unrefused: the activation that starts the gateway is refused
 // at startup (owner decision 2 of #425, 2026-11-19).
 const REQUIRED_MODES = new Set(["admitted", "caller_key_required", "refused", "refused_at_startup", "unavailable", "outside_gateway"]);
+const REFUSING_MODES = new Set(["refused", "refused_at_startup"]);
 
 // Serving startup refuses required mode until a configuration activation can
 // be proven durably recorded. The proof type has no value until #242 gives it
@@ -459,9 +460,15 @@ const sameList = (left, right) => left.length === right.length && left.every((va
 // The checker's summary of a valid inventory, computed from what it checked.
 export function summary(result) {
   const list = (pairs) => pairs.length > 0 ? pairs.join(", ") : "none";
-  return `Authority evidence inventory valid: ${result.groups} groups, ${result.operationModePairs} operation/mode pairs, ${result.sourceReferences} source references.`
+  const { withdrawal_admitted: withdrawals, no_caller_key: unkeyed } = result.admittedRows;
+  const modes = result.requiredModes;
+  return `Authority evidence inventory valid: ${result.groups} rows, ${result.operationModePairs} operation/mode pairs, ${result.sourceReferences} source references.`
+    + ` Required mode: ${result.qualifiedRows} qualified rows; ${withdrawals + unkeyed} admitted rows, none qualified (${withdrawals} withdrawal_admitted, ${unkeyed} no_caller_key);`
+    + ` ${modes.refused} refused, ${modes.refused_at_startup} refused at startup, ${modes.unavailable} unavailable, ${modes.outside_gateway} outside the gateway.`
     + ` Qualified in required mode: ${list(result.qualifiedPairs)}.`
-    + ` Admitted withdrawals with a reviewed keyed path: ${list(result.keyedWithdrawalPairs)}.`;
+    + ` Admitted withdrawals with a reviewed keyed path: ${list(result.keyedWithdrawalPairs)}.`
+    + " Qualified rows are proven by tests that build the application directly."
+    + (result.activationRefusedAtStartup ? " Required mode refuses to start until #242 provides activation evidence." : "");
 }
 
 export function validateInventory(inventory, readSource = (path) => readFileSync(resolve(ROOT, path), "utf8"), qualifiedPaths = QUALIFIED_PATHS, sharedRoutes = SHARED_KEYED_ROUTES) {
@@ -571,6 +578,14 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
     // row with an entry point a request reaches cannot be waved through.
     check(!(group.required_mode === "admitted" && group.disposition.includes("unsupported_future_operation")), `${group.id}: required mode admits an unsupported operation`);
     check(group.required_mode !== "outside_gateway" || group.entrypoints.length === 0, `${group.id}: a reachable entry point must be admitted or refused`);
+    // Closing rule of issue #425: an admitted row is one of the two reviewed
+    // unqualified dispositions, never a gap left open, and a known metadata
+    // gap is tolerated only where required mode refuses the change.
+    check(group.required_mode !== "admitted"
+      || (group.disposition.length === 1 && Object.hasOwn(ADMITTED_UNQUALIFIED, group.disposition[0])),
+      `${group.id}: an admitted row must be no_caller_key or withdrawal_admitted`);
+    check(!group.disposition.includes("missing_metadata") || REFUSING_MODES.has(group.required_mode),
+      `${group.id}: missing_metadata is allowed only on a row that required mode refuses`);
     check(group.disposition.length > 0 && new Set(group.disposition).size === group.disposition.length, `${group.id}: missing/duplicate disposition`);
     for (const disposition of group.disposition) check(DISPOSITIONS.has(disposition), `${group.id}: unknown disposition`);
     check(!group.disposition.includes("already_sufficient") || group.disposition.length === 1, "sufficient contradicts a gap");
@@ -643,6 +658,12 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
   return {
     groups: inventory.groups.length, operationModePairs: seen.size, sourceReferences: references,
     qualifiedPairs: qualifiedPairs.sort(), keyedWithdrawalPairs: keyedWithdrawalPairs.sort(),
+    qualifiedRows: inventory.groups.filter((group) => group.required_durability_supported === true).length,
+    admittedRows: Object.fromEntries(Object.keys(ADMITTED_UNQUALIFIED).map((disposition) =>
+      [disposition, inventory.groups.filter((group) => group.required_mode === "admitted" && group.disposition.includes(disposition)).length])),
+    requiredModes: Object.fromEntries(["refused", "refused_at_startup", "unavailable", "outside_gateway"].map((mode) =>
+      [mode, inventory.groups.filter((group) => group.required_mode === mode).length])),
+    activationRefusedAtStartup: activationUnproven(),
   };
 }
 

@@ -13,7 +13,7 @@ the PR 4 standalone slices (Connection, local-secret, and catalog and overlay
 evidence, [Standalone evidence](#standalone-evidence)), standalone delivery from the
 stores that own that evidence ([Standalone delivery](#standalone-delivery)) and PR 4's
 refusal of unsupported changes ([Required-durability mode](#required-durability-mode)).
-Reviewed source: `ebb579e6444d437bf477d0617b8841d1eea34cfc`.
+Reviewed source: `78414d3d9b2eb050dc02873176e674458a7d93fa`.
 
 This inventory identifies existing atomic records and the work needed for required
 authority-change evidence. PR 1 added the inventory and the proposed event
