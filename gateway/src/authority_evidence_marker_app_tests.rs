@@ -1006,7 +1006,16 @@ impl RecordingSpecUpstream {
         let (ca_pem, server_cert_der, server_key_der) = test_ca_signed_server_certificate();
         let secret_root = connection_db.path.with_extension("secrets");
         fs::create_dir_all(&secret_root).expect("the test secret root creates");
-        fs::write(secret_root.join(UPSTREAM_CA_LOCATOR), ca_pem).expect("the CA writes");
+        let ca_file = secret_root.join(UPSTREAM_CA_LOCATOR);
+        fs::write(&ca_file, ca_pem).expect("the CA writes");
+        // An operator file alias refuses a file others can read, so the CA
+        // file needs the same mode as the secret files beside it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&ca_file, fs::Permissions::from_mode(0o600))
+                .expect("the CA file permissions set");
+        }
         let acceptor = TlsAcceptor::from(Arc::new(
             ServerConfig::builder()
                 .with_no_client_auth()
