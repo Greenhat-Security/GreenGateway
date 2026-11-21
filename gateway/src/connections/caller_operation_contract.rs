@@ -711,12 +711,50 @@ fn marked_candidate(suffix: &str) -> ConnectionWrite {
     .expect("the marked candidate deserializes")
 }
 
+/// The references a delegated-issuer Connection carries instead of the ones
+/// above: its client secret alias and its caller-assertion signing key alias.
+const DELEGATED_MARKERS: [&str; 2] = [
+    "keyed-connection-client-secret-alias-marker",
+    "keyed-connection-caller-assertion-key-marker",
+];
+
+/// A delegated-issuer Connection whose client secret and caller-assertion
+/// signing key aliases are [`DELEGATED_MARKERS`].
+fn delegated_marked_candidate() -> ConnectionWrite {
+    let [client_secret, signing_key] = DELEGATED_MARKERS;
+    serde_json::from_value(json!({
+        "display_name": "Marked API",
+        "enabled": false,
+        "kind": "http_api",
+        "endpoint": {"base_url": "https://keyed.example.test", "base_path": "/v1"},
+        "authentication": {
+            "type": "delegated_issuer_token",
+            "token_exchange_url": "https://keyed.example.test/oauth2/token-exchange",
+            "client_id": "greengateway",
+            "client_secret_id": client_secret,
+            "subject_token_source": "caller_assertion"
+        },
+        "caller_assertion": {
+            "signing_key_id": signing_key,
+            "kid": "keyed-2026-11",
+            "algorithm": "es256",
+            "issuer": "https://gateway.keyed.example.test",
+            "audience": "https://keyed.example.test",
+            "token_type": "caller-assertion+jwt",
+            "header_name": "x-caller-assertion",
+            "lifetime_seconds": 60
+        }
+    }))
+    .expect("the delegated marked candidate deserializes")
+}
+
 /// I5: the binding digest is stored only in the reservation row, and the
 /// credential references the request names (one synthetic marker in each
 /// reference field) stay out of the receipts and of every column of the
-/// evidence, for a create and for a replacement that changes every
-/// reference; they are stored only where the Connection itself keeps its
-/// binding.
+/// evidence, for a create, for a replacement that changes every reference,
+/// and for a replacement to a delegated-issuer body that names a client
+/// secret and a caller-assertion signing key; they are stored only where the
+/// Connection itself keeps its binding.
 pub(crate) async fn the_binding_digest_is_stored_only_in_the_reservation_row(
     db: &impl ContractDatabase,
 ) {
@@ -733,7 +771,7 @@ pub(crate) async fn the_binding_digest_is_stored_only_in_the_reservation_row(
     );
     let remarked = marked_candidate("-next");
     let replace_op = replace_key(81, &actor, &created, &remarked);
-    committed(
+    let replaced = committed(
         replace(
             db,
             &created,
@@ -752,9 +790,40 @@ pub(crate) async fn the_binding_digest_is_stored_only_in_the_reservation_row(
         rows_for(db, &replace_op).await,
         ["connection.replace", "credential.binding_change"]
     );
+    // The client secret and caller-assertion key aliases, the reference
+    // fields a bearer body cannot carry.
+    let delegated = delegated_marked_candidate();
+    let delegated_op = replace_key(82, &actor, &replaced, &delegated);
+    committed(
+        replace(
+            db,
+            &replaced,
+            &replaced.etag(),
+            delegated.clone(),
+            Some(&delegated_op),
+        )
+        .await,
+        "the keyed delegated-issuer replace",
+    );
+    let delegated_receipt = replayed(
+        replace(
+            db,
+            &replaced,
+            &replaced.etag(),
+            delegated,
+            Some(&delegated_op),
+        )
+        .await,
+        "the retried delegated-issuer replace",
+    );
+    assert_eq!(
+        rows_for(db, &delegated_op).await,
+        ["connection.replace", "credential.binding_change"]
+    );
     let digests = [
         create_op.binding_digest().to_owned(),
         replace_op.binding_digest().to_owned(),
+        delegated_op.binding_digest().to_owned(),
     ];
     let mut reserved = db.reservations().await;
     reserved.sort();
@@ -769,14 +838,17 @@ pub(crate) async fn the_binding_digest_is_stored_only_in_the_reservation_row(
             "connection.replace".to_owned(),
             Some(digests[1].clone()),
         ),
+        (
+            delegated_op.id().to_string(),
+            "connection.replace".to_owned(),
+            Some(digests[2].clone()),
+        ),
     ];
     expected.sort();
     assert_eq!(reserved, expected);
-    let receipts = format!(
-        "{}{}",
-        serde_json::to_string(&receipt).expect("the receipt serializes"),
-        serde_json::to_string(&replace_receipt).expect("the receipt serializes")
-    );
+    let receipts = [&receipt, &replace_receipt, &delegated_receipt]
+        .map(|receipt| serde_json::to_string(receipt).expect("the receipt serializes"))
+        .concat();
     let outside = db.text_outside_reservations().await;
     let evidence = db.evidence_text().await;
     assert!(!evidence.is_empty(), "the evidence rows were read");
@@ -791,11 +863,11 @@ pub(crate) async fn the_binding_digest_is_stored_only_in_the_reservation_row(
         );
     }
     // Each marker is a prefix of its `-next` form too.
-    for marker in REFERENCE_MARKERS {
+    for marker in REFERENCE_MARKERS.into_iter().chain(DELEGATED_MARKERS) {
         assert!(!receipts.contains(marker), "{marker} reached a receipt");
         assert!(!evidence.contains(marker), "{marker} reached the evidence");
     }
-    for key in [&create_op, &replace_op] {
+    for key in [&create_op, &replace_op, &delegated_op] {
         assert!(
             !format!("{key:?}").contains(key.binding_digest()),
             "a key's Debug never shows its digest"

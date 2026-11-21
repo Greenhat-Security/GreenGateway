@@ -2202,10 +2202,15 @@ mod cluster_connection_keys {
             .configure_capacity(100)
             .await
             .unwrap();
-        let policy = rbac::Policy::validate_json_value(
-            serde_json::from_str(&connection_policy_document_string()).unwrap(),
-        )
-        .unwrap();
+        // The requests carry real bearer tokens through the HTTP policy
+        // layer, which answers a route no rule names with the policy's
+        // default action. Allow it there, as the other cluster replica tests
+        // do, so that every 403 below is the Connection handler's own
+        // permission check.
+        let mut document: Value =
+            serde_json::from_str(&connection_policy_document_string()).unwrap();
+        document["default_action"] = json!("allow");
+        let policy = rbac::Policy::validate_json_value(document).unwrap();
         storage::PostgresPolicyStore::new(pool.clone())
             .commit(storage::PolicyCommitRequest {
                 precondition: storage::PolicyCommitPrecondition::Initialize,
