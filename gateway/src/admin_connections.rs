@@ -928,8 +928,9 @@ async fn connection_put(
         // A keyed replacement that committed is answered from its evidence
         // even once the Connection has since been deleted, as a keyed delete
         // is (issue #425). The caller is authorized for what the body says
-        // before the key is bound; with the record gone, the body is bound
-        // as received and not judged against it. An unkeyed request for a
+        // and the body is validated before the key is bound; with the record
+        // gone, the body is bound as received and judged as a replacement in
+        // its own right, not against the record. An unkeyed request for a
         // missing record is `404`, as before.
         if parts.headers.contains_key("idempotency-key") {
             let body = match read_request_body(body, connection_admin_body_limit(&state)).await {
@@ -953,6 +954,13 @@ async fn connection_put(
                 }
                 Ok(_) => {}
                 Err(response) => return *response,
+            }
+            // Validated before admission, which can raise the cluster's
+            // contract fence: the body must be a Connection replacement in
+            // its own right, whatever record it would have been judged
+            // against.
+            if let Err(response) = validate_connection_replacement_without_record(&body) {
+                return *response;
             }
             if let Err(response) = admit_keyed_connection_change(
                 &state,
@@ -1269,12 +1277,22 @@ async fn connection_delete(
     )
 }
 
-/// A Connection change that binds a caller key (issue #425).
+/// A Connection change, or a publication of a Connection's managed catalog,
+/// that binds a caller key (issue #425).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum KeyedConnectionChange {
     Create,
     Replace,
     Delete,
+    /// A refresh of a managed MCP Connection's catalog.
+    CatalogMcpPublish,
+    /// An OpenAPI registration, or a refresh of a managed OpenAPI
+    /// Connection's catalog.
+    CatalogOpenApiPublish,
+    /// An OpenAPI overlay stored, with its catalog.
+    CatalogOverlayReplace,
+    /// An OpenAPI overlay removed, with its catalog published without it.
+    CatalogOverlayDelete,
 }
 
 impl KeyedConnectionChange {
@@ -1284,6 +1302,10 @@ impl KeyedConnectionChange {
             Self::Create => "connection.create",
             Self::Replace => "connection.replace",
             Self::Delete => "connection.delete",
+            Self::CatalogMcpPublish => "catalog.mcp.publish",
+            Self::CatalogOpenApiPublish => "catalog.openapi.publish",
+            Self::CatalogOverlayReplace => "catalog.overlay.replace",
+            Self::CatalogOverlayDelete => "catalog.overlay.delete",
         }
     }
 
@@ -1301,6 +1323,18 @@ impl KeyedConnectionChange {
             Self::Delete => {
                 KeyedChange::Withdrawal(authority_events::required::Withdrawal::ConnectionDelete)
             }
+            Self::CatalogMcpPublish => KeyedChange::Gated(
+                authority_events::required::AuthorityOperation::CatalogMcpPublish,
+            ),
+            Self::CatalogOpenApiPublish => KeyedChange::Gated(
+                authority_events::required::AuthorityOperation::CatalogOpenapiPublish,
+            ),
+            Self::CatalogOverlayReplace => KeyedChange::Gated(
+                authority_events::required::AuthorityOperation::CatalogOverlayReplace,
+            ),
+            Self::CatalogOverlayDelete => KeyedChange::Gated(
+                authority_events::required::AuthorityOperation::CatalogOverlayDelete,
+            ),
         }
     }
 }
@@ -1309,7 +1343,10 @@ impl KeyedConnectionChange {
 /// JSON, object keys sorted, so a retry is the same request whatever its
 /// whitespace or key order. A Connection body holds no secret value -- only
 /// credential aliases and provider locators, which decide which credential
-/// the Connection uses and so stay in -- and a delete has no body.
+/// the Connection uses and so stay in -- and a delete has no body. Nor does
+/// a catalog request: an OpenAPI registration carries the specification
+/// and its selection, an overlay put the overlay document, and a refresh or
+/// an overlay delete nothing.
 pub(super) fn canonical_connection_request(body: &[u8]) -> ResponseResult<Vec<u8>> {
     fn sorted(value: Value) -> Value {
         match value {
@@ -1416,14 +1453,18 @@ pub(super) async fn admit_keyed_connection_change(
 /// refreshed document turns out to be converted. Whether it is converted is
 /// known only once it is fetched, so an admitted refresh fetches it again;
 /// the service stopped the first pass before writing or recording anything.
+/// Both passes carry the refresh's caller key, if any (issue #425).
 async fn refresh_managed_openapi_catalog(
     state: &ConnectionAdminState,
     parts: &http::request::Parts,
     principal: &auth::Principal,
     id: &connections::model::ConnectionId,
     current_etag: &str,
+    caller: Option<&authority_events::caller_operation::CallerOperation>,
 ) -> Result<
-    connections::openapi::OpenApiCatalogPublishResult,
+    authority_events::caller_operation::CallerOutcome<
+        connections::openapi::OpenApiCatalogPublishResult,
+    >,
     Box<(ConnectionRefreshFailure, Response)>,
 > {
     let actor = auth::change_actor::ChangeActor::from_principal(principal);
@@ -1431,7 +1472,7 @@ async fn refresh_managed_openapi_catalog(
     loop {
         let result = state
             .openapi_catalogs
-            .refresh_with_admission(id.as_str(), current_etag, converted_catalog, &actor)
+            .refresh_with_operation(id.as_str(), current_etag, converted_catalog, &actor, caller)
             .await;
         match result {
             Err(connections::openapi::OpenApiCatalogError::ConvertedCatalogNeedsAdmission {
@@ -1516,27 +1557,78 @@ pub(super) async fn connection_refresh_endpoint(
         Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
     }
 
+    // Authorized and validated: bind the caller key to the publication the
+    // Connection's discovery makes, ask the gates, and answer an exact retry
+    // from its receipt before the upstream is contacted again (issue #425).
+    // A refresh publishes a catalog revision and leaves the Connection's
+    // ETag where it was, so the precondition above still holds on a retry.
+    // A Connection without discovery publishes nothing and is refused below.
+    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
+    let publication = match &record.write.discovery {
+        Some(connections::model::DiscoveryConfig::ManagedMcp { .. }) => {
+            Some(KeyedConnectionChange::CatalogMcpPublish)
+        }
+        Some(connections::model::DiscoveryConfig::ManagedOpenapi { .. }) => {
+            Some(KeyedConnectionChange::CatalogOpenApiPublish)
+        }
+        None => None,
+    };
+    let caller = match publication {
+        Some(publication) => match admit_keyed_connection_change(
+            &state,
+            &parts,
+            &principal,
+            &actor,
+            publication,
+            &body,
+            id.as_str(),
+        )
+        .await
+        {
+            Ok(caller) => caller,
+            Err(response) => return *response,
+        },
+        None => None,
+    };
+
     let refreshed = match &record.write.discovery {
-        Some(connections::model::DiscoveryConfig::ManagedMcp { .. }) => state
+        Some(connections::model::DiscoveryConfig::ManagedMcp { .. }) => match state
             .mcp_catalogs
-            .refresh(
-                id.as_str(),
+            .refresh_with_operation(id.as_str(), current_etag.as_str(), &actor, caller.as_ref())
+            .await
+        {
+            Ok(authority_events::caller_operation::CallerOutcome::Committed(result)) => {
+                Ok(ConnectionCatalogRefreshResponse::Mcp(result))
+            }
+            // An exact retry: no publication, no audit event.
+            Ok(authority_events::caller_operation::CallerOutcome::Replayed(receipt)) => {
+                return operation_receipt(&receipt)
+            }
+            Err(error) => Err((
+                ConnectionRefreshFailure::mcp(error),
+                connection_refresh_error_response(error),
+            )),
+        },
+        Some(connections::model::DiscoveryConfig::ManagedOpenapi { .. }) => {
+            match refresh_managed_openapi_catalog(
+                &state,
+                &parts,
+                &principal,
+                &id,
                 current_etag.as_str(),
-                &auth::change_actor::ChangeActor::from_principal(&principal),
+                caller.as_ref(),
             )
             .await
-            .map(ConnectionCatalogRefreshResponse::Mcp)
-            .map_err(|error| {
-                (
-                    ConnectionRefreshFailure::mcp(error),
-                    connection_refresh_error_response(error),
-                )
-            }),
-        Some(connections::model::DiscoveryConfig::ManagedOpenapi { .. }) => {
-            refresh_managed_openapi_catalog(&state, &parts, &principal, &id, current_etag.as_str())
-                .await
-                .map(ConnectionCatalogRefreshResponse::OpenApi)
-                .map_err(|failure| *failure)
+            {
+                Ok(authority_events::caller_operation::CallerOutcome::Committed(result)) => {
+                    Ok(ConnectionCatalogRefreshResponse::OpenApi(result))
+                }
+                // An exact retry: no publication, no audit event.
+                Ok(authority_events::caller_operation::CallerOutcome::Replayed(receipt)) => {
+                    return operation_receipt(&receipt)
+                }
+                Err(failure) => Err(*failure),
+            }
         }
         None => Err((
             ConnectionRefreshFailure::plain("discovery_not_configured"),
@@ -1995,9 +2087,45 @@ pub(super) async fn connection_openapi_overlay_put_endpoint(
     };
     let secrets_write_authorized =
         rbac_state.principal_has_permission(&principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION);
+    // The document's own validity and the secret authority it needs are
+    // judged before its caller key is bound and the gates are asked (issue
+    // #425): admission can raise the cluster's contract fence. The catalog
+    // service judges both again under its lifecycle guard.
+    match tools::overlay::validate(&document) {
+        Ok(validated) if validated.has_raw_path_sources() && !secrets_write_authorized => {
+            return openapi_overlay_operation_error_response(
+                connections::openapi::OpenApiOverlayOperationError::SecretsWriteRequired,
+                "overlay update",
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return openapi_overlay_operation_error_response(
+                connections::openapi::OpenApiOverlayOperationError::Rejected(error),
+                "overlay update",
+            );
+        }
+    }
+    if let Err(response) = managed_overlay_target(&state, &raw_id, "overlay update") {
+        return *response;
+    }
     let actor = auth::change_actor::ChangeActor::from_principal(&principal);
+    let caller = match admit_keyed_connection_change(
+        &state,
+        &parts,
+        &principal,
+        &actor,
+        KeyedConnectionChange::CatalogOverlayReplace,
+        &body,
+        &raw_id,
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return *response,
+    };
     mutate_openapi_overlay(&state, &parts, &principal, "overlay update", |admission| {
-        state.openapi_catalogs.put_overlay_with_authorization(
+        state.openapi_catalogs.put_overlay_with_operation(
             &raw_id,
             &expected_etag,
             &document,
@@ -2005,9 +2133,41 @@ pub(super) async fn connection_openapi_overlay_put_endpoint(
             secrets_write_authorized,
             admission,
             &actor,
+            caller.as_ref(),
         )
     })
     .await
+}
+
+/// The Connection an overlay change names, judged before its caller key is
+/// bound (issue #425): an identifier that does not parse, or a Connection
+/// that is not managed, is answered as the catalog service answers it, and
+/// nothing is admitted. The catalog service judges it again.
+fn managed_overlay_target(
+    state: &ConnectionAdminState,
+    raw_id: &str,
+    operation: &'static str,
+) -> ResponseResult<()> {
+    let refused = |error| {
+        Box::new(openapi_overlay_operation_error_response(
+            connections::openapi::OpenApiOverlayOperationError::Catalog(error),
+            operation,
+        ))
+    };
+    let id = connections::model::ConnectionId::parse(raw_id.to_owned())
+        .map_err(|_| refused(connections::openapi::OpenApiCatalogError::InvalidConnectionId))?;
+    if state
+        .control_plane
+        .runtime_snapshot()
+        .managed()
+        .contains_key(&id)
+    {
+        Ok(())
+    } else {
+        Err(refused(
+            connections::openapi::OpenApiCatalogError::ConnectionNotFound,
+        ))
+    }
 }
 
 pub(super) async fn connection_openapi_overlay_delete_endpoint(
@@ -2037,11 +2197,34 @@ pub(super) async fn connection_openapi_overlay_delete_endpoint(
             return bad_request("If-Match must contain exactly one strong entity tag");
         }
     };
+    if let Err(response) = managed_overlay_target(&state, &raw_id, "overlay delete") {
+        return *response;
+    }
+    // Removing the overlay publishes a new catalog revision: it binds its
+    // caller key as a publication, not as a withdrawal (issue #425).
     let actor = auth::change_actor::ChangeActor::from_principal(&principal);
+    let caller = match admit_keyed_connection_change(
+        &state,
+        &parts,
+        &principal,
+        &actor,
+        KeyedConnectionChange::CatalogOverlayDelete,
+        b"",
+        &raw_id,
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return *response,
+    };
     mutate_openapi_overlay(&state, &parts, &principal, "overlay delete", |admission| {
-        state
-            .openapi_catalogs
-            .delete_overlay(&raw_id, &expected_etag, admission, &actor)
+        state.openapi_catalogs.delete_overlay_with_operation(
+            &raw_id,
+            &expected_etag,
+            admission,
+            &actor,
+            caller.as_ref(),
+        )
     })
     .await
 }
@@ -2056,11 +2239,14 @@ async fn mutate_openapi_overlay<Fut>(
 where
     Fut: std::future::Future<
             Output = Result<
-                connections::openapi::OpenApiOverlayMutationResult,
+                authority_events::caller_operation::CallerOutcome<
+                    connections::openapi::OpenApiOverlayMutationResult,
+                >,
                 connections::openapi::OpenApiOverlayOperationError,
             >,
         > + Send,
 {
+    use authority_events::caller_operation::CallerOutcome;
     use connections::openapi::{
         ConvertedCatalogAdmission, OpenApiCatalogError, OpenApiOverlayOperationError,
     };
@@ -2077,10 +2263,12 @@ where
         updated = apply(ConvertedCatalogAdmission::Admitted(*requirement)).await;
     }
     match updated {
-        Ok(result) => {
+        Ok(CallerOutcome::Committed(result)) => {
             emit_managed_openapi_catalog_changed(state, parts, principal, &result.catalog);
             overlay_mutation_response(result)
         }
+        // An exact retry: no publication, no audit event.
+        Ok(CallerOutcome::Replayed(receipt)) => operation_receipt(&receipt),
         Err(error) => openapi_overlay_operation_error_response(error, operation),
     }
 }
@@ -2287,6 +2475,18 @@ pub(super) async fn connection_openapi_register_endpoint(
             return bad_request(&format!("invalid managed OpenAPI register JSON: {error}"));
         }
     };
+    // The specification's size and its preview digest are the request's own
+    // to get right: judged before its caller key is bound (issue #425), and
+    // again by the catalog service.
+    if let Err(error) =
+        connections::openapi::check_registration_spec(&requested.spec, &requested.spec_digest)
+    {
+        emit_managed_openapi_catalog_rejected(&state, &parts, &principal, &id, error.safe_reason());
+        return with_etag(
+            openapi_catalog_error_response(error, "register"),
+            current_etag.as_str(),
+        );
+    }
     let confirmations = requested
         .security_confirmations
         .into_iter()
@@ -2296,14 +2496,33 @@ pub(super) async fn connection_openapi_register_endpoint(
         })
         .collect::<Vec<_>>();
 
+    // Authorized and validated: bind the caller key, ask the gates, and
+    // answer an exact retry from its receipt before anything is generated or
+    // resolved (issue #425). A registration publishes a catalog revision and
+    // leaves the Connection's ETag where it was.
+    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
+    let caller = match admit_keyed_connection_change(
+        &state,
+        &parts,
+        &principal,
+        &actor,
+        KeyedConnectionChange::CatalogOpenApiPublish,
+        &body,
+        id.as_str(),
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return *response,
+    };
+
     // At most two passes: the second only after the operation gate admitted
     // a converted document the first pass stopped at, before writing.
-    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
     let mut converted_catalog = connections::openapi::ConvertedCatalogAdmission::NotAsked;
     let registered = loop {
         let result = state
             .openapi_catalogs
-            .register_with_admission(
+            .register_with_operation(
                 id.as_str(),
                 current_etag.as_str(),
                 requested.expected_spec_revision,
@@ -2314,6 +2533,7 @@ pub(super) async fn connection_openapi_register_endpoint(
                 &confirmations,
                 converted_catalog,
                 &actor,
+                caller.as_ref(),
             )
             .await;
         if let (
@@ -2343,7 +2563,11 @@ pub(super) async fn connection_openapi_register_endpoint(
         break result;
     };
     match registered {
-        Ok(result) => {
+        // An exact retry: no publication, no audit event.
+        Ok(authority_events::caller_operation::CallerOutcome::Replayed(receipt)) => {
+            operation_receipt(&receipt)
+        }
+        Ok(authority_events::caller_operation::CallerOutcome::Committed(result)) => {
             emit_managed_openapi_catalog_changed(&state, &parts, &principal, &result);
             (
                 StatusCode::CREATED,
@@ -2457,6 +2681,107 @@ pub(super) fn parse_connection_write_body(
         candidate.caller_assertion = current.caller_assertion.clone();
     }
     validate_connection_write(candidate)
+}
+
+/// A Connection replacement body judged without the record it names: what a
+/// keyed `PUT` for a Connection that is no longer in the snapshot checks
+/// before its caller key is bound (issue #425). Everything that does not
+/// need the stored record is checked as a replacement is: the body is a
+/// JSON object, every redacted-binding marker is a boolean that is not
+/// combined with an explicit binding and does not clear a caller-assertion
+/// key, and the result is a valid Connection specification. A marker that
+/// keeps a hidden binding stands for one that passes validation, because
+/// only the stored record could say which binding it keeps and whether it
+/// matches. Nothing is read or written.
+pub(super) fn validate_connection_replacement_without_record(body: &Bytes) -> ResponseResult<()> {
+    /// The binding a replacement keeps by marker, as far as validation
+    /// sees it. It is never stored or bound: the caller key binds the body
+    /// as received.
+    const KEPT_BINDING: &str = "kept-binding";
+
+    fn keep(
+        object: &mut serde_json::Map<String, Value>,
+        marker_field: &'static str,
+        binding_field: &'static str,
+    ) -> ResponseResult<()> {
+        let marker = take_redacted_marker(object, marker_field)?;
+        if object.contains_key(binding_field) && marker.is_some() {
+            return Err(Box::new(bad_request(
+                "redacted connection binding markers cannot be combined with explicit binding IDs",
+            )));
+        }
+        if marker == Some(true) {
+            object.insert(
+                binding_field.to_owned(),
+                Value::String(KEPT_BINDING.to_owned()),
+            );
+        }
+        Ok(())
+    }
+
+    fn keep_caller_assertion_key(key: &mut serde_json::Map<String, Value>) -> ResponseResult<()> {
+        if key.get("signing_key_configured") == Some(&Value::Bool(false)) {
+            return Err(Box::new(bad_request(
+                "a caller assertion key cannot be cleared; leave the key out instead",
+            )));
+        }
+        keep(key, "signing_key_configured", "signing_key_id")
+    }
+
+    let mut candidate = serde_json::from_slice::<Value>(body)
+        .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
+    let object = candidate
+        .as_object_mut()
+        .ok_or_else(|| Box::new(bad_request("connection JSON must be an object")))?;
+    if let Some(authentication) = object
+        .get_mut("authentication")
+        .and_then(Value::as_object_mut)
+    {
+        keep(authentication, "secret_configured", "secret_id")?;
+        keep(
+            authentication,
+            "client_secret_configured",
+            "client_secret_id",
+        )?;
+    }
+    if let Some(headers) = object
+        .get_mut("additional_headers")
+        .and_then(Value::as_array_mut)
+    {
+        for header in headers.iter_mut().filter_map(Value::as_object_mut) {
+            keep(header, "secret_configured", "secret_id")?;
+        }
+    }
+    if let Some(assertion) = object
+        .get_mut("caller_assertion")
+        .and_then(Value::as_object_mut)
+    {
+        keep_caller_assertion_key(assertion)?;
+        if let Some(keys) = assertion
+            .get_mut("published_keys")
+            .and_then(Value::as_array_mut)
+        {
+            for key in keys.iter_mut().filter_map(Value::as_object_mut) {
+                keep_caller_assertion_key(key)?;
+            }
+        }
+    }
+    if let Some(tls) = object.get_mut("tls").and_then(Value::as_object_mut) {
+        keep(tls, "ca_bundle_configured", "ca_bundle_alias")?;
+        keep(
+            tls,
+            "client_certificate_configured",
+            "client_certificate_id",
+        )?;
+        keep(
+            tls,
+            "client_private_key_configured",
+            "client_private_key_id",
+        )?;
+    }
+    let candidate = serde_json::from_value::<connections::model::ConnectionWrite>(candidate)
+        .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
+    validate_connection_write(candidate).map(|_| ())
 }
 
 pub(super) fn explicit_connection_binding_intent_from_body(body: &Bytes) -> ResponseResult<bool> {

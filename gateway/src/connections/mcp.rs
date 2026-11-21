@@ -12,6 +12,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     auth::change_actor::ChangeActor,
+    authority_events::caller_operation::{CallerOperation, CallerOutcome},
     tools::{
         definitions::{
             McpCatalogPublishError, ToolDefinition, ToolRegistry, ToolRegistryError, ToolSource,
@@ -100,6 +101,9 @@ pub enum McpCatalogRefreshError {
     RequestFailed,
     InvalidResponse,
     StorageUnavailable,
+    /// The refresh's caller key (`Idempotency-Key`, issue #425) is reserved
+    /// for another request. Nothing was published or recorded.
+    CallerOperationConflict,
 }
 
 impl McpCatalogRefreshError {
@@ -124,6 +128,7 @@ impl McpCatalogRefreshError {
             Self::RequestFailed => "request_failed",
             Self::InvalidResponse => "invalid_response",
             Self::StorageUnavailable => "storage_unavailable",
+            Self::CallerOperationConflict => "caller_operation_conflict",
         }
     }
 
@@ -482,6 +487,30 @@ impl McpConnectionCatalogService {
         expected_etag: &str,
         actor: &ChangeActor,
     ) -> Result<McpCatalogRefreshResult, McpCatalogRefreshError> {
+        match self
+            .refresh_with_operation(raw_connection_id, expected_etag, actor, None)
+            .await?
+        {
+            CallerOutcome::Committed(result) => Ok(result),
+            // Only a keyed refresh is answered from a receipt; one here is a
+            // store defect, refused rather than taken for a publication.
+            CallerOutcome::Replayed(_) => Err(McpCatalogRefreshError::StorageUnavailable),
+        }
+    }
+
+    /// [`Self::refresh`] under a caller key (issue #425). The handler has
+    /// already answered an exact retry of a committed refresh from its
+    /// receipt before calling this, so the upstream is not contacted again;
+    /// a retry that raced its first attempt here is answered by the store
+    /// from the committed evidence, and nothing is installed, published or
+    /// recorded for it.
+    pub async fn refresh_with_operation(
+        &self,
+        raw_connection_id: &str,
+        expected_etag: &str,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+    ) -> Result<CallerOutcome<McpCatalogRefreshResult>, McpCatalogRefreshError> {
         if !self.control_plane.is_managed_store_configured() {
             return Err(McpCatalogRefreshError::StoreUnavailable);
         }
@@ -634,7 +663,7 @@ impl McpConnectionCatalogService {
             return Err(failure);
         }
         let catalog = match store
-            .replace_mcp_catalog(
+            .replace_mcp_catalog_with_operation(
                 &connection_id,
                 &expected,
                 &stored_entries,
@@ -644,20 +673,32 @@ impl McpConnectionCatalogService {
                 // replace the catalog it discovered from.
                 prior.as_ref().map_or(0, |prior| prior.catalog_revision),
                 actor,
+                caller,
             )
             .await
         {
-            Ok(catalog) => catalog,
+            Ok(CallerOutcome::Committed(catalog)) => catalog,
+            // An exact retry of a publication that committed meanwhile:
+            // nothing changed, so nothing is installed or recorded.
+            Ok(CallerOutcome::Replayed(receipt)) => {
+                drop(active);
+                return Ok(CallerOutcome::Replayed(receipt));
+            }
             Err(error) => {
                 let failure = refresh_store_error(&error);
-                self.record_failed_status(
-                    &connection_id,
-                    &expected,
-                    prior.as_ref(),
-                    failure,
-                    started.elapsed(),
-                )
-                .await;
+                // A key bound to another request says nothing about the
+                // upstream or the catalog, so the Connection's status keeps
+                // what it had.
+                if failure != McpCatalogRefreshError::CallerOperationConflict {
+                    self.record_failed_status(
+                        &connection_id,
+                        &expected,
+                        prior.as_ref(),
+                        failure,
+                        started.elapsed(),
+                    )
+                    .await;
+                }
                 drop(active);
                 return Err(failure);
             }
@@ -681,7 +722,7 @@ impl McpConnectionCatalogService {
                 "a newer MCP catalog is already live on this replica; the committed one is durable and not installed"
             );
             drop(active);
-            return Ok(McpCatalogRefreshResult {
+            return Ok(CallerOutcome::Committed(McpCatalogRefreshResult {
                 connection_id,
                 catalog_revision: catalog.catalog_revision,
                 status: self
@@ -699,7 +740,7 @@ impl McpConnectionCatalogService {
                 added_count: counts.0,
                 changed_count: counts.1,
                 removed_count: counts.2,
-            });
+            }));
         }
         if let Err(error) = registry.install_mcp_connection_catalog(connection_id.as_str(), tools) {
             tracing::error!(
@@ -757,7 +798,7 @@ impl McpConnectionCatalogService {
             }
         };
         drop(active);
-        Ok(McpCatalogRefreshResult {
+        Ok(CallerOutcome::Committed(McpCatalogRefreshResult {
             connection_id,
             catalog_revision: catalog.catalog_revision,
             status,
@@ -765,7 +806,7 @@ impl McpConnectionCatalogService {
             added_count: counts.0,
             changed_count: counts.1,
             removed_count: counts.2,
-        })
+        }))
     }
 
     async fn record_failed_status(
@@ -1046,6 +1087,9 @@ fn refresh_store_error(error: &ConnectionStoreError) -> McpCatalogRefreshError {
     match error {
         ConnectionStoreError::Conflict { .. } => McpCatalogRefreshError::PreconditionFailed,
         ConnectionStoreError::ToolNameConflict { .. } => McpCatalogRefreshError::ToolNameConflict,
+        ConnectionStoreError::CallerOperationConflict => {
+            McpCatalogRefreshError::CallerOperationConflict
+        }
         ConnectionStoreError::Validation { .. } | ConnectionStoreError::LimitExceeded { .. } => {
             McpCatalogRefreshError::InvalidResponse
         }
