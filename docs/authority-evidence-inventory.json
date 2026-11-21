@@ -1469,7 +1469,7 @@
         },
         {
           "path": "gateway/src/admin_connections.rs",
-          "anchor": "auth::change_actor::ChangeActor::from_principal(&principal);"
+          "anchor": "KeyedConnectionChange::Delete,"
         }
       ],
       "tests": [

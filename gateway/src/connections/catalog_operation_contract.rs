@@ -636,8 +636,8 @@ pub(crate) async fn a_key_reserved_by_another_action_cannot_take_effect_on_a_cat
 }
 
 /// I1 and I2: a failed catalog evidence insert rolls back the keyed MCP
-/// publication, registration and overlay put together with their
-/// reservations, so the keys stay unused and a later attempt with them
+/// publication, registration, overlay put and overlay delete together with
+/// their reservations, so the keys stay unused and a later attempt with them
 /// commits.
 pub(crate) async fn a_failed_evidence_insert_rolls_back_the_keyed_publication_and_its_reservation(
     db: &impl ContractDatabase,
@@ -646,12 +646,27 @@ pub(crate) async fn a_failed_evidence_insert_rolls_back_the_keyed_publication_an
     let mcp = create(db, mcp_candidate("Faulted MCP")).await;
     let fresh = create(db, openapi_candidate("Faulted registration")).await;
     let api = registered(db, "Faulted OpenAPI").await;
-    let evidence = db.catalog_evidence().await;
     let document = overlay_document("faulted overlay");
+    let overlaid = registered(db, "Faulted overlay delete").await;
+    committed(
+        publish_openapi(
+            db,
+            &overlaid,
+            (1, 1),
+            Some(&overlay_put(&document, 0)),
+            1,
+            None,
+        )
+        .await,
+        "the unkeyed overlay put the delete removes",
+    );
+    let evidence = db.catalog_evidence().await;
     let mcp_op = mcp_key(30, &actor, &mcp);
     let register_op = openapi_key(31, &actor, &fresh);
     let put_op = overlay_put_key(32, &actor, &api, 0, &document);
     let put = overlay_put(&document, 0);
+    let delete_op = overlay_delete_key(33, &actor, &overlaid, 1);
+    let delete = overlay_delete(1);
 
     db.fail_catalog_evidence_inserts(true).await;
     let failures = [
@@ -660,6 +675,9 @@ pub(crate) async fn a_failed_evidence_insert_rolls_back_the_keyed_publication_an
             .await
             .map(|_| ()),
         publish_openapi(db, &api, (1, 1), Some(&put), 1, Some(&put_op))
+            .await
+            .map(|_| ()),
+        publish_openapi(db, &overlaid, (1, 2), Some(&delete), 0, Some(&delete_op))
             .await
             .map(|_| ()),
     ];
@@ -692,6 +710,17 @@ pub(crate) async fn a_failed_evidence_insert_rolls_back_the_keyed_publication_an
         .is_none());
     let stored = db.store().openapi_catalog(&api.id).await.unwrap().unwrap();
     assert_eq!((stored.catalog_revision, stored.overlay_revision), (1, 0));
+    let stored = db
+        .store()
+        .openapi_catalog(&overlaid.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (stored.catalog_revision, stored.overlay_revision),
+        (2, 1),
+        "the overlay was not removed"
+    );
     assert_catalog_reservations_match_evidence(db).await;
 
     committed(
@@ -706,7 +735,11 @@ pub(crate) async fn a_failed_evidence_insert_rolls_back_the_keyed_publication_an
         publish_openapi(db, &api, (1, 1), Some(&put), 1, Some(&put_op)).await,
         "the same keyed overlay put once evidence is writable",
     );
-    assert_eq!(db.reservations().await.len(), 3);
+    committed(
+        publish_openapi(db, &overlaid, (1, 2), Some(&delete), 0, Some(&delete_op)).await,
+        "the same keyed overlay delete once evidence is writable",
+    );
+    assert_eq!(db.reservations().await.len(), 4);
     assert_catalog_reservations_match_evidence(db).await;
 }
 

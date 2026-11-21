@@ -2128,15 +2128,7 @@ impl OpenApiConnectionCatalogService {
         if expected_etag.is_some_and(|expected| record.etag().as_str() != expected) {
             return Err(OpenApiCatalogError::PreconditionFailed);
         }
-        if record.write.kind != ConnectionKind::HttpApi {
-            return Err(OpenApiCatalogError::ConnectionKindMismatch);
-        }
-        if !matches!(
-            &record.write.discovery,
-            Some(DiscoveryConfig::ManagedOpenapi { .. })
-        ) {
-            return Err(OpenApiCatalogError::DiscoveryNotConfigured);
-        }
+        managed_openapi_target(&record)?;
         Ok((connection_id, record))
     }
 
@@ -3187,6 +3179,23 @@ fn validate_spec_size(spec: &str) -> Result<(), OpenApiCatalogError> {
     }
     if spec.len() > MAX_MANAGED_SPEC_BYTES {
         return Err(OpenApiCatalogError::SpecTooLarge);
+    }
+    Ok(())
+}
+
+/// Whether a Connection is one a managed OpenAPI catalog change may name:
+/// an HTTP API Connection with managed OpenAPI discovery. The admin handlers
+/// ask it before a caller key is bound (issue #425), and the service asks it
+/// again under its lifecycle guard.
+pub(crate) fn managed_openapi_target(record: &StoredConnection) -> Result<(), OpenApiCatalogError> {
+    if record.write.kind != ConnectionKind::HttpApi {
+        return Err(OpenApiCatalogError::ConnectionKindMismatch);
+    }
+    if !matches!(
+        &record.write.discovery,
+        Some(DiscoveryConfig::ManagedOpenapi { .. })
+    ) {
+        return Err(OpenApiCatalogError::DiscoveryNotConfigured);
     }
     Ok(())
 }

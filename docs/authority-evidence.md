@@ -737,15 +737,27 @@ keyed form, like the others.
   (the Connection ETag for a refresh or registration, the overlay ETag for an
   overlay change), and the body as canonical JSON: the specification and its
   selection for a registration, the overlay document for an overlay put, and
-  nothing for a refresh or an overlay delete. The overlay put's
-  `allow_unresolved_enum_sources` query parameter is not bound. The digest is
-  stored only in the key's reservation row.
+  nothing for a refresh or an overlay delete. An overlay put that sets
+  `allow_unresolved_enum_sources=true` binds the document and the flag together,
+  so the same key with the flag flipped is a conflict. The digest is stored only
+  in the key's reservation row.
 - **Order of work.** Each handler authorizes the caller and validates the request
-  (an overlay put validates the document and the secret authority its sources need)
   before it binds the key, asks the gates (the evidence gate as the operation's own
   code, and in cluster mode the operation gate) and answers an exact retry from the
-  read-only pre-check. All of this happens before the upstream is fetched or a
-  catalog is generated, so a replayed refresh or registration contacts no upstream.
+  read-only pre-check. Validation covers what can be judged without the upstream:
+  the Connection exists and, for a registration or an overlay change, is an HTTP
+  API Connection with managed OpenAPI discovery; a registration's specification
+  size and preview digest; an overlay put's document and the secret authority its
+  sources need. Whether a registration's specification parses is judged after
+  admission, when the catalog is generated. All of this happens before the
+  upstream is fetched or a catalog is generated, so a replayed refresh or
+  registration contacts no upstream. A refresh or registration compares its
+  `If-Match` with the Connection's current ETag only after the pre-check, as a
+  keyed replacement does, so a committed retry is answered with its receipt even
+  after another writer replaced the Connection, and an unused key with a stale
+  `If-Match` is still `412`. A retry after the Connection was deleted is `404`:
+  a refresh's action is the deleted record's discovery kind, and every catalog
+  route judges the Connection before it binds the key.
   Two first attempts that race both fetch; only one commits. Inside the store's one
   transaction (PostgreSQL after its Connection state lock, SQLite under
   `IMMEDIATE`) the key is looked up first, then the Connection ETag and the catalog

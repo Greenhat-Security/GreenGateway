@@ -1546,23 +1546,17 @@ pub(super) async fn connection_refresh_endpoint(
         return not_found("connection was not found");
     };
     let current_etag = record.etag();
-    match if_match_matches(&parts.headers, current_etag.as_str()) {
-        Ok(true) => {}
-        Ok(false) => {
-            return with_etag(
-                precondition_failed("If-Match does not match the current connection ETag"),
-                current_etag.as_str(),
-            );
-        }
-        Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
-    }
 
     // Authorized and validated: bind the caller key to the publication the
     // Connection's discovery makes, ask the gates, and answer an exact retry
     // from its receipt before the upstream is contacted again (issue #425).
-    // A refresh publishes a catalog revision and leaves the Connection's
-    // ETag where it was, so the precondition above still holds on a retry.
-    // A Connection without discovery publishes nothing and is refused below.
+    // The key binds the `If-Match` as received and is looked up before it is
+    // compared with the Connection's current ETag, as a keyed replacement
+    // does: a committed refresh is answered with its receipt though the
+    // Connection was replaced since, and an unused key with a stale
+    // precondition is `412`. A retry after the Connection was deleted is
+    // `404`: the publication it binds is the deleted record's to say. A
+    // Connection without discovery publishes nothing and is refused below.
     let actor = auth::change_actor::ChangeActor::from_principal(&principal);
     let publication = match &record.write.discovery {
         Some(connections::model::DiscoveryConfig::ManagedMcp { .. }) => {
@@ -1590,6 +1584,16 @@ pub(super) async fn connection_refresh_endpoint(
         },
         None => None,
     };
+    match if_match_matches(&parts.headers, current_etag.as_str()) {
+        Ok(true) => {}
+        Ok(false) => {
+            return with_etag(
+                precondition_failed("If-Match does not match the current connection ETag"),
+                current_etag.as_str(),
+            );
+        }
+        Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
+    }
 
     let refreshed = match &record.write.discovery {
         Some(connections::model::DiscoveryConfig::ManagedMcp { .. }) => match state
@@ -2109,6 +2113,15 @@ pub(super) async fn connection_openapi_overlay_put_endpoint(
     if let Err(response) = managed_overlay_target(&state, &raw_id, "overlay update") {
         return *response;
     }
+    // `allow_unresolved_enum_sources` changes what the put may commit, so the
+    // key binds it too: a put that allows unresolved sources binds the
+    // document and the flag together, as an array no overlay document can
+    // be, and a flipped flag under the same key is `409`.
+    let bound_request = if params.allow_unresolved_enum_sources {
+        Bytes::from(json!([&document, {"allow_unresolved_enum_sources": true}]).to_string())
+    } else {
+        body.clone()
+    };
     let actor = auth::change_actor::ChangeActor::from_principal(&principal);
     let caller = match admit_keyed_connection_change(
         &state,
@@ -2116,7 +2129,7 @@ pub(super) async fn connection_openapi_overlay_put_endpoint(
         &principal,
         &actor,
         KeyedConnectionChange::CatalogOverlayReplace,
-        &body,
+        &bound_request,
         &raw_id,
     )
     .await
@@ -2140,9 +2153,10 @@ pub(super) async fn connection_openapi_overlay_put_endpoint(
 }
 
 /// The Connection an overlay change names, judged before its caller key is
-/// bound (issue #425): an identifier that does not parse, or a Connection
-/// that is not managed, is answered as the catalog service answers it, and
-/// nothing is admitted. The catalog service judges it again.
+/// bound (issue #425): an identifier that does not parse, a Connection that
+/// is not managed, and one that is not a managed OpenAPI Connection are
+/// answered as the catalog service answers them, and nothing is admitted.
+/// The catalog service judges it again.
 fn managed_overlay_target(
     state: &ConnectionAdminState,
     raw_id: &str,
@@ -2156,17 +2170,11 @@ fn managed_overlay_target(
     };
     let id = connections::model::ConnectionId::parse(raw_id.to_owned())
         .map_err(|_| refused(connections::openapi::OpenApiCatalogError::InvalidConnectionId))?;
-    if state
-        .control_plane
-        .runtime_snapshot()
-        .managed()
-        .contains_key(&id)
-    {
-        Ok(())
-    } else {
-        Err(refused(
+    match state.control_plane.runtime_snapshot().managed().get(&id) {
+        Some(record) => connections::openapi::managed_openapi_target(record).map_err(refused),
+        None => Err(refused(
             connections::openapi::OpenApiCatalogError::ConnectionNotFound,
-        ))
+        )),
     }
 }
 
@@ -2455,16 +2463,6 @@ pub(super) async fn connection_openapi_register_endpoint(
         return not_found("connection was not found");
     };
     let current_etag = record.etag();
-    match if_match_matches(&parts.headers, current_etag.as_str()) {
-        Ok(true) => {}
-        Ok(false) => {
-            return with_etag(
-                precondition_failed("If-Match does not match the current connection ETag"),
-                current_etag.as_str(),
-            );
-        }
-        Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
-    }
     let body = match read_request_body(body, managed_openapi_admin_body_limit(&state)).await {
         Ok(body) => body,
         Err(response) => return *response,
@@ -2475,12 +2473,13 @@ pub(super) async fn connection_openapi_register_endpoint(
             return bad_request(&format!("invalid managed OpenAPI register JSON: {error}"));
         }
     };
-    // The specification's size and its preview digest are the request's own
-    // to get right: judged before its caller key is bound (issue #425), and
-    // again by the catalog service.
-    if let Err(error) =
+    // The Connection's kind and discovery, and the specification's size and
+    // preview digest, are judged before its caller key is bound (issue #425),
+    // and again by the catalog service. Whether the specification parses is
+    // judged after admission, when the catalog is generated.
+    if let Err(error) = connections::openapi::managed_openapi_target(record).and_then(|()| {
         connections::openapi::check_registration_spec(&requested.spec, &requested.spec_digest)
-    {
+    }) {
         emit_managed_openapi_catalog_rejected(&state, &parts, &principal, &id, error.safe_reason());
         return with_etag(
             openapi_catalog_error_response(error, "register"),
@@ -2498,8 +2497,11 @@ pub(super) async fn connection_openapi_register_endpoint(
 
     // Authorized and validated: bind the caller key, ask the gates, and
     // answer an exact retry from its receipt before anything is generated or
-    // resolved (issue #425). A registration publishes a catalog revision and
-    // leaves the Connection's ETag where it was.
+    // resolved (issue #425). The key binds the `If-Match` as received and is
+    // looked up before it is compared with the Connection's current ETag, so
+    // a committed registration is answered with its receipt though the
+    // Connection was replaced since; an unused key with a stale
+    // precondition is `412`.
     let actor = auth::change_actor::ChangeActor::from_principal(&principal);
     let caller = match admit_keyed_connection_change(
         &state,
@@ -2515,6 +2517,16 @@ pub(super) async fn connection_openapi_register_endpoint(
         Ok(caller) => caller,
         Err(response) => return *response,
     };
+    match if_match_matches(&parts.headers, current_etag.as_str()) {
+        Ok(true) => {}
+        Ok(false) => {
+            return with_etag(
+                precondition_failed("If-Match does not match the current connection ETag"),
+                current_etag.as_str(),
+            );
+        }
+        Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
+    }
 
     // At most two passes: the second only after the operation gate admitted
     // a converted document the first pass stopped at, before writing.
@@ -2694,12 +2706,22 @@ pub(super) fn parse_connection_write_body(
 /// only the stored record could say which binding it keeps and whether it
 /// matches. Nothing is read or written.
 pub(super) fn validate_connection_replacement_without_record(body: &Bytes) -> ResponseResult<()> {
-    /// The binding a replacement keeps by marker, as far as validation
-    /// sees it. It is never stored or bound: the caller key binds the body
-    /// as received.
-    const KEPT_BINDING: &str = "kept-binding";
+    /// The bindings a replacement keeps by marker, as far as validation
+    /// sees them. Each gets its own stand-in, so two kept bindings never look
+    /// like one alias bound twice (a duplicate signing key, or a token
+    /// exchange secret bound elsewhere). They are never stored or bound: the
+    /// caller key binds the body as received.
+    struct KeptBindings(usize);
+
+    impl KeptBindings {
+        fn next(&mut self) -> Value {
+            self.0 += 1;
+            Value::String(format!("kept-binding-{}", self.0))
+        }
+    }
 
     fn keep(
+        kept: &mut KeptBindings,
         object: &mut serde_json::Map<String, Value>,
         marker_field: &'static str,
         binding_field: &'static str,
@@ -2711,23 +2733,24 @@ pub(super) fn validate_connection_replacement_without_record(body: &Bytes) -> Re
             )));
         }
         if marker == Some(true) {
-            object.insert(
-                binding_field.to_owned(),
-                Value::String(KEPT_BINDING.to_owned()),
-            );
+            object.insert(binding_field.to_owned(), kept.next());
         }
         Ok(())
     }
 
-    fn keep_caller_assertion_key(key: &mut serde_json::Map<String, Value>) -> ResponseResult<()> {
+    fn keep_caller_assertion_key(
+        kept: &mut KeptBindings,
+        key: &mut serde_json::Map<String, Value>,
+    ) -> ResponseResult<()> {
         if key.get("signing_key_configured") == Some(&Value::Bool(false)) {
             return Err(Box::new(bad_request(
                 "a caller assertion key cannot be cleared; leave the key out instead",
             )));
         }
-        keep(key, "signing_key_configured", "signing_key_id")
+        keep(kept, key, "signing_key_configured", "signing_key_id")
     }
 
+    let kept = &mut KeptBindings(0);
     let mut candidate = serde_json::from_slice::<Value>(body)
         .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
     let object = candidate
@@ -2737,8 +2760,9 @@ pub(super) fn validate_connection_replacement_without_record(body: &Bytes) -> Re
         .get_mut("authentication")
         .and_then(Value::as_object_mut)
     {
-        keep(authentication, "secret_configured", "secret_id")?;
+        keep(kept, authentication, "secret_configured", "secret_id")?;
         keep(
+            kept,
             authentication,
             "client_secret_configured",
             "client_secret_id",
@@ -2749,31 +2773,33 @@ pub(super) fn validate_connection_replacement_without_record(body: &Bytes) -> Re
         .and_then(Value::as_array_mut)
     {
         for header in headers.iter_mut().filter_map(Value::as_object_mut) {
-            keep(header, "secret_configured", "secret_id")?;
+            keep(kept, header, "secret_configured", "secret_id")?;
         }
     }
     if let Some(assertion) = object
         .get_mut("caller_assertion")
         .and_then(Value::as_object_mut)
     {
-        keep_caller_assertion_key(assertion)?;
+        keep_caller_assertion_key(kept, assertion)?;
         if let Some(keys) = assertion
             .get_mut("published_keys")
             .and_then(Value::as_array_mut)
         {
             for key in keys.iter_mut().filter_map(Value::as_object_mut) {
-                keep_caller_assertion_key(key)?;
+                keep_caller_assertion_key(kept, key)?;
             }
         }
     }
     if let Some(tls) = object.get_mut("tls").and_then(Value::as_object_mut) {
-        keep(tls, "ca_bundle_configured", "ca_bundle_alias")?;
+        keep(kept, tls, "ca_bundle_configured", "ca_bundle_alias")?;
         keep(
+            kept,
             tls,
             "client_certificate_configured",
             "client_certificate_id",
         )?;
         keep(
+            kept,
             tls,
             "client_private_key_configured",
             "client_private_key_id",

@@ -665,6 +665,23 @@ async fn a_replayed_catalog_change_repeats_no_side_effect() {
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert_catalog_receipt(&receipt, &keys[2], "catalog.overlay.replace", &id, 3);
     receipts.push(receipt);
+    // `allow_unresolved_enum_sources` is bound: the same put with the flag
+    // set is another request.
+    let (_, overlay_route) = CatalogCall::OverlayPut.route(&id);
+    let (status, _, conflict) = exchange(
+        &router,
+        keyed_connection_request(
+            Method::PUT,
+            &format!("{overlay_route}?allow_unresolved_enum_sources=true"),
+            admin.clone(),
+            Some(catalog_overlay_document()),
+            Some(&initial_overlay),
+            Some(&keys[2]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["reason"], json!(CALLER_OPERATION_CONFLICT_REASON));
 
     let delete = || {
         CatalogCall::OverlayDelete.request(
@@ -765,6 +782,7 @@ struct DiscoveringCatalog {
     capture: audit::sink::tests::CaptureSink,
     id: String,
     etag: String,
+    body: Value,
     fetches: Arc<std::sync::atomic::AtomicUsize>,
     _connection_db: TempDb,
     _policy: TempPolicyFile,
@@ -813,6 +831,7 @@ impl DiscoveringCatalog {
             capture,
             id,
             etag,
+            body,
             fetches,
             _connection_db: connection_db,
             _policy: policy,
@@ -821,6 +840,29 @@ impl DiscoveringCatalog {
 
     fn fetches(&self) -> usize {
         self.fetches.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn route(&self) -> String {
+        format!("{CONNECTIONS_ADMIN_ROUTE}/{}", self.id)
+    }
+
+    /// Replace the Connection with a new display name, which moves its ETag.
+    async fn replace(&mut self, display_name: &str) {
+        self.body["display_name"] = json!(display_name);
+        let (status, etag, replaced) = exchange(
+            &self.router,
+            connection_admin_request(
+                Method::PUT,
+                &self.route(),
+                Some(test_principal(&["connections-editor"])),
+                Some(self.body.to_string()),
+                Some(&self.etag),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replaced}");
+        self.etag = etag.expect("the replacement names its ETag");
     }
 
     /// An unkeyed refresh, which fetches the upstream and publishes.
@@ -842,10 +884,13 @@ impl DiscoveringCatalog {
 
 /// The handler answers an exact retry of a keyed refresh from its receipt
 /// before it contacts the upstream (issue #425): the retry fetches nothing
-/// and audits no second catalog change.
+/// and audits no second catalog change. The key is looked up before its
+/// `If-Match` is compared with the Connection's ETag, so the retry is
+/// answered so even after the Connection was replaced; an unused key with
+/// the stale precondition is `412`.
 #[tokio::test]
 async fn a_replayed_refresh_does_not_fetch_the_upstream_again_or_audit_a_second_change() {
-    let catalog = DiscoveringCatalog::new("keyed-refresh-upstream").await;
+    let mut catalog = DiscoveringCatalog::new("keyed-refresh-upstream").await;
     let registration =
         openapi_registration_body(&catalog.router, &catalog.id, &["createWidget"]).await;
     let (status, _, registered) = exchange(
@@ -861,10 +906,11 @@ async fn a_replayed_refresh_does_not_fetch_the_upstream_again_or_audit_a_second_
     .await;
     assert_eq!(status, StatusCode::CREATED, "{registered}");
     let key = caller_key(64);
+    let (id, first_etag) = (catalog.id.clone(), catalog.etag.clone());
     let refresh = || {
         CatalogCall::Refresh.request(
-            &catalog.id,
-            &catalog.etag,
+            &id,
+            &first_etag,
             None,
             keyed_admin(CATALOG_ROLES),
             Some(&key),
@@ -876,12 +922,14 @@ async fn a_replayed_refresh_does_not_fetch_the_upstream_again_or_audit_a_second_
     let per_refresh = catalog.fetches() - before;
     assert!(per_refresh > 0, "a first refresh fetches the upstream");
 
+    catalog.replace("Discovering catalog, renamed").await;
+    let before = catalog.fetches();
     let (status, _, receipt) = exchange(&catalog.router, refresh()).await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert_catalog_receipt(&receipt, &key, "catalog.openapi.publish", &catalog.id, 2);
     assert_eq!(
         catalog.fetches(),
-        before + per_refresh,
+        before,
         "the retry contacted the upstream"
     );
     // One more publication, so that any event the retry emitted would have
@@ -892,22 +940,38 @@ async fn a_replayed_refresh_does_not_fetch_the_upstream_again_or_audit_a_second_
         3,
         "the retry audited a second change"
     );
+    let (status, _, stale) = exchange(
+        &catalog.router,
+        CatalogCall::Refresh.request(
+            &id,
+            &first_etag,
+            None,
+            keyed_admin(CATALOG_ROLES),
+            Some(&caller_key(66)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{stale}");
 }
 
 /// The same for an OpenAPI registration: an exact retry is answered from its
 /// receipt before anything is generated, contacts no upstream, and audits no
-/// second catalog change.
+/// second catalog change. The retry follows a replacement of the Connection,
+/// so its `If-Match` is stale: only the handler's pre-check, which runs
+/// before the precondition and before the catalog service, can answer it
+/// with the receipt.
 #[tokio::test]
 async fn a_replayed_openapi_registration_does_not_fetch_the_upstream_again_or_audit_a_second_change(
 ) {
-    let catalog = DiscoveringCatalog::new("keyed-registration-upstream").await;
+    let mut catalog = DiscoveringCatalog::new("keyed-registration-upstream").await;
     let registration =
         openapi_registration_body(&catalog.router, &catalog.id, &["createWidget"]).await;
     let key = caller_key(65);
+    let (id, first_etag) = (catalog.id.clone(), catalog.etag.clone());
     let register = || {
         CatalogCall::Register.request(
-            &catalog.id,
-            &catalog.etag,
+            &id,
+            &first_etag,
             Some(registration.clone()),
             keyed_admin(CATALOG_ROLES),
             Some(&key),
@@ -915,6 +979,7 @@ async fn a_replayed_openapi_registration_does_not_fetch_the_upstream_again_or_au
     };
     let (status, _, registered) = exchange(&catalog.router, register()).await;
     assert_eq!(status, StatusCode::CREATED, "{registered}");
+    catalog.replace("Discovering catalog, renamed").await;
     let fetched = catalog.fetches();
     let (status, _, receipt) = exchange(&catalog.router, register()).await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
@@ -2698,6 +2763,82 @@ async fn a_keyed_replacement_of_a_missing_connection_is_validated_before_admissi
     assert!(standalone_reservations(&connection_db.path).is_empty());
 }
 
+/// A keyed registration or overlay change aimed at a Connection without
+/// managed OpenAPI discovery is refused before its key is admitted (issue
+/// #425). Under required mode with the log sink, where admission refuses
+/// every keyed catalog change, each is answered with the Connection's own
+/// refusal, not admission's, and nothing is reserved.
+#[tokio::test]
+async fn a_keyed_catalog_change_on_a_connection_without_openapi_discovery_is_refused_before_admission(
+) {
+    let connection_db = TempDb::new("keyed-catalog-wrong-kind");
+    let events = TempDb::new("keyed-catalog-wrong-kind-events");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let best_effort = keyed_connection_router(&connection_db, &policy, test_audit_log(), |_| {});
+    let collection_etag = connection_collection_etag(&best_effort).await;
+    let (status, etag, created) = exchange(
+        &best_effort,
+        keyed_connection_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            keyed_admin(&["connections-superadmin"]),
+            Some(plain_connection_body("Plain API")),
+            Some(&collection_etag),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("an ID").to_owned();
+    let etag = etag.expect("an ETag");
+    drop(best_effort);
+    let router = keyed_connection_router(&connection_db, &policy, test_audit_log(), |config| {
+        qualified_required(config, &events);
+        config.authority_events.sink = config::AuthorityEventSinkSetting::Log;
+    });
+    let registration = json!({
+        "spec": "openapi: 3.0.0",
+        "spec_digest": "0".repeat(64),
+        "expected_spec_revision": 0,
+        "expected_catalog_revision": 0,
+        "selected_tool_names": [],
+        "security_confirmations": [],
+    })
+    .to_string();
+    for (seed, (call, if_match, body)) in (92..).zip([
+        (CatalogCall::Register, etag.as_str(), Some(registration)),
+        (
+            CatalogCall::OverlayPut,
+            "\"overlay\"",
+            Some(catalog_overlay_document()),
+        ),
+        (CatalogCall::OverlayDelete, "\"overlay\"", None),
+    ]) {
+        let (status, _, refused) = exchange(
+            &router,
+            call.request(
+                &id,
+                if_match,
+                body,
+                keyed_admin(CATALOG_ROLES),
+                Some(&caller_key(seed)),
+            ),
+        )
+        .await;
+        assert!(status.is_client_error(), "{call:?}: {status} {refused}");
+        assert_ne!(
+            refused["reason"],
+            json!("authority_evidence_unsupported"),
+            "{call:?} was admitted first"
+        );
+        assert!(
+            refused.to_string().contains("discovery_not_configured"),
+            "{call:?}: {refused}"
+        );
+    }
+    assert!(standalone_reservations(&connection_db.path).is_empty());
+}
+
 #[cfg(feature = "postgres")]
 mod cluster_connection_keys {
     use super::*;
@@ -3362,6 +3503,31 @@ mod cluster_connection_keys {
             .await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{catalog_call:?}: {refused}");
         }
+        // A caller with the route's permission but without secret authority
+        // is refused an overlay with a raw `request.path` source before its
+        // key is admitted.
+        let raw_source = json!({
+            "schema_version": "0.1.0",
+            "enum_sources": {
+                "statuses": {
+                    "request": {"path": "/metadata/statuses"},
+                    "select": {"items": "/items/*", "value": "/value"}
+                }
+            }
+        })
+        .to_string();
+        let (method, uri) = CatalogCall::OverlayPut.route(&id);
+        let (status, _, refused) = call(
+            &router,
+            method,
+            &uri,
+            &admin,
+            Some(raw_source),
+            Some(&overlay),
+            Some(&caller_key(119)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
         assert_eq!(
             read_fence().await,
             fence,
