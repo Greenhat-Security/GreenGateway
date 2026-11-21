@@ -489,7 +489,9 @@ in `gateway/src/admin_responses.rs` follows one contract. Connection create,
 replace and delete do ([below](#keyed-connection-create-replace-and-delete)), and
 so do service-token issue and rotation
 ([below](#keyed-service-token-issue-and-rotation)) and managed catalog publication
-and overlay changes ([below](#keyed-catalog-publication-and-overlay-changes)); each
+and overlay changes ([below](#keyed-catalog-publication-and-overlay-changes)) and
+standalone local-secret create, rotation and delete
+([below](#keyed-local-secret-create-rotation-and-delete)); each
 other operation family
 adopts the contract in its own change, and the inventory qualifies its rows when
 it does. The two routes that took a key first, the
@@ -971,6 +973,133 @@ proves that a keyed catalog change is `409 capability_not_advertised` and reserv
 nothing while a live member lacks `caller_operation_keys`, that a keyed request from
 a caller without the route's permission is `403` and leaves `contract_fence`
 unchanged, and that the first keyed change raises the fence once.
+
+### Keyed local-secret create, rotation and delete
+
+Another operation family on the contract above (issue #425). Local secrets exist
+only in standalone mode (cluster mode has no local-secret keyring, so
+`local_secrets_postgres` stays `unavailable`). Row `local_secrets`
+(`secret.create`, `secret.rotate`) is qualified, and `local_secret_delete` is
+`withdrawal_admitted` with its keyed path
+([below](#rows-admitted-without-qualification)). The `connection-secrets
+reencrypt` command (`secret.reencrypt`) is unchanged: a fixed system actor and
+no caller key.
+
+- **Routes.** `POST /v1{ADMIN_PREFIX}/connection-secrets`, and `PUT` and `DELETE`
+  `/v1{ADMIN_PREFIX}/connection-secrets/{id}`, each with an optional
+  `Idempotency-Key`. They are in `KEYED_ROUTES`, and the checker's
+  `QUALIFIED_PATHS` names the same methods and routes for standalone mode.
+- **Binding.** The key is bound to the action, the recorded actor, the secret ID
+  (empty for a create), the `If-Match` value as received (the secret collection
+  ETag for a create, the item ETag for a rotation or delete), and the canonical
+  request, which is the label (create only) and the purpose
+  (`SecretChangeBinding::canonical_request`, the same bytes in the handler and the
+  store). The secret value is never bound: nothing derived from it enters the
+  digest, the reservation, the receipt, the evidence row or the delivered record.
+  The digest is stored only in the key's reservation row in the Connections
+  database's `authority_caller_operation_ids`.
+- **A retry with another value.** Because the value is not bound, the store tells
+  a retry with a different value apart by comparing values. On an exact retry of a
+  create or rotation, while the secret is still at the revision the receipt
+  names, the store decrypts the committed envelope in memory and compares it with
+  the retried value (and purpose) in constant time; a mismatch is
+  `409 caller_operation_conflict` and the stored value stays. Once the secret was
+  rotated again or deleted, the value of the replayed change no longer exists and
+  cannot be compared, so the receipt is returned as it is; its `revision` shows
+  that it is no longer current. Nothing derived from either value is stored.
+  The comparison does tell whoever holds both the key and the same principal
+  (actor kind, issuer, subject and auth mode are bound) whether a value they
+  send equals the stored one, `200` or `409`, for as long as the secret stays at
+  that revision. The key is not secret (it is the `operation_id` of the receipt
+  and of the delivered record), so this matters for a shared automation identity
+  and a low-entropy value; a replay and a replay conflict record no audit event.
+- **Order of work.** Each handler authorizes the caller
+  (`admin:connections:secrets:write`) and first answers a gateway without a
+  local-secret store, keyed or not, as it always has: a create is judged by its
+  collection `If-Match` and is then `503`, and a rotation or delete is judged by
+  its `If-Match` alone (`428`, `400`, or `412` since there is no stored secret to
+  match). The routes are mounted on every
+  cluster replica, which never has a store, so this comes before any key is
+  bound or gate asked: a keyed request there never raises the contract fence
+  for an operation the replica cannot perform. Then the handler validates the
+  body (its JSON, and the purpose and value of a create or rotation) and binds
+  the key
+  through `caller_operation()`, asks the evidence gate (as `secret.create` or
+  `secret.rotate`; a delete is a withdrawal and never asks it) and answers an exact
+  retry from the read-only pre-check. All of this happens before `If-Match` is
+  compared with the current ETag and before a rotation's client-identity preflight
+  fetches the other half of the pair from a network provider, so an exact retry
+  makes no network call. A committed retry is answered with its receipt even after
+  another writer moved the ETag, or after the secret was deleted; an unused key
+  with a stale `If-Match` is still `412`. Inside the store's one `IMMEDIATE`
+  transaction the key is looked up first, then the item or collection ETag is
+  checked, then the key is reserved, then the envelope and its
+  `connection_local_secret_change_evidence` row are written under the caller's
+  key. A reservation that cannot be written rolls the change back, is `503`, and is
+  counted on the standalone evidence failure counter.
+- **Answers.** The first commit answers as the route always has (`201` with the
+  alias metadata, `200` with the rotated metadata, `200` with the deleted ID). An
+  exact retry is `200` with the receipt `{operation_id, operation, resource_id,
+  revision, committed_at}` read from the change's evidence row (`revision` is the
+  version after a create or rotation and the version a delete removed) with
+  `Cache-Control: no-store`, and repeats no change and no audit event. The first
+  commit published the new secret version to the runtime in the same synchronous
+  call as its store write, so a replay has nothing left to publish. The same key
+  with another label, purpose, target, `If-Match`, action or caller is
+  `409 caller_operation_conflict` and changes nothing.
+- **Completion.** Once admitted, a change runs on a task of its own
+  (`connection_change_to_completion`), so a client that disconnects while the
+  store commits does not cut it short.
+- **Required mode.** Create and rotation are `caller_key_required`: only the keyed
+  request of an issuer-bound principal with `qualified_v1`, the file sink and a
+  Unix build is admitted, and every other form, service-token callers included,
+  is `409 authority_evidence_unsupported` before anything is written or a key
+  is read (a rotation has read the stored secret's metadata by then).
+  Deletion is admitted in every form. The admin UI sends no key, so under
+  `required` it can delete a local secret but not create or rotate one (#242
+  tracks adding keys to it).
+
+Tests. The store contract is in
+`gateway/src/connections/local_secret_operation_tests.rs`
+(`connections::local_secret::operation_tests`); every case ends by asserting that a
+local-secret action's reservation exists exactly when its evidence row does:
+`local_secret_caller_operation_contract`,
+`a_reused_key_with_a_different_binding_conflicts_and_changes_nothing`,
+`a_key_reserved_by_another_action_cannot_take_effect_here`,
+`a_key_bound_to_another_operation_is_refused_by_the_store`,
+`a_failed_evidence_insert_rolls_back_the_keyed_secret_change_and_its_reservation`,
+`a_failed_reservation_rolls_back_the_keyed_secret_change_and_is_counted`,
+`a_stale_etag_under_a_key_writes_no_change_evidence_or_reservation`,
+`two_writers_racing_one_key_commit_one_change`,
+`two_keys_racing_one_revision_leave_only_the_winners_rows`,
+`the_secret_value_never_enters_the_binding_digest` (two values, one digest),
+`a_different_value_under_the_same_key_conflicts_and_keeps_the_stored_value`,
+`a_replay_after_a_later_rotation_returns_the_superseded_receipt` and
+`a_keyed_secret_change_keeps_synthetic_markers_out_of_the_reservation_receipt_evidence_and_file`
+(which also reads the SQLite file's bytes).
+`authority_events::standalone::tests::a_keyed_secret_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit`
+delivers a real keyed create, rotation and delete as closed v1 events through the
+file sink and redelivers them byte for byte. Through the admin handlers,
+`authority_evidence_app_tests::local_secret_keys` proves
+`a_replayed_secret_change_repeats_no_side_effect`,
+`required_mode_refuses_the_unkeyed_secret_create_and_rotate_and_admits_the_keyed_principal`
+(Unix builds),
+`required_mode_refuses_a_keyed_secret_change_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink`,
+`required_mode_admits_every_form_of_secret_delete`,
+`a_keyed_secret_change_that_is_forbidden_or_malformed_reserves_nothing` (`403`,
+`400` and `428`, each leaving no reservation),
+`a_keyed_secret_change_without_a_local_secret_store_is_answered_like_the_unkeyed_one`
+(no keyring: keyed answers as unkeyed, the precondition before `503`, under
+best_effort and required),
+`an_admitted_secret_change_finishes_after_its_client_goes_away` and
+`a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
+(markers in the value, the label and a conflicting retry's value, checked against
+the answers, the audit events, the logs, the metrics, the SQLite file and its WAL).
+The one PostgreSQL test,
+`authority_evidence_app_tests::cluster_connection_keys::postgres_keyed_secret_changes_in_cluster_mode_leave_the_fence_alone`,
+proves that a keyed rotation and delete on a cluster replica, once the operation
+gate would raise the fence, answer as their unkeyed forms, leave the contract
+fence unchanged and reserve nothing.
 
 ## Keyed safe references
 
@@ -1767,8 +1896,8 @@ sink and a Unix build, and names the first of these that fails
 
 | `required_mode` | Rows | What required mode does |
 | --- | --- | --- |
-| `admitted` | Cluster policy, tools, Connection delete, token revocation, JWT revocation, and admin session grant and withdrawal, and standalone Connection delete, local-secret create, rotate, delete and re-encryption, and token revocation | Runs it. Its evidence is the row's `record`. Nine of these pairs stay admitted without qualification on purpose ([below](#rows-admitted-without-qualification)) |
-| `caller_key_required` | PostgreSQL mutation approval preparation, and in both modes Connection create and replace (with the credential binding change a replacement makes), managed catalog publication and overlay put and delete, and service-token issue and rotation | Admits only the issuer-bound keyed request with `qualified_v1`, `AUTHORITY_EVENT_SINK=file` and a Unix build. Required mode refuses the ordinary preparation POST, the unkeyed Connection create and replace, the unkeyed refresh, OpenAPI registration and overlay put and delete, and the unkeyed token issue and rotation. |
+| `admitted` | Cluster policy, tools, Connection delete, token revocation, JWT revocation, and admin session grant and withdrawal, and standalone Connection delete, local-secret delete and re-encryption, and token revocation | Runs it. Its evidence is the row's `record`. Nine of these pairs stay admitted without qualification on purpose ([below](#rows-admitted-without-qualification)) |
+| `caller_key_required` | PostgreSQL mutation approval preparation, and in both modes Connection create and replace (with the credential binding change a replacement makes), managed catalog publication and overlay put and delete, and service-token issue and rotation, and standalone local-secret create and rotation | Admits only the issuer-bound keyed request with `qualified_v1`, `AUTHORITY_EVENT_SINK=file` and a Unix build. Required mode refuses the ordinary preparation POST, the unkeyed Connection create and replace, the unkeyed refresh, OpenAPI registration and overlay put and delete, and the unkeyed token issue and rotation. |
 | `refused` | Standalone mutation approval preparation and mutation approval review, revocation and consumption in both modes. Standalone policy mutations, policy file reloads, and tools publication (admin API and file reloads). The writing form of the offline import (`import-standalone --apply`, with or without `--resume`) in cluster mode | Refuses it when asked, before anything is written |
 | `refused_at_startup` | Standalone admin sessions (`ADMIN_SESSION_MODE=standalone_memory`), and configuration activation in both modes | Refuses to start |
 | `unavailable` | Cluster policy file reload and local secrets, standalone JWT revocation and import, configuration export | Nothing to refuse: the mode or the build has no such operation. A gate that is asked anyway refuses it |
@@ -1815,7 +1944,9 @@ Enforcement:
   is read. Connection create and replace ask as `connection.create` and
   `connection.replace` once the caller is authorized and the body validated, with
   the request's form ([Keyed Connection changes](#keyed-connection-create-replace-and-delete)).
-  Connection deletion, local-secret changes, the `connection-secrets
+  Local-secret create and rotation ask as `secret.create` and `secret.rotate` in
+  the same place ([Keyed local-secret changes](#keyed-local-secret-create-rotation-and-delete)).
+  Connection and local-secret deletion, the `connection-secrets
   reencrypt` command, catalog refreshes, OpenAPI catalog registrations and
   overlay writes and removals never ask: the Connections database records each
   of them in the change's own transaction
@@ -1882,13 +2013,14 @@ sessions and configuration activation in both modes; the compiler also refuses
 `required` with no sink), checks both
 modes and the refusal's audit event, refuses the offline import in cluster mode with
 its own reason (`required_refuses_the_offline_import_in_cluster_mode`), holds the evidenced standalone Connection
-deletion, local-secret and catalog rows `admitted` and ungated, and Connection create
-and replace `caller_key_required` in both modes
+deletion, local-secret deletion and catalog rows `admitted` and ungated, Connection create
+and replace `caller_key_required` in both modes, and local-secret create and rotation
+`caller_key_required` in standalone mode
 (`connection_create_and_replace_admit_only_their_keyed_issuer_bound_form_in_both_modes`); `authority_evidence_app_tests.rs`
 drives every refused standalone admin endpoint through the real handlers and asserts
 the `409`, the audit event and that nothing changed, that an unkeyed Connection
-create is refused, and that Connection deletion and local-secret, catalog, overlay
-and token changes are admitted and write their evidence rows; the
+create and an unkeyed local-secret create are refused, and that Connection and
+local-secret deletion and catalog, overlay and token changes are admitted and write their evidence rows; the
 reload helpers in `middleware/rbac_tests.rs` and `tools/definitions.rs` refuse a
 reload and keep the active document; `config_tests.rs`,
 `gateway-config/src/compiler/stage_tests.rs` and `ha.rs` cover the startup rules,
@@ -1945,10 +2077,10 @@ not caller-keyed. Only the keyed principal form is qualified, so a
 entry for each of its pairs. The pairs are `service_token.revoke` in both modes,
 `connection.delete` in both modes and standalone `secret.delete`. Today
 `token_revoke_postgres` and `token_revoke_standalone` (`POST .../tokens/{id}/revoke`;
-the standalone one since the token database records the token's revision, plan P5)
-and `connection_delete_postgres` and `connection_delete_standalone`
-(`DELETE .../connections/{id}`) have their reviewed paths; the other row,
-`local_secret_delete`, keeps `missing_metadata` until its keyed path is reviewed.
+the standalone one since the token database records the token's revision, plan P5),
+`connection_delete_postgres` and `connection_delete_standalone`
+(`DELETE .../connections/{id}`), and `local_secret_delete`
+(`DELETE .../connection-secrets/{id}`, plan P8) have their reviewed paths.
 
 `catalog.overlay.delete` is not a withdrawal: removing an overlay publishes a new
 catalog revision. The session withdrawal reason stays in `admin_session_evidence`;

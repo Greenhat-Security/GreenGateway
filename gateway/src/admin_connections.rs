@@ -84,6 +84,11 @@ pub(super) async fn connection_secret_create_endpoint(
     State(state): State<ConnectionAdminState>,
     request: AxumRequest,
 ) -> Response {
+    let pins = request.extensions().clone();
+    connection_change_to_completion(pins, Box::pin(connection_secret_create(state, request))).await
+}
+
+async fn connection_secret_create(state: ConnectionAdminState, request: AxumRequest) -> Response {
     record_request(CONNECTION_SECRETS_ADMIN_ROUTE);
 
     let (parts, body) = request.into_parts();
@@ -107,28 +112,25 @@ pub(super) async fn connection_secret_create_endpoint(
             error => connection_admin_authz_error_response(error),
         };
     }
-
-    let current_metadata = state.control_plane.secret_alias_metadata();
-    let current_collection_etag = connections::admin::secret_collection_etag(&current_metadata);
-    match if_match_matches(&parts.headers, &current_collection_etag) {
-        Ok(true) => {}
-        Ok(false) => {
-            return with_connection_secret_collection_etag(
+    if !state.control_plane.is_local_secret_manager_configured() {
+        // As before caller keys, keyed or not: the collection precondition,
+        // then `503`. No key is bound and no gate asked (issue #425).
+        let current_collection_etag = connections::admin::secret_collection_etag(
+            &state.control_plane.secret_alias_metadata(),
+        );
+        return match if_match_matches(&parts.headers, &current_collection_etag) {
+            Ok(true) => connection_secret_store_not_configured(),
+            Ok(false) => with_connection_secret_collection_etag(
                 precondition_failed(
                     "If-Match does not match the current connection-secret collection ETag",
                 ),
                 &current_collection_etag,
-            );
-        }
-        Err(error) => {
-            return with_connection_secret_collection_etag(
+            ),
+            Err(error) => with_connection_secret_collection_etag(
                 if_match_error_response(error),
                 &current_collection_etag,
-            );
-        }
-    }
-    if !state.control_plane.is_local_secret_manager_configured() {
-        return connection_secret_store_not_configured();
+            ),
+        };
     }
 
     let body =
@@ -150,59 +152,128 @@ pub(super) async fn connection_secret_create_endpoint(
         Ok(secret) => secret,
         Err(_) => return connection_secret_validation_error(),
     };
-    // The precondition lock, the collection re-check, and the encrypted
-    // SQLite write run together on the blocking pool: the guard never spans
-    // an await, and the write never sits on the request executor.
-    let created = {
-        let lock = Arc::clone(&state.secret_precondition_lock);
-        let control_plane = state.control_plane.clone();
-        let current_collection_etag = current_collection_etag.clone();
-        let actor = auth::change_actor::ChangeActor::from_principal(&principal);
-        match tokio::task::spawn_blocking(move || -> ResponseResult<_> {
-            let mutation_guard = match lock_connection_secret_mutations(&lock) {
-                Ok(guard) => guard,
-                Err(response) => return Err(response),
-            };
-            let locked_metadata = control_plane.secret_alias_metadata();
-            let locked_collection_etag =
-                connections::admin::secret_collection_etag(&locked_metadata);
-            if locked_collection_etag != current_collection_etag {
-                drop(mutation_guard);
-                return Err(Box::new(with_connection_secret_collection_etag(
+
+    // The collection as it stood before the key is judged, as a rotation
+    // and a delete read the stored secret first. When a first request with
+    // the same key commits after this read -- even after the pre-check
+    // below answered `Unused` -- the retry's `If-Match` still matches this
+    // snapshot, so the retry reaches the store, which judges the key before
+    // the collection and answers from the receipt, instead of this handler
+    // answering `412` (plan P8: the store's judgement is authoritative).
+    let current_collection_etag =
+        connections::admin::secret_collection_etag(&state.control_plane.secret_alias_metadata());
+
+    // Authorized and validated: bind the caller key, ask the gate, and
+    // judge the key before the collection precondition, which a committed
+    // create has since moved (issue #425). An exact retry goes to the store,
+    // which compares its value with the committed one.
+    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
+    let caller = match admit_keyed_secret_change(
+        &state,
+        &parts,
+        &principal,
+        &actor,
+        KeyedSecretChange::Create,
+        "",
+        Some(&label),
+        Some(purpose),
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return *response,
+    };
+    let retry = caller.as_ref().is_some_and(|keyed| keyed.retry);
+    if !retry {
+        match if_match_matches(&parts.headers, &current_collection_etag) {
+            Ok(true) => {}
+            Ok(false) => {
+                return with_connection_secret_collection_etag(
                     precondition_failed(
                         "If-Match does not match the current connection-secret collection ETag",
                     ),
-                    &locked_collection_etag,
-                )));
+                    &current_collection_etag,
+                );
             }
-            let manager = match control_plane.local_secret_manager() {
-                Ok(manager) => manager,
-                Err(_) => {
-                    drop(mutation_guard);
-                    return Err(Box::new(connection_secret_store_not_configured()));
-                }
-            };
-            match manager.create(&label, secret, &actor) {
-                Ok(created) => {
+            Err(error) => {
+                return with_connection_secret_collection_etag(
+                    if_match_error_response(error),
+                    &current_collection_etag,
+                );
+            }
+        }
+    }
+
+    // The precondition lock and the encrypted SQLite write run together on
+    // the blocking pool: the guard never spans an await, and the write never
+    // sits on the request executor. The store judges the key again, then
+    // the collection precondition, inside its transaction.
+    let created =
+        {
+            let lock = Arc::clone(&state.secret_precondition_lock);
+            let control_plane = state.control_plane.clone();
+            let headers = parts.headers.clone();
+            let caller = caller.map(|keyed| keyed.operation);
+            match tokio::task::spawn_blocking(move || -> ResponseResult<_> {
+                let _mutation_guard = lock_connection_secret_mutations(&lock)?;
+                let manager = control_plane
+                    .local_secret_manager()
+                    .map_err(|_| Box::new(connection_secret_store_not_configured()))?;
+                let collection_unchanged = || {
+                    let current = connections::admin::secret_collection_etag(
+                        &control_plane.secret_alias_metadata(),
+                    );
+                    matches!(if_match_matches(&headers, &current), Ok(true))
+                };
+                match manager.create_with_operation(
+                &label,
+                secret,
+                &actor,
+                caller.as_ref(),
+                &collection_unchanged,
+            ) {
+                Ok(authority_events::caller_operation::CallerOutcome::Committed(created)) => {
                     let new_collection_etag = connections::admin::secret_collection_etag(
                         &control_plane.secret_alias_metadata(),
                     );
-                    Ok((created, new_collection_etag))
+                    Ok(authority_events::caller_operation::CallerOutcome::Committed((
+                        created,
+                        new_collection_etag,
+                    )))
+                }
+                Ok(authority_events::caller_operation::CallerOutcome::Replayed(receipt)) => Ok(
+                    authority_events::caller_operation::CallerOutcome::Replayed(receipt),
+                ),
+                Err(connections::local_secret::LocalSecretError::PreconditionFailed) => {
+                    Err(Box::new(with_connection_secret_collection_etag(
+                        precondition_failed(
+                            "If-Match does not match the current connection-secret collection ETag",
+                        ),
+                        &connections::admin::secret_collection_etag(
+                            &control_plane.secret_alias_metadata(),
+                        ),
+                    )))
                 }
                 Err(error) => Err(Box::new(connection_secret_error_response(error))),
             }
-        })
-        .await
-        {
-            Ok(Ok((created, new_collection_etag))) => (created, new_collection_etag),
-            Ok(Err(response)) => return *response,
-            Err(error) => {
-                tracing::error!(error = %error, "connection-secret mutation task failed");
-                return internal_server_error("connection-secret mutation failed");
+            })
+            .await
+            {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(response)) => return *response,
+                Err(error) => {
+                    tracing::error!(error = %error, "connection-secret mutation task failed");
+                    return internal_server_error("connection-secret mutation failed");
+                }
             }
+        };
+    let (created, new_collection_etag) = match created {
+        authority_events::caller_operation::CallerOutcome::Committed(created) => created,
+        // An exact retry: no change and no audit event.
+        authority_events::caller_operation::CallerOutcome::Replayed(receipt) => {
+            return operation_receipt(&receipt)
         }
     };
-    let (created, new_collection_etag) = created;
     let item_etag = connections::admin::secret_metadata_etag(&created);
     emit_connection_secret_changed(&state, &parts, &principal, "created", &created, 0);
     (
@@ -222,9 +293,113 @@ pub(super) async fn connection_secret_create_endpoint(
         .into_response()
 }
 
+/// The `412` of a local-secret rotation or delete whose `If-Match` no
+/// longer names the stored secret: with the secret's current ETag, or the
+/// collection's when the secret is gone.
+fn connection_secret_item_precondition_failed(
+    control_plane: &connections::control_plane::ConnectionControlPlane,
+    id: &str,
+) -> Response {
+    let message = "If-Match does not match the current connection-secret ETag";
+    match local_secret_metadata(control_plane, id) {
+        Ok(current) => with_etag(
+            precondition_failed(message),
+            &connections::admin::secret_metadata_etag(&current),
+        ),
+        Err(_) => with_connection_secret_collection_etag(
+            precondition_failed(message),
+            &connections::admin::secret_collection_etag(&control_plane.secret_alias_metadata()),
+        ),
+    }
+}
+
+/// The in-memory precondition of an unkeyed or first keyed rotation or
+/// delete, checked after admission: `current` is the stored secret, if any.
+fn connection_secret_item_precondition(
+    state: &ConnectionAdminState,
+    headers: &HeaderMap,
+    current: Option<&connections::secret::SecretAliasMetadata>,
+) -> ResponseResult<()> {
+    let Some(current) = current else {
+        if let Err(error) = if_match_matches(headers, "\"connection-secret:no-current-version\"") {
+            return Err(Box::new(if_match_error_response(error)));
+        }
+        let current_collection_etag = connections::admin::secret_collection_etag(
+            &state.control_plane.secret_alias_metadata(),
+        );
+        return Err(Box::new(with_connection_secret_collection_etag(
+            precondition_failed("If-Match does not match an existing connection secret"),
+            &current_collection_etag,
+        )));
+    };
+    let current_etag = connections::admin::secret_metadata_etag(current);
+    match if_match_matches(headers, &current_etag) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Box::new(with_etag(
+            precondition_failed("If-Match does not match the current connection-secret ETag"),
+            &current_etag,
+        ))),
+        Err(error) => Err(Box::new(with_etag(
+            if_match_error_response(error),
+            &current_etag,
+        ))),
+    }
+}
+
+/// The stored local secret `id` names, `None` when there is none, or the
+/// answer for an operator-provisioned alias, which is read-only.
+fn current_local_secret(
+    control_plane: &connections::control_plane::ConnectionControlPlane,
+    id: &str,
+) -> ResponseResult<Option<connections::secret::SecretAliasMetadata>> {
+    match local_secret_metadata(control_plane, id) {
+        Ok(current) => Ok(Some(current)),
+        Err(response) if response.status() == StatusCode::NOT_FOUND => Ok(None),
+        Err(response) => Err(response),
+    }
+}
+
+/// The answer to a rotation or delete on a gateway with no local-secret
+/// store -- every cluster replica, and a standalone one without a keyring --
+/// decided before the body is read and before a caller key is bound or any
+/// gate is asked (issue #425). Such a gateway cannot perform the change, so
+/// a keyed request must not raise the cluster's caller-key contract fence or
+/// be judged by the evidence gate: keyed or not, it is answered as before
+/// keys existed, `428`/`400`/`412` from the `If-Match` precondition (there
+/// is no stored secret to match), or `503` should one be listed anyway.
+/// `None` when the store is configured.
+fn without_local_secret_manager(
+    state: &ConnectionAdminState,
+    headers: &HeaderMap,
+    current: Option<&connections::secret::SecretAliasMetadata>,
+) -> Option<Response> {
+    if state.control_plane.is_local_secret_manager_configured() {
+        return None;
+    }
+    Some(
+        match connection_secret_item_precondition(state, headers, current) {
+            Ok(()) => connection_secret_store_not_configured(),
+            Err(response) => *response,
+        },
+    )
+}
+
 pub(super) async fn connection_secret_rotate_endpoint(
     State(state): State<ConnectionAdminState>,
     Path(raw_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    let pins = request.extensions().clone();
+    connection_change_to_completion(
+        pins,
+        Box::pin(connection_secret_rotate(state, raw_id, request)),
+    )
+    .await
+}
+
+async fn connection_secret_rotate(
+    state: ConnectionAdminState,
+    raw_id: String,
     request: AxumRequest,
 ) -> Response {
     record_request(CONNECTION_SECRET_ADMIN_ROUTE);
@@ -250,35 +425,12 @@ pub(super) async fn connection_secret_rotate_endpoint(
             error => connection_admin_authz_error_response(error),
         };
     }
-
-    let current = match local_secret_metadata(&state.control_plane, &raw_id) {
+    let current = match current_local_secret(&state.control_plane, &raw_id) {
         Ok(current) => current,
-        Err(response) if response.status() == StatusCode::NOT_FOUND => {
-            if let Err(error) =
-                if_match_matches(&parts.headers, "\"connection-secret:no-current-version\"")
-            {
-                return if_match_error_response(error);
-            }
-            let current_collection_etag = connections::admin::secret_collection_etag(
-                &state.control_plane.secret_alias_metadata(),
-            );
-            return with_connection_secret_collection_etag(
-                precondition_failed("If-Match does not match an existing connection secret"),
-                &current_collection_etag,
-            );
-        }
         Err(response) => return *response,
     };
-    let current_etag = connections::admin::secret_metadata_etag(&current);
-    match if_match_matches(&parts.headers, &current_etag) {
-        Ok(true) => {}
-        Ok(false) => {
-            return with_etag(
-                precondition_failed("If-Match does not match the current connection-secret ETag"),
-                &current_etag,
-            );
-        }
-        Err(error) => return with_etag(if_match_error_response(error), &current_etag),
+    if let Some(response) = without_local_secret_manager(&state, &parts.headers, current.as_ref()) {
+        return response;
     }
     let body =
         match read_connection_secret_body(body, connection_secret_admin_body_limit(&state)).await {
@@ -296,62 +448,70 @@ pub(super) async fn connection_secret_rotate_endpoint(
         Ok(replacement) => replacement,
         Err(_) => return connection_secret_validation_error(),
     };
-    // When this secret is one half of a client identity whose other half lives
-    // behind a network provider, the synchronous preflight inside rotate cannot
-    // fetch that half to match the pair. Do it here, before the mutation guard,
-    // so the network I/O happens outside the lock.
-    if let Err(error) = state
-        .control_plane
-        .ensure_rotated_identity_pairs_resolvable(&raw_id, &replacement)
-        .await
+
+    // Authorized and validated: bind the caller key and ask the gate before
+    // the precondition, so a committed rotation is answered from its receipt
+    // after the secret moved on, and an unused key with a stale `If-Match`
+    // is `412` (issue #425). An exact retry skips the identity preflight's
+    // network I/O: the store answers it from the key.
+    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
+    let caller = match admit_keyed_secret_change(
+        &state,
+        &parts,
+        &principal,
+        &actor,
+        KeyedSecretChange::Rotate,
+        &raw_id,
+        None,
+        Some(purpose),
+    )
+    .await
     {
-        return connection_mutation_error_response(error);
+        Ok(caller) => caller,
+        Err(response) => return *response,
+    };
+    let retry = caller.as_ref().is_some_and(|keyed| keyed.retry);
+    if !retry {
+        if let Err(response) =
+            connection_secret_item_precondition(&state, &parts.headers, current.as_ref())
+        {
+            return *response;
+        }
+        // When this secret is one half of a client identity whose other half
+        // lives behind a network provider, the synchronous preflight inside
+        // rotate cannot fetch that half to match the pair. Do it here, before
+        // the mutation guard, so the network I/O happens outside the lock.
+        if let Err(error) = state
+            .control_plane
+            .ensure_rotated_identity_pairs_resolvable(&raw_id, &replacement)
+            .await
+        {
+            return connection_mutation_error_response(error);
+        }
     }
-    // See the create handler: the guard, the re-check, and the encrypted
-    // SQLite write run together on the blocking pool.
+    // See the create handler: the guard and the encrypted SQLite write run
+    // together on the blocking pool, and the store decides the key and the
+    // item precondition inside its transaction.
     let rotated = {
         let lock = Arc::clone(&state.secret_precondition_lock);
         let control_plane = state.control_plane.clone();
         let raw_id_for_mutation = raw_id.clone();
-        let current_etag_for_mutation = current_etag.clone();
-        let actor = auth::change_actor::ChangeActor::from_principal(&principal);
+        let headers = parts.headers.clone();
+        let caller = caller.map(|keyed| keyed.operation);
         match tokio::task::spawn_blocking(move || -> ResponseResult<_> {
-            let mutation_guard = match lock_connection_secret_mutations(&lock) {
-                Ok(guard) => guard,
-                Err(response) => return Err(response),
-            };
-            let locked_current = match local_secret_metadata(&control_plane, &raw_id_for_mutation) {
-                Ok(current) => current,
-                Err(_) => {
-                    let current_collection_etag = connections::admin::secret_collection_etag(
-                        &control_plane.secret_alias_metadata(),
-                    );
-                    drop(mutation_guard);
-                    return Err(Box::new(with_connection_secret_collection_etag(
-                        precondition_failed("connection secret changed during rotation"),
-                        &current_collection_etag,
-                    )));
-                }
-            };
-            let locked_etag = connections::admin::secret_metadata_etag(&locked_current);
-            if locked_etag != current_etag_for_mutation {
-                drop(mutation_guard);
-                return Err(Box::new(with_etag(
-                    precondition_failed(
-                        "If-Match does not match the current connection-secret ETag",
-                    ),
-                    &locked_etag,
-                )));
-            }
-            let manager = match control_plane.local_secret_manager() {
-                Ok(manager) => manager,
-                Err(_) => {
-                    drop(mutation_guard);
-                    return Err(Box::new(connection_secret_store_not_configured()));
-                }
-            };
-            match manager.rotate(&raw_id_for_mutation, replacement, &actor) {
-                Ok(rotated) => {
+            let _mutation_guard = lock_connection_secret_mutations(&lock)?;
+            let manager = control_plane
+                .local_secret_manager()
+                .map_err(|_| Box::new(connection_secret_store_not_configured()))?;
+            let expected = |etag: &str| matches!(if_match_matches(&headers, etag), Ok(true));
+            match manager.rotate_with_operation(
+                &raw_id_for_mutation,
+                replacement,
+                &actor,
+                caller.as_ref(),
+                &expected,
+            ) {
+                Ok(authority_events::caller_operation::CallerOutcome::Committed(rotated)) => {
                     let dependency_count =
                         connection_secret_dependency_counts(&control_plane.runtime_snapshot())
                             .get(raw_id_for_mutation.as_str())
@@ -360,14 +520,30 @@ pub(super) async fn connection_secret_rotate_endpoint(
                     let new_collection_etag = connections::admin::secret_collection_etag(
                         &control_plane.secret_alias_metadata(),
                     );
-                    Ok((rotated, dependency_count, new_collection_etag))
+                    Ok(
+                        authority_events::caller_operation::CallerOutcome::Committed((
+                            rotated,
+                            dependency_count,
+                            new_collection_etag,
+                        )),
+                    )
                 }
+                Ok(authority_events::caller_operation::CallerOutcome::Replayed(receipt)) => Ok(
+                    authority_events::caller_operation::CallerOutcome::Replayed(receipt),
+                ),
+                Err(
+                    connections::local_secret::LocalSecretError::PreconditionFailed
+                    | connections::local_secret::LocalSecretError::NotFound,
+                ) => Err(Box::new(connection_secret_item_precondition_failed(
+                    &control_plane,
+                    &raw_id_for_mutation,
+                ))),
                 Err(error) => Err(Box::new(connection_secret_error_response(error))),
             }
         })
         .await
         {
-            Ok(Ok(rotation)) => rotation,
+            Ok(Ok(outcome)) => outcome,
             Ok(Err(response)) => return *response,
             Err(error) => {
                 tracing::error!(error = %error, "connection-secret mutation task failed");
@@ -375,7 +551,13 @@ pub(super) async fn connection_secret_rotate_endpoint(
             }
         }
     };
-    let (rotated, dependency_count, new_collection_etag) = rotated;
+    let (rotated, dependency_count, new_collection_etag) = match rotated {
+        authority_events::caller_operation::CallerOutcome::Committed(rotated) => rotated,
+        // An exact retry: no change and no audit event.
+        authority_events::caller_operation::CallerOutcome::Replayed(receipt) => {
+            return operation_receipt(&receipt)
+        }
+    };
     let item_etag = connections::admin::secret_metadata_etag(&rotated);
     emit_connection_secret_changed(
         &state,
@@ -409,6 +591,19 @@ pub(super) async fn connection_secret_delete_endpoint(
     Path(raw_id): Path<String>,
     request: AxumRequest,
 ) -> Response {
+    let pins = request.extensions().clone();
+    connection_change_to_completion(
+        pins,
+        Box::pin(connection_secret_delete(state, raw_id, request)),
+    )
+    .await
+}
+
+async fn connection_secret_delete(
+    state: ConnectionAdminState,
+    raw_id: String,
+    request: AxumRequest,
+) -> Response {
     record_request(CONNECTION_SECRET_ADMIN_ROUTE);
 
     let (parts, body) = request.into_parts();
@@ -432,35 +627,12 @@ pub(super) async fn connection_secret_delete_endpoint(
             error => connection_admin_authz_error_response(error),
         };
     }
-
-    let current = match local_secret_metadata(&state.control_plane, &raw_id) {
+    let current = match current_local_secret(&state.control_plane, &raw_id) {
         Ok(current) => current,
-        Err(response) if response.status() == StatusCode::NOT_FOUND => {
-            if let Err(error) =
-                if_match_matches(&parts.headers, "\"connection-secret:no-current-version\"")
-            {
-                return if_match_error_response(error);
-            }
-            let current_collection_etag = connections::admin::secret_collection_etag(
-                &state.control_plane.secret_alias_metadata(),
-            );
-            return with_connection_secret_collection_etag(
-                precondition_failed("If-Match does not match an existing connection secret"),
-                &current_collection_etag,
-            );
-        }
         Err(response) => return *response,
     };
-    let current_etag = connections::admin::secret_metadata_etag(&current);
-    match if_match_matches(&parts.headers, &current_etag) {
-        Ok(true) => {}
-        Ok(false) => {
-            return with_etag(
-                precondition_failed("If-Match does not match the current connection-secret ETag"),
-                &current_etag,
-            );
-        }
-        Err(error) => return with_etag(if_match_error_response(error), &current_etag),
+    if let Some(response) = without_local_secret_manager(&state, &parts.headers, current.as_ref()) {
+        return response;
     }
     let body = match read_connection_secret_body(body, state.max_body_size.min(1024)).await {
         Ok(body) => body,
@@ -470,67 +642,98 @@ pub(super) async fn connection_secret_delete_endpoint(
         return bad_request("connection-secret delete does not accept a request body");
     }
     drop(body);
-    // See the create handler: the guard, the re-check, and the encrypted
-    // SQLite delete run together on the blocking pool.
+
+    // Authorized and validated: bind the caller key and admit it -- a
+    // withdrawal, which every form of stays admitted -- before the
+    // precondition, so a committed delete is answered from its receipt after
+    // the secret is gone (issue #425).
+    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
+    let caller = match admit_keyed_secret_change(
+        &state,
+        &parts,
+        &principal,
+        &actor,
+        KeyedSecretChange::Delete,
+        &raw_id,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return *response,
+    };
+    let retry = caller.as_ref().is_some_and(|keyed| keyed.retry);
+    if !retry {
+        if let Err(response) =
+            connection_secret_item_precondition(&state, &parts.headers, current.as_ref())
+        {
+            return *response;
+        }
+    }
+    // See the create handler: the guard and the encrypted SQLite delete run
+    // together on the blocking pool. The secret as it stood under the guard
+    // is what the audit event describes.
     let deletion = {
         let lock = Arc::clone(&state.secret_precondition_lock);
         let control_plane = state.control_plane.clone();
         let raw_id_for_mutation = raw_id.clone();
-        let current_etag_for_mutation = current_etag.clone();
-        let actor = auth::change_actor::ChangeActor::from_principal(&principal);
-        tokio::task::spawn_blocking(move || -> ResponseResult<String> {
-            let mutation_guard = match lock_connection_secret_mutations(&lock) {
-                Ok(guard) => guard,
-                Err(response) => return Err(response),
-            };
-            let locked_current = match local_secret_metadata(&control_plane, &raw_id_for_mutation) {
-                Ok(current) => current,
-                Err(_) => {
-                    let current_collection_etag = connections::admin::secret_collection_etag(
+        let headers = parts.headers.clone();
+        let caller = caller.map(|keyed| keyed.operation);
+        tokio::task::spawn_blocking(move || -> ResponseResult<_> {
+            let _mutation_guard = lock_connection_secret_mutations(&lock)?;
+            let manager = control_plane
+                .local_secret_manager()
+                .map_err(|_| Box::new(connection_secret_store_not_configured()))?;
+            let deleted = local_secret_metadata(&control_plane, &raw_id_for_mutation).ok();
+            let expected = |etag: &str| matches!(if_match_matches(&headers, etag), Ok(true));
+            match manager.delete_with_operation(
+                &raw_id_for_mutation,
+                &actor,
+                caller.as_ref(),
+                &expected,
+            ) {
+                Ok(authority_events::caller_operation::CallerOutcome::Committed(())) => {
+                    let new_collection_etag = connections::admin::secret_collection_etag(
                         &control_plane.secret_alias_metadata(),
                     );
-                    drop(mutation_guard);
-                    return Err(Box::new(with_connection_secret_collection_etag(
-                        precondition_failed("connection secret changed during deletion"),
-                        &current_collection_etag,
-                    )));
+                    Ok(
+                        authority_events::caller_operation::CallerOutcome::Committed((
+                            deleted,
+                            new_collection_etag,
+                        )),
+                    )
                 }
-            };
-            let locked_etag = connections::admin::secret_metadata_etag(&locked_current);
-            if locked_etag != current_etag_for_mutation {
-                drop(mutation_guard);
-                return Err(Box::new(with_etag(
-                    precondition_failed(
-                        "If-Match does not match the current connection-secret ETag",
-                    ),
-                    &locked_etag,
-                )));
+                Ok(authority_events::caller_operation::CallerOutcome::Replayed(receipt)) => Ok(
+                    authority_events::caller_operation::CallerOutcome::Replayed(receipt),
+                ),
+                Err(
+                    connections::local_secret::LocalSecretError::PreconditionFailed
+                    | connections::local_secret::LocalSecretError::NotFound,
+                ) => Err(Box::new(connection_secret_item_precondition_failed(
+                    &control_plane,
+                    &raw_id_for_mutation,
+                ))),
+                Err(error) => Err(Box::new(connection_secret_error_response(error))),
             }
-            let manager = match control_plane.local_secret_manager() {
-                Ok(manager) => manager,
-                Err(_) => {
-                    drop(mutation_guard);
-                    return Err(Box::new(connection_secret_store_not_configured()));
-                }
-            };
-            if let Err(error) = manager.delete(&raw_id_for_mutation, &actor) {
-                return Err(Box::new(connection_secret_error_response(error)));
-            }
-            let new_collection_etag =
-                connections::admin::secret_collection_etag(&control_plane.secret_alias_metadata());
-            Ok(new_collection_etag)
         })
         .await
     };
-    let new_collection_etag = match deletion {
-        Ok(Ok(new_collection_etag)) => new_collection_etag,
+    let (deleted, new_collection_etag) = match deletion {
+        Ok(Ok(authority_events::caller_operation::CallerOutcome::Committed(deleted))) => deleted,
+        // An exact retry: no change and no audit event.
+        Ok(Ok(authority_events::caller_operation::CallerOutcome::Replayed(receipt))) => {
+            return operation_receipt(&receipt)
+        }
         Ok(Err(response)) => return *response,
         Err(error) => {
             tracing::error!(error = %error, "connection-secret mutation task failed");
             return internal_server_error("connection-secret mutation failed");
         }
     };
-    emit_connection_secret_changed(&state, &parts, &principal, "deleted", &current, 0);
+    if let Some(deleted) = &deleted {
+        emit_connection_secret_changed(&state, &parts, &principal, "deleted", deleted, 0);
+    }
     (
         StatusCode::OK,
         [
@@ -545,6 +748,159 @@ pub(super) async fn connection_secret_delete_endpoint(
         }),
     )
         .into_response()
+}
+
+/// A local-secret change that binds a caller key (issue #425, plan P8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyedSecretChange {
+    Create,
+    Rotate,
+    /// A withdrawal: every form of it stays admitted.
+    Delete,
+}
+
+impl KeyedSecretChange {
+    /// The operation code the key is reserved for and the evidence records.
+    const fn action(self) -> &'static str {
+        match self {
+            Self::Create => connections::local_secret::EVIDENCE_ACTION_CREATE,
+            Self::Rotate => connections::local_secret::EVIDENCE_ACTION_ROTATE,
+            Self::Delete => connections::local_secret::EVIDENCE_ACTION_DELETE,
+        }
+    }
+
+    /// What the change is to the evidence gate. Its operation's code is
+    /// [`Self::action`], so the key bound here is the one the gate is asked
+    /// about.
+    fn keyed_change(self) -> KeyedChange {
+        match self {
+            Self::Create => {
+                KeyedChange::Gated(authority_events::required::AuthorityOperation::SecretCreate)
+            }
+            Self::Rotate => {
+                KeyedChange::Gated(authority_events::required::AuthorityOperation::SecretRotate)
+            }
+            Self::Delete => {
+                KeyedChange::Withdrawal(authority_events::required::Withdrawal::SecretDelete)
+            }
+        }
+    }
+}
+
+/// An admitted keyed local-secret change: its bound key, and whether the
+/// read-only pre-check found it already reserved for this very request.
+struct KeyedSecretOperation {
+    operation: authority_events::caller_operation::CallerOperation,
+    /// The key holds a committed change bound to this request: the store
+    /// answers it -- with the receipt, or `409` for another value -- before
+    /// any precondition, so the handler skips its own.
+    retry: bool,
+}
+
+/// Bind a local-secret change's caller key and admit it (issue #425, plan
+/// P8). Called once the handler has authorized the caller and validated the
+/// request, and before the precondition check and any external I/O: the
+/// key is bound to the action, the recorded actor, the secret identifier
+/// (empty for a create), the `If-Match` value and the label and purpose
+/// ([`connections::local_secret::SecretChangeBinding`]), never the secret
+/// value; the evidence gate (create and rotate) is asked; and the
+/// reservation table is read. A key bound to anything else is `409`.
+/// Local secrets exist only on a standalone gateway with a keyring: every
+/// handler answers a gateway without a local-secret store before it gets
+/// here (`connection_secret_store_not_configured` for a create,
+/// [`without_local_secret_manager`] for a rotation or delete), and this
+/// function refuses one again before anything is bound, so the operation
+/// gate is never asked and a cluster's contract fence never moves for a
+/// local secret. `Ok(None)` is an unkeyed request the gate admitted.
+#[allow(clippy::too_many_arguments)]
+async fn admit_keyed_secret_change(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    actor: &auth::change_actor::ChangeActor,
+    change: KeyedSecretChange,
+    secret_id: &str,
+    label: Option<&str>,
+    purpose: Option<connections::secret::SecretPurpose>,
+) -> ResponseResult<Option<KeyedSecretOperation>> {
+    if !state.control_plane.is_local_secret_manager_configured() {
+        return Err(Box::new(connection_secret_store_not_configured()));
+    }
+    let caller = if parts.headers.contains_key("idempotency-key") {
+        let if_match = if_match_precondition(&parts.headers)?;
+        let binding = connections::local_secret::SecretChangeBinding {
+            action: change.action(),
+            actor,
+            secret_id,
+            if_match: &if_match,
+            label,
+            purpose,
+        };
+        caller_operation(
+            &parts.headers,
+            actor,
+            binding.action,
+            binding.secret_id,
+            binding.if_match,
+            &binding.canonical_request(),
+        )?
+    } else {
+        None
+    };
+    let gates = KeyedChangeGates {
+        evidence: &state.authority_evidence,
+        #[cfg(feature = "postgres")]
+        membership: state.membership.as_deref(),
+        audit: &state.audit,
+        client_ip_policy: &state.client_ip_policy,
+    };
+    admit_keyed_authority_change(
+        &gates,
+        change.keyed_change(),
+        caller.as_ref(),
+        actor,
+        parts,
+        principal,
+    )
+    .await?;
+    let Some(operation) = caller else {
+        return Ok(None);
+    };
+    // The read-only pre-check. The store judges the key again inside the
+    // change's transaction.
+    let control_plane = state.control_plane.clone();
+    let checked = operation.clone();
+    let key = tokio::task::spawn_blocking(move || {
+        control_plane
+            .local_secret_manager()
+            .map_err(|_| connections::local_secret::LocalSecretError::StorageFailure)?
+            .caller_operation_state(&checked)
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, "a local-secret caller key could not be read");
+        Box::new(service_unavailable(
+            "the caller operation could not be read",
+        ))
+    })?;
+    match key {
+        Ok(authority_events::caller_operation::CallerKeyState::Unused) => {
+            Ok(Some(KeyedSecretOperation {
+                operation,
+                retry: false,
+            }))
+        }
+        Ok(authority_events::caller_operation::CallerKeyState::SameBinding) => {
+            Ok(Some(KeyedSecretOperation {
+                operation,
+                retry: true,
+            }))
+        }
+        Ok(authority_events::caller_operation::CallerKeyState::OtherBinding) => {
+            Err(Box::new(caller_operation_conflict()))
+        }
+        Err(error) => Err(Box::new(connection_secret_error_response(error))),
+    }
 }
 
 pub(super) async fn connection_list_endpoint(
@@ -3289,6 +3645,12 @@ pub(super) fn connection_secret_error_response(
         connections::local_secret::LocalSecretError::LimitExceeded { .. }
         | connections::local_secret::LocalSecretError::IdentifierCollision => {
             conflict("connection-secret capacity has been reached")
+        }
+        connections::local_secret::LocalSecretError::CallerOperationConflict => {
+            caller_operation_conflict()
+        }
+        connections::local_secret::LocalSecretError::PreconditionFailed => {
+            precondition_failed("If-Match does not match the current connection-secret ETag")
         }
         connections::local_secret::LocalSecretError::DependencyConflict {
             connection_ids,

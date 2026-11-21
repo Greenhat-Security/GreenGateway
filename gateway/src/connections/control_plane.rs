@@ -51,8 +51,9 @@ use super::{
         KubernetesSecretProvider, KubernetesTransport,
     },
     local_secret::{
-        LocalSecretError, LocalSecretKeyring, LocalSecretKeyringConfigError, LocalSecretManager,
-        LocalSecretProvider, MasterKeyRotationProgress,
+        committed_change, CollectionPrecondition, ItemPrecondition, LocalSecretError,
+        LocalSecretKeyring, LocalSecretKeyringConfigError, LocalSecretManager, LocalSecretProvider,
+        MasterKeyRotationProgress,
     },
     managed_store::ManagedConnectionStore,
     model::{
@@ -3518,10 +3519,7 @@ impl LocalSecretManager for CoordinatedLocalSecretManager {
         secret: ResolvedSecret,
         actor: &ChangeActor,
     ) -> Result<SecretAliasMetadata, LocalSecretError> {
-        let _guard = self.mutation_guard();
-        let metadata = self.provider.create(label, secret, actor)?;
-        self.publish_version(&metadata);
-        Ok(metadata)
+        committed_change(self.create_with_operation(label, secret, actor, None, &|| true))
     }
 
     fn rotate(
@@ -3530,27 +3528,98 @@ impl LocalSecretManager for CoordinatedLocalSecretManager {
         replacement: ResolvedSecret,
         actor: &ChangeActor,
     ) -> Result<SecretAliasMetadata, LocalSecretError> {
-        let _guard = self.mutation_guard();
-        let snapshot = self.runtime.load_full();
-        for record in snapshot.managed().values() {
-            self.secret_resolver
-                .validate_enabled_candidate_with_rotated_secret(&record.write, id, &replacement)
-                .map_err(|error| match error {
-                    BindingActivationError::Invalid { .. }
-                    | BindingActivationError::SigningKey { .. } => LocalSecretError::InvalidSecret,
-                    BindingActivationError::Unavailable => LocalSecretError::StorageFailure,
-                })?;
-        }
-        let metadata = self.provider.rotate(id, replacement, actor)?;
-        self.publish_version(&metadata);
-        Ok(metadata)
+        committed_change(self.rotate_with_operation(id, replacement, actor, None, &|_| true))
     }
 
     fn delete(&self, id: &str, actor: &ChangeActor) -> Result<(), LocalSecretError> {
+        committed_change(self.delete_with_operation(id, actor, None, &|_| true))
+    }
+
+    fn create_with_operation(
+        &self,
+        label: &str,
+        secret: ResolvedSecret,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+        collection_unchanged: CollectionPrecondition<'_>,
+    ) -> Result<CallerOutcome<SecretAliasMetadata>, LocalSecretError> {
         let _guard = self.mutation_guard();
-        self.provider.delete(id, actor)?;
-        self.remove_version(id);
-        Ok(())
+        let outcome = self.provider.create_with_operation(
+            label,
+            secret,
+            actor,
+            caller,
+            collection_unchanged,
+        )?;
+        if let CallerOutcome::Committed(metadata) = &outcome {
+            self.publish_version(metadata);
+        }
+        Ok(outcome)
+    }
+
+    fn rotate_with_operation(
+        &self,
+        id: &str,
+        replacement: ResolvedSecret,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+        expected: ItemPrecondition<'_>,
+    ) -> Result<CallerOutcome<SecretAliasMetadata>, LocalSecretError> {
+        let _guard = self.mutation_guard();
+        // A key a committed change already holds is answered by the provider
+        // (a receipt or a conflict) without validating the replacement
+        // against today's Connections: that rotation was validated when it
+        // committed, and a retry changes nothing. The guard keeps the answer
+        // current until the provider judges the key again.
+        let key_unused = match caller {
+            None => true,
+            Some(caller) => self.provider.caller_operation_state(caller)? == CallerKeyState::Unused,
+        };
+        if key_unused {
+            let snapshot = self.runtime.load_full();
+            for record in snapshot.managed().values() {
+                self.secret_resolver
+                    .validate_enabled_candidate_with_rotated_secret(&record.write, id, &replacement)
+                    .map_err(|error| match error {
+                        BindingActivationError::Invalid { .. }
+                        | BindingActivationError::SigningKey { .. } => {
+                            LocalSecretError::InvalidSecret
+                        }
+                        BindingActivationError::Unavailable => LocalSecretError::StorageFailure,
+                    })?;
+            }
+        }
+        let outcome =
+            self.provider
+                .rotate_with_operation(id, replacement, actor, caller, expected)?;
+        if let CallerOutcome::Committed(metadata) = &outcome {
+            self.publish_version(metadata);
+        }
+        Ok(outcome)
+    }
+
+    fn delete_with_operation(
+        &self,
+        id: &str,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+        expected: ItemPrecondition<'_>,
+    ) -> Result<CallerOutcome<()>, LocalSecretError> {
+        let _guard = self.mutation_guard();
+        let outcome = self
+            .provider
+            .delete_with_operation(id, actor, caller, expected)?;
+        if let CallerOutcome::Committed(()) = outcome {
+            self.remove_version(id);
+        }
+        Ok(outcome)
+    }
+
+    fn caller_operation_state(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<CallerKeyState, LocalSecretError> {
+        self.provider.caller_operation_state(caller)
     }
 
     fn metadata(&self) -> Vec<SecretAliasMetadata> {

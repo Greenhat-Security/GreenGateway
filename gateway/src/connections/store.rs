@@ -4457,7 +4457,8 @@ pub(crate) fn is_catalog_action(action: &str) -> bool {
 
 /// The receipt of the change `caller`'s key committed, read from the
 /// evidence table its action is recorded in: a catalog publication's from
-/// `catalog_change_evidence`, a Connection change's from
+/// `catalog_change_evidence`, a local secret change's from
+/// `connection_local_secret_change_evidence`, a Connection change's from
 /// `connection_change_evidence`.
 fn operation_receipt_for(
     connection: &Connection,
@@ -4465,6 +4466,8 @@ fn operation_receipt_for(
 ) -> rusqlite::Result<Option<OperationReceipt>> {
     if is_catalog_action(caller.action()) {
         catalog_operation_receipt(connection, caller)
+    } else if super::local_secret::is_local_secret_action(caller.action()) {
+        super::local_secret::local_secret_operation_receipt(connection, caller)
     } else {
         connection_operation_receipt(connection, caller)
     }

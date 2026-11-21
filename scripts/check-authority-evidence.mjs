@@ -348,6 +348,22 @@ export const QUALIFIED_PATHS = Object.freeze({
     operation: "catalog.overlay.delete", storage_mode: "standalone", method: "DELETE",
     route: "/v1{ADMIN_PREFIX}/connections/{id}/overlay", ...KEYED_DELIVERY,
   },
+  // Keyed local-secret create and rotation, standalone only (issue #425).
+  // The secret value is compared on a replay but never bound.
+  "secret.create/standalone": {
+    operation: "secret.create", storage_mode: "standalone", method: "POST",
+    route: "/v1{ADMIN_PREFIX}/connection-secrets", ...KEYED_DELIVERY,
+  },
+  "secret.rotate/standalone": {
+    operation: "secret.rotate", storage_mode: "standalone", method: "PUT",
+    route: "/v1{ADMIN_PREFIX}/connection-secrets/{id}", ...KEYED_DELIVERY,
+  },
+  // Admitted withdrawal: the containing row also admits the unkeyed DELETE
+  // and service-token callers, unqualified.
+  "secret.delete/standalone": {
+    operation: "secret.delete", storage_mode: "standalone", method: "DELETE",
+    route: "/v1{ADMIN_PREFIX}/connection-secrets/{id}", ...KEYED_DELIVERY,
+  },
 });
 // The dispatcher that delivers a qualified pair in each mode.
 const QUALIFIED_DELIVERY = { postgres: "journaled_dispatch", standalone: "standalone_cursor_dispatch" };

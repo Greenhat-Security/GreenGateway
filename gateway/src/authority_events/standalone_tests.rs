@@ -1515,3 +1515,213 @@ async fn a_keyed_catalog_change_is_redelivered_identically_after_a_crash_before_
         assert!(!contents.contains(marker), "{marker} reached the file");
     }
 }
+
+/// A keyed local-secret create, rotation and delete (issue #425, plan P8)
+/// are delivered under the negotiated format as closed `authority_event.v1`
+/// events through the file sink, produced from real commits of the
+/// standalone Connections database, each under its own caller key. A crash
+/// after the sink accepted and before the cursor advance redelivers the
+/// same records byte for byte, so consumers deduplicate on
+/// `(authority_id, event_id)`. No secret value, label, secret ID, actor,
+/// issuer or binding digest reaches the file.
+#[tokio::test]
+async fn a_keyed_secret_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit() {
+    use crate::authority_events::caller_operation::{
+        test_caller_key, CallerOperation, CallerOutcome,
+    };
+    use crate::config::AuthorityEventFormat;
+    use crate::connections::local_secret::{
+        LocalSecretKeyConfig, LocalSecretKeyRole, LocalSecretKeyring, LocalSecretProvider,
+        SecretChangeBinding, EVIDENCE_ACTION_CREATE, EVIDENCE_ACTION_DELETE,
+        EVIDENCE_ACTION_ROTATE,
+    };
+    use crate::connections::secret::SecretRootConfig;
+    use std::collections::BTreeSet;
+
+    const VALUE_MARKER: &str = "standalone-keyed-secret-value-marker";
+    const ROTATED_MARKER: &str = "standalone-keyed-secret-rotated-marker";
+    const LABEL_MARKER: &str = "Standalone keyed secret label marker";
+    let scratch = Scratch::new("keyed-secrets");
+    let path = scratch.path("connections.sqlite");
+    let connections = SqliteConnectionStore::open(&path).expect("the Connections store opens");
+    let root = scratch.path("secret-root");
+    std::fs::create_dir_all(&root).expect("the secret root creates");
+    std::fs::write(root.join("primary.key"), [41u8; 32]).expect("the master key writes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("the secret root permissions set");
+        std::fs::set_permissions(
+            root.join("primary.key"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("the master key permissions set");
+    }
+    let keyring = LocalSecretKeyring::load(
+        &[LocalSecretKeyConfig {
+            id: "standalone-keyed-primary".to_owned(),
+            file: "primary.key".to_owned(),
+            role: LocalSecretKeyRole::Primary,
+        }],
+        &SecretRootConfig::new(root),
+    )
+    .expect("the keyring loads");
+    let provider = LocalSecretProvider::open(&connections, keyring, BTreeSet::new())
+        .expect("the local-secret provider opens");
+    let actor = actor();
+    let bind = |seed: u8,
+                action: &'static str,
+                secret_id: &str,
+                label: Option<&str>,
+                purpose: Option<SecretPurpose>|
+     -> CallerOperation {
+        SecretChangeBinding {
+            action,
+            actor: &actor,
+            secret_id,
+            if_match: "\"standalone-keyed-secret\"",
+            label,
+            purpose,
+        }
+        .bind(test_caller_key(seed))
+        .expect("the key binds")
+    };
+    let value = |value: &str| {
+        ResolvedSecret::new(SecretPurpose::StaticBearer, value.as_bytes().to_vec())
+            .expect("the value validates")
+    };
+    let create = bind(
+        90,
+        EVIDENCE_ACTION_CREATE,
+        "",
+        Some(LABEL_MARKER),
+        Some(SecretPurpose::StaticBearer),
+    );
+    let created = match provider
+        .create_with_operation(
+            LABEL_MARKER,
+            value(VALUE_MARKER),
+            &actor,
+            Some(&create),
+            &|| true,
+        )
+        .expect("the keyed create commits")
+    {
+        CallerOutcome::Committed(created) => created,
+        CallerOutcome::Replayed(receipt) => panic!("a first use replayed: {receipt:?}"),
+    };
+    let rotate = bind(
+        91,
+        EVIDENCE_ACTION_ROTATE,
+        &created.id,
+        None,
+        Some(SecretPurpose::StaticBearer),
+    );
+    assert!(matches!(
+        provider
+            .rotate_with_operation(
+                &created.id,
+                value(ROTATED_MARKER),
+                &actor,
+                Some(&rotate),
+                &|_| true,
+            )
+            .expect("the keyed rotation commits"),
+        CallerOutcome::Committed(_)
+    ));
+    let delete = bind(92, EVIDENCE_ACTION_DELETE, &created.id, None, None);
+    assert!(matches!(
+        provider
+            .delete_with_operation(&created.id, &actor, Some(&delete), &|_| true)
+            .expect("the keyed delete commits"),
+        CallerOutcome::Committed(())
+    ));
+    drop(provider);
+
+    let material = generated_key_hex();
+    let events = scratch.path("keyed-secrets.jsonl");
+    let sink = FileSink::new(events.clone(), AuthorityEventFormat::QualifiedV1);
+    let stop = CancellationToken::new();
+    let crashing: Arc<dyn StandaloneEvidenceAuthority> = Arc::new(CrashingAdvance {
+        inner: connections,
+        crash: AtomicBool::new(true),
+    });
+    let mut crashed = 0;
+    for mut lane in lanes_for(&crashing, &material).await {
+        // Only the local-secret lane holds rows; its advance fails after the
+        // sink accepted them.
+        match lane.step(&sink, 100, &stop).await {
+            Err(StepError::Cursor(_)) => crashed += 1,
+            Ok(_) => {}
+            other => panic!("only the cursor advance fails: {other:?}"),
+        }
+    }
+    assert_eq!(
+        crashed, 1,
+        "the local-secret lane crashed before its cursor moved"
+    );
+    // The process dies here.
+    drop(crashing);
+    assert_eq!(
+        cursor(&path, StandaloneEvidenceSource::LocalSecretChange),
+        0
+    );
+
+    let restarted: Arc<dyn StandaloneEvidenceAuthority> =
+        Arc::new(SqliteConnectionStore::open(&path).expect("the Connections store reopens"));
+    for mut lane in lanes_for(&restarted, &material).await {
+        lane.deliver_until_caught_up(&sink, test_config(100), &stop)
+            .await
+            .expect("delivery succeeds");
+    }
+    assert_eq!(
+        cursor(&path, StandaloneEvidenceSource::LocalSecretChange),
+        3
+    );
+
+    let contents = std::fs::read_to_string(&events).expect("the event file reads");
+    let lines: Vec<&str> = contents.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), 6);
+    assert_eq!(
+        &lines[..3],
+        &lines[3..],
+        "recovery must redeliver byte-identical records"
+    );
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/schemas/authority_event.v1.schema.json"
+    ))
+    .expect("the schema parses");
+    let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
+    let delivered: Vec<serde_json::Value> = lines[..3]
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("every line is JSON"))
+        .collect();
+    for event in &delivered {
+        assert_eq!(event["schema_version"], "authority_event.v1", "{event}");
+        validator.validate(event).expect("a closed v1 event");
+    }
+    assert_eq!(
+        delivered
+            .iter()
+            .map(|event| event["operation"].as_str().expect("an operation"))
+            .collect::<Vec<_>>(),
+        ["secret.create", "secret.rotate", "secret.delete"]
+    );
+    for (event, key) in delivered.iter().zip([&create, &rotate, &delete]) {
+        assert_eq!(event["operation_id"], key.id().to_string(), "{event}");
+    }
+    for marker in [
+        ACTOR_MARKER,
+        ACTOR_ISSUER_MARKER,
+        VALUE_MARKER,
+        ROTATED_MARKER,
+        LABEL_MARKER,
+        created.id.as_str(),
+        create.binding_digest(),
+        rotate.binding_digest(),
+        delete.binding_digest(),
+    ] {
+        assert!(!contents.contains(marker), "{marker} reached the file");
+    }
+}
