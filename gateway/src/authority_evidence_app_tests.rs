@@ -1222,7 +1222,7 @@ async fn a_keyed_catalog_change_without_the_routes_permission_is_forbidden_and_r
 /// create is admitted only in its keyed form (issue #425), so an unkeyed one
 /// is refused before anything is written.
 #[tokio::test]
-async fn required_evidence_admits_standalone_connection_and_secret_changes() {
+async fn required_evidence_admits_standalone_withdrawals_and_refuses_unkeyed_creates() {
     let connection_db = TempDb::new("authority-evidence-connections");
     let policy = TempPolicyFile::new(&connection_policy_document_string());
     let (audit_log, capture) = captured_audit();
@@ -1328,31 +1328,19 @@ async fn required_evidence_admits_standalone_connection_and_secret_changes() {
         ))
         .await
         .expect("secret create should complete");
-    assert_eq!(secret.status(), StatusCode::CREATED);
+    // An unkeyed local-secret create is refused too (issue #425, plan P8).
+    assert_eq!(secret.status(), StatusCode::CONFLICT);
+    let refused = json_body(secret).await;
+    assert_eq!(refused["operation"], json!("secret.create"));
     let (secret_evidence, _) = standalone_change_evidence(
         &connection_db.path,
         "connection_local_secret_change_evidence",
     );
+    assert!(secret_evidence.is_empty());
     assert_eq!(
-        secret_evidence
-            .iter()
-            .map(|change| change.action.as_str())
-            .collect::<Vec<_>>(),
-        ["secret.create"]
-    );
-
-    // The audit writer delivers in order: once the secret's own event has
-    // arrived, a refusal of an admitted change before it would have too.
-    assert_eventually(Duration::from_secs(5), || {
-        capture
-            .events()
-            .iter()
-            .any(|event| event.event_type == audit::event::CONNECTION_SECRET_CHANGED)
-    });
-    assert_eq!(
-        refused_operations(&capture, 1),
-        ["connection.create"],
-        "only the unkeyed create was refused"
+        refused_operations(&capture, 2),
+        ["connection.create", "secret.create"],
+        "only the unkeyed creates were refused"
     );
 }
 
@@ -2865,6 +2853,10 @@ async fn a_keyed_catalog_change_on_a_connection_without_openapi_discovery_is_ref
     assert!(standalone_reservations(&connection_db.path).is_empty());
 }
 
+/// Keyed local-secret changes (issue #425, plan P8).
+#[path = "authority_evidence_secret_app_tests.rs"]
+mod local_secret_keys;
+
 #[cfg(feature = "postgres")]
 mod cluster_connection_keys {
     use super::*;
@@ -3588,6 +3580,120 @@ mod cluster_connection_keys {
             [(key.clone(), "catalog.openapi.publish".to_owned())]
         );
         assert_eq!(read_fence().await, raised, "the fence was raised once");
+    }
+
+    /// The local-secret item routes are mounted on a cluster replica, which
+    /// has no local-secret store and can never rotate or delete one (plan
+    /// P8). Once the operation gate would admit a key and raise the contract
+    /// fence, a keyed rotation and a keyed delete -- the latter a
+    /// withdrawal, which is never evidence-gated -- are still answered
+    /// exactly as their unkeyed forms (`412`, or `428` without `If-Match`),
+    /// leave the fence unchanged byte for byte and reserve nothing. A keyed
+    /// Connection create on the same replica then raises the fence, so the
+    /// gate was armed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_keyed_secret_changes_in_cluster_mode_leave_the_fence_alone() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database =
+            storage::contract_tests::postgres_audit_tests::create_test_database(&admin_dsn).await;
+        let foundation = test_pool(&database.dsn).await;
+        let pool = foundation.pool();
+        storage::migrations::apply_missing_for_startup(pool, &test_settings())
+            .await
+            .unwrap();
+        let (router, earlier) = keyed_replica(pool).await;
+        stale(pool, earlier).await;
+        let secrets = signed_token_with_issuer(
+            "secret-manager",
+            &["connections-secret-manager"],
+            CLUSTER_ISSUER,
+        );
+        let fence = storage::read_contract_fence(pool)
+            .await
+            .expect("the fence reads");
+        let route = format!("{CONNECTION_SECRETS_ADMIN_ROUTE}/never-stored");
+        let rotation = json!({"purpose": "static_bearer", "value": "never-stored-value"});
+        for (method, body) in [
+            (Method::PUT, Some(rotation.to_string())),
+            (Method::DELETE, None),
+        ] {
+            for (if_match, expected) in [
+                (
+                    Some("\"connection-secret:never-stored:v1\""),
+                    StatusCode::PRECONDITION_FAILED,
+                ),
+                (None, StatusCode::PRECONDITION_REQUIRED),
+            ] {
+                let (status, _, unkeyed) = call(
+                    &router,
+                    method.clone(),
+                    &route,
+                    &secrets,
+                    body.clone(),
+                    if_match,
+                    None,
+                )
+                .await;
+                let case = format!("{method} If-Match={if_match:?}");
+                assert_eq!(status, expected, "{case}: {unkeyed}");
+                let (status, _, keyed) = call(
+                    &router,
+                    method.clone(),
+                    &route,
+                    &secrets,
+                    body.clone(),
+                    if_match,
+                    Some(&caller_key(82)),
+                )
+                .await;
+                assert_eq!((status, &keyed), (expected, &unkeyed), "{case}");
+                assert_eq!(
+                    storage::read_contract_fence(pool)
+                        .await
+                        .expect("the fence reads"),
+                    fence,
+                    "{case}: a keyed local-secret change leaves the contract fence unchanged"
+                );
+            }
+        }
+        let reservations: i64 = pool
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT count(*) FROM greengateway.authority_caller_operation_ids",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(reservations, 0);
+
+        // The gate was armed: a keyed Connection create raises the fence.
+        let admin =
+            signed_token_with_issuer("operator", &["connections-superadmin"], CLUSTER_ISSUER);
+        let etag = collection_etag(&router, &admin).await;
+        let (status, _, created) = call(
+            &router,
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            &admin,
+            Some(disabled_connection("Fence witness")),
+            Some(&etag),
+            Some(&caller_key(83)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(
+            storage::read_contract_fence(pool)
+                .await
+                .expect("the fence reads")
+                .generation,
+            fence.generation + 1
+        );
     }
 }
 

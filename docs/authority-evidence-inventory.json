@@ -4157,12 +4157,12 @@
       "boundary": "LocalSecretProvider create/rotate/delete and reencrypt_master_key_batch refuse an actor the evidence cannot record exactly (ChangeActor::is_recordable), then each runs one IMMEDIATE transaction in the Connections SQLite database that changes the envelope(s) and appends one connection_local_secret_change_evidence row before it commits; an evidence insert failure rolls the change back (ChangeEvidenceFailure, 503 from the admin API). Control-plane preflights and runtime publication surround the store call; the CLI executes one bounded batch per invocation.",
       "record": "Current sealed record, version and timestamps; rotation replaces material and deletion removes it. connection_local_secret_change_evidence (Connections schema migration 12, no foreign key) keeps one append-only row per committed create, rotate, delete and non-empty re-encryption batch: actor (subject, kind, auth mode and, for a principal that has one, canonical issuer, with the same pairing CHECK as PostgreSQL migration 24 and every column required), action, event/operation UUIDs, the gateway-minted secret ID and its version before/after, or for a batch only how many envelopes it rewrote. Never the label, purpose, plaintext, ciphertext, nonce or key ID. Not found, purpose mismatch, dependency conflict and an empty batch write none.",
       "actor": "Admin endpoints pass the authenticated principal as a ChangeActor: subject (1 to 4096 bytes), actor_kind, actor_auth_mode and canonical actor_issuer. The connection-secrets reencrypt command records the fixed label operator:connection-secrets-reencrypt as a system actor (kind and auth mode system, no issuer), which is not a named human.",
-      "identity": "Generated event/operation UUIDs per store call, the local secret ID with its version axis (no successor on delete), or the batch count in the maintenance shape with no revision, store sequence and process-clock committed_at (a rotation's rotated_at). The secret ID is an internal identifier; a delivered event would need a keyed reference for it.",
+      "identity": "A keyed request (Idempotency-Key, issue #425) binds the caller-supplied UUIDv7 to the action, the recorded actor, the secret ID (empty for a create), the If-Match value as received and the canonical request, which is the label (create only) and the purpose, never the value (SecretChangeBinding::canonical_request). The IMMEDIATE transaction looks the key up in this database's authority_caller_operation_ids first, reserves it with the change and the evidence row, whose operation_id it is, and answers an exact retry with the receipt (secret ID, revision, committed_at). An unkeyed change generates its operation UUID. Every event has its own generated event UUID; the local secret ID with its version axis, store sequence and process-clock committed_at (a rotation's rotated_at). The secret ID is an internal identifier; the delivered event carries a keyed reference for it.",
       "delivery": "standalone_cursor_dispatch",
       "disposition": [
-        "missing_metadata"
+        "already_sufficient"
       ],
-      "follow_up": "Plan P8 of #425: a caller-bound operation identity for create and rotate. Delivered from this same database since Connections schema migration 14 (standalone_cursor_dispatch), with a keyed reference for the secret ID. import-standalone does not carry these rows. Issuer, actor kind and auth mode are recorded.",
+      "follow_up": "Qualified by plan P8 of #425: a keyed principal create or rotation is delivered as authority_event.v1 under the negotiated format from this same Connections database after its cursor (standalone_cursor_dispatch). Required mode admits only the keyed request of a provider-authenticated principal with a canonical issuer, under qualified_v1 with the file sink on a Unix build. import-standalone does not carry these rows.",
       "sources": [
         {
           "path": "gateway/src/connections/local_secret.rs",
@@ -4207,9 +4207,275 @@
           "anchor": "async fn connection_secret_admin_crud_is_safe_permissioned_and_preconditioned("
         }
       ],
-      "required_durability_supported": false,
-      "required_mode": "admitted",
-      "test_claim": "Standalone regression anchors for the transactional local-secret evidence in the Connections database: forced insert failure and rollback of each change, restart, refused changes and unrecordable actors, synthetic-marker exclusion, the CLI's system actor and the admin endpoints recording the authenticated principal. They do not certify the proposed authority-event contract or delivery."
+      "required_durability_supported": true,
+      "required_mode": "caller_key_required",
+      "test_claim": "Standalone regression anchors for the transactional local-secret evidence in the Connections database (forced insert failure and rollback, restart, refused changes and unrecordable actors, the admin endpoints recording the authenticated principal) and, through the qualified delivery paths, the keyed contract: exact retries answered from the receipt, a different value under the same key refused while the stored value stays, a replay after a later rotation answered with the superseded receipt, conflicts, rollback with the evidence or the reservation, stale ETags, racing writers, synthetic markers kept out of the digest, reservation, receipt, evidence, database file, audit, logs and metrics, and v1 delivery and redelivery through the file sink.",
+      "qualified_delivery_paths": [
+        {
+          "criteria": {
+            "operation": "secret.create",
+            "storage_mode": "standalone",
+            "method": "POST",
+            "route": "/v1{ADMIN_PREFIX}/connection-secrets",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed POST binds the caller's UUIDv7 to the action, the recorded actor, the empty secret ID, the secret collection If-Match ETag and the label and purpose; the secret value is never bound. The key is checked after authorization and validation, before If-Match is compared with the current ETag and before any network preflight. In one IMMEDIATE transaction the key is looked up, the ETag is checked, the key is reserved, and the change and its evidence row under the caller's key commit together; a failed evidence insert or reservation rolls all of it back. An exact retry is answered 200 with the receipt and changes nothing: while the secret is still at the revision the receipt names, the committed envelope is decrypted in memory and compared in constant time with the retried value, and another value is 409 and keeps the stored value; once the secret was rotated again or deleted, the receipt is returned and its revision shows it is no longer current. Nothing derived from the value is stored. Unkeyed requests and service-token callers are refused in required mode. The standalone dispatcher delivers it from the same Connections database under that file's own authority; the negotiated file sink syncs the qualified event and its parent directory on Unix before the cursor advances. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/connections/local_secret.rs",
+              "anchor": "pub(crate) fn create_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/local_secret.rs",
+              "anchor": "pub(crate) fn canonical_request("
+            },
+            {
+              "path": "gateway/src/connections/local_secret.rs",
+              "anchor": "fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/local_secret.rs",
+              "anchor": "fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/connections/local_secret.rs",
+              "anchor": "fn committed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/local_secret.rs",
+              "anchor": "fn constant_time_eq("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "async fn admit_keyed_secret_change("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery.rs",
+              "anchor": "pub(crate) fn project_standalone("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn local_secret_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_reused_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_key_reserved_by_another_action_cannot_take_effect_here("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_failed_evidence_insert_rolls_back_the_keyed_secret_change_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_failed_reservation_rolls_back_the_keyed_secret_change_and_is_counted("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_stale_etag_under_a_key_writes_no_change_evidence_or_reservation("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn two_writers_racing_one_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn two_keys_racing_one_revision_leave_only_the_winners_rows("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_reservation_receipt_evidence_and_file("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_tests.rs",
+              "anchor": "async fn a_keyed_secret_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn the_secret_value_never_enters_the_binding_digest("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_different_value_under_the_same_key_conflicts_and_keeps_the_stored_value("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_replay_after_a_later_rotation_returns_the_superseded_receipt("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_the_unkeyed_secret_create_and_rotate_and_admits_the_keyed_principal("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_a_keyed_secret_change_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "async fn a_replayed_secret_change_repeats_no_side_effect("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "async fn a_keyed_secret_change_that_is_forbidden_or_malformed_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "async fn an_admitted_secret_change_finishes_after_its_client_goes_away("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics("
+            }
+          ]
+        },
+        {
+          "criteria": {
+            "operation": "secret.rotate",
+            "storage_mode": "standalone",
+            "method": "PUT",
+            "route": "/v1{ADMIN_PREFIX}/connection-secrets/{id}",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed PUT binds the caller's UUIDv7 to the action, the recorded actor, the secret ID, the item If-Match ETag and the purpose; the secret value is never bound. The key is checked after authorization and validation, before If-Match is compared with the current ETag and before any network preflight. In one IMMEDIATE transaction the key is looked up, the ETag is checked, the key is reserved, and the change and its evidence row under the caller's key commit together; a failed evidence insert or reservation rolls all of it back. An exact retry is answered 200 with the receipt and changes nothing: while the secret is still at the revision the receipt names, the committed envelope is decrypted in memory and compared in constant time with the retried value, and another value is 409 and keeps the stored value; once the secret was rotated again or deleted, the receipt is returned and its revision shows it is no longer current. Nothing derived from the value is stored. Unkeyed requests and service-token callers are refused in required mode. The standalone dispatcher delivers it from the same Connections database under that file's own authority; the negotiated file sink syncs the qualified event and its parent directory on Unix before the cursor advances. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/connections/local_secret.rs",
+              "anchor": "pub(crate) fn rotate_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/local_secret.rs",
+              "anchor": "pub(crate) fn canonical_request("
+            },
+            {
+              "path": "gateway/src/connections/local_secret.rs",
+              "anchor": "fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/local_secret.rs",
+              "anchor": "fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/connections/local_secret.rs",
+              "anchor": "fn committed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/local_secret.rs",
+              "anchor": "fn constant_time_eq("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "async fn admit_keyed_secret_change("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery.rs",
+              "anchor": "pub(crate) fn project_standalone("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn local_secret_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_reused_key_with_a_different_binding_conflicts_and_changes_nothing("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_key_reserved_by_another_action_cannot_take_effect_here("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_failed_evidence_insert_rolls_back_the_keyed_secret_change_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_failed_reservation_rolls_back_the_keyed_secret_change_and_is_counted("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_stale_etag_under_a_key_writes_no_change_evidence_or_reservation("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn two_writers_racing_one_key_commit_one_change("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn two_keys_racing_one_revision_leave_only_the_winners_rows("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_reservation_receipt_evidence_and_file("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_tests.rs",
+              "anchor": "async fn a_keyed_secret_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn the_secret_value_never_enters_the_binding_digest("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_different_value_under_the_same_key_conflicts_and_keeps_the_stored_value("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_replay_after_a_later_rotation_returns_the_superseded_receipt("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_the_unkeyed_secret_create_and_rotate_and_admits_the_keyed_principal("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "async fn required_mode_refuses_a_keyed_secret_change_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "async fn a_replayed_secret_change_repeats_no_side_effect("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "async fn a_keyed_secret_change_that_is_forbidden_or_malformed_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "async fn an_admitted_secret_change_finishes_after_its_client_goes_away("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics("
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "local_secret_delete",
@@ -4228,12 +4494,12 @@
       "boundary": "LocalSecretProvider create/rotate/delete and reencrypt_master_key_batch refuse an actor the evidence cannot record exactly (ChangeActor::is_recordable), then each runs one IMMEDIATE transaction in the Connections SQLite database that changes the envelope(s) and appends one connection_local_secret_change_evidence row before it commits; an evidence insert failure rolls the change back (ChangeEvidenceFailure, 503 from the admin API). Control-plane preflights and runtime publication surround the store call; the CLI executes one bounded batch per invocation.",
       "record": "Current sealed record, version and timestamps; rotation replaces material and deletion removes it. connection_local_secret_change_evidence (Connections schema migration 12, no foreign key) keeps one append-only row per committed create, rotate, delete and non-empty re-encryption batch: actor (subject, kind, auth mode and, for a principal that has one, canonical issuer, with the same pairing CHECK as PostgreSQL migration 24 and every column required), action, event/operation UUIDs, the gateway-minted secret ID and its version before/after, or for a batch only how many envelopes it rewrote. Never the label, purpose, plaintext, ciphertext, nonce or key ID. Not found, purpose mismatch, dependency conflict and an empty batch write none.",
       "actor": "Admin endpoints pass the authenticated principal as a ChangeActor: subject (1 to 4096 bytes), actor_kind, actor_auth_mode and canonical actor_issuer. The connection-secrets reencrypt command records the fixed label operator:connection-secrets-reencrypt as a system actor (kind and auth mode system, no issuer), which is not a named human.",
-      "identity": "Generated event/operation UUIDs per store call, the local secret ID with its version axis (no successor on delete), or the batch count in the maintenance shape with no revision, store sequence and process-clock committed_at (a rotation's rotated_at). The secret ID is an internal identifier; a delivered event would need a keyed reference for it.",
+      "identity": "With an Idempotency-Key (issue #425) the caller's UUIDv7 is the deletion's operation_id, bound to the action, the recorded actor, the secret ID and the If-Match value and reserved with the evidence row in the deleting IMMEDIATE transaction; an exact retry is answered from the evidence row, which outlives the record, and a key bound to anything else is 409. Without one, event/operation UUIDs are generated. The local secret ID with its version axis (no successor on delete), store sequence and process-clock committed_at. The secret ID is an internal identifier; the delivered event carries a keyed reference for it.",
       "delivery": "standalone_cursor_dispatch",
       "disposition": [
-        "missing_metadata"
+        "withdrawal_admitted"
       ],
-      "follow_up": "A withdrawal (owner ruling 4 on #425, 2026-11-20): required mode admits every form, because refusing an unkeyed or service-token deletion would fail open. Plan P8 of #425 adds the keyed principal form's reviewed qualified path, and this row then becomes withdrawal_admitted. Delivered from this same database since Connections schema migration 14 (standalone_cursor_dispatch), with a keyed reference for the secret ID. import-standalone does not carry these rows.",
+      "follow_up": "A withdrawal admitted in every form in required mode (owner ruling 4 on #425, 2026-11-20): refusing the unkeyed DELETE the admin UI sends, or a service-token caller's delete, would leave a secret's authority in place, so both stay admitted; they commit their evidence atomically and are delivered at least once as authority_event_delivery.v1, and are not caller-keyed. Only the keyed principal form has the reviewed qualified path below (plan P8 of #425). import-standalone does not carry these rows.",
       "sources": [
         {
           "path": "gateway/src/connections/store.rs",
@@ -4276,7 +4542,97 @@
       ],
       "required_durability_supported": false,
       "required_mode": "admitted",
-      "test_claim": "Standalone regression anchors for the transactional local-secret evidence in the Connections database: forced insert failure and rollback of each change, restart, refused changes and unrecordable actors, synthetic-marker exclusion, the CLI's system actor and the admin endpoints recording the authenticated principal. They do not certify the proposed authority-event contract or delivery."
+      "test_claim": "Standalone regression anchors for the transactional local-secret evidence in the Connections database: forced insert failure and rollback of each change, restart, refused changes and unrecordable actors, the admin endpoints recording the authenticated principal. They do not certify the proposed authority-event contract or delivery. The qualified delivery path below lists the tests that certify the keyed principal form; the unkeyed and service-token forms are not certified.",
+      "qualified_delivery_paths": [
+        {
+          "criteria": {
+            "operation": "secret.delete",
+            "storage_mode": "standalone",
+            "method": "DELETE",
+            "route": "/v1{ADMIN_PREFIX}/connection-secrets/{id}",
+            "operation_id_version": 7,
+            "actor_kind": "principal",
+            "issuer": "canonical_provider",
+            "format": "qualified_v1",
+            "durable_sink": "file",
+            "filesystem": "unix_file_and_directory_sync",
+            "wire_schema": "authority_event.v1"
+          },
+          "guarantee": "The keyed DELETE binds the caller's UUIDv7 to the action, the recorded actor, the secret ID and the If-Match ETag. The key is checked after authorization and validation and before If-Match is compared with the current ETag. In one IMMEDIATE transaction the key is looked up, the ETag is checked, the key is reserved, and the deletion and its evidence row under the caller's key commit together; the evidence outlives the record, so an exact retry after the record is gone is answered 200 with the receipt and changes nothing. Unkeyed requests and service-token callers stay admitted (withdrawal_admitted) and do not qualify for this path. The standalone dispatcher delivers it from the same Connections database under that file's own authority; the negotiated file sink syncs the qualified event and its parent directory on Unix before the cursor advances. Consumers deduplicate on (authority_id, event_id).",
+          "sources": [
+            {
+              "path": "gateway/src/connections/local_secret.rs",
+              "anchor": "pub(crate) fn delete_with_operation("
+            },
+            {
+              "path": "gateway/src/connections/local_secret.rs",
+              "anchor": "fn keyed_receipt("
+            },
+            {
+              "path": "gateway/src/connections/local_secret.rs",
+              "anchor": "fn reserve_caller_key("
+            },
+            {
+              "path": "gateway/src/admin_connections.rs",
+              "anchor": "async fn admit_keyed_secret_change("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_delivery.rs",
+              "anchor": "pub(crate) fn project_standalone("
+            },
+            {
+              "path": "gateway/src/authority_events/sink.rs",
+              "anchor": "fn sync_file_directories("
+            }
+          ],
+          "tests": [
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn local_secret_caller_operation_contract("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_key_reserved_by_another_action_cannot_take_effect_here("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_failed_evidence_insert_rolls_back_the_keyed_secret_change_and_its_reservation("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_stale_etag_under_a_key_writes_no_change_evidence_or_reservation("
+            },
+            {
+              "path": "gateway/src/connections/local_secret_operation_tests.rs",
+              "anchor": "fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_reservation_receipt_evidence_and_file("
+            },
+            {
+              "path": "gateway/src/authority_events/standalone_tests.rs",
+              "anchor": "async fn a_keyed_secret_change_is_redelivered_identically_after_a_crash_before_the_cursor_commit("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "async fn required_mode_admits_every_form_of_secret_delete("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "async fn a_replayed_secret_change_repeats_no_side_effect("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "async fn a_keyed_secret_change_that_is_forbidden_or_malformed_reserves_nothing("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "async fn an_admitted_secret_change_finishes_after_its_client_goes_away("
+            },
+            {
+              "path": "gateway/src/authority_evidence_secret_app_tests.rs",
+              "anchor": "fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics("
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "local_secret_reencrypt",

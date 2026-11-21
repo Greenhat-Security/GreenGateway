@@ -22,7 +22,13 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::auth::change_actor::ChangeActor;
+use crate::{
+    auth::change_actor::ChangeActor,
+    authority_events::caller_operation::{
+        BindingRefusal, CallerKeyReservation, CallerKeyState, CallerOperation,
+        CallerOperationBinding, CallerOutcome, OperationReceipt,
+    },
+};
 
 use super::{
     model::{MAX_CREDENTIALS, MAX_DISPLAY_NAME_CHARS, MAX_SECRET_ID_BYTES},
@@ -222,6 +228,18 @@ pub enum LocalSecretError {
     /// `connection_local_secret_change_evidence`) could not be written, so
     /// the change was rolled back with it.
     ChangeEvidenceFailure,
+    /// The caller key (issue #425) is reserved for another action or another
+    /// binding, or an exact retry of a create or rotation carries another
+    /// value than the one it committed, which is still current. Nothing
+    /// changed.
+    CallerOperationConflict,
+    /// The caller key's reservation could not be read or written, or names
+    /// a change without its evidence row. Nothing changed.
+    CallerOperationUnavailable,
+    /// The request's precondition no longer holds for the stored state: the
+    /// `If-Match` it carried is stale. Nothing changed and nothing was
+    /// reserved.
+    PreconditionFailed,
 }
 
 impl fmt::Display for LocalSecretError {
@@ -262,6 +280,15 @@ impl fmt::Display for LocalSecretError {
             Self::ChangeEvidenceFailure => {
                 formatter.write_str("local secret change evidence could not be recorded")
             }
+            Self::CallerOperationConflict => {
+                formatter.write_str("the caller operation key is bound to another request")
+            }
+            Self::CallerOperationUnavailable => {
+                formatter.write_str("the caller operation key could not be judged or reserved")
+            }
+            Self::PreconditionFailed => {
+                formatter.write_str("the local secret precondition no longer holds")
+            }
         }
     }
 }
@@ -299,6 +326,42 @@ pub trait LocalSecretManager: Send + Sync {
         actor: &ChangeActor,
     ) -> Result<SecretAliasMetadata, LocalSecretError>;
     fn delete(&self, id: &str, actor: &ChangeActor) -> Result<(), LocalSecretError>;
+    /// Create under an optional caller key (issue #425), as
+    /// [`LocalSecretProvider::create_with_operation`] describes.
+    fn create_with_operation(
+        &self,
+        label: &str,
+        secret: ResolvedSecret,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+        collection_unchanged: CollectionPrecondition<'_>,
+    ) -> Result<CallerOutcome<SecretAliasMetadata>, LocalSecretError>;
+    /// Rotate under an optional caller key, as
+    /// [`LocalSecretProvider::rotate_with_operation`] describes.
+    fn rotate_with_operation(
+        &self,
+        id: &str,
+        replacement: ResolvedSecret,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+        expected: ItemPrecondition<'_>,
+    ) -> Result<CallerOutcome<SecretAliasMetadata>, LocalSecretError>;
+    /// Delete under an optional caller key, as
+    /// [`LocalSecretProvider::delete_with_operation`] describes.
+    fn delete_with_operation(
+        &self,
+        id: &str,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+        expected: ItemPrecondition<'_>,
+    ) -> Result<CallerOutcome<()>, LocalSecretError>;
+    /// The read-only pre-check of a keyed change: what the reservation table
+    /// says about `caller`'s key. Advisory; the change's own transaction
+    /// judges the key again.
+    fn caller_operation_state(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<CallerKeyState, LocalSecretError>;
     fn metadata(&self) -> Vec<SecretAliasMetadata>;
     /// A batch that finds nothing to re-encrypt changes nothing and records
     /// nothing.
@@ -372,7 +435,30 @@ impl LocalSecretProvider {
         secret: ResolvedSecret,
         actor: &ChangeActor,
     ) -> Result<SecretAliasMetadata, LocalSecretError> {
+        committed_change(self.create_with_operation(label, secret, actor, None, &|| true))
+    }
+
+    /// Create on behalf of `actor` under an optional caller key (issue
+    /// #425), in one IMMEDIATE transaction and in the order of work every
+    /// keyed operation follows: the key's reservation is judged first, and
+    /// an exact retry is answered with the receipt of the committed create
+    /// once its value is compared with the committed one
+    /// ([`Self::committed_receipt`]); then `collection_unchanged` decides the
+    /// request's precondition; then the key is reserved, the envelope
+    /// written and the evidence recorded with the key as its operation ID.
+    /// A key bound to anything else is
+    /// [`LocalSecretError::CallerOperationConflict`]. Without a key the
+    /// create behaves as it always did and mints its own operation ID.
+    pub(crate) fn create_with_operation(
+        &self,
+        label: &str,
+        secret: ResolvedSecret,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+        collection_unchanged: CollectionPrecondition<'_>,
+    ) -> Result<CallerOutcome<SecretAliasMetadata>, LocalSecretError> {
         validate_change_actor(actor)?;
+        ensure_caller_action(caller, EVIDENCE_ACTION_CREATE)?;
         validate_label(label)?;
         let purpose = secret.purpose();
         if !purpose.is_locally_storable() {
@@ -383,6 +469,14 @@ impl LocalSecretProvider {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| LocalSecretError::StorageFailure)?;
+        if let Some(receipt) = self.keyed_receipt(&transaction, caller, Some(&secret))? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
+        // A stale precondition ends the request here; dropping the
+        // transaction rolls it back, and nothing was reserved.
+        if !collection_unchanged() {
+            return Err(LocalSecretError::PreconditionFailed);
+        }
         let count: i64 = transaction
             .query_row("SELECT COUNT(*) FROM connection_local_secrets", [], |row| {
                 row.get(0)
@@ -397,6 +491,9 @@ impl LocalSecretProvider {
         let id = self.generate_available_id(&transaction)?;
         let version = 1u64;
         let (nonce, ciphertext) = self.encrypt(&id, version, purpose, secret.expose())?;
+        if let Some(receipt) = self.reserve_caller_key(&transaction, caller, Some(&secret))? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         transaction
             .execute(
                 r#"
@@ -422,6 +519,7 @@ impl LocalSecretProvider {
         record_change_evidence(
             &transaction,
             &SecretChangeEvidence {
+                operation_id: &operation_id_for(caller),
                 action: EVIDENCE_ACTION_CREATE,
                 secret_id: Some(&id),
                 prior_version: None,
@@ -448,7 +546,7 @@ impl LocalSecretProvider {
         let mut all_metadata = self.metadata_write();
         all_metadata.push(metadata.clone());
         all_metadata.sort_by(|left, right| left.id.cmp(&right.id));
-        Ok(metadata)
+        Ok(CallerOutcome::Committed(metadata))
     }
 
     pub fn rotate(
@@ -457,7 +555,25 @@ impl LocalSecretProvider {
         replacement: ResolvedSecret,
         actor: &ChangeActor,
     ) -> Result<SecretAliasMetadata, LocalSecretError> {
+        committed_change(self.rotate_with_operation(id, replacement, actor, None, &|_| true))
+    }
+
+    /// Rotate under an optional caller key, in the order
+    /// [`Self::create_with_operation`] follows: the key first, so that a
+    /// committed keyed retry gets its receipt even after another writer
+    /// moved the secret on; then `expected` judges the stored secret's ETag
+    /// (a stale one is [`LocalSecretError::PreconditionFailed`]); then the
+    /// reservation, the new envelope and the evidence.
+    pub(crate) fn rotate_with_operation(
+        &self,
+        id: &str,
+        replacement: ResolvedSecret,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+        expected: ItemPrecondition<'_>,
+    ) -> Result<CallerOutcome<SecretAliasMetadata>, LocalSecretError> {
         validate_change_actor(actor)?;
+        ensure_caller_action(caller, EVIDENCE_ACTION_ROTATE)?;
         if !is_valid_local_secret_id(id) {
             return Err(LocalSecretError::NotFound);
         }
@@ -465,8 +581,14 @@ impl LocalSecretProvider {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| LocalSecretError::StorageFailure)?;
+        if let Some(receipt) = self.keyed_receipt(&transaction, caller, Some(&replacement))? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         let current = query_record(&transaction, id)?.ok_or(LocalSecretError::NotFound)?;
         current.validate()?;
+        if !expected(&item_etag(&current.id, current.version)) {
+            return Err(LocalSecretError::PreconditionFailed);
+        }
         if current.purpose != replacement.purpose() {
             return Err(LocalSecretError::InvalidSecret);
         }
@@ -482,6 +604,9 @@ impl LocalSecretProvider {
             replacement.expose(),
         )?;
         let now = utc_timestamp()?;
+        if let Some(receipt) = self.reserve_caller_key(&transaction, caller, Some(&replacement))? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         let changed = transaction
             .execute(
                 r#"
@@ -508,6 +633,7 @@ impl LocalSecretProvider {
         record_change_evidence(
             &transaction,
             &SecretChangeEvidence {
+                operation_id: &operation_id_for(caller),
                 action: EVIDENCE_ACTION_ROTATE,
                 secret_id: Some(&current.id),
                 prior_version: Some(current.version),
@@ -532,11 +658,26 @@ impl LocalSecretProvider {
             rotated_at: Some(now),
         };
         self.upsert_metadata(metadata.clone());
-        Ok(metadata)
+        Ok(CallerOutcome::Committed(metadata))
     }
 
     pub fn delete(&self, id: &str, actor: &ChangeActor) -> Result<(), LocalSecretError> {
+        committed_change(self.delete_with_operation(id, actor, None, &|_| true))
+    }
+
+    /// Delete under an optional caller key, in the order
+    /// [`Self::rotate_with_operation`] follows. A delete is a withdrawal: it
+    /// has no value to compare on a retry, so an exact retry is answered
+    /// with its receipt, which names the revision the secret had.
+    pub(crate) fn delete_with_operation(
+        &self,
+        id: &str,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+        expected: ItemPrecondition<'_>,
+    ) -> Result<CallerOutcome<()>, LocalSecretError> {
         validate_change_actor(actor)?;
+        ensure_caller_action(caller, EVIDENCE_ACTION_DELETE)?;
         if !is_valid_local_secret_id(id) {
             return Err(LocalSecretError::NotFound);
         }
@@ -545,6 +686,9 @@ impl LocalSecretProvider {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| LocalSecretError::StorageFailure)?;
+        if let Some(receipt) = self.keyed_receipt(&transaction, caller, None)? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         let Some(prior_version) = transaction
             .query_row(
                 "SELECT secret_version FROM connection_local_secrets WHERE id = ?1",
@@ -558,6 +702,9 @@ impl LocalSecretProvider {
         };
         let prior_version =
             u64::try_from(prior_version).map_err(|_| LocalSecretError::CorruptRecord)?;
+        if !expected(&item_etag(id, prior_version)) {
+            return Err(LocalSecretError::PreconditionFailed);
+        }
         let mut statement = transaction
             .prepare(
                 r#"
@@ -580,6 +727,9 @@ impl LocalSecretProvider {
                 connection_ids,
             });
         }
+        if let Some(receipt) = self.reserve_caller_key(&transaction, caller, None)? {
+            return Ok(CallerOutcome::Replayed(receipt));
+        }
         let changed = transaction
             .execute(
                 "DELETE FROM connection_local_secrets WHERE id = ?1",
@@ -594,6 +744,7 @@ impl LocalSecretProvider {
         record_change_evidence(
             &transaction,
             &SecretChangeEvidence {
+                operation_id: &operation_id_for(caller),
                 action: EVIDENCE_ACTION_DELETE,
                 secret_id: Some(id),
                 prior_version: Some(prior_version),
@@ -607,7 +758,121 @@ impl LocalSecretProvider {
             .commit()
             .map_err(|_| LocalSecretError::StorageFailure)?;
         self.metadata_write().retain(|metadata| metadata.id != id);
-        Ok(())
+        Ok(CallerOutcome::Committed(()))
+    }
+
+    /// What this database's reservation table says about `caller`'s key:
+    /// the read-only pre-check a handler asks before any external work.
+    pub(crate) fn caller_operation_state(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<CallerKeyState, LocalSecretError> {
+        if !is_local_secret_action(caller.action()) {
+            return Err(LocalSecretError::CallerOperationConflict);
+        }
+        let connection = self.connection_guard();
+        crate::storage::standalone_authority_events::read_caller_operation(&connection, caller)
+            .map_err(|_| LocalSecretError::CallerOperationUnavailable)
+    }
+
+    /// Step 1 of a keyed change, inside its IMMEDIATE transaction: the key's
+    /// reservation judged against this request. `None` for no key or an
+    /// unused one; the receipt for an exact retry of a committed change; a
+    /// conflict for a key reserved for anything else.
+    fn keyed_receipt(
+        &self,
+        connection: &Connection,
+        caller: Option<&CallerOperation>,
+        retried: Option<&ResolvedSecret>,
+    ) -> Result<Option<OperationReceipt>, LocalSecretError> {
+        let Some(caller) = caller else {
+            return Ok(None);
+        };
+        let state =
+            crate::storage::standalone_authority_events::read_caller_operation(connection, caller)
+                .map_err(|_| LocalSecretError::CallerOperationUnavailable)?;
+        match state {
+            CallerKeyState::Unused => Ok(None),
+            CallerKeyState::OtherBinding => Err(LocalSecretError::CallerOperationConflict),
+            CallerKeyState::SameBinding => self
+                .committed_receipt(connection, caller, retried)
+                .map(Some),
+        }
+    }
+
+    /// Step 3 of a keyed change: reserve the key with its binding digest in
+    /// the change's transaction, which commits or rolls back with the change
+    /// and its evidence. A reservation that cannot be written rolls the
+    /// change back like a failed evidence insert and is counted with them
+    /// (I2).
+    fn reserve_caller_key(
+        &self,
+        connection: &Connection,
+        caller: Option<&CallerOperation>,
+        retried: Option<&ResolvedSecret>,
+    ) -> Result<Option<OperationReceipt>, LocalSecretError> {
+        let Some(caller) = caller else {
+            return Ok(None);
+        };
+        let reservation = crate::storage::standalone_authority_events::reserve_bound_operation(
+            connection, caller,
+        )
+        .map_err(|_| {
+            crate::storage::record_standalone_evidence_failure(
+                crate::storage::StandaloneEvidenceStore::Connections,
+            );
+            LocalSecretError::CallerOperationUnavailable
+        })?;
+        match reservation {
+            CallerKeyReservation::Reserved => Ok(None),
+            CallerKeyReservation::OtherBinding => Err(LocalSecretError::CallerOperationConflict),
+            CallerKeyReservation::SameBinding => self
+                .committed_receipt(connection, caller, retried)
+                .map(Some),
+        }
+    }
+
+    /// The receipt of an exact retry, read from its evidence row. A create or
+    /// rotation retry carries a value, which the binding does not cover:
+    /// while the secret is still at the revision the receipt names, the
+    /// committed envelope is decrypted in memory and compared in constant
+    /// time with the retried value, and another value is a conflict. Once
+    /// the secret was rotated again or deleted, the committed value no
+    /// longer exists and the receipt is returned as it is; its revision
+    /// shows that it is no longer current. Nothing derived from either value
+    /// is stored.
+    fn committed_receipt(
+        &self,
+        connection: &Connection,
+        caller: &CallerOperation,
+        retried: Option<&ResolvedSecret>,
+    ) -> Result<OperationReceipt, LocalSecretError> {
+        let receipt = local_secret_operation_receipt(connection, caller)
+            .map_err(|_| LocalSecretError::StorageFailure)?
+            .ok_or_else(|| {
+                tracing::error!(
+                    "a caller operation is reserved without its local-secret evidence row; \
+                     the change is refused"
+                );
+                LocalSecretError::CallerOperationUnavailable
+            })?;
+        let Some(retried) = retried else {
+            return Ok(receipt);
+        };
+        let Some(record) = query_record(connection, &receipt.resource_id)? else {
+            return Ok(receipt);
+        };
+        if receipt.revision.is_none() || i64::try_from(record.version).ok() != receipt.revision {
+            return Ok(receipt);
+        }
+        let committed = self.decrypt_record(&record)?;
+        if committed.purpose() == retried.purpose()
+            && constant_time_eq(committed.expose(), retried.expose())
+        {
+            Ok(receipt)
+        } else {
+            Err(LocalSecretError::CallerOperationConflict)
+        }
     }
 
     pub fn metadata(&self) -> Vec<SecretAliasMetadata> {
@@ -702,6 +967,7 @@ impl LocalSecretProvider {
             record_change_evidence(
                 &transaction,
                 &SecretChangeEvidence {
+                    operation_id: &operation_id_for(None),
                     action: EVIDENCE_ACTION_REENCRYPT,
                     secret_id: None,
                     prior_version: None,
@@ -982,6 +1248,52 @@ impl LocalSecretManager for LocalSecretProvider {
         LocalSecretProvider::delete(self, id, actor)
     }
 
+    fn create_with_operation(
+        &self,
+        label: &str,
+        secret: ResolvedSecret,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+        collection_unchanged: CollectionPrecondition<'_>,
+    ) -> Result<CallerOutcome<SecretAliasMetadata>, LocalSecretError> {
+        LocalSecretProvider::create_with_operation(
+            self,
+            label,
+            secret,
+            actor,
+            caller,
+            collection_unchanged,
+        )
+    }
+
+    fn rotate_with_operation(
+        &self,
+        id: &str,
+        replacement: ResolvedSecret,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+        expected: ItemPrecondition<'_>,
+    ) -> Result<CallerOutcome<SecretAliasMetadata>, LocalSecretError> {
+        LocalSecretProvider::rotate_with_operation(self, id, replacement, actor, caller, expected)
+    }
+
+    fn delete_with_operation(
+        &self,
+        id: &str,
+        actor: &ChangeActor,
+        caller: Option<&CallerOperation>,
+        expected: ItemPrecondition<'_>,
+    ) -> Result<CallerOutcome<()>, LocalSecretError> {
+        LocalSecretProvider::delete_with_operation(self, id, actor, caller, expected)
+    }
+
+    fn caller_operation_state(
+        &self,
+        caller: &CallerOperation,
+    ) -> Result<CallerKeyState, LocalSecretError> {
+        LocalSecretProvider::caller_operation_state(self, caller)
+    }
+
     fn metadata(&self) -> Vec<SecretAliasMetadata> {
         LocalSecretProvider::metadata(self)
     }
@@ -1002,9 +1314,9 @@ impl LocalSecretManager for LocalSecretProvider {
 /// The closed action vocabulary of `connection_local_secret_change_evidence`
 /// (the Connections store's migration 12). Values are the proposed
 /// authority-event operation codes; the table's CHECK refuses anything else.
-const EVIDENCE_ACTION_CREATE: &str = "secret.create";
-const EVIDENCE_ACTION_ROTATE: &str = "secret.rotate";
-const EVIDENCE_ACTION_DELETE: &str = "secret.delete";
+pub(crate) const EVIDENCE_ACTION_CREATE: &str = "secret.create";
+pub(crate) const EVIDENCE_ACTION_ROTATE: &str = "secret.rotate";
+pub(crate) const EVIDENCE_ACTION_DELETE: &str = "secret.delete";
 const EVIDENCE_ACTION_REENCRYPT: &str = "secret.reencrypt";
 
 fn validate_change_actor(actor: &ChangeActor) -> Result<(), LocalSecretError> {
@@ -1015,10 +1327,171 @@ fn validate_change_actor(actor: &ChangeActor) -> Result<(), LocalSecretError> {
     }
 }
 
+/// A create's precondition, decided inside the change's transaction after
+/// the caller key is judged: whether the connection-secret collection the
+/// request's `If-Match` named is still current. The collection ETag covers
+/// every alias, not only the ones this store holds, so the caller decides.
+pub(crate) type CollectionPrecondition<'a> = &'a dyn Fn() -> bool;
+
+/// A rotation's or delete's precondition, decided inside the change's
+/// transaction after the caller key is judged: whether the request's
+/// `If-Match` admits the stored secret's current ETag, which it is given.
+pub(crate) type ItemPrecondition<'a> = &'a dyn Fn(&str) -> bool;
+
+/// The value of an unkeyed store call, which can never be a replay.
+pub(crate) fn committed_change<T>(
+    outcome: Result<CallerOutcome<T>, LocalSecretError>,
+) -> Result<T, LocalSecretError> {
+    match outcome? {
+        CallerOutcome::Committed(value) => Ok(value),
+        // Only a caller key is ever answered from a receipt.
+        CallerOutcome::Replayed(_) => Err(LocalSecretError::StorageFailure),
+    }
+}
+
+/// A caller key bound to another action than the store call it was passed
+/// to is a handler defect: refused before anything is read or written.
+fn ensure_caller_action(
+    caller: Option<&CallerOperation>,
+    action: &'static str,
+) -> Result<(), LocalSecretError> {
+    match caller {
+        Some(caller) if caller.action() != action => {
+            tracing::error!(
+                bound = caller.action(),
+                action,
+                "a local-secret change was passed a caller key bound to another action; it is refused"
+            );
+            Err(LocalSecretError::CallerOperationConflict)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The operation ID a change records: the caller's key, or one minted once
+/// for an unkeyed call.
+fn operation_id_for(caller: Option<&CallerOperation>) -> String {
+    caller
+        .map_or_else(Uuid::new_v4, CallerOperation::id)
+        .to_string()
+}
+
+/// The ETag the admin API gives the secret `id` at `version`.
+fn item_etag(id: &str, version: u64) -> String {
+    super::admin::secret_item_etag(id, version)
+}
+
+/// Whether two values are equal, in time that depends only on their
+/// lengths.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let difference = left
+        .iter()
+        .zip(right)
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right));
+    std::hint::black_box(difference) == 0
+}
+
+/// Whether `action` is one of the local-secret changes a caller key can be
+/// bound to. `secret.reencrypt` is not: it has no caller key.
+pub(crate) fn is_local_secret_action(action: &str) -> bool {
+    matches!(
+        action,
+        EVIDENCE_ACTION_CREATE | EVIDENCE_ACTION_ROTATE | EVIDENCE_ACTION_DELETE
+    )
+}
+
+/// The receipt of the local-secret change `caller`'s key committed: its
+/// `connection_local_secret_change_evidence` row for the key's action,
+/// naming the secret and its revision after the change (before it, for a
+/// delete), never anything from the request.
+pub(crate) fn local_secret_operation_receipt(
+    connection: &Connection,
+    caller: &CallerOperation,
+) -> rusqlite::Result<Option<OperationReceipt>> {
+    connection
+        .query_row(
+            "SELECT secret_id, prior_version, new_version, committed_at \
+             FROM connection_local_secret_change_evidence \
+             WHERE operation_id = ?1 AND action = ?2",
+            params![caller.id().to_string(), caller.action()],
+            |row| {
+                let secret_id: Option<String> = row.get(0)?;
+                let prior: Option<i64> = row.get(1)?;
+                let new: Option<i64> = row.get(2)?;
+                Ok(OperationReceipt {
+                    operation_id: caller.id().to_string(),
+                    operation: caller.action().to_owned(),
+                    resource_id: secret_id.unwrap_or_default(),
+                    revision: new.or(prior),
+                    committed_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+}
+
+/// What a keyed local-secret change binds its key to (issue #425, plan P8):
+/// the action, the actor, the secret identifier (empty for a create), the
+/// `If-Match` value as received, and the label and purpose the request
+/// names. It has no field for the secret value, which never enters the
+/// digest: a retry with another value is told apart by comparing it with
+/// the committed envelope in memory
+/// ([`LocalSecretProvider::create_with_operation`]).
+pub(crate) struct SecretChangeBinding<'a> {
+    pub(crate) action: &'static str,
+    pub(crate) actor: &'a ChangeActor,
+    pub(crate) secret_id: &'a str,
+    pub(crate) if_match: &'a str,
+    /// The label a create names; `None` for a rotation or a delete.
+    pub(crate) label: Option<&'a str>,
+    /// The purpose a create or rotation names; `None` for a delete.
+    pub(crate) purpose: Option<SecretPurpose>,
+}
+
+impl SecretChangeBinding<'_> {
+    /// The canonical request this binding's key is bound to: the label and
+    /// the purpose, each as a presence byte, its length (eight bytes, big
+    /// endian) and its bytes. The admin handlers pass it to the shared
+    /// header binding (`admin_responses::caller_operation`) with the same
+    /// action, actor, target and `If-Match`, so a key they bind is the key
+    /// [`Self::bind`] binds.
+    pub(crate) fn canonical_request(&self) -> Vec<u8> {
+        let mut request = Vec::new();
+        for field in [self.label, self.purpose.map(purpose_as_str)] {
+            let field = field.map(str::as_bytes);
+            request.push(u8::from(field.is_some()));
+            let bytes = field.unwrap_or_default();
+            request.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+            request.extend_from_slice(bytes);
+        }
+        request
+    }
+
+    /// Bind `key` to this request ([`Self::canonical_request`]).
+    pub(crate) fn bind(&self, key: Uuid) -> Result<CallerOperation, BindingRefusal> {
+        CallerOperation::bind(
+            key,
+            &CallerOperationBinding {
+                action: self.action,
+                actor: self.actor,
+                target: self.secret_id,
+                precondition: self.if_match,
+                request: &self.canonical_request(),
+            },
+        )
+    }
+}
+
 /// One committed local-secret change's evidence: the gateway-minted secret
 /// ID, its version axis and the actor. Never the label, purpose, plaintext,
 /// ciphertext, nonce or key ID.
 struct SecretChangeEvidence<'a> {
+    /// The caller's key, or an ID minted once for an unkeyed call
+    /// ([`operation_id_for`]).
+    operation_id: &'a str,
     action: &'static str,
     secret_id: Option<&'a str>,
     prior_version: Option<u64>,
@@ -1028,8 +1501,8 @@ struct SecretChangeEvidence<'a> {
     actor: &'a ChangeActor,
 }
 
-/// Append one evidence row inside the caller's transaction, under event and
-/// operation IDs minted here, once per store call. Any failure is returned
+/// Append one evidence row inside the caller's transaction, under an event ID
+/// minted here and the operation ID the change carries. Any failure is returned
 /// for the caller to roll back, so the change never commits without it,
 /// and it is reported as an evidence failure rather than as whatever
 /// constraint class SQLite gave it. A failed insert is counted here, once
@@ -1065,7 +1538,7 @@ fn record_change_evidence(
             "#,
             params![
                 Uuid::new_v4().to_string(),
-                Uuid::new_v4().to_string(),
+                evidence.operation_id,
                 evidence.actor.subject(),
                 evidence.actor.issuer(),
                 evidence.actor.kind().as_str(),
@@ -1312,6 +1785,10 @@ fn validate_key_file_permissions(
 }
 
 #[cfg(test)]
+#[path = "local_secret_operation_tests.rs"]
+mod operation_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{fs, path::PathBuf};
 
@@ -1322,15 +1799,15 @@ mod tests {
 
     const CANARY: &[u8] = b"greengateway-local-secret-canary";
     const PRIMARY_ID: &str = "primary-key-id-canary";
-    const PRIMARY_FILE: &str = "primary.key";
+    pub(super) const PRIMARY_FILE: &str = "primary.key";
 
-    struct TestEnvironment {
+    pub(super) struct TestEnvironment {
         root: PathBuf,
-        database: PathBuf,
+        pub(super) database: PathBuf,
     }
 
     impl TestEnvironment {
-        fn new(name: &str) -> Self {
+        pub(super) fn new(name: &str) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "greengateway-local-secret-{name}-{}",
                 Uuid::new_v4()
@@ -1341,7 +1818,7 @@ mod tests {
             Self { root, database }
         }
 
-        fn write_key(&self, file: &str, byte: u8) {
+        pub(super) fn write_key(&self, file: &str, byte: u8) {
             let path = self.root.join(file);
             fs::write(&path, [byte; MASTER_KEY_BYTES]).expect("temporary master key should write");
             set_file_permissions(&path, 0o600);
@@ -1367,7 +1844,7 @@ mod tests {
                 .expect("temporary connection store should open")
         }
 
-        fn provider(
+        pub(super) fn provider(
             &self,
             configs: &[LocalSecretKeyConfig],
         ) -> Result<(SqliteConnectionStore, LocalSecretProvider), LocalSecretError> {
@@ -1379,7 +1856,7 @@ mod tests {
             Ok((store, provider))
         }
 
-        fn primary_config(&self) -> Vec<LocalSecretKeyConfig> {
+        pub(super) fn primary_config(&self) -> Vec<LocalSecretKeyConfig> {
             vec![Self::config(
                 PRIMARY_ID,
                 PRIMARY_FILE,
@@ -1411,7 +1888,7 @@ mod tests {
         }
     }
 
-    fn secret(purpose: SecretPurpose, value: &[u8]) -> ResolvedSecret {
+    pub(super) fn secret(purpose: SecretPurpose, value: &[u8]) -> ResolvedSecret {
         ResolvedSecret::new(purpose, value.to_vec()).expect("test secret should validate")
     }
 
@@ -2434,7 +2911,10 @@ mod tests {
 
     /// The stored envelope of one secret, to prove a failed change left it
     /// exactly as it was.
-    fn envelope(database: &std::path::Path, id: &str) -> (i64, String, Vec<u8>, Vec<u8>) {
+    pub(super) fn envelope(
+        database: &std::path::Path,
+        id: &str,
+    ) -> (i64, String, Vec<u8>, Vec<u8>) {
         Connection::open(database)
             .expect("database should open")
             .query_row(

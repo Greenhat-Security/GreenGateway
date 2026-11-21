@@ -58,13 +58,14 @@ pub(crate) const REFUSAL_REASON: &str = "authority_evidence_unsupported";
 /// Only changes some deployment mode refuses, or admits only in their keyed
 /// form, are listed. An operation every mode that performs it records in its
 /// own transaction, and that no change has bound to a caller key yet, never
-/// asks: local-secret changes and re-encryption, service-token revocation,
-/// and JWT revocation. The inventory test holds that rule too: an operation
+/// asks: local-secret re-encryption, service-token revocation, and JWT
+/// revocation. The inventory test holds that rule too: an operation
 /// no gate asks about must be `admitted` or `unavailable` wherever its row
 /// says. Connection create and replace, service-token issue and rotation, and
 /// managed catalog publication and overlay writes and removals, are listed
 /// since they bind caller keys (issue #425): both modes admit only their
-/// keyed form under `required`. A `credential.binding_change` is never asked
+/// keyed form under `required`. So are local-secret creation and rotation,
+/// which only standalone mode performs. A `credential.binding_change` is never asked
 /// on its own: it is part of the `connection.replace` that makes it, under
 /// the same caller key.
 ///
@@ -124,6 +125,14 @@ pub(crate) enum AuthorityOperation {
     /// A managed OpenAPI overlay removed, and its catalog published without
     /// it: a publication, not a withdrawal.
     CatalogOverlayDelete,
+    /// A local secret created through the admin API. It binds a caller key
+    /// (issue #425, plan P8): the envelope, its evidence and its key's
+    /// reservation commit in one IMMEDIATE transaction of the standalone
+    /// Connections database. Cluster mode has no local secrets.
+    SecretCreate,
+    /// A local secret's value rotated through the admin API, keyed like a
+    /// creation. Deletion is a withdrawal and never asks ([`Withdrawal`]).
+    SecretRotate,
 }
 
 /// The changes a remote caller starts that only remove authority, and so
@@ -245,6 +254,8 @@ impl AuthorityOperation {
             Self::CatalogOpenapiPublish => "catalog.openapi.publish",
             Self::CatalogOverlayReplace => "catalog.overlay.replace",
             Self::CatalogOverlayDelete => "catalog.overlay.delete",
+            Self::SecretCreate => "secret.create",
+            Self::SecretRotate => "secret.rotate",
         }
     }
 
@@ -266,14 +277,18 @@ impl AuthorityOperation {
     /// both modes (issue #425): the change, its evidence and its key's
     /// reservation commit in one transaction of the mode's own store (the
     /// Connections database in standalone mode), so both admit their keyed
-    /// form.
+    /// form. Local-secret creation and rotation bind one too, in the
+    /// standalone Connections database; cluster mode rejects a local secret
+    /// keyring and performs neither.
     pub(crate) const fn required_mode(self, backend: StateBackend) -> RequiredMode {
         match backend {
             StateBackend::Postgres => match self {
                 Self::ServiceTokenIssue | Self::ServiceTokenRotate => {
                     RequiredMode::CallerKeyRequired
                 }
-                Self::PolicyFileReload => RequiredMode::Unavailable,
+                Self::PolicyFileReload | Self::SecretCreate | Self::SecretRotate => {
+                    RequiredMode::Unavailable
+                }
                 Self::MutationApprovalPrepare => RequiredMode::CallerKeyRequired,
                 Self::ConnectionCreate | Self::ConnectionReplace => RequiredMode::CallerKeyRequired,
                 Self::CatalogMcpPublish
@@ -306,6 +321,7 @@ impl AuthorityOperation {
                 | Self::CatalogOpenapiPublish
                 | Self::CatalogOverlayReplace
                 | Self::CatalogOverlayDelete => RequiredMode::CallerKeyRequired,
+                Self::SecretCreate | Self::SecretRotate => RequiredMode::CallerKeyRequired,
                 _ => RequiredMode::Refused,
             },
         }

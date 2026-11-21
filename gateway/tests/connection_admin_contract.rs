@@ -27,6 +27,15 @@ const KEYED_CONNECTION_CHANGES: [(&str, &str); 7] = [
     ("/v1/admin/connections/{id}/overlay", "delete"),
 ];
 
+/// The local-secret routes that honour an `Idempotency-Key` (issue #425).
+/// Local secrets exist only in standalone mode, so they have no capability
+/// wait, and a delete, a withdrawal, is never refused by required mode.
+const KEYED_SECRET_CHANGES: [(&str, &str); 3] = [
+    ("/v1/admin/connection-secrets", "post"),
+    ("/v1/admin/connection-secrets/{id}", "put"),
+    ("/v1/admin/connection-secrets/{id}", "delete"),
+];
+
 const EXPECTED_OPERATIONS: &[ExpectedOperation] = &[
     ExpectedOperation {
         path: "/v1/admin/connections",
@@ -512,9 +521,9 @@ fn connection_admin_openapi_has_exact_routes_operations_and_safe_contracts() {
                     operation.path
                 )
             });
-        let primary = if KEYED_CONNECTION_CHANGES.contains(&(operation.path, operation.method))
-            && operation.success_status == "200"
-        {
+        let keyed = KEYED_CONNECTION_CHANGES.contains(&(operation.path, operation.method))
+            || KEYED_SECRET_CHANGES.contains(&(operation.path, operation.method));
+        let primary = if keyed && operation.success_status == "200" {
             assert_eq!(
                 success.pointer("/oneOf/1/$ref"),
                 Some(&Value::String(schema_reference("OperationReceipt"))),
@@ -583,6 +592,59 @@ fn connection_admin_openapi_has_exact_routes_operations_and_safe_contracts() {
             ))
         );
     }
+
+    // Issue #425: the keyed local-secret changes describe the exact retry's
+    // receipt, the conflict of a reused key, and, for a create or rotation,
+    // the required-mode refusal; their key binds no secret value.
+    for (path, method) in KEYED_SECRET_CHANGES {
+        let operation = &paths[path][method];
+        let exact_retry = operation
+            .pointer("/responses/200/content/application~1json/schema")
+            .unwrap_or(&Value::Null);
+        let receipt = Value::String(schema_reference("OperationReceipt"));
+        assert!(
+            exact_retry.get("$ref") == Some(&receipt)
+                || exact_retry.pointer("/oneOf/1/$ref") == Some(&receipt),
+            "{} {path}: a keyed change's exact retry is answered 200 with its receipt",
+            method.to_ascii_uppercase()
+        );
+        let conflict = operation
+            .pointer("/responses/409/description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            conflict.contains("caller_operation_conflict"),
+            "{} {path} documents caller_operation_conflict",
+            method.to_ascii_uppercase()
+        );
+        if method != "delete" {
+            assert_eq!(
+                operation.pointer("/responses/409/content/application~1json/schema/oneOf/1/$ref"),
+                Some(&Value::String(schema_reference("AuthorityEvidenceRefusal"))),
+                "{} {path} documents the required-mode refusal",
+                method.to_ascii_uppercase()
+            );
+            assert!(
+                conflict.contains("authority_evidence_unsupported"),
+                "{} {path} documents authority_evidence_unsupported",
+                method.to_ascii_uppercase()
+            );
+        }
+        assert_eq!(
+            operation.pointer("/parameters/1/$ref"),
+            Some(&Value::String(
+                "#/components/parameters/ConnectionSecretIdempotencyKey".to_owned()
+            ))
+        );
+    }
+    let secret_key = openapi
+        .pointer("/components/parameters/ConnectionSecretIdempotencyKey/description")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        secret_key.contains("never the secret value"),
+        "the local-secret key documents that the value is not bound"
+    );
 
     const HTTP_METHODS: &[&str] = &[
         "get", "put", "post", "delete", "options", "head", "patch", "trace",

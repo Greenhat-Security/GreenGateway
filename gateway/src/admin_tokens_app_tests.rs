@@ -2034,12 +2034,12 @@ async fn a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_ret
 }
 
 #[derive(Clone, Default)]
-struct CapturedLogs {
+pub(super) struct CapturedLogs {
     buffer: Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 impl CapturedLogs {
-    fn contents(&self) -> String {
+    pub(super) fn contents(&self) -> String {
         String::from_utf8_lossy(&self.buffer.lock().expect("captured logs lock")).into_owned()
     }
 }
@@ -2068,7 +2068,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
 
 /// Every level on this thread, so a debug line that carried a plaintext or
 /// a digest would show.
-fn capture_all_logs() -> (CapturedLogs, impl Drop) {
+pub(super) fn capture_all_logs() -> (CapturedLogs, impl Drop) {
     let logs = CapturedLogs::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)

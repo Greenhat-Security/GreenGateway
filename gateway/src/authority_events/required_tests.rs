@@ -8,7 +8,7 @@ use serde_json::Value;
 use super::*;
 use crate::audit::sink::tests::CaptureSink;
 
-const EVERY_OPERATION: [AuthorityOperation; 23] = [
+const EVERY_OPERATION: [AuthorityOperation; 25] = [
     AuthorityOperation::PolicyPublish,
     AuthorityOperation::PolicyRollback,
     AuthorityOperation::PolicyRuleCreate,
@@ -32,6 +32,15 @@ const EVERY_OPERATION: [AuthorityOperation; 23] = [
     AuthorityOperation::CatalogOpenapiPublish,
     AuthorityOperation::CatalogOverlayReplace,
     AuthorityOperation::CatalogOverlayDelete,
+    AuthorityOperation::SecretCreate,
+    AuthorityOperation::SecretRotate,
+];
+
+/// The local-secret changes standalone mode admits only in their keyed form
+/// (issue #425, plan P8). Cluster mode does not perform them.
+const KEYED_SECRET_OPERATIONS: [AuthorityOperation; 2] = [
+    AuthorityOperation::SecretCreate,
+    AuthorityOperation::SecretRotate,
 ];
 
 /// The operations both modes admit only in their keyed form (issue #425).
@@ -148,6 +157,7 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
         } else if KEYED_CONNECTION_OPERATIONS.contains(&operation)
             || KEYED_TOKEN_OPERATIONS.contains(&operation)
             || KEYED_CATALOG_OPERATIONS.contains(&operation)
+            || KEYED_SECRET_OPERATIONS.contains(&operation)
         {
             "admits it only with an Idempotency-Key, on a route that honours one"
         } else {
@@ -180,7 +190,9 @@ fn required_refuses_every_standalone_operation_and_what_cluster_mode_cannot_perf
     );
     for operation in refused_in_cluster {
         let why = match operation {
-            AuthorityOperation::PolicyFileReload => "does not perform it",
+            AuthorityOperation::PolicyFileReload
+            | AuthorityOperation::SecretCreate
+            | AuthorityOperation::SecretRotate => "does not perform it",
             AuthorityOperation::ConfigurationImport => "records evidence for only part of it",
             // The ordinary preparation POST refuses a key: the message names
             // the keyed route instead.
@@ -651,14 +663,9 @@ fn the_gate_enforces_exactly_what_the_evidence_inventory_says() {
     );
     // The standalone Connections database records these in the change's own
     // transaction, so required mode admits them and no gate asks: Connection
-    // deletion and local-secret changes since its migration 12.
-    for code in [
-        "connection.delete",
-        "secret.create",
-        "secret.rotate",
-        "secret.delete",
-        "secret.reencrypt",
-    ] {
+    // and local-secret deletion, which are withdrawals, and re-encryption,
+    // which no caller starts, since its migration 12.
+    for code in ["connection.delete", "secret.delete", "secret.reencrypt"] {
         assert_eq!(
             by_mode.get(&(code, "standalone")),
             Some(&"admitted"),
@@ -698,6 +705,21 @@ fn the_gate_enforces_exactly_what_the_evidence_inventory_says() {
                 "{code} in {mode}"
             );
         }
+    }
+    // Local-secret creation and rotation bind caller keys in standalone mode
+    // (issue #425, plan P8): only their keyed form is admitted. Cluster mode
+    // has no local secrets.
+    for code in ["secret.create", "secret.rotate"] {
+        assert_eq!(
+            by_mode.get(&(code, "standalone")),
+            Some(&"caller_key_required"),
+            "{code}"
+        );
+        assert_eq!(
+            by_mode.get(&(code, "postgres")),
+            Some(&"unavailable"),
+            "{code}"
+        );
     }
     // The policy, tools and policy test changes bind caller keys in the
     // PostgreSQL document commit (issue #425); standalone mode records no

@@ -735,6 +735,19 @@ pub(super) const KEYED_ROUTES: &[KeyedRoute] = &[
         method: "DELETE",
         route: "/v1{ADMIN_PREFIX}/connections/{id}/overlay",
     },
+    // Keyed local-secret create, rotate and delete (issue #425).
+    KeyedRoute {
+        method: "POST",
+        route: "/v1{ADMIN_PREFIX}/connection-secrets",
+    },
+    KeyedRoute {
+        method: "PUT",
+        route: "/v1{ADMIN_PREFIX}/connection-secrets/{id}",
+    },
+    KeyedRoute {
+        method: "DELETE",
+        route: "/v1{ADMIN_PREFIX}/connection-secrets/{id}",
+    },
     // Keyed policy, tools and policy test changes (issue #425). Cluster
     // mode honours the key; standalone mode refuses it.
     KeyedRoute {

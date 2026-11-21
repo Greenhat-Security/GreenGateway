@@ -50,8 +50,9 @@ function honouringAll(entries) {
 test("a row is supported only when every pair has its reviewed path", () => {
   // Today these rows qualify: PostgreSQL keyed preparation, and in both
   // modes keyed Connection create and replace, keyed catalog publication
-  // and overlay changes, and keyed token issue and rotation; in PostgreSQL
-  // keyed policy, tools and policy test changes.
+  // and overlay changes, and keyed token issue and rotation, and standalone
+  // keyed local-secret create and rotation; in PostgreSQL keyed policy, tools
+  // and policy test changes.
   const current = validateInventory(inventory());
   assert.deepEqual(current.qualifiedPairs, [
     "catalog.mcp.publish/postgres", "catalog.mcp.publish/standalone", "catalog.openapi.publish/postgres", "catalog.openapi.publish/standalone",
@@ -59,12 +60,12 @@ test("a row is supported only when every pair has its reviewed path", () => {
     "connection.create/postgres", "connection.create/standalone", "connection.replace/postgres", "connection.replace/standalone", "credential.binding_change/postgres", "credential.binding_change/standalone",
     "mutation_approval.prepare/postgres",
     "policy.publish/postgres", "policy.rollback/postgres", "policy.rule.create/postgres", "policy.rule.delete/postgres", "policy.rule.reorder/postgres", "policy.rule.update/postgres", "policy.suggestion.accept/postgres",
-    "policy_tests.publish/postgres",
+    "policy_tests.publish/postgres", "secret.create/standalone", "secret.rotate/standalone",
     "service_token.issue/postgres", "service_token.issue/standalone", "service_token.rotate/postgres", "service_token.rotate/standalone",
     "tools.publish/postgres",
   ]);
   assert.deepEqual(current.keyedWithdrawalPairs, [
-    "connection.delete/postgres", "connection.delete/standalone", "service_token.revoke/postgres", "service_token.revoke/standalone",
+    "connection.delete/postgres", "connection.delete/standalone", "secret.delete/standalone", "service_token.revoke/postgres", "service_token.revoke/standalone",
   ]);
   const prepare = (value) => groupOf(value, "mutation_approval_prepare_postgres");
   // Every part of the bar is required: the path for each pair, keyed-only
@@ -133,29 +134,21 @@ test("a row is supported only when every pair has its reviewed path", () => {
     assert.throws(() => validateInventory(redelivered), new RegExp(`${id}: unproven durability claim`), id);
   }
 
-  // A reviewed table entry is what earns a row, standalone included: with an
-  // entry for the standalone local-secret pairs (and their routes honoured by
-  // the router), the row qualifies once it meets the whole bar, and not
-  // before.
-  const secretPath = (operation) => ({
-    ...pathOf(inventory(), "mutation_approval_prepare_postgres").criteria,
-    operation, storage_mode: "standalone", method: "POST",
-    route: `/v1{ADMIN_PREFIX}/fixture/${operation}`,
-  });
-  const secrets = ["secret.create", "secret.rotate"].map(secretPath);
-  const table = { ...QUALIFIED_PATHS, ...Object.fromEntries(secrets.map((path) => [`${path.operation}/standalone`, path])) };
-  const readSource = honouringAll(secrets);
-  const flipped = inventory();
-  Object.assign(groupOf(flipped, "local_secrets"), {
-    required_mode: "caller_key_required", disposition: ["already_sufficient"], required_durability_supported: true,
-    qualified_delivery_paths: secrets.map((criteria) => ({ ...structuredClone(pathOf(flipped, "mutation_approval_prepare_postgres")), criteria })),
-  });
-  assert.deepEqual(validateInventory(flipped, readSource, table).qualifiedPairs.filter((pair) => pair.startsWith("secret.")),
-    ["secret.create/standalone", "secret.rotate/standalone"]);
-  assert.throws(() => validateInventory(flipped, readSource), /local_secrets: qualified path secret\.create\/standalone is outside the reviewed table/);
-  const journaled = structuredClone(flipped);
+  // The standalone local-secret row loses its claim with either path, or
+  // with its mode's dispatcher, and a path is earned only by its reviewed
+  // table entry.
+  for (const operation of ["secret.create", "secret.rotate"]) {
+    const partial = inventory();
+    groupOf(partial, "local_secrets").qualified_delivery_paths = groupOf(partial, "local_secrets").qualified_delivery_paths
+      .filter((path) => path.criteria.operation !== operation);
+    assert.throws(() => validateInventory(partial), /local_secrets: unproven durability claim/, operation);
+  }
+  const journaled = inventory();
   groupOf(journaled, "local_secrets").delivery = "journaled_dispatch";
-  assert.throws(() => validateInventory(journaled, readSource, table), /local_secrets: unproven durability claim/);
+  assert.throws(() => validateInventory(journaled), /local_secrets: unproven durability claim/);
+  const unreviewed = { ...QUALIFIED_PATHS };
+  delete unreviewed["secret.create/standalone"];
+  assert.throws(() => validateInventory(inventory(), source, unreviewed), /local_secrets: qualified path secret\.create\/standalone is outside the reviewed table/);
 });
 
 test("a path outside the reviewed table is refused", () => {
@@ -319,8 +312,8 @@ test("a keyed route shared by reviewed paths names only pairs that have one", ()
 test("the summary line is computed from the inventory", () => {
   const line = summary(validateInventory(inventory()));
   assert.match(line, new RegExp(`^Authority evidence inventory valid: ${inventory().groups.length} groups, ${OPERATIONS.length * 2} operation/mode pairs, \\d+ source references\\.`));
-  assert.match(line, / Qualified in required mode: catalog\.mcp\.publish\/postgres, .*, connection\.create\/postgres, .*, mutation_approval\.prepare\/postgres, policy\.publish\/postgres, .*, policy_tests\.publish\/postgres, service_token\.issue\/postgres, .*, service_token\.rotate\/standalone, tools\.publish\/postgres\./);
-  assert.match(line, / Admitted withdrawals with a reviewed keyed path: connection\.delete\/postgres, connection\.delete\/standalone, service_token\.revoke\/postgres, service_token\.revoke\/standalone\./);
+  assert.match(line, / Qualified in required mode: catalog\.mcp\.publish\/postgres, .*, connection\.create\/postgres, .*, mutation_approval\.prepare\/postgres, policy\.publish\/postgres, .*, policy_tests\.publish\/postgres, secret\.create\/standalone, secret\.rotate\/standalone, service_token\.issue\/postgres, .*, service_token\.rotate\/standalone, tools\.publish\/postgres\./);
+  assert.match(line, / Admitted withdrawals with a reviewed keyed path: connection\.delete\/postgres, connection\.delete\/standalone, secret\.delete\/standalone, service_token\.revoke\/postgres, service_token\.revoke\/standalone\./);
   assert.equal(summary({ groups: 1, operationModePairs: 2, sourceReferences: 3, qualifiedPairs: [], keyedWithdrawalPairs: [] }),
     "Authority evidence inventory valid: 1 groups, 2 operation/mode pairs, 3 source references. Qualified in required mode: none. Admitted withdrawals with a reviewed keyed path: none.");
 });
@@ -474,7 +467,7 @@ test("no_caller_key is limited to its reviewed pairs", () => {
     assert.equal(group.qualified_delivery_paths, undefined, group.id);
   }
   // A caller-started change that is not a withdrawal cannot be relabelled.
-  for (const id of ["mutation_approvals", "tools_standalone", "local_secrets", "policy_standalone", "local_secret_delete"]) {
+  for (const id of ["mutation_approvals", "tools_standalone", "policy_standalone"]) {
     const relabelled = inventory();
     row(relabelled, id).disposition = ["no_caller_key"];
     assert.throws(() => validateInventory(relabelled), new RegExp(`${id}: no_caller_key is limited to its reviewed pairs`), id);
@@ -499,8 +492,8 @@ test("withdrawal_admitted is limited to its reviewed pairs and needs a reviewed 
   const revoke = (value) => row(value, "token_revoke_postgres");
   const current = inventory();
   assert.deepEqual(rowsWith(current, "withdrawal_admitted").map((group) => group.id),
-    ["connection_delete_postgres", "connection_delete_standalone", "token_revoke_postgres", "token_revoke_standalone"]);
-  for (const id of ["connection_delete_postgres", "connection_delete_standalone"]) {
+    ["connection_delete_postgres", "connection_delete_standalone", "local_secret_delete", "token_revoke_postgres", "token_revoke_standalone"]);
+  for (const id of ["connection_delete_postgres", "connection_delete_standalone", "local_secret_delete"]) {
     assert.deepEqual(row(current, id).qualified_delivery_paths.map((path) => path.criteria.method), ["DELETE"], id);
   }
   assert.deepEqual(row(current, "token_revoke_standalone").qualified_delivery_paths.map((path) => path.criteria.method), ["POST"]);
@@ -509,7 +502,7 @@ test("withdrawal_admitted is limited to its reviewed pairs and needs a reviewed 
   assert.equal(revoke(current).qualified_delivery_paths.length, 1);
   for (const pair of rowsWith(current, "withdrawal_admitted").flatMap(pairsOf)) assert.ok(WITHDRAWALS.includes(pair), pair);
   // A change that grants or replaces authority is never a withdrawal.
-  for (const id of ["tools_standalone", "policy_standalone", "local_secrets", "mutation_approvals", "jwt_postgres"]) {
+  for (const id of ["tools_standalone", "policy_standalone", "mutation_approvals", "jwt_postgres"]) {
     const relabelled = inventory();
     row(relabelled, id).disposition = ["withdrawal_admitted"];
     assert.throws(() => validateInventory(relabelled), new RegExp(`${id}: withdrawal_admitted is limited to its reviewed pairs`), id);
@@ -519,11 +512,11 @@ test("withdrawal_admitted is limited to its reviewed pairs and needs a reviewed 
   revoke(folded).operations = ["service_token.rotate", "service_token.revoke"];
   folded.groups = folded.groups.filter((group) => group.id !== "token_rotate_postgres");
   assert.throws(() => validateInventory(folded), /token_revoke_postgres: withdrawal_admitted is limited to its reviewed pairs/);
-  // A withdrawal with no reviewed keyed path yet keeps its gap label: the
-  // label is earned by the path, one per pair.
+  // A withdrawal loses its label with its reviewed keyed path: the label is
+  // earned by the path, one per pair.
   for (const id of ["local_secret_delete"]) {
     const unearned = inventory();
-    row(unearned, id).disposition = ["withdrawal_admitted"];
+    delete row(unearned, id).qualified_delivery_paths;
     assert.throws(() => validateInventory(unearned), new RegExp(`${id}: withdrawal_admitted needs one reviewed keyed path per pair`), id);
   }
   const pathless = inventory();
@@ -602,7 +595,7 @@ test("required mode never admits an unsupported row or waves through a reachable
   // The standalone Connections database records these in the change's own transaction.
   assert.equal(byId.connection_standalone, "caller_key_required");
   assert.equal(byId.connection_delete_standalone, "admitted");
-  assert.equal(byId.local_secrets, "admitted");
+  assert.equal(byId.local_secrets, "caller_key_required");
   assert.equal(byId.local_secret_delete, "admitted");
   assert.equal(byId.local_secret_reencrypt, "admitted");
   // The offline import records evidence for two of its sections only.
