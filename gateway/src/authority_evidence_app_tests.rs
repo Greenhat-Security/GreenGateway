@@ -2264,6 +2264,14 @@ mod cluster_connection_keys {
         config.deployment_id = Some(DEPLOYMENT.into());
         configure_test_jwt_provider(&mut config, spawn_test_jwks_server().await);
         config.auth_providers[0].issuer = Some(CLUSTER_ISSUER.into());
+        // The test JWKS server listens on loopback; the Connections name
+        // their own hosts.
+        config.egress_allowed_hosts = vec![
+            "127.0.0.1".into(),
+            "cluster-keys.example.test".into(),
+            "keyed.example.test".into(),
+        ];
+        config.egress_deny_private_ips = false;
         config.rate_limit_write_burst = 1000;
         config.rate_limit_write_rps = 1000.0;
         let router = replica(config, pool, membership).await;
