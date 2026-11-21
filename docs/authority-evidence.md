@@ -12,7 +12,11 @@ journal ([Admin session withdrawals and journal capacity](#admin-session-withdra
 the PR 4 standalone slices (Connection, local-secret, and catalog and overlay
 evidence, [Standalone evidence](#standalone-evidence)), standalone delivery from the
 stores that own that evidence ([Standalone delivery](#standalone-delivery)) and PR 4's
-refusal of unsupported changes ([Required-durability mode](#required-durability-mode)).
+refusal of unsupported changes ([Required-durability mode](#required-durability-mode)),
+the caller operation keys of every keyed family
+([Keyed authority changes](#keyed-authority-changes)) and the closing
+reconciliation of this inventory
+([Next reviewable slices](#next-reviewable-slices-and-validation-gates)).
 Reviewed source: `78414d3d9b2eb050dc02873176e674458a7d93fa`.
 
 This inventory identifies existing atomic records and the work needed for required
@@ -334,10 +338,24 @@ unknown fields. There is no free-form payload, message, error,
 URL, header, policy document or credentials field. Tests reject secret/token,
 ciphertext, nonce, provider/key locator and raw-response field injections at
 every object boundary. They also reject malformed categories, actor modes,
-timestamps, imprecise numeric revisions and invalid transitions. These tests do
-not prove runtime redaction; future producer tests must construct events from
-real safe mutation inputs with synthetic sensitive markers and inspect stored
-records, logs and metrics.
+timestamps, imprecise numeric revisions and invalid transitions. These schema
+tests alone do not prove runtime redaction. The producer tests of each keyed
+family do: they drive real keyed changes whose inputs carry synthetic sensitive
+markers and inspect what the gateway stores and emits. Service tokens:
+`a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext`
+(no plaintext or binding digest in any handler log line) and
+`storage::contract_tests::sqlite_a_failed_token_reservation_is_counted_and_no_secret_reaches_logs_or_metrics`.
+Connections: `the_binding_digest_is_stored_only_in_the_reservation_row`, run
+against both stores, which keeps a marker in every credential reference out of
+the receipts and the evidence rows. Catalogs:
+`a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record`
+(both stores). Local secrets:
+`a_keyed_secret_change_keeps_synthetic_markers_out_of_the_reservation_receipt_evidence_and_file`
+and, through the router,
+`a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`.
+Policy, tools and policy tests:
+`a_keyed_document_commit_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record`.
+The family sections below describe each.
 
 ### PostgreSQL approval preparation
 
@@ -1225,8 +1243,10 @@ policy test suite: the receipt after the ETag moved, `409` on another binding,
 `required_mode_refuses_the_unkeyed_policy_change_and_admits_the_keyed_principal`
 (admission on Unix builds),
 `required_mode_refuses_a_keyed_policy_change_by_a_service_token_or_under_delivery_v1_or_with_the_log_sink`,
-`required_mode_preflight_refuses_to_seed_an_empty_tools_document` and
-`required_mode_preflight_passes_when_the_tools_document_exists`.
+`required_mode_preflight_refuses_to_seed_an_empty_tools_document`,
+`required_mode_preflight_passes_when_the_tools_document_exists` and
+`an_admitted_policy_change_finishes_after_its_client_goes_away` (a keyed
+`PUT .../policy` whose client disconnects commits, and its retry gets the receipt).
 The acceptance and draft publication routes are proved through the suggestion
 admin handlers of a cluster replica, against PostgreSQL, by
 `admin_observability_app_tests::cluster_discovery_tests::`
@@ -1554,9 +1574,13 @@ Not covered by PR 3, and still open:
   SQLite stores that own it, after a cursor in each
   ([Standalone delivery](#standalone-delivery)).
 - **The v1 contract.** The dispatcher qualifies any row with a caller UUIDv7 and
-  an issuer-bound principal ([Authority event v1](#authority-event-v1)), but
-  only token revocation and approval preparation bind a caller key yet. Each
-  other operation needs a keyed route before it delivers `authority_event.v1`.
+  an issuer-bound principal ([Authority event v1](#authority-event-v1)). Token
+  revocation and approval preparation bound a caller key first; keyed token issue
+  and rotation, Connection, catalog and local-secret changes, and cluster policy,
+  tools and policy test changes do too since #833 to #840
+  ([Keyed authority changes](#keyed-authority-changes)). An operation without a
+  keyed route, and the unkeyed form of one with a keyed route, are delivered as
+  `authority_event_delivery.v1`.
   Kind, auth mode and issuer are recorded since migration 24
   ([Actor metadata](#actor-metadata)).
 - **Service-token issue (migration 27).** A create writes its
@@ -2019,8 +2043,9 @@ evidence. **Until #242 provides evidence of configuration activation, a gateway 
 this mode refuses to start, in both deployment modes** (owner decision of
 2026-11-19); the rest of this section describes what the mode does once a gateway
 can start in it, and what the tests that build the application directly prove.
-Each row states which requests the mode admits. PostgreSQL keyed
-approval preparation and keyed Connection create and replace in both modes have the
+Each row states which requests the mode admits. The 13 qualified rows (PostgreSQL
+keyed approval preparation, and the keyed forms of the service-token, Connection,
+catalog, local-secret and cluster policy, tools and policy test changes) have the
 complete caller-bound event and its tested delivery path. Other rows list their
 remaining gaps. The default is `best_effort`. The setting is separate from
 `AUDIT_DURABILITY`, whose `required` default covers request decisions only: tying
@@ -2039,8 +2064,8 @@ sink and a Unix build, and names the first of these that fails
 | `required_mode` | Rows | What required mode does |
 | --- | --- | --- |
 | `admitted` | Cluster Connection delete, token revocation, JWT revocation, and admin session grant and withdrawal, and standalone Connection delete, local-secret delete and re-encryption, and token revocation | Runs it. Its evidence is the row's `record`. Nine of these pairs stay admitted without qualification on purpose ([below](#rows-admitted-without-qualification)) |
-| `caller_key_required` | PostgreSQL mutation approval preparation, and in both modes Connection create and replace (with the credential binding change a replacement makes), managed catalog publication and overlay put and delete, and service-token issue and rotation, and standalone local-secret create and rotation, and in cluster mode policy mutations, OpenAPI tools registration and stored policy test suite writes | Admits only the issuer-bound keyed request with `qualified_v1`, `AUTHORITY_EVENT_SINK=file` and a Unix build. Required mode refuses the ordinary preparation POST, the unkeyed Connection create and replace, the unkeyed refresh, OpenAPI registration and overlay put and delete, the unkeyed token issue and rotation, and the unkeyed cluster policy, tools and policy test changes. |
-| `refused` | Standalone mutation approval preparation and mutation approval review, revocation and consumption in both modes. Standalone policy mutations, policy file reloads, and tools publication (admin API and file reloads). The writing form of the offline import (`import-standalone --apply`, with or without `--resume`) in cluster mode | Refuses it when asked, before anything is written |
+| `caller_key_required` | PostgreSQL mutation approval preparation, and in both modes Connection create and replace (with the credential binding change a replacement makes), managed catalog publication and overlay put and delete, and service-token issue and rotation, and standalone local-secret create and rotation, and in cluster mode policy mutations, OpenAPI tools registration and stored policy test suite writes | Admits only the issuer-bound keyed request with `qualified_v1`, `AUTHORITY_EVENT_SINK=file` and a Unix build. Required mode refuses the ordinary preparation POST, the unkeyed Connection create and replace, the unkeyed refresh, OpenAPI registration and overlay put and delete, the unkeyed token issue and rotation, the unkeyed standalone local-secret create and rotation, and the unkeyed cluster policy, tools and policy test changes. |
+| `refused` | Standalone mutation approval preparation and mutation approval review, revocation and consumption in both modes. Standalone policy mutations, policy file reloads, stored policy test suite writes, and tools publication (admin API and file reloads), which stay with #242. The writing form of the offline import (`import-standalone --apply`, with or without `--resume`) in cluster mode | Refuses it when asked, before anything is written |
 | `refused_at_startup` | Standalone admin sessions (`ADMIN_SESSION_MODE=standalone_memory`), and configuration activation in both modes | Refuses to start |
 | `unavailable` | Cluster policy file reload and local secrets, standalone JWT revocation and import, configuration export | Nothing to refuse: the mode or the build has no such operation. A gate that is asked anyway refuses it |
 | `outside_gateway` | External secret-provider rotation | Not covered: the provider owns the write and the gateway cannot refuse it |
@@ -2145,11 +2170,12 @@ What required mode does not do:
   [Rows admitted without qualification](#rows-admitted-without-qualification) are
   atomic and delivered, but carry no caller key.
 - A standalone gateway in required mode therefore changes its policy and tools only
-  through its startup files, and creates and replaces Connections and publishes
-  managed catalogs and overlays only with a caller key. Connection deletion, local
-  secrets, master-key re-encryption and service tokens are changed as usual. The
-  standalone evidence slices that write policy and tools records in their owning
-  stores change those rows to `admitted` as they land.
+  through its startup files (those rows stay refused until #242, see
+  [Next reviewable slices](#next-reviewable-slices-and-validation-gates), item 5),
+  and issues and rotates service tokens, creates and replaces Connections,
+  publishes managed catalogs and overlays, and creates and rotates local secrets
+  only with a caller key. Token revocation, Connection and local-secret deletion and
+  master-key re-encryption are changed as usual.
 
 Tests: `gateway/src/authority_events/required_tests.rs` holds the gate's table to the
 inventory (every `refused` row has a gate that refuses it in that mode, every gate
@@ -2184,6 +2210,74 @@ writes nothing (`a_dry_run_under_required_plans_every_section_and_writes_nothing
 `the_import_writes_nothing_under_required_and_its_dry_run_still_runs` in
 `gateway/tests/audit_durability_startup.rs` shows the same through the real binary:
 the refusal line, status 1 and nothing written.
+
+### Remaining limits
+
+These hold when issue #425 closes:
+
+- Required mode cannot serve in either deployment mode until #242 provides
+  per-activation evidence. The qualified rows are proven by tests that build the
+  application directly; no deployment has run them in required mode.
+- Required mode admits keyed non-withdrawal changes only from provider-authenticated
+  principals, with `qualified_v1`, the file sink and a Unix build. Admin callers
+  authenticated by a gateway service token are refused for those changes; in
+  `best_effort` their keyed changes are recorded and delivered as
+  `authority_event_delivery.v1`.
+- Token revocation, Connection delete and local-secret delete are admitted in every
+  form in required mode. Their unkeyed and service-token forms are atomic and
+  delivered at least once as `authority_event_delivery.v1`, but are not caller-keyed.
+- JWT revocation, admin session grant and withdrawal, and local-secret re-encryption
+  have no caller key. They are atomic, delivered at least once as
+  `authority_event_delivery.v1`, reconciled by natural key, and not qualified.
+- The admin session withdrawal reason is recorded in `admin_session_evidence` and
+  not delivered.
+- The offline import's writing form and all mutation-approval operations except
+  PostgreSQL keyed preparation are refused in required mode.
+- A keyed request that changes nothing is not reconcilable by key.
+- A replayed token issue or rotation never returns the secret; the caller revokes
+  and issues again.
+- A changed secret value under a reused key is detected only while the secret is
+  still at the replayed revision.
+- Keys are honoured only once every live member advertises `caller_operation_keys`.
+  The first honoured key is a rollback cutoff for earlier builds.
+- Evidence committed before each family's evidence migration carries no actor
+  metadata and never qualifies. Nothing is backfilled.
+- Delivery is at least once. The durable file-sink guarantee is stated for Unix
+  only.
+
+The family changes recorded these further limits:
+
+- Connections: under required mode the admin UI, which sends no `Idempotency-Key`,
+  cannot create or replace a Connection (or issue or rotate a token, or publish).
+  Keys in the admin UI are handed to #242.
+- Catalogs: a keyed refresh or OpenAPI registration retried after its Connection
+  was deleted answers `404`, not the receipt.
+- Local secrets exist only in standalone mode. On a replayed create or rotation the
+  retried value is compared with the stored one, so the same principal holding the
+  key can confirm a guessed value; mismatches are not counted, audited or
+  rate-limited. The constant-time comparison is hand-written.
+- Policy, tools and policy test keys are honoured in cluster mode only; a
+  standalone gateway answers a keyed request `400 standalone_caller_key_unsupported`.
+  A replayed draft publication does not mark the draft published. Keyed admission
+  in required mode on the draft publication and suggestion acceptance routes is
+  exercised through `PUT .../policy` only.
+- `admit_keyed_authority_change` compares a `Gated` operation with the key's
+  action, but nothing in it checks an unkeyed request labelled `Withdrawal`. The
+  guard is the route-enumerating test
+  `required_mode_refuses_the_unkeyed_form_of_every_gated_keyed_route`
+  (`gateway/src/authority_evidence_route_app_tests.rs`), which drives every route in
+  `KEYED_ROUTES` and requires each gated one to refuse its unkeyed form in required
+  mode.
+- The router-level log capture in the service-token replay test is per thread, so
+  it does not see what the token store logs on the blocking pool; a separate store
+  test driven on its own thread
+  (`sqlite_a_failed_token_reservation_is_counted_and_no_secret_reaches_logs_or_metrics`)
+  covers that.
+- The keyed suggestion acceptance and draft publication tests in
+  `admin_observability_app_tests::cluster_discovery_tests` build their own
+  PostgreSQL pool with TLS disabled, so they run only in the loopback PostgreSQL
+  jobs and not in the verified-TLS shard
+  ([Verified-TLS storage tests](#verified-tls-storage-tests)).
 
 ### Rows admitted without qualification
 
@@ -2243,6 +2337,24 @@ behaviour is characterized, not changed, by
 reactivation of an expired entry), `a_repeated_withdrawal_records_one_withdrawal` in
 `storage::postgres_admin_sessions`, and the re-encryption batch tests in
 `connections::local_secret` and `connection_secret_maintenance`.
+
+## Changes the inventory does not cover
+
+The delegated-token purge (`POST /v1{ADMIN_PREFIX}/principal/delegated-tokens/revoke`,
+`principal_delegated_tokens_revoke_endpoint` in `gateway/src/admin_observability.rs`)
+withdraws authority: it drops every delegated issuer token the gateway caches for one
+principal, under every `delegated_issuer_token` Connection, and revokes each at its
+issuer where the Connection names a `revocation_url`
+([configuration](configuration.md)). It is audited, and in cluster mode it is
+recorded as a shared security revision through the operation gate so that every
+replica purges its own cache. It has no authority evidence row: it is not one of the
+inventory's operations, and giving it one would need a new operation code and a new
+schema version of the delivered record. The owner ruled (decision 8 on #425,
+2026-11-20) that it stays outside the inventory. `scripts/check-authority-evidence.mjs`
+records it, with that reason, in its table of endpoints that are not inventory
+authority changes (`NOT_AUTHORITY_CHANGES`), so the scan does not report it as
+unclassified. Required mode does not ask the evidence gate for it, and like every
+route outside `KEYED_ROUTES` it refuses an `Idempotency-Key`.
 
 ## Verified-TLS storage tests
 
@@ -2321,6 +2433,20 @@ only against the loopback database.
 
 ## Next reviewable slices and validation gates
 
+Issue #425 shipped in these pull requests: configuration activation refused at
+startup in required mode (#826); the rows admitted without qualification named and
+the offline import's writing form refused (#831); caller operation IDs bound to a
+request digest in both stores, with PostgreSQL migration 36 (#828); every
+caller-bound principal change delivered as `authority_event.v1` (#827); one gate for
+keyed changes, the `KEYED_ROUTES` guard and the `caller_operation_keys` capability
+(#833, with #838); keyed service-token issue and rotation (#836), Connection create,
+replace and delete (#834), catalog publication and overlay changes (#837), local
+secret changes (#839), and cluster policy, tools and policy test changes (#840); and
+the closing reconciliation of this inventory and these docs. Items 1 to 4 below are
+the evidence and delivery slices those changes built on, and say where each gained
+its caller-bound form. Item 5 is what stays open, handed to #242. The limits that remain are listed under
+[Remaining limits](#remaining-limits).
+
 1. **PostgreSQL Connection deletion evidence (landed).** The delete transaction
    now writes non-cascading actor/action/event/operation metadata to migration
    16's `connection_change_evidence`, beside the unchanged outbox tombstone and
@@ -2342,8 +2468,9 @@ only against the loopback database.
    change back, a full journal refused with `503`, survival after delete and
    restart, and the absence of specification, binding and secret material.
    Connections created or replaced before migration 28 keep only their cascading
-   version history. Still open for this row: a caller-bound operation identity at
-   the store boundary.
+   version history. A caller-bound operation identity at the store boundary landed
+   with #834 for create, replace and delete in both modes
+   ([Keyed Connection create, replace and delete](#keyed-connection-create-replace-and-delete)).
 2. **Service-token and JWT metadata (landed).** `ServiceTokenStore` rotate and
    revoke now take the mutating actor, and both adapters write one evidence row
    per committed change in the change's own transaction: migration 18's
@@ -2370,8 +2497,9 @@ only against the loopback database.
    actor, its forced insert failure and rollback, plaintext and hash exclusion,
    restart and the contiguous issue, rotate and revoke chain; tokens issued
    before it keep `created_by` as their only record. Both stores bind the caller's
-   operation ID for the keyed revocation route. Issue and rotation still generate
-   operation IDs internally.
+   operation ID for the keyed revocation route, and since #836 for keyed issue and
+   rotation too ([Keyed service-token issue and rotation](#keyed-service-token-issue-and-rotation));
+   an unkeyed issue or rotation still generates its operation ID internally.
 3. **Shared documents/catalog metadata (landed).** The shared document core
    (`postgres_documents::commit_in`) now writes one migration 23
    `document_change_evidence` row beside the outbox row of every policy and tools
@@ -2406,9 +2534,12 @@ only against the loopback database.
    canonical issuer as Connection deletion does ([Actor metadata](#actor-metadata)).
    Migration 32 journals both tables and aligns the document rows' actor vocabulary
    with migration 24's ([Policy, tools and catalog delivery](#policy-tools-and-catalog-delivery)).
-   Still open: a caller-bound operation identity. No scheduled catalog refresh ships,
-   so no system catalog actor is recorded yet.
-4. **Durable dispatch (landed for the journaled evidence).** Migration 21's
+   A caller-bound operation identity landed for catalog publication and overlay
+   changes in both modes with #837, and for cluster policy, tools and policy test
+   changes with #840 ([Keyed policy, tools and policy test changes](#keyed-policy-tools-and-policy-test-changes));
+   standalone policy and tools changes stay with #242 (item 5). No scheduled catalog
+   refresh ships, so no system catalog actor is recorded yet.
+4. **Durable dispatch and standalone evidence (landed).** Migration 21's
    journal, capacity reservation and dispatcher cursor, the leased dispatcher and
    the log and file sinks, as described under [Durable delivery](#durable-delivery).
    Migration 21 moves the serving contract from exactly schema 20 to exactly schema
@@ -2428,31 +2559,48 @@ only against the loopback database.
    for each session's withdrawal ([Admin session withdrawals and journal capacity](#admin-session-withdrawals-and-journal-capacity)),
    moving the serving contract from exactly schema 25 to exactly schema 26, a
    coordinated drain/migrate/restart. Still open: the items listed at the end of
-   that section.
-5. **Standalone evidence and #242 ledger integration.** Add evidence only within
-   each owning SQLite store transaction; test forced insert failure and restart.
-   Connections and local secrets have landed in the Connections database
-   (migration 12 of that store, [Standalone evidence](#standalone-evidence)), with
-   tests for each change's forced insert failure and rollback, survival of deletion
-   and restart, refused and ineffective changes writing nothing, unrecordable actors
-   refused, the migration onto an existing database fabricating nothing, the actor
-   CHECKs pinned to migration 24's, synthetic-marker exclusion, and the admin
-   endpoints and maintenance command recording their whole actors. Managed catalog
-   and overlay publication has landed in the same database (its migration 13), with
-   tests for every action and actor shape, survival of replacement, Connection
-   deletion and restart, refused and stale publications writing nothing, forced
-   insert failure and rollback as a store failure, the migration fabricating
-   nothing, the CHECKs pinned to migration 12's and PostgreSQL migration 23's, and
-   synthetic-marker exclusion; required mode admits it. Still open here: a
-   caller-bound operation identity, and delivery of any standalone evidence.
-   For policy/tools/configuration, require ledger-owned safe manifest/digest,
-   parent revision/CAS, actor/operation intent, atomic activation/evidence or
-   recoverable staging, authoritative replay after interruption, and export
-   intent accepted before artifact release. Until all are demonstrated,
-   required mode rejects unsupported configurations and operations; it does so
-   since PR 4 ([Required-durability mode](#required-durability-mode)), and each
-   row that gains evidence changes its `required_mode` with it.
+   that section. Standalone evidence landed in the stores that own it: Connections
+   and local secrets in the Connections database (its migration 12), managed
+   catalog and overlay publication in the same database (its migration 13), and
+   service-token changes in the token database, each written in the change's own
+   transaction ([Standalone evidence](#standalone-evidence)), and delivered from
+   those stores through a cursor in each ([Standalone delivery](#standalone-delivery)).
+   Since #827, under `AUTHORITY_EVENT_FORMAT=qualified_v1`, every caller-bound
+   principal change of both modes is delivered as `authority_event.v1`
+   ([Authority event v1](#authority-event-v1)).
+5. **#242 hand-off: the standalone revision ledger and configuration activation.**
+   By owner decision (recorded 2026-11-19), the rows that depend on the standalone
+   revision ledger and bundle activation are not part of #425 and are tracked in
+   #242: `policy_standalone`, `policy_reload`, `tools_standalone` and
+   `policy_tests_standalone` (refused in required mode), `configuration_activation`
+   (refused at startup, in both modes) and `configuration_export` (unavailable).
+   Each row's `follow_up` in the inventory says so. Required mode keeps each of them
+   as it is until #242 demonstrates, with tests: a ledger-owned safe manifest and
+   digest; parent revision and compare-and-swap; actor and operation intent;
+   activation and evidence that are atomic or recoverably staged; authoritative
+   replay after interruption; and export intent accepted before an artifact is
+   released. Raw secrets are never hashed or exported as a substitute for redaction.
+   Six further points carry over from #425:
+   1. `AUTHORITY_EVIDENCE_DURABILITY=required` refuses to start until an
+      `ActivationProof` exists for the exact configuration being activated. The
+      proof must be checked per activation, inside the activation stage, and never
+      granted per backend; #242 changes the type, the place of the check and the
+      `configuration_activation` row in one reviewed change.
+   2. Bundle-mode serving must pass the same check when it ships.
+   3. In cluster mode, required-mode preflight refuses to seed an empty tools
+      document, because the seed is an unkeyed system write; the activation must
+      cover it or the document must be provisioned beforehand.
+   4. The Cloudflare Worker refuses `required` up front; lift that with the same
+      change that makes a mode start.
+   5. Every qualified row is proven by tests that build the application directly;
+      no deployment has run them in required mode.
+   6. The admin UI sends no `Idempotency-Key`, so in required mode it can revoke and
+      delete but cannot issue, rotate, create, replace or publish; it needs to send a
+      UUIDv7 key on those mutations before required mode is offered to operators.
 
-The inventory's source anchors can become stale as those slices land; update the
-classification, proofs and reviewed revision in the same PR. Do not close #425
-from this PR 1 contract or from passing these lightweight checks.
+The inventory's source anchors can become stale as code changes; update the
+classification, proofs and reviewed revision in the same pull request.
+`scripts/check-authority-evidence.mjs` holds the end state: an admitted row is
+`no_caller_key` or `withdrawal_admitted`, `missing_metadata` appears only on a row
+that required mode refuses, and `configuration_activation` stays
+`refused_at_startup` while `ActivationProof` has no value.
