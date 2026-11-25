@@ -209,7 +209,7 @@ remain mandatory: compiled Rust binaries and embedded JavaScript bundles do not
 provide a complete language dependency inventory to an image scanner. Passing
 this gate is not a claim that every embedded component has been identified.
 
-`image-scan-policy.json` contains the reviewed exceptions (initially empty).
+`image-scan-policy.json` contains the reviewed exceptions, listed below.
 Each entry requires `advisory`, exact `package`, exact installed `version`,
 `owner`, substantive `rationale`, and timezone-qualified `expires`, at most 90
 days ahead. Optional `digest` further restricts the exception to one OCI index.
@@ -217,6 +217,29 @@ Wildcards, missing fields, duplicates and expired exceptions fail validation.
 Review the affected package, vendor advisory and exposure before approving an
 exception in a PR; never add blanket exceptions to obtain a green release.
 Reports retain both the original finding and the applied review metadata.
+
+### Image scan exceptions
+
+- [CVE-2026-121757](https://security-tracker.debian.org/tracker/CVE-2026-121757)
+  (CP949 to UTF-8 with `//IGNORE`),
+  [CVE-2026-121758](https://security-tracker.debian.org/tracker/CVE-2026-121758)
+  (ISO-2022-CN-EXT to UTF-8) and
+  [CVE-2026-124024](https://security-tracker.debian.org/tracker/CVE-2026-124024)
+  (UCS-4 to IBM1390/IBM1399), `libc6` 2.41-12+deb13u4 from the distroless
+  `base-nossl-debian13` runtime base. Owner: GreenGateway maintainers, part of
+  #420; approved by the repository owner on 2026-11-25. Each is a glibc iconv
+  converter reading past the end of its input buffer. Trivy reports them with
+  unknown severity, which blocks. Debian marks all three `no-dsa` (minor issue)
+  for trixie and lists no fixed version, so no base-image update clears them.
+  Exposure: exploitation needs attacker-controlled input and charset passed to
+  `iconv`. The gateway binary is Rust and never calls `iconv_open` or `iconv`;
+  no crate in `Cargo.lock`, including the bundled SQLite and AWS-LC C sources,
+  calls them (the `libc` crate only declares the bindings). Each exception
+  matches the exact advisory, package and installed version, so a base-image
+  update that changes `libc6` needs a fresh review. Expires 2026-12-25T00:00:00Z.
+  Removal condition: Debian ships a fixed `libc6` for trixie and the runtime base
+  digest moves to it, or the exception expires; then remove the three entries
+  and this one.
 
 Update the scanner release and its verified official Linux archive checksum
 together, run the gate regressions and a real registry scan, and review changes
