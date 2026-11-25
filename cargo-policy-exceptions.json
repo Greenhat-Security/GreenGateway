@@ -194,7 +194,7 @@
           "tokio-postgres@0.7.18"
         ],
         "0.3.0": [
-          "rusqlite@0.41.1"
+          "rusqlite@0.43.0"
         ]
       }
     },
@@ -242,12 +242,11 @@
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
-      "reason": "metrics-util 0.20 and the SQLite VFS (rsqlite-vfs) still use hashbrown 0.16 while SQLite hashlink, indexmap and jsonschema's referencing use 0.17.",
+      "reason": "metrics-util 0.20 still uses hashbrown 0.16 while SQLite hashlink, indexmap and jsonschema's referencing use 0.17.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "0.16.1": [
-          "metrics-util@0.20.4",
-          "rsqlite-vfs@0.1.1"
+          "metrics-util@0.20.4"
         ],
         "0.17.1": [
           "hashlink@0.12.2",
@@ -409,7 +408,7 @@
           "jni-macros@0.22.4",
           "jni-sys-macros@0.4.1",
           "jsonschema-macros-core@0.60.2",
-          "rust-embed-impl@8.13.0",
+          "rust-embed-impl@8.14.0",
           "strum_macros@0.28.0",
           "synstructure@0.13.2",
           "tls_codec_derive@0.4.2",
