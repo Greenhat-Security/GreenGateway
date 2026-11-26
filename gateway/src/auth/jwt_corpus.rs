@@ -328,11 +328,23 @@ fn identity(algorithm: Algorithm) -> Result<Identity, &'static str> {
         token: encode(
             &Header::new(Algorithm::HS256),
             &base_claims(),
-            &EncodingKey::from_secret(&der),
+            &EncodingKey::from_secret(&der)
+                .map_err(|_| "JWT corpus alternate-algorithm key is empty")?,
         )
         .map_err(|_| "JWT corpus alternate-algorithm signing failed")?,
         accepted: false,
         failure: "JWT with wrong algorithm was accepted",
+    });
+    // RFC 7515 4.1.11: a validly signed token whose `crit` header names an
+    // extension the validator does not understand must be rejected.
+    let mut critical = Header::new(identity.cached.algorithm);
+    critical.kid = Some(identity.cached.kid.clone());
+    critical.crit = Some(vec!["corpus-unknown-extension".to_owned()]);
+    identity.cases.push(SignedCase {
+        token: encode(&critical, &base_claims(), &identity.encoding)
+            .map_err(|_| "JWT corpus critical-extension signing failed")?,
+        accepted: false,
+        failure: "JWT naming an unknown critical header extension was accepted",
     });
     Ok(identity)
 }
@@ -347,7 +359,7 @@ fn generated_jwt_corpus_checks_acceptance_rejection_and_no_lookup() {
         );
         assert_eq!(
             identity.cases.iter().filter(|case| !case.accepted).count(),
-            12
+            13
         );
     }
     for input in [

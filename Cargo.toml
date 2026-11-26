@@ -60,7 +60,7 @@ ipnet = "2.11.0"
 # Exact comparison costs grow with the square of a number's digits;
 # `gateway/src/tools/definitions.rs` bounds that work.
 jsonschema = { version = "0.60.2", default-features = false, features = ["arbitrary-precision", "idna"] }
-jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "12.0.0", features = ["aws_lc_rs"] }
 # Already in the graph transitively (tokio, mio and socket2 depend on it on
 # Unix), and the same 0.2.x they resolve. Naming it directly adds a dependency
 # edge, not a crate: `ggctl/src/credential.rs` takes `O_NONBLOCK` from it so a
