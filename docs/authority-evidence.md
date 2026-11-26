@@ -406,7 +406,16 @@ for each keyed family, for the operations listed here and no others:
   locators are markers too; each fetch records that the certificate presented
   is the one issued for the run, and no line of the client private key reaches
   a log line, a metric, an answer or the audit stream. `catalog.mcp.publish` is
-  not driven.
+  driven by
+  `marker_keys::a_keyed_mcp_catalog_publication_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
+  (standalone) and
+  `cluster_connection_keys::postgres_keyed_mcp_catalog_publication_keeps_synthetic_markers_out_of_the_logs_and_metrics`
+  (PostgreSQL): a keyed refresh of an enabled managed MCP Connection at a
+  loopback HTTPS MCP server the test runs, which requires the same client
+  certificate and records that every request carried both secret values; its
+  exact retry, answered from the receipt without contacting the server; its key
+  reused under another `If-Match`; and, standalone, a keyed refresh whose
+  reservation cannot be written.
 - Policy, tools and policy tests:
   `a_keyed_document_commit_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record`,
   and for logs, metrics, answers and audit
@@ -2360,10 +2369,9 @@ The family changes recorded these further limits:
   `required_mode_refuses_the_unkeyed_cluster_acceptance_and_draft_publication_before_reading`.
 - Log-line and metric-label redaction (I5) is tested only for the operations the
   router-level marker tests drive
-  ([Authority event v1](#authority-event-v1) lists them).
-  `catalog.mcp.publish` has no log and metric test. The capture sees `tracing`
-  events on the runtime's own threads, not `log`-crate records from dependencies
-  or threads the code spawns itself, such as the audit log writer.
+  ([Authority event v1](#authority-event-v1) lists them). The capture sees
+  `tracing` events on the runtime's own threads, not `log`-crate records from
+  dependencies or threads the code spawns itself, such as the audit log writer.
 
 ### Rows admitted without qualification
 

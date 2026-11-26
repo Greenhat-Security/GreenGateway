@@ -4513,6 +4513,206 @@ mod cluster_connection_keys {
             assert!(!rendered.contains(digest), "a digest reached the metrics");
         }
     }
+
+    /// I5 for `catalog.mcp.publish` on a PostgreSQL-backed cluster replica,
+    /// the form of
+    /// `marker_keys::a_keyed_mcp_catalog_publication_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
+    /// that runs against the PostgreSQL store: an enabled managed MCP
+    /// Connection at a loopback HTTPS MCP server the test controls, whose
+    /// bearer and additional-header secrets and TLS client identity are
+    /// marked operator aliases. A keyed refresh, which lists the server's
+    /// tools and publishes them, and records that every request the server
+    /// received carried both secret values and the issued client
+    /// certificate; its exact retry, answered from the receipt without
+    /// contacting the server; and the key reused under another `If-Match`.
+    /// No marker, no line of the client private key and no binding digest
+    /// reaches a log line at any level, the rendered metrics, an answer or
+    /// the audit stream.
+    #[test]
+    fn postgres_keyed_mcp_catalog_publication_keeps_synthetic_markers_out_of_the_logs_and_metrics()
+    {
+        use super::marker_keys::{
+            bound_digest, client_private_key_lines, configure_catalog_source_aliases,
+            credentialed_mcp_connection_body, resolved_catalog_credentials,
+            write_catalog_source_secrets, RecordingMcpUpstream, CATALOG_SOURCE_MARKERS,
+            CLIENT_TLS_MARKERS,
+        };
+        let secrets = TempDb::new("cluster-mcp-catalog-markers");
+        write_catalog_source_secrets(&secrets);
+        let (audit_log, capture) = captured_audit();
+        let (outcome, logged, rendered) =
+            super::super::admin_tokens_app_tests::capture_logs_and_metrics_on_every_runtime_thread(
+                async {
+                    let Some(admin_dsn) = locator() else {
+                        eprintln!("skipping: no test database locator; CI runs this test");
+                        return None;
+                    };
+                    let database =
+                        storage::contract_tests::postgres_audit_tests::create_test_database(
+                            &admin_dsn,
+                        )
+                        .await;
+                    let foundation = test_pool(&database.dsn).await;
+                    let pool = foundation.pool();
+                    storage::migrations::apply_missing_for_startup(pool, &test_settings())
+                        .await
+                        .unwrap();
+                    let upstream = RecordingMcpUpstream::spawn(&secrets).await;
+                    let (router, earlier) = keyed_replica_with(pool, audit_log, |config| {
+                        config.connection_secrets_root =
+                            Some(connections::secret::SecretRootConfig::new(
+                                secrets.path.with_extension("secrets"),
+                            ));
+                        configure_catalog_source_aliases(config);
+                    })
+                    .await;
+                    stale(pool, earlier).await;
+                    let roles: Vec<&str> = std::iter::once("connections-superadmin")
+                        .chain(CATALOG_ROLES.iter().copied())
+                        .collect();
+                    let admin = signed_token_with_issuer("operator", &roles, CLUSTER_ISSUER);
+                    let actor = auth::change_actor::ChangeActor::for_test_with_issuer(
+                        "operator",
+                        CLUSTER_ISSUER,
+                    );
+                    let mut answers = Vec::new();
+
+                    // The Connection, created without a key; its answer names
+                    // its references to its creator and is not kept.
+                    let collection = collection_etag(&router, &admin).await;
+                    let (status, headers, created) = call(
+                        &router,
+                        Method::POST,
+                        CONNECTIONS_ADMIN_ROUTE,
+                        &admin,
+                        Some(credentialed_mcp_connection_body(&upstream.base_url())),
+                        Some(&collection),
+                        None,
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::CREATED, "{created}");
+                    let id = created["id"].as_str().expect("an ID").to_owned();
+                    let etag = headers[header::ETAG].to_str().unwrap().to_owned();
+                    upstream.take_received();
+
+                    let (method, uri) = CatalogCall::Refresh.route(&id);
+                    let key = caller_key(126);
+                    let refresh = |if_match: String| {
+                        let (router, admin, method, uri, key) = (
+                            router.clone(),
+                            admin.clone(),
+                            method.clone(),
+                            uri.clone(),
+                            key.clone(),
+                        );
+                        async move {
+                            call(
+                                &router,
+                                method,
+                                &uri,
+                                &admin,
+                                None,
+                                Some(&if_match),
+                                Some(&key),
+                            )
+                            .await
+                        }
+                    };
+                    let (status, _, published) = refresh(etag.clone()).await;
+                    assert_eq!(status, StatusCode::OK, "{published}");
+                    let received = upstream.take_received();
+                    assert!(!received.is_empty(), "the refresh reached the upstream");
+                    assert!(
+                        received
+                            .iter()
+                            .all(|request| *request == resolved_catalog_credentials()),
+                        "{received:?}"
+                    );
+                    answers.push(published);
+                    let (status, _, receipt) = refresh(etag.clone()).await;
+                    assert_eq!(status, StatusCode::OK, "{receipt}");
+                    assert_eq!(
+                        receipt["operation"],
+                        json!("catalog.mcp.publish"),
+                        "{receipt}"
+                    );
+                    assert!(
+                        upstream.take_received().is_empty(),
+                        "the exact retry is answered from its receipt"
+                    );
+                    answers.push(receipt);
+                    let other = "\"another-connection-etag\"".to_owned();
+                    let (status, _, conflict) = refresh(other.clone()).await;
+                    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+                    answers.push(conflict);
+                    let committed =
+                        bound_digest(&actor, &key, "catalog.mcp.publish", &id, &etag, "");
+                    let refused =
+                        bound_digest(&actor, &key, "catalog.mcp.publish", &id, &other, "");
+
+                    assert_eventually(Duration::from_secs(5), || {
+                        capture.events().iter().any(|event| {
+                            event.event_type == audit::event::CONNECTION_REFRESHED
+                                && event.payload["connection_id"] == json!(id)
+                        })
+                    });
+                    let stored: Vec<String> = pool
+                        .get()
+                        .await
+                        .unwrap()
+                        .query(
+                            "SELECT binding_digest FROM greengateway.authority_caller_operation_ids",
+                            &[],
+                        )
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(|row| row.get::<_, Option<String>>(0).expect("a bound digest"))
+                        .collect();
+                    Some((answers, committed, refused, stored))
+                },
+            );
+        let Some((answers, committed, refused, stored)) = outcome else {
+            return;
+        };
+
+        // The digest computed here is the one the handler bound.
+        assert_eq!(stored, vec![committed.clone()]);
+        assert!(!logged.is_empty(), "the handlers' log lines were captured");
+        let answered = format!("{answers:?}");
+        let audited = format!("{:?}", capture.events());
+        // Read only if the PostgreSQL run spawned the upstream that wrote it.
+        let key_lines = secrets
+            .path
+            .with_extension("secrets")
+            .join(CLIENT_TLS_MARKERS[3])
+            .exists()
+            .then(|| client_private_key_lines(&secrets))
+            .unwrap_or_default();
+        let markers = CATALOG_SOURCE_MARKERS
+            .iter()
+            .chain(CLIENT_TLS_MARKERS.iter())
+            .map(|marker| (*marker).to_owned())
+            .chain(key_lines);
+        for marker in markers {
+            assert!(!answered.contains(&marker), "{marker} reached an answer");
+            assert!(
+                !audited.contains(&marker),
+                "{marker} reached the audit stream"
+            );
+            assert!(!logged.contains(&marker), "{marker} reached the logs");
+            assert!(!rendered.contains(&marker), "{marker} reached the metrics");
+        }
+        for digest in [&committed, &refused] {
+            assert!(!answered.contains(digest), "a digest reached an answer");
+            assert!(
+                !audited.contains(digest),
+                "a digest reached the audit stream"
+            );
+            assert!(!logged.contains(digest), "a digest reached the logs");
+            assert!(!rendered.contains(digest), "a digest reached the metrics");
+        }
+    }
 }
 
 /// Keyed service-token issue and rotation in cluster mode, through the admin
