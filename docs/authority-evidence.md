@@ -2312,6 +2312,13 @@ These hold when issue #425 closes:
   metadata and never qualifies. Nothing is backfilled.
 - Delivery is at least once. The durable file-sink guarantee is stated for Unix
   only.
+- Log-line and metric-label redaction (I5) is tested for the operations
+  [Authority event v1](#authority-event-v1) lists per family, not for every keyed
+  operation in both modes (issue #844). Service-token issue and rotation, which
+  are qualified rows in PostgreSQL, are driven in the SQLite form only, as are
+  the OAuth client-credentials replacement and the keyed Connection delete. The
+  keyed local-secret delete has no log and metric test. Each of these leaves
+  this list when its test lands.
 
 The family changes recorded these further limits:
 
