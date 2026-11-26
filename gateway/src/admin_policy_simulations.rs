@@ -110,7 +110,7 @@ impl PolicyEvaluationLimiter {
     pub(super) fn try_acquire(self: &Arc<Self>, actor: String) -> Option<PolicyEvaluationSlot> {
         let limit = self.limit;
         self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < limit).then_some(active + 1)
             })
             .ok()?;

@@ -86,7 +86,7 @@ a fixed distant time, so it reaches neither the leeway edge nor a malformed
 number. Fixed examples in `gateway/src/auth/jwt_tests.rs` cover both. They are
 not generated properties: the edge moves with the current clock, which a seed
 cannot pin. Each calls the production `JwtValidator::decode_with_key`
-(jsonwebtoken 11.1.0) with a token signed by the in-memory RSA test key.
+(jsonwebtoken 12.0.0) with a token signed by the in-memory RSA test key.
 
 - **Leeway edges.** `JWT_EXP_LEEWAY_SECS` (60) applies to `exp` and `nbf`.
   An `exp` that lapsed 10 seconds less than the leeway ago is accepted, and

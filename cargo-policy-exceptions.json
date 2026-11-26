@@ -9,19 +9,18 @@
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2027-02-22",
-      "reason": "hyper-util 0.1.21, reqwest 0.13.5, pem 4 (via rcgen 0.14.10), rmcp 3.9.0 and the gateway workspace pin use base64 0.23 while axum, jsonwebtoken, metrics-exporter-prometheus, pem 3 and postgres-protocol still require 0.22.",
+      "reason": "hyper-util 0.1.21, jsonwebtoken 12.0.0, reqwest 0.13.5, pem 4 (via rcgen 0.14.10), rmcp 3.9.0 and the gateway workspace pin use base64 0.23 while axum, metrics-exporter-prometheus and postgres-protocol still require 0.22.",
       "remediation": "Re-evaluate when the listed 0.22 parent dependencies update; remove the exception once their version requirements converge on 0.23.",
       "parents": {
         "0.22.1": [
           "axum@0.8.9",
-          "jsonwebtoken@11.1.0",
           "metrics-exporter-prometheus@0.18.3",
-          "pem@3.0.6",
           "postgres-protocol@0.6.12"
         ],
         "0.23.1": [
           "gateway@1.0.1",
           "hyper-util@0.1.21",
+          "jsonwebtoken@12.0.0",
           "pem@4.0.0",
           "reqwest@0.13.5",
           "rmcp@3.9.0"
@@ -207,12 +206,10 @@
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2027-02-22",
-      "reason": "JWT, ring and rand_core 0.6 use getrandom 0.2; ahash, schema tooling, rand_core 0.9 and tempfile use 0.3; the gateway, current RustCrypto, UUID, rand 0.10, QUIC and PostgreSQL use 0.4: three incompatible generations.",
+      "reason": "ring uses getrandom 0.2; ahash, schema tooling and rand_core 0.9 use 0.3; the gateway, JWT, current RustCrypto, UUID, rand 0.10, tempfile, QUIC and PostgreSQL use 0.4: three incompatible generations.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "0.2.17": [
-          "jsonwebtoken@11.1.0",
-          "rand_core@0.6.4",
           "ring@0.17.14"
         ],
         "0.3.4": [
@@ -220,16 +217,17 @@
           "jsonschema-value@0.60.2",
           "jsonschema@0.60.2",
           "rand_core@0.9.5",
-          "referencing@0.60.2",
-          "tempfile@3.27.0"
+          "referencing@0.60.2"
         ],
         "0.4.3": [
           "crypto-common@0.2.2",
           "deadpool-postgres@0.14.2",
           "gateway@1.0.1",
           "jobserver@0.1.35",
+          "jsonwebtoken@12.0.0",
           "quinn-proto@0.11.19",
           "rand@0.10.2",
+          "tempfile@3.27.0",
           "uuid@1.29.2"
         ]
       }
@@ -274,25 +272,6 @@
           "cap-primitives@4.0.3",
           "cap-std@4.0.3",
           "io-extras@0.19.0"
-        ]
-      }
-    },
-    {
-      "name": "pem",
-      "versions": [
-        "3.0.6",
-        "4.0.0"
-      ],
-      "owner": "GreenGateway maintainers",
-      "expires": "2027-02-22",
-      "reason": "rcgen 0.14.10 moved to pem 4 while jsonwebtoken 11.1.0 still parses PEM with pem 3.",
-      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
-      "parents": {
-        "3.0.6": [
-          "jsonwebtoken@11.1.0"
-        ],
-        "4.0.0": [
-          "rcgen@0.14.10"
         ]
       }
     },
@@ -344,17 +323,13 @@
       "name": "rand_core",
       "versions": [
         "0.10.1",
-        "0.6.4",
         "0.9.5"
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2027-02-22",
-      "reason": "Signature, property/QUIC generators and current crypto require distinct rand_core traits.",
+      "reason": "Property and QUIC generators use rand_core 0.9 while signature 3, current crypto and rand 0.10 use 0.10.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
-        "0.6.4": [
-          "signature@2.2.0"
-        ],
         "0.9.5": [
           "rand@0.9.5",
           "rand_chacha@0.9.0",
@@ -366,7 +341,8 @@
           "getrandom@0.4.3",
           "rand@0.10.2",
           "rand_pcg@0.10.2",
-          "rand_xorshift@0.5.0"
+          "rand_xorshift@0.5.0",
+          "signature@3.0.0"
         ]
       }
     },

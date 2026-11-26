@@ -22,8 +22,9 @@ visibility, dependency or security default changes.
 | Path | `path_prefix_matches`, `is_unsafe_request_path`, `exempt_path_matches`: literal boundaries, unsafe dot insertion and exact probe exemptions |
 
 JWT setup generates fresh ES256 and EdDSA keys in memory. Every JWT case forces
-two valid-signature acceptances and 24 denials covering issuer, audience, expiry,
-not-before, required claims, signature corruption and algorithm confusion.
+two valid-signature acceptances and 26 denials covering issuer, audience, expiry,
+not-before, required claims, signature corruption, algorithm confusion and a
+`crit` header naming an extension the validator does not understand.
 Arbitrary token/header/claim/JWK fragments reach the real decoders. RSA JWK
 parsing is reachable, but this harness generates no positive RS256 signatures;
 the existing RSA tests remain unchanged.
@@ -41,7 +42,7 @@ claims remain unchanged. The positive fixture expires in 2100; the forced
 future-not-before fixture is in 2200. Review these explicit dates before 2100.
 
 Deterministic tests cover what that mapping skips, against the same
-`JwtValidator::decode_with_key` (jsonwebtoken 11.1.0, `JWT_EXP_LEEWAY_SECS` =
+`JwtValidator::decode_with_key` (jsonwebtoken 12.0.0, `JWT_EXP_LEEWAY_SECS` =
 60, `nbf` validated); see
 [JWT time claims](pure-parser-properties.md#jwt-time-claims) for what they
 pin:

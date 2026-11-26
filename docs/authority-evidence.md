@@ -353,7 +353,9 @@ check that no marker or binding digest reaches a log line, a metric name or labe
 an answer or (where the test has it) the audit stream. Their capture
 (`admin_tokens_app_tests::capture_logs_and_metrics_on_every_runtime_thread`)
 covers the test's thread and the runtime's blocking pool, where the SQLite stores
-run, and checks itself before it returns
+run, and checks itself before it returns: a log line and a metric label it plants
+on each of those threads must both be captured, so a test that searches the
+rendering for a marker cannot pass by missing a metric label emitted on the pool
 (`the_capture_sees_logs_and_metrics_on_the_blocking_pool` pins it). It does not see
 `log`-crate records from dependencies or threads the code spawns itself, such as
 the audit log writer. Log-line and metric-label redaction (I5) is therefore tested
@@ -369,7 +371,12 @@ for each keyed family, for the operations listed here and no others:
   `a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
   (keyed create and rotation with their retries and conflicts, standalone; the
   values, the label and the digests reach no answer, audit event, log line or
-  metric, and the values reach neither the database file nor its WAL).
+  metric, and the values reach neither the database file nor its WAL). Both also
+  read back the nonce and ciphertext each change stored and search for them as
+  hex, base64 and the `Debug` form of their first eight bytes: the store test in
+  the reservations, receipts and evidence columns, the router test in every
+  answer (the secret's own view included), the audit events, the logs and the
+  metrics.
 - Connections: `the_binding_digest_is_stored_only_in_the_reservation_row`, run
   against both stores, for the receipts and evidence rows;
   `marker_keys::a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
@@ -1165,7 +1172,8 @@ best_effort and required),
 (markers in the value, the label and a conflicting retry's value, checked against
 the answers, the audit events, the logs and metrics captured on the test's thread
 and the runtime's blocking pool, where the SQLite store runs, the SQLite file and
-its WAL).
+its WAL; the stored nonce and ciphertext of the create and the rotation are
+checked against the same answers, audit events, logs and metrics).
 The one PostgreSQL test,
 `authority_evidence_app_tests::cluster_connection_keys::postgres_keyed_secret_changes_in_cluster_mode_leave_the_fence_alone`,
 proves that a keyed rotation and delete on a cluster replica, once the operation
