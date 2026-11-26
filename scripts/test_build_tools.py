@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 import unittest
@@ -58,6 +59,11 @@ class ToolContractTests(unittest.TestCase):
         self.replace("Dockerfile", "cargo build --locked", "cargo build")
         self.rejects("Docker Node")
         self.rejects("must be locked")
+
+    def test_docker_rustc_assertion_drift_fails(self):
+        production = re.escape(build_tools.versions()["rust_production"])
+        self.replace("Dockerfile", f"'^rustc {production} '", r"'^rustc 0\.0\.1 '")
+        self.rejects("Docker rustc assertion")
 
     def test_unversioned_audit_or_disabled_checksums_fail(self):
         self.replace(".github/workflows/ci.yml", "cargo-audit@0.22.2", "cargo-audit")
