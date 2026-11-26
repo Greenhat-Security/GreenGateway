@@ -2115,7 +2115,10 @@ fn trace_subscriber(logs: CapturedLogs) -> impl tracing::Subscriber + Send + Syn
 /// meanwhile consults a TRACE subscriber and stays enabled. The capture
 /// checks itself: one line, through a callsite first reached on a thread
 /// with no subscriber, must be captured on the test thread before the test
-/// starts and on the blocking pool after it ends.
+/// starts and on the blocking pool after it ends. The same sentinel plants
+/// a metric label naming its thread, and both labels must be in the
+/// rendering, so a marker in a metric label emitted on either thread is
+/// one a caller's search of the rendering would find.
 pub(super) fn capture_logs_and_metrics_on_every_runtime_thread<T>(
     test: impl std::future::Future<Output = T>,
 ) -> (T, String, String) {
@@ -2157,18 +2160,29 @@ pub(super) fn capture_logs_and_metrics_on_every_runtime_thread<T>(
     });
     runtime.shutdown_timeout(Duration::from_secs(5));
     let logged = logs.contents();
+    let rendered = recorder.handle().render();
     for place in ["test thread", "blocking pool"] {
         assert!(
             logged.contains(&format!("capture sentinel on the {place}")),
             "the capture missed a log line on the {place}"
         );
+        let planted = format!("{CAPTURE_SENTINEL_METRIC}{{place=\"{place}\"}} 1");
+        assert!(
+            rendered.lines().any(|line| line == planted),
+            "the capture missed a metric label on the {place}: {rendered}"
+        );
     }
-    (output, logged, recorder.handle().render())
+    (output, logged, rendered)
 }
 
-/// The one callsite of the capture's self-check.
+/// The counter the capture's self-check plants, labelled with its thread.
+const CAPTURE_SENTINEL_METRIC: &str = "capture_sentinel_total";
+
+/// The one callsite of the capture's self-check: a log line, and a metric
+/// whose label names the thread.
 fn capture_sentinel(place: &str) {
     tracing::trace!("capture sentinel on the {place}");
+    ::metrics::counter!(CAPTURE_SENTINEL_METRIC, "place" => place.to_owned()).increment(1);
 }
 
 /// The capture sees a log line and a metric emitted on the blocking pool,
