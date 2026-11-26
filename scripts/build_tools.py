@@ -213,6 +213,9 @@ def check(root=ROOT):
             errors.append("Docker Node tag differs from declared version")
         if f"FROM rust:{pins['rust_production']}-slim-bookworm@" not in dockerfile:
             errors.append("Docker production compiler differs from declared version")
+        # The builder stage also asserts the compiler it actually runs.
+        if f"rustc --version | grep -E '^rustc {re.escape(pins['rust_production'])} '" not in dockerfile:
+            errors.append("Docker rustc assertion differs from production compiler")
         for line in dockerfile.splitlines():
             if "cargo build" in line and "--locked" not in line:
                 errors.append("Docker Cargo builds must be locked")

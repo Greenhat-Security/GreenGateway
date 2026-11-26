@@ -825,8 +825,10 @@ async fn an_admitted_secret_change_finishes_after_its_client_goes_away() {
 /// receipt, conflict answer, audit event, log line or metric, and the values
 /// reach neither the Connections database file nor its WAL. Logs and metrics
 /// are captured on the test's thread and on the runtime's blocking pool,
-/// where the local-secret store runs. The store rows
-/// (`local_secret_operation_tests`) check the reservation and evidence rows.
+/// where the local-secret store runs. The stored nonce and ciphertext of the
+/// create and of the rotation, read back from the secret's row, reach none
+/// of those either. The store rows (`local_secret_operation_tests`) check
+/// the reservation and evidence rows.
 #[test]
 fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics() {
     const VALUE_MARKER: &str = "keyed-secret-value-marker-0f3a";
@@ -837,12 +839,18 @@ fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_a
     let connection_db = TempDb::new("keyed-secret-markers");
     let policy = TempPolicyFile::new(&connection_policy_document_string());
     let (audit_log, capture) = captured_audit();
-    let (answers, logged, rendered) =
+    let ((answers, sealed, views), logged, rendered) =
         super::super::admin_tokens_app_tests::capture_logs_and_metrics_on_every_runtime_thread(
             async {
                 let router = keyed_connection_router(&connection_db, &policy, audit_log, |_| {});
                 let admin = keyed_admin(&["connections-secret-manager"]);
                 let collection = secret_collection_etag(&router, &admin).await;
+                let stored = |id: &str| {
+                    crate::connections::test_support::stored_ciphertext_renderings(
+                        &connection_db.path,
+                        id,
+                    )
+                };
                 let create_key = caller_key(83);
                 let create = |value: &str| {
                     keyed_connection_request(
@@ -858,6 +866,8 @@ fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_a
                 let (status, etag, created) = exchange(&router, create(VALUE_MARKER)).await;
                 assert_eq!(status, StatusCode::CREATED, "{created}");
                 let id = created["id"].as_str().expect("an ID").to_owned();
+                let mut sealed = stored(&id);
+                let mut views = vec![created];
                 for value in [VALUE_MARKER, CONFLICT_MARKER] {
                     answers.push(exchange(&router, create(value)).await.2);
                 }
@@ -877,11 +887,13 @@ fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_a
                 // for the caller who rotated it; its retries answer from the key.
                 let (status, _, rotated) = exchange(&router, rotate(ROTATED_MARKER)).await;
                 assert_eq!(status, StatusCode::OK, "{rotated}");
+                sealed.extend(stored(&id));
+                views.push(rotated);
                 for value in [ROTATED_MARKER, CONFLICT_MARKER] {
                     answers.push(exchange(&router, rotate(value)).await.2);
                 }
                 assert_eventually(Duration::from_secs(5), || secret_changes(&capture) >= 2);
-                answers
+                (answers, sealed, views)
             },
         );
     assert_eq!(answers[0]["operation"], json!("secret.create"));
@@ -905,6 +917,29 @@ fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_a
         );
         assert!(!logged.contains(marker), "{marker} reached the logs");
         assert!(!rendered.contains(marker), "{marker} reached the metrics");
+    }
+    // Searched in the create's and the rotation's own answers too: the
+    // secret's view names its label, so the markers are not searched there,
+    // but never its stored form.
+    let answered_with_view = format!("{answered}{views:?}");
+    for form in &sealed {
+        let form = form.as_str();
+        assert!(
+            !answered_with_view.contains(form),
+            "a stored ciphertext or nonce reached an answer"
+        );
+        assert!(
+            !audited.contains(form),
+            "a stored ciphertext or nonce reached the audit stream"
+        );
+        assert!(
+            !logged.contains(form),
+            "a stored ciphertext or nonce reached the logs"
+        );
+        assert!(
+            !rendered.contains(form),
+            "a stored ciphertext or nonce reached the metrics"
+        );
     }
     for (_, _, digest) in secret_reservations(&connection_db.path) {
         let digest = digest.expect("every local-secret key is bound by digest");

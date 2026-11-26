@@ -453,7 +453,7 @@ mod tests {
         .await;
         let validator = validator(CookieSessionAuthConfig {
             introspection_url: url,
-            http_timeout: Duration::from_secs(1),
+            http_timeout: TEST_INTROSPECTION_TIMEOUT,
             cache_ttl: Duration::from_secs(5),
             user_id_claim: "account.id".to_owned(),
             email_claim: Some("account.email".to_owned()),
@@ -633,8 +633,10 @@ mod tests {
             "127.0.0.1",
         )
         .await;
+        // The two calls before the sleep must fall inside the TTL even on a
+        // loaded runner; the sleep alone outlasts it.
         let validator = validator(CookieSessionAuthConfig {
-            cache_ttl: Duration::from_millis(30),
+            cache_ttl: Duration::from_millis(400),
             ..config(&url)
         });
         let credential = SessionCredential::Cookie("cached-session".to_owned());
@@ -649,7 +651,7 @@ mod tests {
             .expect("second request should use cache");
         assert_eq!(server.call_count(), 1);
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         validator
             .validate_session(&credential)
             .await
@@ -740,6 +742,11 @@ mod tests {
         assert!(matches!(error, AuthError::InvalidSession(_)));
     }
 
+    /// The introspection timeout of every test that is not about timeouts.
+    /// The servers answer on loopback at once, but an instrumented build on
+    /// a loaded runner has missed a one-second bound.
+    const TEST_INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
+
     fn validator(config: CookieSessionAuthConfig) -> CookieSessionValidator {
         CookieSessionValidator::new(config, egress_client()).expect("validator should build")
     }
@@ -747,7 +754,7 @@ mod tests {
     fn config(url: &str) -> CookieSessionAuthConfig {
         CookieSessionAuthConfig {
             introspection_url: url.to_owned(),
-            http_timeout: Duration::from_secs(1),
+            http_timeout: TEST_INTROSPECTION_TIMEOUT,
             cache_ttl: Duration::from_secs(5),
             user_id_claim: "user_id".to_owned(),
             email_claim: None,

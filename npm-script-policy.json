@@ -36,15 +36,15 @@
         "reason": "Optional Darwin watcher; published tarball has no install lifecycle hook or binding.gyp despite lock metadata."
       },
       "node_modules/workerd": {
-        "version": "1.20261110.1",
-        "resolved": "https://registry.npmjs.org/workerd/-/workerd-1.20261110.1.tgz",
-        "integrity": "sha512-GKdtki7t19f16vegol8Iw5Dh0mnjHLuwLx8rlhTPvyRBEXM0Osl9eYexWAW8uZD7OMw4WKNq9yvENg5kPDUJ9w==",
+        "version": "1.20261119.1",
+        "resolved": "https://registry.npmjs.org/workerd/-/workerd-1.20261119.1.tgz",
+        "integrity": "sha512-lalSvY+ad5asqMgzA/DfrZo7wvuvOHJc/aS1UctUrwu76fJE/LkSKJlprfBu0LeU79Qai5d+xFooQA9CIfj+dQ==",
         "allow": false,
         "scripts": {
           "postinstall": "node install.js"
         },
         "source_sha256": {
-          "package/install.js": "329f7f26e7a057e2d9b17ec8d1cfc358fcd7fb6db1a363b06e7779887175eb14"
+          "package/install.js": "43db83d33f8f631ea3da3cd7621000def33b8ddcdca28dd86a41e38c36fd83c2"
         },
         "reason": "Native binary is supplied by the locked platform optional dependency; installer fallback downloads and binary rewrites are unnecessary for supported builds."
       }

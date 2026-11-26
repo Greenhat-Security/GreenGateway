@@ -1007,7 +1007,9 @@ const ROTATED_MARKER: &str = "keyed-local-secret-rotated-value-marker";
 /// I5, store part: a marker in every secret-bearing request field (the
 /// created and the rotated value) stays out of the reservations, the
 /// receipts, every evidence column and the bytes of the SQLite file and its
-/// WAL; the binding digest is stored only in the reservation row.
+/// WAL; the binding digest is stored only in the reservation row. The
+/// ciphertext and nonce each change stored, read back from the secret's
+/// row, reach no reservation, receipt or evidence column either.
 #[test]
 fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_reservation_receipt_evidence_and_file()
 {
@@ -1023,6 +1025,8 @@ fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_reservation_receipt_
         ),
         "the keyed create",
     );
+    let mut sealed =
+        crate::connections::test_support::stored_ciphertext_renderings(db.database(), &created.id);
     let rotation = rotate_key(91, &actor, &created);
     let rotated = committed(
         rotate(
@@ -1034,6 +1038,13 @@ fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_reservation_receipt_
         ),
         "the keyed rotation",
     );
+    let rotated_sealed =
+        crate::connections::test_support::stored_ciphertext_renderings(db.database(), &rotated.id);
+    assert!(
+        rotated_sealed.iter().all(|form| !sealed.contains(form)),
+        "the rotation stored a fresh nonce and ciphertext"
+    );
+    sealed.extend(rotated_sealed);
     let receipts = [
         replayed(
             create(
@@ -1074,6 +1085,18 @@ fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_reservation_receipt_
             ("evidence", &evidence_text),
         ] {
             assert!(!text.contains(marker), "{marker} reached the {place}");
+        }
+    }
+    for form in &sealed {
+        for (place, text) in [
+            ("reservation", &reservation_text),
+            ("receipt", &receipt_text),
+            ("evidence", &evidence_text),
+        ] {
+            assert!(
+                !text.contains(form.as_str()),
+                "a stored ciphertext or nonce reached the {place}"
+            );
         }
     }
     for digest in [&create_key, &rotation, &deletion].map(CallerOperation::binding_digest) {
