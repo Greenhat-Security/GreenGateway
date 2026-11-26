@@ -353,7 +353,9 @@ check that no marker or binding digest reaches a log line, a metric name or labe
 an answer or (where the test has it) the audit stream. Their capture
 (`admin_tokens_app_tests::capture_logs_and_metrics_on_every_runtime_thread`)
 covers the test's thread and the runtime's blocking pool, where the SQLite stores
-run, and checks itself before it returns
+run, and checks itself before it returns: a log line and a metric label it plants
+on each of those threads must both be captured, so a test that searches the
+rendering for a marker cannot pass by missing a metric label emitted on the pool
 (`the_capture_sees_logs_and_metrics_on_the_blocking_pool` pins it). It does not see
 `log`-crate records from dependencies or threads the code spawns itself, such as
 the audit log writer. Log-line and metric-label redaction (I5) is therefore tested
