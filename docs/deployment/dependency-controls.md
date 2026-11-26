@@ -77,7 +77,7 @@ and the Dockerfile must agree with it. `scripts/build_tools.py check` rejects
 missing declarations, version drift, unpinned installs and implicit npx downloads.
 CI uses the shared `.github/actions/build-tools` action before any build.
 
-The production/default compiler is Rust 1.99.1, matching the reviewed
+The production/default compiler is Rust 1.100.0, matching the reviewed
 Docker image update.
 The required `production-compiler` job checks all targets with that compiler;
 ordinary CI uses the previously passing Rust 1.98.1. As with the 1.98.0 image
