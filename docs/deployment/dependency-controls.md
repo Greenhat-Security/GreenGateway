@@ -98,7 +98,7 @@ sockets while the upstream connector uses 0.30. The explicit
 `axum-tungstenite` alias preserves typed downstream error classification;
 tests check close, capacity, protocol and internal-error outcomes. Exact
 duplicate versions and parent chains are recorded in the Cargo policy with
-maintainer ownership and a 2026-12-01 expiry. Remove the old transport group
+maintainer ownership and a 2027-02-22 expiry. Remove the old transport group
 when Axum converges; no license or advisory allowances are added.
 
 jsonschema 0.60.2 is built without default features (so no HTTP or file
