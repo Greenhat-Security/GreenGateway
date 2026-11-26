@@ -1063,13 +1063,16 @@ mod cluster_document_keys {
     }
 
     /// The binding digest the document handlers compute for a keyed change
-    /// of the whole document by `actor` (`admit_keyed_document_change`):
-    /// the action, the actor, no target, the precondition headers as
-    /// `name: value` lines and the canonical JSON body.
+    /// by `actor` (`admit_keyed_document_change`): the action, the actor,
+    /// the target (a rule id or rollback version; empty for the whole
+    /// document or a create), the precondition headers as `name: value`
+    /// lines and the request: a JSON body in canonical form, an empty one
+    /// (a delete or rollback) as it is.
     fn document_digest(
         actor: &auth::change_actor::ChangeActor,
         key: &str,
         action: &'static str,
+        target: &str,
         precondition: (&str, &str),
         body: &str,
     ) -> String {
@@ -1079,9 +1082,10 @@ mod cluster_document_keys {
             &headers,
             actor,
             action,
-            "",
+            target,
             &format!("{}: {}\n", precondition.0, precondition.1),
-            &canonical_connection_request(body.as_bytes()).expect("the body is JSON"),
+            &canonical_connection_request(body.as_bytes())
+                .unwrap_or_else(|_| body.as_bytes().to_vec()),
         )
         .expect("the key binds")
         .expect("the request is keyed")
@@ -1110,10 +1114,11 @@ mod cluster_document_keys {
     }
 
     /// I5 for the policy, tools and policy test family through the real
-    /// handlers of a cluster replica: a keyed policy publication, tools
-    /// registration and policy test suite publication, each with its exact
-    /// retry and a conflicting retry under its key, and a keyed policy
-    /// publication whose evidence row cannot be inserted. These documents
+    /// handlers of a cluster replica: a keyed policy publication, rule
+    /// create, update, reorder and delete, rollback, tools registration and
+    /// policy test suite publication, each with its exact retry and a
+    /// conflicting retry under its key, and a keyed policy publication
+    /// whose evidence row cannot be inserted. These documents
     /// carry no secret value (a policy, an inline OpenAPI specification, a
     /// suite of test cases), so what must stay out is what the key binds
     /// them with: no binding digest and no caller key reaches a log line at
@@ -1141,8 +1146,11 @@ mod cluster_document_keys {
                         CLUSTER_ISSUER,
                     );
                     let mut answers = Vec::new();
+                    // Every digest computed here, and those of the requests
+                    // that committed.
                     let mut computed = Vec::new();
-                    let keys: Vec<String> = (60..64).map(caller_key).collect();
+                    let mut committed = Vec::new();
+                    let keys: Vec<String> = (60..69).map(caller_key).collect();
 
                     // The policy itself.
                     let policy = cluster_policy("marked").to_string();
@@ -1178,9 +1186,97 @@ mod cluster_document_keys {
                             &actor,
                             &keys[0],
                             "policy.publish",
+                            "",
                             ("if-match", etag),
                             &policy,
                         ));
+                    }
+                    committed.push(computed[computed.len() - 2].clone());
+
+                    // Its rules and its history, as the replay test above
+                    // drives them. The delete and the rollback carry no
+                    // body; the update, the delete and the rollback name
+                    // their target in the path, and the key binds it.
+                    let rule_route = format!("{POLICY_RULES_ADMIN_ROUTE}/created");
+                    let edits: [(Method, &str, Option<String>, &'static str, &str); 5] = [
+                        (
+                            Method::POST,
+                            POLICY_RULES_ADMIN_ROUTE,
+                            Some(
+                                json!({"id": "created", "path": "/created", "action": "allow"})
+                                    .to_string(),
+                            ),
+                            "policy.rule.create",
+                            "",
+                        ),
+                        (
+                            Method::PATCH,
+                            &rule_route,
+                            Some(json!({"action": "deny"}).to_string()),
+                            "policy.rule.update",
+                            "created",
+                        ),
+                        (
+                            Method::PUT,
+                            POLICY_RULES_ORDER_ADMIN_ROUTE,
+                            Some(json!(["created", "second", "first"]).to_string()),
+                            "policy.rule.reorder",
+                            "",
+                        ),
+                        (
+                            Method::DELETE,
+                            &rule_route,
+                            None,
+                            "policy.rule.delete",
+                            "created",
+                        ),
+                        (
+                            Method::POST,
+                            "/v1/admin/policy/rollback/1",
+                            None,
+                            "policy.rollback",
+                            "1",
+                        ),
+                    ];
+                    for (key, (method, uri, body, action, target)) in keys[4..].iter().zip(edits) {
+                        let edit = |etag: String| {
+                            let (router, admin) = (&router, &admin);
+                            let (method, body) = (method.clone(), body.clone());
+                            async move {
+                                call(
+                                    router,
+                                    method,
+                                    uri,
+                                    admin,
+                                    body,
+                                    &[("if-match", &etag)],
+                                    Some(key),
+                                )
+                                .await
+                            }
+                        };
+                        let etag = policy_etag(&router, &admin).await;
+                        let (status, _, changed) = edit(etag.clone()).await;
+                        assert!(status.is_success(), "{action}: {status} {changed}");
+                        let (status, _, receipt) = edit(etag.clone()).await;
+                        assert_eq!(status, StatusCode::OK, "{action}: {receipt}");
+                        assert_receipt(&receipt, key, action, "policy");
+                        answers.push(receipt);
+                        let fresh = policy_etag(&router, &admin).await;
+                        let (status, _, conflict) = edit(fresh.clone()).await;
+                        assert_eq!(status, StatusCode::CONFLICT, "{action}: {conflict}");
+                        answers.push(conflict);
+                        for etag in [&etag, &fresh] {
+                            computed.push(document_digest(
+                                &actor,
+                                key,
+                                action,
+                                target,
+                                ("if-match", etag),
+                                body.as_deref().unwrap_or_default(),
+                            ));
+                        }
+                        committed.push(computed[computed.len() - 2].clone());
                     }
 
                     // The tools document.
@@ -1231,10 +1327,12 @@ mod cluster_document_keys {
                             &actor,
                             &keys[1],
                             "tools.publish",
+                            "",
                             ("if-match", etag),
                             &registration,
                         ));
                     }
+                    committed.push(computed[computed.len() - 2].clone());
 
                     // The stored policy test suite.
                     let suite = suite_document();
@@ -1269,10 +1367,12 @@ mod cluster_document_keys {
                             &actor,
                             &keys[2],
                             "policy_tests.publish",
+                            "",
                             ("if-none-match", "*"),
                             body,
                         ));
                     }
+                    committed.push(computed[computed.len() - 2].clone());
 
                     // Test-only fault injection: a publication whose evidence
                     // row cannot be inserted.
@@ -1302,9 +1402,11 @@ mod cluster_document_keys {
                         &actor,
                         &keys[3],
                         "policy.publish",
+                        "",
                         ("if-match", &etag),
                         &failing,
                     ));
+                    committed.push(computed[computed.len() - 1].clone());
                     client
                         .batch_execute(
                             "DROP TRIGGER fail_document_change_evidence \
@@ -1322,21 +1424,15 @@ mod cluster_document_keys {
                         events_of(&capture, audit::event::POLICY_CHANGED) >= 2
                     });
                     let stored = document_digests(pool).await;
-                    Some((answers, keys, computed, stored))
+                    Some((answers, keys, computed, committed, stored))
                 },
             );
-        let Some((answers, keys, computed, stored)) = outcome else {
+        let Some((answers, keys, computed, mut committed, stored)) = outcome else {
             return;
         };
 
         // The digests computed here are the ones the handlers bound: each
         // committed request's reservation holds the one computed for it.
-        let mut committed = vec![
-            computed[0].clone(),
-            computed[2].clone(),
-            computed[4].clone(),
-            computed[6].clone(),
-        ];
         committed.sort();
         assert_eq!(stored, committed);
 
