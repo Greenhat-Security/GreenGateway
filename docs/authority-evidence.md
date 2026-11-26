@@ -369,9 +369,10 @@ for each keyed family, for the operations listed here and no others:
 - Local secrets: `a_keyed_secret_change_keeps_synthetic_markers_out_of_the_reservation_receipt_evidence_and_file`
   and, through the router,
   `a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
-  (keyed create and rotation with their retries and conflicts, standalone; the
-  values, the label and the digests reach no answer, audit event, log line or
-  metric, and the values reach neither the database file nor its WAL). Both also
+  (keyed create, rotation and, through the router, delete, with their retries and
+  conflicts, standalone; the values, the label and the digests reach no answer,
+  audit event, log line or metric, and the values reach neither the database
+  file nor its WAL). Both also
   read back the nonce and ciphertext each change stored and search for them as
   hex, base64 and the `Debug` form of their first eight bytes: the store test in
   the reservations, receipts and evidence columns, the router test in every
@@ -2316,9 +2317,8 @@ These hold when issue #425 closes:
   [Authority event v1](#authority-event-v1) lists per family, not for every keyed
   operation in both modes (issue #844). Service-token issue and rotation, which
   are qualified rows in PostgreSQL, are driven in the SQLite form only, as are
-  the OAuth client-credentials replacement and the keyed Connection delete. The
-  keyed local-secret delete has no log and metric test. Each of these leaves
-  this list when its test lands.
+  the OAuth client-credentials replacement and the keyed Connection delete. Each
+  of these leaves this list when its test lands.
 
 The family changes recorded these further limits:
 
