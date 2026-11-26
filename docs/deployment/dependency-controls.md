@@ -225,9 +225,11 @@ Reports retain both the original finding and the applied review metadata.
   [CVE-2026-121758](https://security-tracker.debian.org/tracker/CVE-2026-121758)
   (ISO-2022-CN-EXT to UTF-8) and
   [CVE-2026-124024](https://security-tracker.debian.org/tracker/CVE-2026-124024)
-  (UCS-4 to IBM1390/IBM1399), `libc6` 2.41-12+deb13u4 from the distroless
+  (UCS-4 to IBM1390/IBM1399), `libc6` 2.41-12+deb13u5 from the distroless
   `base-nossl-debian13` runtime base. Owner: GreenGateway maintainers, part of
-  #420; approved by the repository owner on 2026-11-25. Each is a glibc iconv
+  #420; approved by the repository owner on 2026-11-25 for `2.41-12+deb13u4` and
+  re-approved on 2026-11-26 for `2.41-12+deb13u5`, which fixes other glibc CVEs
+  but none of these three, keeping the same expiry. Each is a glibc iconv
   converter reading past the end of its input buffer. Trivy reports them with
   unknown severity, which blocks. Debian marks all three `no-dsa` (minor issue)
   for trixie and lists no fixed version, so no base-image update clears them.
@@ -293,7 +295,7 @@ pull requests run are read-only and hold no secret.
 The gateway uses the digest-pinned `gcr.io/distroless/base-nossl-debian13:nonroot`
 runtime. Debian 13 glibc supports the older Rust builder ABI; the actual loader
 and running-image tests enforce compatibility. The base retains CA roots,
-DNS/NSS, fixed tzdata 2026e and Debian package metadata for scanning. Shells,
+DNS/NSS, fixed tzdata 2026f and Debian package metadata for scanning. Shells,
 apt, curl, Perl, mount utilities and OpenSSL are absent. Gateway uses Rustls,
 and Linux linkage requires only glibc and libgcc.
 

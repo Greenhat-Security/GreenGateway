@@ -6,25 +6,25 @@
     {
       "advisory": "CVE-2026-121757",
       "package": "libc6",
-      "version": "2.41-12+deb13u4",
+      "version": "2.41-12+deb13u5",
       "owner": "GreenGateway maintainers",
-      "rationale": "CP949 to UTF-8 with //IGNORE. Debian marks this glibc iconv converter over-read no-dsa (minor issue) for trixie and lists no fixed version. Exploitation needs attacker-controlled input and charset passed to iconv. The gateway is a Rust binary that never calls iconv_open or iconv, and no Rust or bundled C dependency in Cargo.lock uses iconv. Approved by the repository owner on 2026-11-25 for 30 days; re-review on expiry or on any base-image change.",
+      "rationale": "CP949 to UTF-8 with //IGNORE. Debian marks this glibc iconv converter over-read no-dsa (minor issue) for trixie and lists no fixed version. Exploitation needs attacker-controlled input and charset passed to iconv. The gateway is a Rust binary that never calls iconv_open or iconv, and no Rust or bundled C dependency in Cargo.lock uses iconv. Approved by the repository owner on 2026-11-25 for 30 days; re-approved on 2026-11-26 for libc6 2.41-12+deb13u5, which fixes other glibc CVEs but not this one, without extending the expiry. Re-review on expiry or on any base-image change.",
       "expires": "2026-12-25T00:00:00Z"
     },
     {
       "advisory": "CVE-2026-121758",
       "package": "libc6",
-      "version": "2.41-12+deb13u4",
+      "version": "2.41-12+deb13u5",
       "owner": "GreenGateway maintainers",
-      "rationale": "ISO-2022-CN-EXT to UTF-8. Debian marks this glibc iconv converter over-read no-dsa (minor issue) for trixie and lists no fixed version. Exploitation needs attacker-controlled input and charset passed to iconv. The gateway is a Rust binary that never calls iconv_open or iconv, and no Rust or bundled C dependency in Cargo.lock uses iconv. Approved by the repository owner on 2026-11-25 for 30 days; re-review on expiry or on any base-image change.",
+      "rationale": "ISO-2022-CN-EXT to UTF-8. Debian marks this glibc iconv converter over-read no-dsa (minor issue) for trixie and lists no fixed version. Exploitation needs attacker-controlled input and charset passed to iconv. The gateway is a Rust binary that never calls iconv_open or iconv, and no Rust or bundled C dependency in Cargo.lock uses iconv. Approved by the repository owner on 2026-11-25 for 30 days; re-approved on 2026-11-26 for libc6 2.41-12+deb13u5, which fixes other glibc CVEs but not this one, without extending the expiry. Re-review on expiry or on any base-image change.",
       "expires": "2026-12-25T00:00:00Z"
     },
     {
       "advisory": "CVE-2026-124024",
       "package": "libc6",
-      "version": "2.41-12+deb13u4",
+      "version": "2.41-12+deb13u5",
       "owner": "GreenGateway maintainers",
-      "rationale": "UCS-4 to IBM1390/IBM1399. Debian marks this glibc iconv converter over-read no-dsa (minor issue) for trixie and lists no fixed version. Exploitation needs attacker-controlled input and charset passed to iconv. The gateway is a Rust binary that never calls iconv_open or iconv, and no Rust or bundled C dependency in Cargo.lock uses iconv. Approved by the repository owner on 2026-11-25 for 30 days; re-review on expiry or on any base-image change.",
+      "rationale": "UCS-4 to IBM1390/IBM1399. Debian marks this glibc iconv converter over-read no-dsa (minor issue) for trixie and lists no fixed version. Exploitation needs attacker-controlled input and charset passed to iconv. The gateway is a Rust binary that never calls iconv_open or iconv, and no Rust or bundled C dependency in Cargo.lock uses iconv. Approved by the repository owner on 2026-11-25 for 30 days; re-approved on 2026-11-26 for libc6 2.41-12+deb13u5, which fixes other glibc CVEs but not this one, without extending the expiry. Re-review on expiry or on any base-image change.",
       "expires": "2026-12-25T00:00:00Z"
     }
   ]

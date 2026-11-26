@@ -69,7 +69,7 @@ RUN printf 'root:x:0:0:root:/root:/sbin/nologin\ngreengateway:x:10001:10001::/no
 # Debian 13 glibc supports the older builder ABI. The supported no-SSL base
 # keeps CA roots, NSS/DNS, fixed timezone data and scanner-visible metadata.
 # Shells, apt, curl, Perl, mount tools and unused OpenSSL are absent.
-FROM gcr.io/distroless/base-nossl-debian13:nonroot@sha256:6a2a3346335b94d3be0732472245f42ca3ce3cc1135a9521a2bda4b677f2ef0d AS runtime
+FROM gcr.io/distroless/base-nossl-debian13:nonroot@sha256:4006ac92504be607b70de01d1f64f38288c69fcd8faa820f6d3aed266ea32ac5 AS runtime
 
 COPY --from=builder /tmp/runtime-gcc/ /
 COPY --from=builder /app/target/release/gateway /usr/local/bin/gateway
