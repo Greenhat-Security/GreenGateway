@@ -493,10 +493,11 @@ fn a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_lo
 /// digest reaches a log line, the rendered metrics, a receipt, a conflict
 /// or failure answer, or the audit stream.
 ///
-/// Not driven: `catalog.mcp.publish`, which needs an MCP upstream to list
-/// tools from. The registration's and the first overlay replacement's own
-/// answers are the catalog's view for the caller who changed it, so they
-/// are not searched.
+/// `catalog.mcp.publish` is driven by
+/// [`a_keyed_mcp_catalog_publication_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`].
+/// The registration's and the first overlay replacement's own answers are
+/// the catalog's view for the caller who changed it, so they are not
+/// searched.
 #[test]
 fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics() {
     let connection_db = TempDb::new("keyed-catalog-markers");
@@ -838,6 +839,165 @@ fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_
     );
 }
 
+/// I5 for `catalog.mcp.publish` through the real handlers. The Connection
+/// is an enabled managed MCP Connection at a [`RecordingMcpUpstream`]: its
+/// bearer and additional-header secrets are operator aliases whose IDs,
+/// file locators and values are [`CATALOG_SOURCE_MARKERS`], its discovery
+/// uses them, and it presents the TLS client identity the
+/// [`CLIENT_TLS_MARKERS`] aliases name. Against it: a keyed refresh, which
+/// lists the upstream's tools and publishes them, and records that every
+/// request the upstream received carried both secret values and the issued
+/// client certificate; its exact retry, answered from the receipt without
+/// contacting the upstream; the key reused under another `If-Match`; and a
+/// keyed refresh whose reservation cannot be written. No marker, no line of
+/// the client private key and no binding digest reaches a log line, the
+/// rendered metrics, an answer or the audit stream.
+#[test]
+fn a_keyed_mcp_catalog_publication_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics(
+) {
+    let connection_db = TempDb::new("keyed-mcp-catalog-markers");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let (audit_log, capture) = captured_audit();
+    write_catalog_source_secrets(&connection_db);
+    let ((answers, digests, committed), logged, rendered) =
+        super::super::admin_tokens_app_tests::capture_logs_and_metrics_on_every_runtime_thread(
+            async {
+                let upstream = RecordingMcpUpstream::spawn(&connection_db).await;
+                let router =
+                    keyed_connection_router(&connection_db, &policy, audit_log, |config| {
+                        configure_catalog_source_aliases(config);
+                        // Loopback only, where the upstream listens.
+                        config.egress_allowed_hosts = vec!["127.0.0.1".to_owned()];
+                        config.egress_deny_private_ips = false;
+                    });
+                let roles: Vec<&str> = std::iter::once("connections-superadmin")
+                    .chain(CATALOG_ROLES.iter().copied())
+                    .collect();
+                let admin = keyed_admin(&roles);
+                let actor = auth::change_actor::ChangeActor::from_principal(&admin);
+                let mut answers = Vec::new();
+                let mut digests = Vec::new();
+                let mut committed = Vec::new();
+
+                // The Connection, created without a key; its answer names its
+                // references to its creator and is not kept.
+                let collection = connection_collection_etag(&router).await;
+                let (status, etag, created) = exchange(
+                    &router,
+                    keyed_connection_request(
+                        Method::POST,
+                        CONNECTIONS_ADMIN_ROUTE,
+                        admin.clone(),
+                        Some(credentialed_mcp_connection_body(&upstream.base_url())),
+                        Some(&collection),
+                        None,
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "{created}");
+                let id = created["id"].as_str().expect("an ID").to_owned();
+                let etag = etag.expect("the create names its ETag");
+                upstream.take_received();
+
+                let refresh = |key: &str, if_match: &str| {
+                    CatalogCall::Refresh.request(&id, if_match, None, admin.clone(), Some(key))
+                };
+                let key = caller_key(104);
+                let (status, _, published) = exchange(&router, refresh(&key, &etag)).await;
+                assert_eq!(status, StatusCode::OK, "{published}");
+                let received = upstream.take_received();
+                assert!(!received.is_empty(), "the refresh reached the upstream");
+                assert!(
+                    received
+                        .iter()
+                        .all(|request| *request == resolved_catalog_credentials()),
+                    "{received:?}"
+                );
+                answers.push(published);
+                committed.push(bound_digest(
+                    &actor,
+                    &key,
+                    "catalog.mcp.publish",
+                    &id,
+                    &etag,
+                    "",
+                ));
+                let (status, _, receipt) = exchange(&router, refresh(&key, &etag)).await;
+                assert_eq!(status, StatusCode::OK, "{receipt}");
+                assert_eq!(
+                    receipt["operation"],
+                    json!("catalog.mcp.publish"),
+                    "{receipt}"
+                );
+                assert!(
+                    upstream.take_received().is_empty(),
+                    "the exact retry is answered from its receipt"
+                );
+                answers.push(receipt);
+                let other = "\"another-connection-etag\"";
+                let (status, _, conflict) = exchange(&router, refresh(&key, other)).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+                answers.push(conflict);
+                digests.push(bound_digest(
+                    &actor,
+                    &key,
+                    "catalog.mcp.publish",
+                    &id,
+                    other,
+                    "",
+                ));
+
+                fail_every_reservation(&connection_db.path);
+                let failed_key = caller_key(105);
+                let (status, _, failed) = exchange(&router, refresh(&failed_key, &etag)).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{failed}");
+                answers.push(failed);
+                digests.push(bound_digest(
+                    &actor,
+                    &failed_key,
+                    "catalog.mcp.publish",
+                    &id,
+                    &etag,
+                    "",
+                ));
+
+                // The audit writer delivers in order: wait until it has
+                // delivered the publication's refresh before the audit
+                // stream is searched.
+                assert_eventually(Duration::from_secs(5), || {
+                    capture.events().iter().any(|event| {
+                        event.event_type == audit::event::CONNECTION_REFRESHED
+                            && event.payload["connection_id"] == json!(id)
+                    })
+                });
+                (answers, digests, committed)
+            },
+        );
+
+    // The digest computed here is the one the handler bound.
+    let reserved: Vec<String> = standalone_reservations(&connection_db.path)
+        .into_iter()
+        .map(|(_, _, digest)| digest.expect("every catalog key is bound by digest"))
+        .collect();
+    assert_eq!(reserved, committed);
+
+    let markers: Vec<String> = CATALOG_SOURCE_MARKERS
+        .iter()
+        .chain(CLIENT_TLS_MARKERS.iter())
+        .map(|marker| (*marker).to_owned())
+        .chain(client_private_key_lines(&connection_db))
+        .collect();
+    let digests: Vec<String> = digests.into_iter().chain(committed).collect();
+    assert_nothing_marked_escaped(
+        &markers,
+        &digests,
+        &format!("{answers:?}"),
+        &format!("{:?}", capture.events()),
+        &logged,
+        &rendered,
+    );
+}
+
 /// A catalog Connection's credentials: the IDs of its two operator secret
 /// aliases (bearer, then additional header), the file each reads, and the
 /// value in that file.
@@ -1057,45 +1217,7 @@ impl RecordingSpecUpstream {
     /// root of `connection_db`, and writes the client certificate and key
     /// it will require to the [`CLIENT_TLS_MARKERS`] locators beside it.
     pub(super) async fn spawn(connection_db: &TempDb) -> Self {
-        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
-        let (ca_pem, server_cert_der, server_key_der) = test_ca_signed_server_certificate();
-        let (client_ca_der, client_cert_pem, client_key_pem, client_cert_der) =
-            test_ca_signed_client_identity();
-        let secret_root = connection_db.path.with_extension("secrets");
-        fs::create_dir_all(&secret_root).expect("the test secret root creates");
-        for (locator, contents) in [
-            (UPSTREAM_CA_LOCATOR, ca_pem),
-            (CLIENT_TLS_MARKERS[2], client_cert_pem),
-            (CLIENT_TLS_MARKERS[3], client_key_pem),
-        ] {
-            let file = secret_root.join(locator);
-            fs::write(&file, contents).expect("the TLS file writes");
-            // An operator file alias refuses a file others can read, so
-            // these files need the same mode as the secret files beside them.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&file, fs::Permissions::from_mode(0o600))
-                    .expect("the TLS file permissions set");
-            }
-        }
-        let mut client_roots = tokio_rustls::rustls::RootCertStore::empty();
-        client_roots
-            .add(CertificateDer::from(client_ca_der))
-            .expect("the client CA is accepted");
-        let client_verifier =
-            tokio_rustls::rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
-                .build()
-                .expect("the client certificate verifier builds");
-        let acceptor = TlsAcceptor::from(Arc::new(
-            ServerConfig::builder()
-                .with_client_cert_verifier(client_verifier)
-                .with_single_cert(
-                    vec![CertificateDer::from(server_cert_der)],
-                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key_der)),
-                )
-                .expect("the upstream TLS configuration builds"),
-        ));
+        let (acceptor, issued) = recording_tls_acceptor(connection_db);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("the upstream binds");
@@ -1103,7 +1225,6 @@ impl RecordingSpecUpstream {
         let received = Arc::new(std::sync::Mutex::new(Vec::new()));
         let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (recorded, fails) = (Arc::clone(&received), Arc::clone(&failing));
-        let issued = Arc::new(client_cert_der);
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let (acceptor, recorded, fails, issued) = (
@@ -1171,6 +1292,173 @@ impl RecordingSpecUpstream {
     pub(super) fn take_received(&self) -> Vec<ReceivedCredentials> {
         std::mem::take(&mut *self.received.lock().expect("the record locks"))
     }
+}
+
+/// The TLS side of the recording upstreams: a server certificate from a CA
+/// generated for the run, whose certificate it writes to
+/// [`UPSTREAM_CA_LOCATOR`] in the test secret root of `connection_db`, and a
+/// required client certificate from a client CA generated for the run, whose
+/// certificate and key it writes to the [`CLIENT_TLS_MARKERS`] locators beside
+/// it. The acceptor, and the DER of the client certificate it issued.
+fn recording_tls_acceptor(connection_db: &TempDb) -> (TlsAcceptor, Arc<Vec<u8>>) {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let (ca_pem, server_cert_der, server_key_der) = test_ca_signed_server_certificate();
+    let (client_ca_der, client_cert_pem, client_key_pem, client_cert_der) =
+        test_ca_signed_client_identity();
+    let secret_root = connection_db.path.with_extension("secrets");
+    fs::create_dir_all(&secret_root).expect("the test secret root creates");
+    for (locator, contents) in [
+        (UPSTREAM_CA_LOCATOR, ca_pem),
+        (CLIENT_TLS_MARKERS[2], client_cert_pem),
+        (CLIENT_TLS_MARKERS[3], client_key_pem),
+    ] {
+        let file = secret_root.join(locator);
+        fs::write(&file, contents).expect("the TLS file writes");
+        // An operator file alias refuses a file others can read, so
+        // these files need the same mode as the secret files beside them.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o600))
+                .expect("the TLS file permissions set");
+        }
+    }
+    let mut client_roots = tokio_rustls::rustls::RootCertStore::empty();
+    client_roots
+        .add(CertificateDer::from(client_ca_der))
+        .expect("the client CA is accepted");
+    let client_verifier =
+        tokio_rustls::rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+            .build()
+            .expect("the client certificate verifier builds");
+    let acceptor = TlsAcceptor::from(Arc::new(
+        ServerConfig::builder()
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(
+                vec![CertificateDer::from(server_cert_der)],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key_der)),
+            )
+            .expect("the upstream TLS configuration builds"),
+    ));
+    (acceptor, Arc::new(client_cert_der))
+}
+
+/// A loopback HTTPS MCP server the test controls, standing in for a managed
+/// MCP Connection's upstream: the streamable HTTP transport (JSON answers,
+/// no sessions) of one test tool, behind the TLS of
+/// [`recording_tls_acceptor`], which requires the client identity of
+/// [`CLIENT_TLS_MARKERS`]. It records the credentials of every request it
+/// receives, as [`RecordingSpecUpstream`] does.
+pub(super) struct RecordingMcpUpstream {
+    address: std::net::SocketAddr,
+    received: Arc<std::sync::Mutex<Vec<ReceivedCredentials>>>,
+}
+
+impl RecordingMcpUpstream {
+    /// Starts the server, writing its CA and the client identity it
+    /// requires to the test secret root of `connection_db`.
+    pub(super) async fn spawn(connection_db: &TempDb) -> Self {
+        let (acceptor, issued) = recording_tls_acceptor(connection_db);
+        let handler = TestMcpUpstreamServer {
+            tool_name: "marked_catalog_tool".to_owned(),
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let mcp = Router::new().nest_service(
+            "/mcp",
+            RmcpStreamableHttpService::new(
+                move || Ok(handler.clone()),
+                Arc::new(RmcpNeverSessionManager::default()),
+                RmcpStreamableHttpServerConfig::default()
+                    .with_legacy_session_mode(false)
+                    .with_json_response(true)
+                    .disable_allowed_hosts(),
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("the MCP upstream binds");
+        let address = listener
+            .local_addr()
+            .expect("the MCP upstream has an address");
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&received);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (acceptor, recorded, issued, mcp) = (
+                    acceptor.clone(),
+                    Arc::clone(&recorded),
+                    Arc::clone(&issued),
+                    mcp.clone(),
+                );
+                tokio::spawn(async move {
+                    let Ok(stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let presented_issued = stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|chain| chain.first())
+                        .is_some_and(|leaf| leaf.as_ref() == issued.as_slice());
+                    let service = hyper::service::service_fn(
+                        move |request: http::Request<hyper::body::Incoming>| {
+                            let header = |name: &str| {
+                                request
+                                    .headers()
+                                    .get(name)
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_owned)
+                            };
+                            recorded.lock().expect("the record locks").push((
+                                header("authorization"),
+                                header("x-proxy-token"),
+                                presented_issued,
+                            ));
+                            mcp.clone().oneshot(request.map(Body::new))
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        Self { address, received }
+    }
+
+    /// The base URL a Connection names to reach this server.
+    pub(super) fn base_url(&self) -> String {
+        format!("https://{}", self.address)
+    }
+
+    /// The requests received since the last call, oldest first.
+    pub(super) fn take_received(&self) -> Vec<ReceivedCredentials> {
+        std::mem::take(&mut *self.received.lock().expect("the record locks"))
+    }
+}
+
+/// The body of an enabled managed MCP Connection at `base_url`, a
+/// [`RecordingMcpUpstream`], whose discovery uses its own bearer and
+/// additional-header secrets, the aliases of [`CATALOG_SOURCE_MARKERS`], and
+/// which presents the client identity of [`CLIENT_TLS_MARKERS`].
+pub(super) fn credentialed_mcp_connection_body(base_url: &str) -> String {
+    json!({
+        "display_name": "Marked MCP catalog",
+        "enabled": true,
+        "kind": "mcp_streamable_http",
+        "endpoint": {"base_url": base_url, "base_path": "/mcp"},
+        "authentication": {"type": "static_bearer", "secret_id": CATALOG_SOURCE_MARKERS[0]},
+        "additional_headers": [
+            {"header_name": "x-proxy-token", "secret_id": CATALOG_SOURCE_MARKERS[1]}
+        ],
+        "tls": {
+            "ca_bundle_alias": UPSTREAM_CA_ALIAS,
+            "client_certificate_id": CLIENT_TLS_MARKERS[0],
+            "client_private_key_id": CLIENT_TLS_MARKERS[1]
+        },
+        "discovery": {"type": "managed_mcp", "use_connection_authentication": true}
+    })
+    .to_string()
 }
 
 /// A client CA generated for the run and a client certificate it signed:

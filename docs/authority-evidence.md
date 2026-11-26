@@ -365,7 +365,12 @@ for each keyed family, for the operations listed here and no others:
   (keyed issue and rotation with their retries, conflicts, `403` refusals and a
   failed reservation, standalone; no plaintext or binding digest in a log line or
   a metric) and the store test
-  `storage::contract_tests::sqlite_a_failed_token_reservation_is_counted_and_no_secret_reaches_logs_or_metrics`.
+  `storage::contract_tests::sqlite_a_failed_token_reservation_is_counted_and_no_secret_reaches_logs_or_metrics`;
+  in the PostgreSQL form, where both are qualified rows,
+  `cluster_token_keys::postgres_keyed_token_changes_keep_the_plaintext_and_digests_out_of_the_logs_and_metrics`
+  (keyed issue and rotation with their exact retries and their keys reused for
+  another request; no plaintext or binding digest in an answer, the audit stream,
+  a log line or a metric).
 - Local secrets: `a_keyed_secret_change_keeps_synthetic_markers_out_of_the_reservation_receipt_evidence_and_file`
   and, through the router,
   `a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
@@ -385,9 +390,9 @@ for each keyed family, for the operations listed here and no others:
   `cluster_connection_keys::postgres_keyed_connection_and_catalog_changes_keep_synthetic_markers_out_of_the_logs_and_metrics`
   (PostgreSQL) for logs, metrics, answers and audit. The credential aliases of
   bearer, additional-header and TLS client authentication, a delegated issuer,
-  caller assertions and OAuth client credentials are marked. The OAuth
-  client-credentials replacement and the keyed Connection delete are driven in
-  the SQLite form only.
+  caller assertions and OAuth client credentials are marked. Both forms drive
+  the OAuth client-credentials replacement and the keyed Connection delete, each
+  with its exact retry.
 - Catalogs: `a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record`
   (both stores), and for logs, metrics, answers and audit
   `marker_keys::a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
@@ -401,15 +406,27 @@ for each keyed family, for the operations listed here and no others:
   locators are markers too; each fetch records that the certificate presented
   is the one issued for the run, and no line of the client private key reaches
   a log line, a metric, an answer or the audit stream. `catalog.mcp.publish` is
-  not driven.
+  driven by
+  `marker_keys::a_keyed_mcp_catalog_publication_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics`
+  (standalone) and
+  `cluster_connection_keys::postgres_keyed_mcp_catalog_publication_keeps_synthetic_markers_out_of_the_logs_and_metrics`
+  (PostgreSQL): a keyed refresh of an enabled managed MCP Connection at a
+  loopback HTTPS MCP server the test runs, which requires the same client
+  certificate and records that every request carried both secret values; its
+  exact retry, answered from the receipt without contacting the server; its key
+  reused under another `If-Match`; and, standalone, a keyed refresh whose
+  reservation cannot be written.
 - Policy, tools and policy tests:
   `a_keyed_document_commit_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record`,
   and for logs, metrics, answers and audit
   `cluster_document_keys::a_keyed_document_change_keeps_its_digest_and_key_out_of_the_receipt_audit_logs_and_metrics`
-  (PostgreSQL). That test drives `policy.publish`, `tools.publish` and
-  `policy_tests.publish` only. Rule create, update, delete and reorder, rollback
-  and suggestion acceptance share the binding and commit path but are not driven,
-  so they have no log and metric test.
+  (PostgreSQL), which drives `policy.publish`, rule create, update, reorder and
+  delete, `policy.rollback`, `tools.publish` and `policy_tests.publish`, and
+  `cluster_discovery_tests::a_keyed_cluster_acceptance_keeps_its_digest_and_key_out_of_the_receipt_audit_logs_and_metrics`
+  (PostgreSQL) for `policy.suggestion.accept`. Each change is keyed, retried
+  exactly and then retried under its key with another `If-Match`, body or
+  suggestion revision; no binding digest reaches an answer, the audit stream, a
+  log line or a metric, and no caller key a log line or a metric.
 
 The family sections below describe each.
 
@@ -2318,12 +2335,6 @@ These hold when issue #425 closes:
   metadata and never qualifies. Nothing is backfilled.
 - Delivery is at least once. The durable file-sink guarantee is stated for Unix
   only.
-- Log-line and metric-label redaction (I5) is tested for the operations
-  [Authority event v1](#authority-event-v1) lists per family, not for every keyed
-  operation in both modes (issue #844). Service-token issue and rotation, which
-  are qualified rows in PostgreSQL, are driven in the SQLite form only, as are
-  the OAuth client-credentials replacement and the keyed Connection delete. Each
-  of these leaves this list when its test lands.
 
 The family changes recorded these further limits:
 
@@ -2358,13 +2369,9 @@ The family changes recorded these further limits:
   `required_mode_refuses_the_unkeyed_cluster_acceptance_and_draft_publication_before_reading`.
 - Log-line and metric-label redaction (I5) is tested only for the operations the
   router-level marker tests drive
-  ([Authority event v1](#authority-event-v1) lists them). The policy
-  rule create, update, delete and reorder, policy rollback and suggestion
-  acceptance, and `catalog.mcp.publish`, have no log and metric test. The OAuth
-  client-credentials replacement and the keyed Connection delete are driven in
-  the SQLite form only. The capture sees `tracing` events on the runtime's own
-  threads, not `log`-crate records from dependencies or threads the code spawns
-  itself, such as the audit log writer.
+  ([Authority event v1](#authority-event-v1) lists them). The capture sees
+  `tracing` events on the runtime's own threads, not `log`-crate records from
+  dependencies or threads the code spawns itself, such as the audit log writer.
 
 ### Rows admitted without qualification
 

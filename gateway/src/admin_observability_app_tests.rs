@@ -10982,6 +10982,133 @@ mod cluster_discovery_tests {
         .await;
     }
 
+    /// The binding digest the acceptance route computes for a keyed
+    /// acceptance of `id` by [`keyed_principal`]
+    /// (`admit_keyed_document_change`): the suggestion is the target, the
+    /// policy `If-Match` and the suggestion revision are the precondition
+    /// lines, and the request has no body.
+    fn acceptance_digest(id: &str, key: &str, policy_etag: &str, revision: &str) -> String {
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", key.parse().expect("the key is a header"));
+        caller_operation(
+            &headers,
+            &auth::change_actor::ChangeActor::from_principal(&keyed_principal()),
+            "policy.suggestion.accept",
+            id,
+            &format!("if-match: {policy_etag}\n{SUGGESTION_REVISION_HEADER}: {revision}\n"),
+            &[],
+        )
+        .expect("the key binds")
+        .expect("the request is keyed")
+        .binding_digest()
+        .to_owned()
+    }
+
+    /// I5 for `policy.suggestion.accept` through the cluster acceptance
+    /// route: a keyed acceptance, its exact retry once the suggestion is
+    /// closed, and the key reused at another suggestion revision, under the
+    /// log and metric capture. The suggestion and the rule it adds are
+    /// configuration, not secrets, so what must stay out is what the key
+    /// binds them with: no binding digest and no caller key reaches a log
+    /// line at any level or the rendered metrics, and no digest reaches an
+    /// answer or the audit stream. The receipt names its key to the caller
+    /// by design.
+    #[test]
+    fn a_keyed_cluster_acceptance_keeps_its_digest_and_key_out_of_the_receipt_audit_logs_and_metrics(
+    ) {
+        let (outcome, logged, rendered) =
+            super::super::admin_tokens_app_tests::capture_logs_and_metrics_on_every_runtime_thread(
+                async {
+                    let Some(admin_dsn) = locator() else {
+                        eprintln!("skipping: no test database locator; CI runs this test");
+                        return None;
+                    };
+                    let database = create_test_database(&admin_dsn).await;
+                    let pool = migrated_pool(&database.dsn).await;
+                    let audit_store = cluster_audit_store(&pool).await;
+                    seed_baseline_generation_fixture(&pool, &audit_store).await;
+                    let harness = cluster_suggestions_harness(&pool, audit_store).await;
+                    raise_caller_key_fence(&pool).await;
+                    let id = generate_one_suggestion(&harness.router).await;
+                    let etag = acceptance_footprint(&harness.policy_store, &pool, &id)
+                        .await
+                        .active_etag;
+                    let key = caller_key(92);
+                    let accept = |revision: &str| {
+                        harness.router.clone().oneshot(keyed_accept(
+                            &id,
+                            &key,
+                            &etag,
+                            revision,
+                            &[],
+                        ))
+                    };
+                    let mut answers = Vec::new();
+
+                    let accepted = accept("1").await.expect("accept request should complete");
+                    assert_eq!(accepted.status(), StatusCode::CREATED);
+                    answers.push(json_body(accepted).await);
+                    let retried = accept("1").await.expect("retry should complete");
+                    assert_eq!(retried.status(), StatusCode::OK);
+                    let receipt = json_body(retried).await;
+                    assert_policy_receipt(&receipt, &key, "policy.suggestion.accept");
+                    answers.push(receipt);
+                    let conflict = accept("2").await.expect("conflict should complete");
+                    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+                    let conflict = json_body(conflict).await;
+                    assert_eq!(conflict["reason"], json!("caller_operation_conflict"));
+                    answers.push(conflict);
+
+                    let computed: Vec<String> = ["1", "2"]
+                        .into_iter()
+                        .map(|revision| acceptance_digest(&id, &key, &etag, revision))
+                        .collect();
+                    let stored: Vec<String> = pool
+                        .get()
+                        .await
+                        .expect("client")
+                        .query(
+                            "SELECT binding_digest FROM greengateway.authority_caller_operation_ids \
+                             WHERE action = 'policy.suggestion.accept'",
+                            &[],
+                        )
+                        .await
+                        .expect("reservations read")
+                        .iter()
+                        .map(|row| row.get::<_, Option<String>>(0).expect("a bound digest"))
+                        .collect();
+                    assert_eventually(Duration::from_secs(5), || {
+                        events_of(&harness.audit, audit::event::POLICY_CHANGED) == 1
+                    });
+                    let audited = format!("{:?}", harness.audit.events());
+                    Some((answers, key, computed, stored, audited))
+                },
+            );
+        let Some((answers, key, computed, stored, audited)) = outcome else {
+            return;
+        };
+
+        // The digest computed here is the one the route bound: the accepted
+        // request's reservation holds it.
+        assert_eq!(stored, vec![computed[0].clone()]);
+        assert!(!logged.is_empty(), "the route's log lines were captured");
+        let answered = format!("{answers:?}");
+        for digest in &computed {
+            assert!(!answered.contains(digest), "a digest reached an answer");
+            assert!(
+                !audited.contains(digest),
+                "a digest reached the audit stream"
+            );
+            assert!(!logged.contains(digest), "a digest reached the logs");
+            assert!(!rendered.contains(digest), "a digest reached the metrics");
+        }
+        assert!(!logged.contains(&key), "the caller key reached the logs");
+        assert!(
+            !rendered.contains(&key),
+            "the caller key reached the metrics"
+        );
+    }
+
     /// A keyed draft publication without a suggestion: admitted before the
     /// draft is read, it reserves `policy.publish`; an exact retry after
     /// the ETag moved is `200` with the receipt and no second event; the
