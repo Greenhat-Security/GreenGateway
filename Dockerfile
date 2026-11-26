@@ -16,7 +16,7 @@ COPY .node-version .npm-version build-tools.json npm-script-policy.json ./
 COPY scripts/npm-script-policy.mjs scripts/npm-script-policy.mjs
 RUN test "$(node --version)" = "v$(cat .node-version)" \
     && test "$(npm --version)" = "$(cat .npm-version)" \
-    && rustc --version | grep -E '^rustc 1\.99\.1 '
+    && rustc --version | grep -E '^rustc 1\.100\.0 '
 COPY gateway/Cargo.toml gateway/Cargo.toml
 # Cargo loads the whole workspace, so every member's manifest must be here.
 # The image ships only the gateway: `ggctl`, the operator CLI, keeps a stub
