@@ -484,17 +484,19 @@ fn a_keyed_connection_change_keeps_synthetic_markers_out_of_the_receipt_audit_lo
 /// files, so the aliases were resolved and their files read; a keyed
 /// refresh that fails after that (the upstream answers `500`, the refresh
 /// `502 request_failed`, and the upstream again received both values); and
-/// a keyed overlay replacement whose reservation cannot be written. No
-/// marker and no binding digest reaches a log line, the rendered metrics, a
-/// receipt, a conflict or failure answer, or the audit stream.
+/// a keyed overlay replacement whose reservation cannot be written. The
+/// upstream requires a TLS client certificate, which the Connection names
+/// through two operator aliases whose IDs and file locators are
+/// [`CLIENT_TLS_MARKERS`]; each fetch records that the certificate presented
+/// is the one issued for the run, so both aliases were resolved and their
+/// files read. No marker, no line of the client private key and no binding
+/// digest reaches a log line, the rendered metrics, a receipt, a conflict
+/// or failure answer, or the audit stream.
 ///
-/// Not driven: the TLS client certificate and key aliases of a catalog's
-/// Connection, because an enabled Connection builds its TLS client from PEM
-/// material that a marker is not (the Connection test marks those aliases
-/// on a disabled Connection); and `catalog.mcp.publish`, which needs an MCP
-/// upstream to list tools from. The registration's and the first overlay
-/// replacement's own answers are the catalog's view for the caller who
-/// changed it, so they are not searched.
+/// Not driven: `catalog.mcp.publish`, which needs an MCP upstream to list
+/// tools from. The registration's and the first overlay replacement's own
+/// answers are the catalog's view for the caller who changed it, so they
+/// are not searched.
 #[test]
 fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_and_metrics() {
     let connection_db = TempDb::new("keyed-catalog-markers");
@@ -820,8 +822,10 @@ fn a_keyed_catalog_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_
             CATALOG_SOURCE_MARKERS
                 .iter()
                 .chain(ENUM_SOURCE_MARKERS.iter())
+                .chain(CLIENT_TLS_MARKERS.iter())
                 .map(|marker| (*marker).to_owned()),
         )
+        .chain(client_private_key_lines(&connection_db))
         .collect();
     let digests: Vec<String> = digests.into_iter().chain(committed).collect();
     assert_nothing_marked_escaped(
@@ -872,12 +876,14 @@ pub(super) fn write_catalog_source_secrets(connection_db: &TempDb) {
     }
 }
 
-/// Configures the two operator aliases of [`CATALOG_SOURCE_MARKERS`] and
-/// [`UPSTREAM_CA_ALIAS`].
+/// Configures the two operator aliases of [`CATALOG_SOURCE_MARKERS`], the
+/// two of [`CLIENT_TLS_MARKERS`] and [`UPSTREAM_CA_ALIAS`].
 pub(super) fn configure_catalog_source_aliases(config: &mut config::Config) {
     for (id, locator) in [
         (CATALOG_SOURCE_MARKERS[0], CATALOG_SOURCE_MARKERS[2]),
         (CATALOG_SOURCE_MARKERS[1], CATALOG_SOURCE_MARKERS[3]),
+        (CLIENT_TLS_MARKERS[0], CLIENT_TLS_MARKERS[2]),
+        (CLIENT_TLS_MARKERS[1], CLIENT_TLS_MARKERS[3]),
     ] {
         config
             .connection_secret_aliases
@@ -915,17 +921,22 @@ pub(super) fn credentialed_catalog_connection_body(discovery_path: Option<&str>)
 /// [`credentialed_catalog_connection_body`] with `base_url` as its endpoint;
 /// any other endpoint than [`UNADMITTED_CATALOG_ENDPOINT`] is a
 /// [`RecordingSpecUpstream`], whose CA it trusts through
-/// [`UPSTREAM_CA_ALIAS`].
+/// [`UPSTREAM_CA_ALIAS`] and to which it presents the client identity of
+/// [`CLIENT_TLS_MARKERS`].
 pub(super) fn credentialed_catalog_connection_body_at(
     base_url: &str,
     discovery_path: Option<&str>,
 ) -> String {
     let mut discovery = json!({"type": "managed_openapi", "use_connection_authentication": true});
-    // Only the test's own upstream needs its CA trusted.
+    // Only the test's own upstream needs its CA trusted and a client identity.
     let tls = if base_url == UNADMITTED_CATALOG_ENDPOINT {
         json!({})
     } else {
-        json!({"ca_bundle_alias": UPSTREAM_CA_ALIAS})
+        json!({
+            "ca_bundle_alias": UPSTREAM_CA_ALIAS,
+            "client_certificate_id": CLIENT_TLS_MARKERS[0],
+            "client_private_key_id": CLIENT_TLS_MARKERS[1]
+        })
     };
     if let Some(path) = discovery_path {
         discovery["path"] = json!(path);
@@ -972,17 +983,21 @@ async fn create_credentialed_catalog_connection(
     )
 }
 
-/// The two credential headers a catalog Connection's discovery sends, as
-/// one upstream request carried them: `authorization`, then `x-proxy-token`.
-pub(super) type ReceivedCredentials = (Option<String>, Option<String>);
+/// The credentials a catalog Connection's discovery sends, as one upstream
+/// request carried them: the `authorization` and `x-proxy-token` headers,
+/// and whether the TLS client certificate it presented is the one
+/// [`RecordingSpecUpstream::spawn`] issued for the run.
+pub(super) type ReceivedCredentials = (Option<String>, Option<String>, bool);
 
 /// What a fetch of the catalog Connection's specification must carry: the
 /// two secret values of [`CATALOG_SOURCE_MARKERS`], read from the files the
-/// operator aliases name.
+/// operator aliases name, over a connection authenticated with the client
+/// identity the [`CLIENT_TLS_MARKERS`] aliases name.
 pub(super) fn resolved_catalog_credentials() -> ReceivedCredentials {
     (
         Some(format!("Bearer {}", CATALOG_SOURCE_MARKERS[4])),
         Some(CATALOG_SOURCE_MARKERS[5].to_owned()),
+        true,
     )
 }
 
@@ -992,11 +1007,44 @@ pub(super) fn resolved_catalog_credentials() -> ReceivedCredentials {
 pub(super) const UPSTREAM_CA_ALIAS: &str = "catalog-upstream-ca";
 const UPSTREAM_CA_LOCATOR: &str = "catalog-upstream-ca.pem";
 
+/// The TLS client identity a credentialed catalog Connection presents to
+/// [`RecordingSpecUpstream`], which requires one: the IDs of its operator
+/// aliases (certificate, then private key) and the file each reads in the
+/// test secret root. [`RecordingSpecUpstream::spawn`] writes a certificate
+/// and key generated for the run to those files.
+pub(super) const CLIENT_TLS_MARKERS: [&str; 4] = [
+    "marked-catalog-client-certificate-alias",
+    "marked-catalog-client-key-alias",
+    "marked-catalog-client-certificate-locator",
+    "marked-catalog-client-key-locator",
+];
+
+/// Each base64 line of the TLS client private key [`RecordingSpecUpstream`]
+/// wrote for the run in the test secret root of `connection_db`: no line of
+/// the key may reach anything a test searches.
+pub(super) fn client_private_key_lines(connection_db: &TempDb) -> Vec<String> {
+    let pem = fs::read_to_string(
+        connection_db
+            .path
+            .with_extension("secrets")
+            .join(CLIENT_TLS_MARKERS[3]),
+    )
+    .expect("the client key file reads");
+    let lines: Vec<String> = pem
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with("-----"))
+        .map(str::to_owned)
+        .collect();
+    assert!(!lines.is_empty(), "the client key has a body");
+    lines
+}
+
 /// A loopback HTTPS upstream the test controls, standing in for a catalog
 /// Connection's specification host (a credentialed Connection must use
-/// HTTPS): it records the credential headers of every request it receives
-/// and answers with the widget specification, or with `500` once
-/// [`Self::fail`] was called.
+/// HTTPS). It requires a TLS client certificate from a client CA generated
+/// for the run, so a handshake without one fails and nothing is recorded.
+/// It records the credentials of every request it receives and answers with
+/// the widget specification, or with `500` once [`Self::fail`] was called.
 pub(super) struct RecordingSpecUpstream {
     address: std::net::SocketAddr,
     received: Arc<std::sync::Mutex<Vec<ReceivedCredentials>>>,
@@ -1006,25 +1054,42 @@ pub(super) struct RecordingSpecUpstream {
 impl RecordingSpecUpstream {
     /// Starts the upstream under a CA generated for this run, whose
     /// certificate it writes to [`UPSTREAM_CA_LOCATOR`] in the test secret
-    /// root of `connection_db`.
+    /// root of `connection_db`, and writes the client certificate and key
+    /// it will require to the [`CLIENT_TLS_MARKERS`] locators beside it.
     pub(super) async fn spawn(connection_db: &TempDb) -> Self {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
         let (ca_pem, server_cert_der, server_key_der) = test_ca_signed_server_certificate();
+        let (client_ca_der, client_cert_pem, client_key_pem, client_cert_der) =
+            test_ca_signed_client_identity();
         let secret_root = connection_db.path.with_extension("secrets");
         fs::create_dir_all(&secret_root).expect("the test secret root creates");
-        let ca_file = secret_root.join(UPSTREAM_CA_LOCATOR);
-        fs::write(&ca_file, ca_pem).expect("the CA writes");
-        // An operator file alias refuses a file others can read, so the CA
-        // file needs the same mode as the secret files beside it.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&ca_file, fs::Permissions::from_mode(0o600))
-                .expect("the CA file permissions set");
+        for (locator, contents) in [
+            (UPSTREAM_CA_LOCATOR, ca_pem),
+            (CLIENT_TLS_MARKERS[2], client_cert_pem),
+            (CLIENT_TLS_MARKERS[3], client_key_pem),
+        ] {
+            let file = secret_root.join(locator);
+            fs::write(&file, contents).expect("the TLS file writes");
+            // An operator file alias refuses a file others can read, so
+            // these files need the same mode as the secret files beside them.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o600))
+                    .expect("the TLS file permissions set");
+            }
         }
+        let mut client_roots = tokio_rustls::rustls::RootCertStore::empty();
+        client_roots
+            .add(CertificateDer::from(client_ca_der))
+            .expect("the client CA is accepted");
+        let client_verifier =
+            tokio_rustls::rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+                .build()
+                .expect("the client certificate verifier builds");
         let acceptor = TlsAcceptor::from(Arc::new(
             ServerConfig::builder()
-                .with_no_client_auth()
+                .with_client_cert_verifier(client_verifier)
                 .with_single_cert(
                     vec![CertificateDer::from(server_cert_der)],
                     PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key_der)),
@@ -1038,18 +1103,35 @@ impl RecordingSpecUpstream {
         let received = Arc::new(std::sync::Mutex::new(Vec::new()));
         let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (recorded, fails) = (Arc::clone(&received), Arc::clone(&failing));
+        let issued = Arc::new(client_cert_der);
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let (acceptor, recorded, fails) =
-                    (acceptor.clone(), Arc::clone(&recorded), Arc::clone(&fails));
+                let (acceptor, recorded, fails, issued) = (
+                    acceptor.clone(),
+                    Arc::clone(&recorded),
+                    Arc::clone(&fails),
+                    Arc::clone(&issued),
+                );
                 tokio::spawn(async move {
                     let Ok(mut stream) = acceptor.accept(stream).await else {
                         return;
                     };
-                    let Some(credentials) = read_request_credentials(&mut stream).await else {
+                    let presented_issued = stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|chain| chain.first())
+                        .is_some_and(|leaf| leaf.as_ref() == issued.as_slice());
+                    let Some((authorization, proxy_token)) =
+                        read_request_credentials(&mut stream).await
+                    else {
                         return;
                     };
-                    recorded.lock().expect("the record locks").push(credentials);
+                    recorded.lock().expect("the record locks").push((
+                        authorization,
+                        proxy_token,
+                        presented_issued,
+                    ));
                     let response = if fails.load(std::sync::atomic::Ordering::SeqCst) {
                         "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\
                          Connection: close\r\n\r\n"
@@ -1091,11 +1173,39 @@ impl RecordingSpecUpstream {
     }
 }
 
-/// Reads one request's head from `stream` and returns its credential
-/// headers, or `None` if the stream closes first.
+/// A client CA generated for the run and a client certificate it signed:
+/// the CA's DER, the certificate and its private key as PEM, and the
+/// certificate's DER.
+fn test_ca_signed_client_identity() -> (Vec<u8>, String, String, Vec<u8>) {
+    let mut ca_params = rcgen::CertificateParams::default();
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "GreenGateway Test Client CA");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = rcgen::KeyPair::generate().expect("the client CA key generates");
+    let ca = ca_params
+        .self_signed(&ca_key)
+        .expect("the client CA certificate builds");
+    let mut params = rcgen::CertificateParams::new(vec!["catalog-client.example.test".to_owned()])
+        .expect("the client certificate parameters build");
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let key = rcgen::KeyPair::generate().expect("the client key generates");
+    let certificate = params
+        .signed_by(&key, &rcgen::Issuer::from_params(&ca_params, &ca_key))
+        .expect("the client certificate builds");
+    (
+        ca.der().as_ref().to_vec(),
+        certificate.pem(),
+        key.serialize_pem(),
+        certificate.der().as_ref().to_vec(),
+    )
+}
+
+/// Reads one request's head from `stream` and returns its `authorization`
+/// and `x-proxy-token` headers, or `None` if the stream closes first.
 async fn read_request_credentials(
     stream: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-) -> Option<ReceivedCredentials> {
+) -> Option<(Option<String>, Option<String>)> {
     let mut head = Vec::new();
     let mut chunk = [0u8; 1024];
     while !head.windows(4).any(|window| window == b"\r\n\r\n") {

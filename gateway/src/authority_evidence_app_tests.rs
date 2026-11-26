@@ -3844,12 +3844,12 @@ mod cluster_connection_keys {
     fn postgres_keyed_connection_and_catalog_changes_keep_synthetic_markers_out_of_the_logs_and_metrics(
     ) {
         use super::marker_keys::{
-            bound_digest, configure_catalog_source_aliases, credentialed_catalog_connection_body,
-            credentialed_catalog_connection_body_at, delegated_connection_body,
-            enum_source_overlay_document, marked_connection_body, marked_overlay_document,
-            resolved_catalog_credentials, write_catalog_source_secrets, RecordingSpecUpstream,
-            CATALOG_SOURCE_MARKERS, DELEGATED_MARKERS, ENUM_SOURCE_MARKERS, OVERLAY_MARKERS,
-            REFERENCE_MARKERS, SUFFIXES,
+            bound_digest, client_private_key_lines, configure_catalog_source_aliases,
+            credentialed_catalog_connection_body, credentialed_catalog_connection_body_at,
+            delegated_connection_body, enum_source_overlay_document, marked_connection_body,
+            marked_overlay_document, resolved_catalog_credentials, write_catalog_source_secrets,
+            RecordingSpecUpstream, CATALOG_SOURCE_MARKERS, CLIENT_TLS_MARKERS, DELEGATED_MARKERS,
+            ENUM_SOURCE_MARKERS, OVERLAY_MARKERS, REFERENCE_MARKERS, SUFFIXES,
         };
         let secrets = TempDb::new("cluster-catalog-markers");
         write_catalog_source_secrets(&secrets);
@@ -4411,9 +4411,18 @@ mod cluster_connection_keys {
                 CATALOG_SOURCE_MARKERS
                     .iter()
                     .chain(ENUM_SOURCE_MARKERS.iter())
+                    .chain(CLIENT_TLS_MARKERS.iter())
                     .map(|marker| (*marker).to_owned()),
             );
-        for marker in markers {
+        // Read only if the PostgreSQL run spawned the upstream that wrote it.
+        let key_lines = secrets
+            .path
+            .with_extension("secrets")
+            .join(CLIENT_TLS_MARKERS[3])
+            .exists()
+            .then(|| client_private_key_lines(&secrets))
+            .unwrap_or_default();
+        for marker in markers.chain(key_lines) {
             assert!(!answered.contains(&marker), "{marker} reached an answer");
             assert!(
                 !audited.contains(&marker),

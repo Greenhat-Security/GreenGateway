@@ -396,7 +396,12 @@ for each keyed family, for the operations listed here and no others:
   and an overlay delete on a credentialed Connection whose secret IDs, file
   locators and values are markers. One refresh resolves both credentials and
   sends them to a recording HTTPS upstream the test runs, and one fails after
-  sending them. `catalog.mcp.publish` is not driven.
+  sending them. That upstream requires a TLS client certificate, which the
+  enabled Connection names through two operator aliases whose IDs and file
+  locators are markers too; each fetch records that the certificate presented
+  is the one issued for the run, and no line of the client private key reaches
+  a log line, a metric, an answer or the audit stream. `catalog.mcp.publish` is
+  not driven.
 - Policy, tools and policy tests:
   `a_keyed_document_commit_keeps_synthetic_markers_out_of_the_reservation_receipt_and_record`,
   and for logs, metrics, answers and audit
