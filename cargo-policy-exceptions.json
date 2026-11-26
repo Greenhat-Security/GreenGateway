@@ -8,7 +8,7 @@
         "0.23.1"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "hyper-util 0.1.21, reqwest 0.13.5, pem 4 (via rcgen 0.14.10), rmcp 3.9.0 and the gateway workspace pin use base64 0.23 while axum, jsonwebtoken, metrics-exporter-prometheus, pem 3 and postgres-protocol still require 0.22.",
       "remediation": "Re-evaluate when the listed 0.22 parent dependencies update; remove the exception once their version requirements converge on 0.23.",
       "parents": {
@@ -35,7 +35,7 @@
         "0.11.1"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "fancy-regex requires bit-set 0.8 for its regex engine and proptest 1.12 requires bit-set 0.11 for property tests.",
       "remediation": "Remove this exception when fancy-regex and proptest accept the same bit-set version.",
       "parents": {
@@ -55,7 +55,7 @@
         "0.10.1"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "fancy-regex uses bit-vec 0.8 through bit-set 0.8, yasna requires bit-vec 0.9 for ASN.1 encoding, and proptest 1.12 requires bit-vec 0.10.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -78,7 +78,7 @@
         "0.12.1"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "The 0.10 and 0.11 digest families use incompatible buffer APIs.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -98,7 +98,7 @@
         "0.9.6"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "DER/X509 still use 0.9 while the newer digest family requires 0.10.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -118,7 +118,7 @@
         "0.3.1"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "The tungstenite 0.29 SHA1 0.10 build and current ChaCha/Poly1305/SHA1/SHA2 require different CPU feature APIs.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -140,7 +140,7 @@
         "0.2.2"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "The existing HMAC/SHA and current AEAD/cipher implementations use incompatible RustCrypto generations.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -162,7 +162,7 @@
         "0.11.3"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "The tungstenite 0.29 SHA1 0.10 build and gateway HMAC/SHA2/PostgreSQL protocol crypto use different digest generations.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -184,7 +184,7 @@
         "0.3.0"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "PostgreSQL and bundled SQLite require different fallible iterator interfaces.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -206,7 +206,7 @@
         "0.4.3"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "JWT, ring and rand_core 0.6 use getrandom 0.2; ahash, schema tooling, rand_core 0.9 and tempfile use 0.3; the gateway, current RustCrypto, UUID, rand 0.10, QUIC and PostgreSQL use 0.4: three incompatible generations.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -241,7 +241,7 @@
         "0.17.1"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "metrics-util 0.20 still uses hashbrown 0.16 while SQLite hashlink, indexmap and jsonschema's referencing use 0.17.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -262,7 +262,7 @@
         "3.0.1"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "File timestamp support and capability filesystem APIs have different interface generations.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -284,7 +284,7 @@
         "4.0.0"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "rcgen 0.14.10 moved to pem 4 while jsonwebtoken 11.1.0 still parses PEM with pem 3.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -303,7 +303,7 @@
         "6.0.0"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "The 0.3 and 0.4 getrandom generations require different UEFI bindings.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -322,7 +322,7 @@
         "0.9.5"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "metrics-util and tungstenite 0.29 require rand 0.9, while proptest 1.12, QUIC, PostgreSQL, MCP and tungstenite 0.30 use rand 0.10.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -348,7 +348,7 @@
         "0.9.5"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "Signature, property/QUIC generators and current crypto require distinct rand_core traits.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -373,7 +373,7 @@
     {
       "name": "sha1",
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "Axum WebSockets use tungstenite 0.29/SHA1 0.10; upstream tungstenite 0.30 uses SHA1 0.11 solely for the RFC 6455 handshake.",
       "remediation": "Remove the older WebSocket and SHA1 versions when Axum adopts tungstenite 0.30; recheck the exact downstream error type during that update.",
       "versions": [
@@ -397,7 +397,7 @@
         "3.0.10"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "serde_derive 1.0.229, the gateway transport guard example and the other current proc-macro crates require syn 3 while the remaining derive crates still use syn 2. jsonschema-macros-core is locked but never built: jsonschema's arbitrary-precision feature names it only through a weak optional-dependency feature.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -440,7 +440,7 @@
     {
       "name": "tokio-tungstenite",
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "Axum 0.8.9 pins its downstream WebSocket adapter to 0.29 while the gateway upstream adapter uses 0.30.",
       "remediation": "Remove the older WebSocket and SHA1 versions when Axum adopts tungstenite 0.30; recheck the exact downstream error type during that update.",
       "versions": [
@@ -463,7 +463,7 @@
         "0.7.1"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "The gateway workspace pin uses tower-http 0.7 for its cors, request-id and trace layers while reqwest 0.13.5 still requires 0.6 for its follow-redirect middleware.",
       "remediation": "Re-evaluate when reqwest moves its tower-http requirement to 0.7; remove the exception once the version requirements converge.",
       "parents": {
@@ -478,7 +478,7 @@
     {
       "name": "tungstenite",
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "Axum downstream WebSockets still use 0.29; upstream sockets use 0.30. The explicit 0.29 alias preserves downstream typed error classification.",
       "remediation": "Remove the older WebSocket and SHA1 versions when Axum adopts tungstenite 0.30; recheck the exact downstream error type during that update.",
       "versions": [
@@ -502,7 +502,7 @@
         "0.9.0"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "AWS-LC and ring/webpki select distinct parsing interfaces; changing TLS backends is out of scope.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -522,7 +522,7 @@
         "0.14.7+wasi-0.2.4"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "Existing socket/randomness support and wasite use separate WASI interface generations.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -543,7 +543,7 @@
         "0.61.2"
       ],
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "reason": "fs-set-times, io-extras, winx and ring use windows-sys 0.52 while cap-std, the runtime, TLS and notification dependencies use 0.61: distinct Windows ABI binding generations.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
@@ -581,7 +581,7 @@
       ],
       "reason": "Existing filesystem watcher. Retain its CC0 text; this exact exception does not approve new CC0 code dependencies.",
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "remediation": "Review the license text and distribution obligations again before updating this exact crate version."
     },
     {
@@ -591,7 +591,7 @@
       ],
       "reason": "Existing root-certificate data used by rustls-platform-verifier. Retain the data license when redistributing the roots.",
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "remediation": "Review the license text and distribution obligations again before updating this exact crate version."
     },
     {
@@ -601,7 +601,7 @@
       ],
       "reason": "Existing Windows capability filesystem binding. Retain its Apache license and LLVM exception text.",
       "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
+      "expires": "2027-02-22",
       "remediation": "Review the license text and distribution obligations again before updating this exact crate version."
     }
   ]
