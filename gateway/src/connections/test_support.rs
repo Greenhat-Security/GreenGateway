@@ -144,6 +144,40 @@ impl Drop for AssertionSigningKeyRoot {
     }
 }
 
+/// The forms a test searches for when it checks that a local secret's
+/// stored ciphertext and nonce, read from the Connections database at
+/// `database`, reached nothing else: each as lowercase and uppercase hex,
+/// as unpadded standard and URL-safe base64 (which also find the padded
+/// forms), and as the `Debug` list of its first eight bytes, which is how a
+/// byte vector a log line or an error formatted would begin.
+pub(crate) fn stored_ciphertext_renderings(database: &Path, secret_id: &str) -> Vec<String> {
+    use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+    use base64::Engine as _;
+
+    let (nonce, ciphertext): (Vec<u8>, Vec<u8>) = rusqlite::Connection::open(database)
+        .expect("the Connections database opens")
+        .query_row(
+            "SELECT nonce, ciphertext FROM connection_local_secrets WHERE id = ?1",
+            [secret_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the local secret is stored");
+    let mut renderings = Vec::new();
+    for bytes in [nonce, ciphertext] {
+        assert!(
+            bytes.len() >= 8,
+            "a stored nonce or ciphertext is at least 8 bytes"
+        );
+        renderings.push(hex::encode(&bytes));
+        renderings.push(hex::encode_upper(&bytes));
+        renderings.push(STANDARD_NO_PAD.encode(&bytes));
+        renderings.push(URL_SAFE_NO_PAD.encode(&bytes));
+        let prefix = format!("{:?}", &bytes[..8]);
+        renderings.push(prefix.trim_matches(['[', ']']).to_owned());
+    }
+    renderings
+}
+
 #[cfg(unix)]
 fn restrict(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
