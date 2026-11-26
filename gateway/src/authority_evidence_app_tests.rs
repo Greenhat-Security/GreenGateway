@@ -3817,9 +3817,12 @@ mod cluster_connection_keys {
     /// keyed OpenAPI registration on an enabled Connection whose discovery
     /// uses its marked operator secret aliases, and a keyed overlay
     /// replacement with marked free text), each with its exact retry and a
-    /// conflicting retry; a keyed refresh of that Connection, a keyed
-    /// overlay replacement with a marked enum source request and a keyed
-    /// overlay delete, each with its exact retry; then a keyed create whose
+    /// conflicting retry; a keyed replacement of the first Connection to an
+    /// OAuth client-credentials body naming a marker as its client secret
+    /// alias, a keyed delete of that Connection, a keyed refresh of the
+    /// catalog's Connection, a keyed overlay replacement with a marked enum
+    /// source request and a keyed overlay delete, each with its exact
+    /// retry; then a keyed create whose
     /// caller key cannot be reserved and a keyed overlay replacement whose
     /// catalog evidence row cannot be inserted. Then, with that Connection
     /// replaced to name a discovery path: a keyed refresh refused at the
@@ -3830,8 +3833,7 @@ mod cluster_connection_keys {
     /// aliases' files, so the aliases were resolved and their files read;
     /// and a keyed refresh that fails after that (the upstream answers
     /// `500`, the refresh `502 request_failed`, and the upstream again
-    /// received both values). The SQLite form also drives the OAuth
-    /// client-credentials replacement and the Connection delete. No marker
+    /// received both values). No marker
     /// and no binding digest reaches a log line at any level, the rendered
     /// metrics, a receipt, a conflict or failure answer, or the audit
     /// stream. Each forced store failure is answered `503`, and both are
@@ -3847,9 +3849,10 @@ mod cluster_connection_keys {
             bound_digest, client_private_key_lines, configure_catalog_source_aliases,
             credentialed_catalog_connection_body, credentialed_catalog_connection_body_at,
             delegated_connection_body, enum_source_overlay_document, marked_connection_body,
-            marked_overlay_document, resolved_catalog_credentials, write_catalog_source_secrets,
-            RecordingSpecUpstream, CATALOG_SOURCE_MARKERS, CLIENT_TLS_MARKERS, DELEGATED_MARKERS,
-            ENUM_SOURCE_MARKERS, OVERLAY_MARKERS, REFERENCE_MARKERS, SUFFIXES,
+            marked_overlay_document, oauth_connection_body, resolved_catalog_credentials,
+            write_catalog_source_secrets, RecordingSpecUpstream, CATALOG_SOURCE_MARKERS,
+            CLIENT_TLS_MARKERS, DELEGATED_MARKERS, ENUM_SOURCE_MARKERS, OAUTH_MARKERS,
+            OVERLAY_MARKERS, REFERENCE_MARKERS, SUFFIXES,
         };
         let secrets = TempDb::new("cluster-catalog-markers");
         write_catalog_source_secrets(&secrets);
@@ -3952,11 +3955,12 @@ mod cluster_connection_keys {
                     let delegated = delegated_connection_body(SUFFIXES[0]);
                     let conflicting = delegated_connection_body(SUFFIXES[1]);
                     let mut statuses = Vec::new();
+                    let mut delegated_etag = None;
                     for (index, body) in [&delegated, &delegated, &conflicting]
                         .into_iter()
                         .enumerate()
                     {
-                        let (status, _, answer) = call(
+                        let (status, headers, answer) = call(
                             &router,
                             Method::PUT,
                             &route,
@@ -3969,6 +3973,10 @@ mod cluster_connection_keys {
                         statuses.push(status);
                         if index > 0 {
                             answers.push(answer);
+                        } else {
+                            delegated_etag = headers
+                                .get(header::ETAG)
+                                .map(|value| value.to_str().unwrap().to_owned());
                         }
                     }
                     assert_eq!(
@@ -3976,6 +3984,7 @@ mod cluster_connection_keys {
                         [StatusCode::OK, StatusCode::OK, StatusCode::CONFLICT],
                         "{answers:?}"
                     );
+                    let delegated_etag = delegated_etag.expect("the replacement names its ETag");
                     committed.push(bound_digest(
                         &actor,
                         &replace_key,
@@ -3991,6 +4000,68 @@ mod cluster_connection_keys {
                         &id,
                         &etag,
                         &conflicting,
+                    ));
+
+                    // A replacement to an OAuth client-credentials body naming
+                    // a marked client secret alias, then a delete of the
+                    // Connection that still names it, each with its exact
+                    // retry.
+                    let oauth = oauth_connection_body(SUFFIXES[0]);
+                    let oauth_key = caller_key(124);
+                    let mut statuses = Vec::new();
+                    let mut oauth_etag = None;
+                    for index in 0..2 {
+                        let (status, headers, answer) = call(
+                            &router,
+                            Method::PUT,
+                            &route,
+                            &admin,
+                            Some(oauth.clone()),
+                            Some(&delegated_etag),
+                            Some(&oauth_key),
+                        )
+                        .await;
+                        statuses.push(status);
+                        if index > 0 {
+                            answers.push(answer);
+                        } else {
+                            oauth_etag = headers
+                                .get(header::ETAG)
+                                .map(|value| value.to_str().unwrap().to_owned());
+                        }
+                    }
+                    assert_eq!(statuses, [StatusCode::OK, StatusCode::OK], "{answers:?}");
+                    let oauth_etag = oauth_etag.expect("the replacement names its ETag");
+                    committed.push(bound_digest(
+                        &actor,
+                        &oauth_key,
+                        "connection.replace",
+                        &id,
+                        &delegated_etag,
+                        &oauth,
+                    ));
+                    let delete_key = caller_key(125);
+                    for _ in 0..2 {
+                        let (status, _, answer) = call(
+                            &router,
+                            Method::DELETE,
+                            &route,
+                            &admin,
+                            None,
+                            Some(&oauth_etag),
+                            Some(&delete_key),
+                        )
+                        .await;
+                        assert!(status.is_success(), "{status}: {answer}");
+                        answers.push(answer);
+                    }
+                    committed.push(bound_digest(
+                        &actor,
+                        &delete_key,
+                        "connection.delete",
+                        &id,
+                        &oauth_etag,
+                        "",
                     ));
 
                     // An OpenAPI registration on a credentialed Connection,
@@ -4404,6 +4475,7 @@ mod cluster_connection_keys {
                 REFERENCE_MARKERS
                     .iter()
                     .chain(DELEGATED_MARKERS.iter())
+                    .chain(OAUTH_MARKERS.iter())
                     .chain(OVERLAY_MARKERS.iter())
                     .map(move |marker| format!("{marker}{suffix}"))
             })
@@ -4463,6 +4535,7 @@ mod cluster_token_keys {
         config: config::Config,
         pool: &deadpool_postgres::Pool,
         membership: Arc<cluster_membership::ClusterMembership>,
+        audit_log: audit::AuditLog,
     ) -> Router {
         let policy = Arc::new(storage::PostgresPolicyStore::new(pool.clone()));
         let tools = Arc::new(storage::PostgresToolStore::new(pool.clone()));
@@ -4491,7 +4564,7 @@ mod cluster_token_keys {
         let app = gateway_app_with_process_started_at_and_overrides(
             config,
             PrometheusBuilder::new().build_recorder().handle(),
-            test_audit_log(),
+            audit_log,
             test_audit_event_sender(),
             Instant::now(),
             GatewayAppBuildOverrides {
@@ -4586,35 +4659,15 @@ mod cluster_token_keys {
         (tokens, evidence)
     }
 
-    /// The keyed token routes in cluster mode, end to end:
-    ///
-    /// - while a live member lacks `caller_operation_keys`, a keyed issue and
-    ///   a keyed rotation are `409 capability_not_advertised`, mint nothing,
-    ///   record nothing and reserve nothing, and the unkeyed forms still
-    ///   commit;
-    /// - once that member is stale, so that the operation gate would admit a
-    ///   key and raise the contract fence, a keyed issue or rotation from a
-    ///   caller without `admin:tokens:write`, or from a writer who may not
-    ///   delegate the token's scopes, is still `403`, a keyed issue with a
-    ///   malformed `expires_at` is `400`, and the fence is unchanged byte for
-    ///   byte: authorization and validation come before admission;
-    /// - the first authorized keyed issue raises the fence once, and exact
-    ///   retries of the issue and of a keyed rotation are answered from
-    ///   their receipts with `secret_returned: false` and no plaintext.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn postgres_keyed_token_changes_wait_for_the_fleet_and_authorize_and_validate_before_the_fence(
-    ) {
-        let Some(admin_dsn) = locator() else {
-            eprintln!("skipping: no test database locator; CI runs this test");
-            return;
-        };
-        let database =
-            storage::contract_tests::postgres_audit_tests::create_test_database(&admin_dsn).await;
-        let foundation = test_pool(&database.dsn).await;
-        let pool = foundation.pool();
-        storage::migrations::apply_missing_for_startup(pool, &test_settings())
-            .await
-            .unwrap();
+    /// The replica the tests here build over the migrated `pool`: the token
+    /// policy, whose HTTP default is `allow` so that every `403` is the token
+    /// handler's own, an empty tools document, room in the journal, and
+    /// `earlier`, a live member built before caller keys, in the roster. The
+    /// router and that member's ID.
+    async fn keyed_replica(
+        pool: &deadpool_postgres::Pool,
+        audit_log: audit::AuditLog,
+    ) -> (Router, uuid::Uuid) {
         storage::postgres_authority_events::PostgresAuthorityEventStore::new(pool.clone())
             .configure_capacity(100)
             .await
@@ -4622,7 +4675,7 @@ mod cluster_token_keys {
         // The requests carry real bearer tokens through the HTTP policy
         // layer, which answers a route no rule names with the policy's
         // default action. Allow it there, as the Connection replica test
-        // does, so that every 403 below is the token handler's own.
+        // does, so that every 403 in these tests is the token handler's own.
         let mut document: Value = serde_json::from_str(&token_policy_document_string()).unwrap();
         document["default_action"] = json!("allow");
         let policy = rbac::Policy::validate_json_value(document).unwrap();
@@ -4689,7 +4742,39 @@ mod cluster_token_keys {
         config.egress_deny_private_ips = false;
         config.rate_limit_write_burst = 1000;
         config.rate_limit_write_rps = 1000.0;
-        let router = replica(config, pool, membership).await;
+        (replica(config, pool, membership, audit_log).await, earlier)
+    }
+
+    /// The keyed token routes in cluster mode, end to end:
+    ///
+    /// - while a live member lacks `caller_operation_keys`, a keyed issue and
+    ///   a keyed rotation are `409 capability_not_advertised`, mint nothing,
+    ///   record nothing and reserve nothing, and the unkeyed forms still
+    ///   commit;
+    /// - once that member is stale, so that the operation gate would admit a
+    ///   key and raise the contract fence, a keyed issue or rotation from a
+    ///   caller without `admin:tokens:write`, or from a writer who may not
+    ///   delegate the token's scopes, is still `403`, a keyed issue with a
+    ///   malformed `expires_at` is `400`, and the fence is unchanged byte for
+    ///   byte: authorization and validation come before admission;
+    /// - the first authorized keyed issue raises the fence once, and exact
+    ///   retries of the issue and of a keyed rotation are answered from
+    ///   their receipts with `secret_returned: false` and no plaintext.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_keyed_token_changes_wait_for_the_fleet_and_authorize_and_validate_before_the_fence(
+    ) {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database =
+            storage::contract_tests::postgres_audit_tests::create_test_database(&admin_dsn).await;
+        let foundation = test_pool(&database.dsn).await;
+        let pool = foundation.pool();
+        storage::migrations::apply_missing_for_startup(pool, &test_settings())
+            .await
+            .unwrap();
+        let (router, earlier) = keyed_replica(pool, test_audit_log()).await;
         let admin = signed_token_with_issuer("operator", &["superadmin"], CLUSTER_ISSUER);
         let reader = signed_token_with_issuer("reader", &["tokens-reader"], CLUSTER_ISSUER);
         // Holds `admin:tokens:write` but not the `probe-reader` role the
@@ -4864,6 +4949,192 @@ mod cluster_token_keys {
         assert_eq!(token_reservations(pool).await, expected);
         assert_eq!(token_rows(pool).await, (2, 4));
         assert_eq!(read_fence().await, raised, "the fence was raised once");
+    }
+
+    /// I5 for keyed service-token issue and rotation in their PostgreSQL
+    /// form, where both are qualified rows: the form of
+    /// `admin_tokens_app_tests::a_replayed_token_issue_or_rotation_repeats_no_side_effect_and_never_returns_the_plaintext`
+    /// that runs against the PostgreSQL token store. A keyed issue, its
+    /// exact retry and its key reused for other scopes; a keyed rotation,
+    /// its exact retry and its key reused on another token. No plaintext
+    /// and no binding digest reaches a log line at any level or the
+    /// rendered metrics, and none reaches a receipt, a conflict answer or
+    /// the audit stream. Token IDs and caller keys are not secrets; each
+    /// receipt names its key to its caller by design.
+    #[test]
+    fn postgres_keyed_token_changes_keep_the_plaintext_and_digests_out_of_the_logs_and_metrics() {
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let (outcome, logged, rendered) =
+            super::super::admin_tokens_app_tests::capture_logs_and_metrics_on_every_runtime_thread(
+                async {
+                    let Some(admin_dsn) = locator() else {
+                        eprintln!("skipping: no test database locator; CI runs this test");
+                        return None;
+                    };
+                    let database =
+                        storage::contract_tests::postgres_audit_tests::create_test_database(
+                            &admin_dsn,
+                        )
+                        .await;
+                    let foundation = test_pool(&database.dsn).await;
+                    let pool = foundation.pool();
+                    storage::migrations::apply_missing_for_startup(pool, &test_settings())
+                        .await
+                        .unwrap();
+                    let (router, earlier) = keyed_replica(pool, audit_log).await;
+                    // The member built before caller keys goes stale, so the
+                    // operation gate admits a key.
+                    let updated = pool
+                        .get()
+                        .await
+                        .unwrap()
+                        .execute(
+                            "UPDATE greengateway.cluster_members
+                             SET last_heartbeat_at = now() - make_interval(secs => 60)
+                             WHERE instance_id = $1::text::uuid",
+                            &[&earlier.to_string()],
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(updated, 1);
+                    let admin =
+                        signed_token_with_issuer("operator", &["superadmin"], CLUSTER_ISSUER);
+                    let body = json!({ "scopes": ["probe-reader"] }).to_string();
+                    let mut answers = Vec::new();
+                    let mut plaintexts = Vec::new();
+                    let plaintext_of = |answer: &Value| {
+                        answer["plaintext_token"]
+                            .as_str()
+                            .expect("the first response carries the plaintext")
+                            .to_owned()
+                    };
+
+                    // A keyed issue, its exact retry, its key for other scopes.
+                    let issue_key = caller_key(130);
+                    let (status, issued) = call(
+                        &router,
+                        TOKENS_ADMIN_ROUTE,
+                        &admin,
+                        Some(body.clone()),
+                        Some(&issue_key),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::CREATED, "{issued}");
+                    let id = issued["token"]["id"].as_str().expect("an ID").to_owned();
+                    plaintexts.push(plaintext_of(&issued));
+                    let (status, receipt) = call(
+                        &router,
+                        TOKENS_ADMIN_ROUTE,
+                        &admin,
+                        Some(body.clone()),
+                        Some(&issue_key),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::OK, "{receipt}");
+                    assert_eq!(receipt["operation"], json!("service_token.issue"));
+                    assert_eq!(receipt["secret_returned"], json!(false));
+                    answers.push(receipt);
+                    let (status, conflict) = call(
+                        &router,
+                        TOKENS_ADMIN_ROUTE,
+                        &admin,
+                        Some(json!({ "scopes": ["tokens-reader"] }).to_string()),
+                        Some(&issue_key),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+                    assert_eq!(conflict["reason"], json!("caller_operation_conflict"));
+                    answers.push(conflict);
+
+                    // A keyed rotation, its exact retry, its key on another
+                    // token.
+                    let rotate_key = caller_key(131);
+                    let rotate = format!("{TOKENS_ADMIN_ROUTE}/{id}/rotate");
+                    let (status, rotated) =
+                        call(&router, &rotate, &admin, None, Some(&rotate_key)).await;
+                    assert_eq!(status, StatusCode::OK, "{rotated}");
+                    plaintexts.push(plaintext_of(&rotated));
+                    let (status, receipt) =
+                        call(&router, &rotate, &admin, None, Some(&rotate_key)).await;
+                    assert_eq!(status, StatusCode::OK, "{receipt}");
+                    assert_eq!(receipt["operation"], json!("service_token.rotate"));
+                    assert_eq!(receipt["secret_returned"], json!(false));
+                    answers.push(receipt);
+                    let (status, other) = call(
+                        &router,
+                        TOKENS_ADMIN_ROUTE,
+                        &admin,
+                        Some(body.clone()),
+                        None,
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::CREATED, "{other}");
+                    plaintexts.push(plaintext_of(&other));
+                    let other_rotate = format!(
+                        "{TOKENS_ADMIN_ROUTE}/{}/rotate",
+                        other["token"]["id"].as_str().expect("an ID")
+                    );
+                    let (status, conflict) =
+                        call(&router, &other_rotate, &admin, None, Some(&rotate_key)).await;
+                    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+                    assert_eq!(conflict["reason"], json!("caller_operation_conflict"));
+                    answers.push(conflict);
+
+                    assert_eventually(Duration::from_secs(5), || {
+                        capture
+                            .events()
+                            .iter()
+                            .filter(|event| event.event_type == audit::event::SERVICE_TOKEN_CHANGED)
+                            .count()
+                            == 3
+                    });
+                    let digests: Vec<String> = pool
+                        .get()
+                        .await
+                        .unwrap()
+                        .query(
+                            "SELECT binding_digest FROM greengateway.authority_caller_operation_ids \
+                             WHERE action LIKE 'service_token.%'",
+                            &[],
+                        )
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(|row| row.get::<_, Option<String>>(0).expect("a bound digest"))
+                        .collect();
+                    assert_eq!(digests.len(), 2, "the issue and the rotation are reserved");
+                    Some((answers, plaintexts, digests))
+                },
+            );
+        let Some((answers, plaintexts, digests)) = outcome else {
+            return;
+        };
+
+        assert!(
+            logged
+                .lines()
+                .any(|line| !line.contains("capture sentinel on the")),
+            "the handlers logged"
+        );
+        let answered = format!("{answers:?}");
+        let audited = format!("{:?}", capture.events());
+        for marker in plaintexts.iter().chain(&digests) {
+            assert!(
+                !answered.contains(marker),
+                "a secret marker reached an answer"
+            );
+            assert!(
+                !audited.contains(marker),
+                "a secret marker reached the audit stream"
+            );
+            assert!(!logged.contains(marker), "a secret marker reached the logs");
+            assert!(
+                !rendered.contains(marker),
+                "a secret marker reached the metrics"
+            );
+        }
     }
 }
 
