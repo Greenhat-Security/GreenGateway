@@ -822,7 +822,9 @@ async fn an_admitted_secret_change_finishes_after_its_client_goes_away() {
 
 /// I5 at the application boundary: markers in every secret-bearing request
 /// field -- the created and rotated values, and the label -- reach no
-/// receipt, conflict answer, audit event, log line or metric, and the values
+/// receipt, conflict answer, audit event, log line or metric through the
+/// keyed create, rotation and delete, their exact retries and a conflicting
+/// reuse of each key, and the values
 /// reach neither the Connections database file nor its WAL. Logs and metrics
 /// are captured on the test's thread and on the runtime's blocking pool,
 /// where the local-secret store runs. The stored nonce and ciphertext of the
@@ -892,7 +894,46 @@ fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_a
                 for value in [ROTATED_MARKER, CONFLICT_MARKER] {
                     answers.push(exchange(&router, rotate(value)).await.2);
                 }
-                assert_eventually(Duration::from_secs(5), || secret_changes(&capture) >= 2);
+
+                // A keyed delete of the rotated secret, its exact retry, and
+                // its key reused under the create's precondition.
+                let listed = exchange(
+                    &router,
+                    keyed_connection_request(
+                        Method::GET,
+                        CONNECTION_SECRETS_ADMIN_ROUTE,
+                        admin.clone(),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .await
+                .2;
+                let rotated_etag = listed["secrets"]
+                    .as_array()
+                    .and_then(|secrets| secrets.iter().find(|secret| secret["id"] == json!(id)))
+                    .and_then(|secret| secret["etag"].as_str())
+                    .expect("the list names the rotated secret's ETag")
+                    .to_owned();
+                let delete_key = caller_key(85);
+                let delete = |if_match: &str| {
+                    keyed_connection_request(
+                        Method::DELETE,
+                        &route,
+                        admin.clone(),
+                        None,
+                        Some(if_match),
+                        Some(&delete_key),
+                    )
+                };
+                let (status, _, deleted) = exchange(&router, delete(&rotated_etag)).await;
+                assert_eq!(status, StatusCode::OK, "{deleted}");
+                views.push(deleted);
+                answers.push(exchange(&router, delete(&rotated_etag)).await.2);
+                let created_etag = etag.as_deref().expect("the create names its ETag");
+                answers.push(exchange(&router, delete(created_etag)).await.2);
+                assert_eventually(Duration::from_secs(5), || secret_changes(&capture) >= 3);
                 (answers, sealed, views)
             },
         );
@@ -906,6 +947,12 @@ fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_a
         answers[3]["reason"],
         json!(CALLER_OPERATION_CONFLICT_REASON)
     );
+    assert_eq!(answers[4]["operation"], json!("secret.delete"));
+    assert_eq!(
+        answers[5]["reason"],
+        json!(CALLER_OPERATION_CONFLICT_REASON)
+    );
+    assert_eq!(secret_changes(&capture), 3);
 
     let answered = format!("{answers:?}");
     let audited = format!("{:?}", capture.events());
@@ -941,6 +988,8 @@ fn a_keyed_secret_change_keeps_synthetic_markers_out_of_the_receipt_audit_logs_a
             "a stored ciphertext or nonce reached the metrics"
         );
     }
+    // The create's, the rotation's and the delete's keys, each bound by digest.
+    assert_eq!(secret_reservations(&connection_db.path).len(), 3);
     for (_, _, digest) in secret_reservations(&connection_db.path) {
         let digest = digest.expect("every local-secret key is bound by digest");
         assert!(!answered.contains(&digest), "a digest reached an answer");
